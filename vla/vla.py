@@ -3,11 +3,12 @@
 # Silicon Perception Inc.
 #
 # Recurrent CNN core: a per-token ContextCNN DFF loop + DecoderCNN. The current
-# token (raw byte) is embedded, broadcast over an S×S grid, projected and summed
-# into the recurrent DFF state; the decoder reads the state out to next-token
-# logits. Image and audio conditioning will be added back incrementally.
+# token is embedded, broadcast over an S×S grid, projected and summed into the
+# recurrent DFF state; the decoder reads the state out to next-token logits.
+# Image and audio conditioning will be added back incrementally.
 #
-# Vocabulary: 256 (raw bytes). No attention, no positional encoding.
+# Vocabulary: 256 (raw bytes) by default, or the 50257-token TinyStories BPE vocabulary
+# with --tokenizer tiny1m|tiny8m (see _TOKENIZERS). No attention, no positional encoding.
 
 import math
 import torch ; print('torch', torch.__version__)
@@ -17,6 +18,7 @@ import torchinfo
 import numpy as np
 import argparse
 import collections
+import itertools
 import glob
 import os
 import queue
@@ -61,6 +63,80 @@ def _printable(s):
     return ''.join(out)
 
 
+# ── tokenizers ────────────────────────────────────────────────────────────────
+# --tokenizer selects the vocabulary the whole script runs on: the clip builder emits
+# ids from it, the model embeds/decodes them, and every display path renders them.
+# 'char' is the raw-byte default; the tiny* names pull a pretrained TinyStories GPT-Neo
+# tokenizer together with that model's embedding and lm_head (see VLAModel).
+
+_TOKENIZERS = {
+    'char':   None,
+    'tiny1m': 'roneneldan/TinyStories-1M',   # GPT-Neo, hidden 64,  vocab 50257
+    'tiny8m': 'roneneldan/TinyStories-8M',   # GPT-Neo, hidden 256, vocab 50257
+}
+
+_tokenizer = None   # the live tokenizer, bound to model.tok once the model is built
+
+
+class ByteTokenizer:
+    """Raw bytes: the vocabulary is the 256 byte values and START/END/NULL are the
+    0x02/0x03/0x00 control bytes, so a clip is literally [START] utf-8 bytes [END]."""
+    is_char    = True
+    vocab_size = 256
+    start_id, end_id, null_id = START, END, NULL
+
+    def encode(self, text): return list(text.encode('utf-8', errors='replace'))
+    def decode(self, ids):  return bytes(ids).decode('utf-8', errors='replace')
+
+
+class HFTokenizer:
+    """A pretrained BPE tokenizer from the hub. GPT-Neo has no separate BOS token --
+    bos_token_id and eos_token_id are both <|endoftext|> (50256) -- so START and END are
+    the same id here and a clip is [EOT] tokens [EOT], the framing the TinyStories models
+    were trained with. There is no NULL equivalent (id 0 is an ordinary token), so
+    null_id is None and nothing is ever filtered out of the output."""
+    is_char = False
+    null_id = None
+
+    def __init__(self, repo, vocab_size):
+        from transformers import AutoTokenizer
+        self.tok        = AutoTokenizer.from_pretrained(repo)
+        # A recurrent model has no context window, and we never truncate; without this the
+        # tokenizer warns about every document longer than the source model's 2048 tokens.
+        self.tok.model_max_length = int(1e12)
+        eot             = self.tok.eos_token_id
+        self.end_id     = eot if eot is not None else self.tok.bos_token_id
+        bos             = self.tok.bos_token_id
+        self.start_id   = bos if bos is not None else self.end_id
+        # the model's embedding rows, not len(tokenizer): the logits are that wide
+        self.vocab_size = vocab_size
+
+    def encode(self, text): return self.tok.encode(text)
+    def decode(self, ids):  return self.tok.decode(ids)
+
+
+def _render(ids):
+    """Render a token-id sequence for display. Byte mode decodes UTF-8 and hands the
+    string to _printable(); BPE mode decodes runs of ordinary tokens the same way and
+    renders the document marker itself. Since START and END are one id in BPE mode, the
+    marker shows as <STX> when it opens the sequence and <ETX> anywhere after -- which is
+    exactly the role it plays in the [START] text [END] framing."""
+    if _tokenizer.is_char:
+        return _printable(bytes(ids).decode('utf-8', errors='replace'))
+    out, run = [], []
+    for n, t in enumerate(ids):
+        if t in (_tokenizer.start_id, _tokenizer.end_id):
+            if run:
+                out.append(_printable(_tokenizer.decode(run)))
+                run = []
+            out.append(STX_TEXT if n == 0 else ETX_TEXT)
+        else:
+            run.append(t)
+    if run:
+        out.append(_printable(_tokenizer.decode(run)))
+    return ''.join(out)
+
+
 # ── args ──────────────────────────────────────────────────────────────────────
 
 parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
@@ -70,7 +146,23 @@ parser.add_argument('--context',       default=7,     type=int,
 parser.add_argument('--n_hidden',      default=512,   type=int,
                     help='ContextCNN channel depth')
 parser.add_argument('--c_text',        default=1,     type=int,
-                    help='token embedding channels (None → n_hidden)')
+                    help='token embedding channels (None → n_hidden). Ignored by '
+                         '--tokenizer tiny1m|tiny8m, which take it from the pretrained '
+                         'embedding width (64 / 256)')
+parser.add_argument('--tokenizer',     default='char', choices=sorted(_TOKENIZERS),
+                    help='vocabulary and token embedding/readout: "char" is the raw 256-byte '
+                         'default (learned embedding, decoder straight to 256 logits); '
+                         '"tiny1m"/"tiny8m" swap in the pretrained BPE tokenizer, token '
+                         'embedding and lm_head of roneneldan/TinyStories-1M / -8M '
+                         '(50257-token vocabulary) and adapt the CNN to them with the linear '
+                         '1x1 conv2d already in text_proj (embedding width → n_hidden) and in '
+                         'the decoder (n_hidden → embedding width, then lm_head → logits). '
+                         'The pretrained weights are frozen unless --unfreeze')
+parser.add_argument('--unfreeze',      default=False, action='store_true',
+                    help='train the pretrained token embedding and lm_head too '
+                         '(--tokenizer tiny1m|tiny8m); by default they are frozen and only '
+                         'the CNN and its two adapters are trained. No effect with '
+                         '--tokenizer char')
 parser.add_argument('--depth',         default=7,     type=int,
                     help='ContextCNN conv layer count')
 parser.add_argument('--n_layers',      default=3,     type=int,
@@ -122,6 +214,17 @@ parser.add_argument('--momentum',      default=0.0,   type=float,
                          'ignored by rprop/adagrad)')
 parser.add_argument('--weight_decay',  default=0.0,   type=float,
                     help='L2 weight decay (--opt sgd/rmsprop/adagrad; ignored by rprop)')
+parser.add_argument('--clip',          default=0.0,   type=float,
+                    help='clip the global gradient norm to this value before the optimizer '
+                         'step (0 = off). ContextCNN is a plain Conv->BatchNorm->ReLU chain '
+                         'with no residual path, which amplifies the backward signal by ~1.15x '
+                         'per layer, so the gradient norm at init grows like 1.15**--depth: '
+                         'harmless at depth 8, ~1e2 at 32, ~1e4 at 56. AdamW hides this (its '
+                         'step is bounded by the lr however large the gradient is) but SGD '
+                         'multiplies it straight into the weights and diverges on step 0. '
+                         'Clipping makes the deep configurations trainable with any optimizer. '
+                         'The logged grad column still reports the norm BEFORE clipping, and a '
+                         '"clipped" column reports the fraction of steps that hit the limit')
 # learning rate: all --schedule modes are driven by this one set. lr_max is the peak
 # (and the optimizer base lr); lr_min is the floor; lr_warmup / lr_period are step counts.
 parser.add_argument('--schedule',      default='const',
@@ -169,8 +272,26 @@ parser.add_argument('--n',             default=200,   type=int,
                          'streams until the window is closed, and the training-loop GEN '
                          'samples are a fixed length')
 parser.add_argument('--prompt',        default='',
-                    help='generation prompt; START (0x02) is always prepended, so leave '
+                    help='generation prompt; START is always prepended (0x02 with '
+                         '--tokenizer char, <|endoftext|> with tiny1m|tiny8m), so leave '
                          'empty to generate from START alone')
+parser.add_argument('--eval',          default=False, action='store_true',
+                    help='one-shot: load a checkpoint, compute teacher-forced loss over a '
+                         'held-out split of --dataset, report it and exit. No training. '
+                         'Each document is an independent batch row framed [START] text '
+                         '[END] with a fresh DFF state, and every step is scored -- the '
+                         'same clip framing and gradient target the training loop uses, and '
+                         'the same measurement gptneo.py --eval makes, so the two numbers '
+                         'compare directly. Note --init: a "relu"/"gaussian" context seed is '
+                         'random, so the loss moves slightly run to run unless --seed is '
+                         'fixed (--init zero is exactly reproducible)')
+parser.add_argument('--split',         default=None,
+                    help="--eval split; default is the corpus's held-out split (validation "
+                         "for tiny/c4), or 'validation' for a bare hub repo id")
+parser.add_argument('--column',        default=None,
+                    help='--eval text column (default: the corpus default, else "text")')
+parser.add_argument('--examples',      default=0,     type=int,
+                    help='--eval: stop after this many documents (0 = the whole split)')
 parser.add_argument('--init',          default='relu',
                     choices=['zero', 'gaussian', 'relu'],
                     help='how the DFF context is seeded before prompting and at every '
@@ -229,7 +350,8 @@ _mix = _parse_mix(args.mix)
 
 # ── restore architecture args from checkpoint ─────────────────────────────────
 
-_ARCH_ARGS = ('context', 'n_hidden', 'c_text', 'n_layers', 'depth', 'kernel', 'skip')
+_ARCH_ARGS = ('context', 'n_hidden', 'c_text', 'n_layers', 'depth', 'kernel', 'skip',
+              'tokenizer')
 
 _loaded_ckpt = None
 _start_step  = 0                 # resumed global step count (0 for a fresh run)
@@ -258,7 +380,7 @@ if args.c_text is None:          # default token embedding width to n_hidden
 # ── log / device / seed ───────────────────────────────────────────────────────
 
 if args.log is None:
-    if args.generate or args.vis or args.push:   # one-shot modes: don't create a log file
+    if args.generate or args.vis or args.push or args.eval:   # one-shot: no log file
         args.log = os.devnull
     else:
         # training -> log/log.<date>. Never reuse a name: two runs started in the
@@ -311,13 +433,16 @@ class ContextCNN(nn.Module):
 
 
 class DecoderCNN(nn.Module):
-    """1×1 conv n_hidden→256, then global average pool → logits.
+    """1×1 conv n_hidden→n_out, then global average pool.
     Input:  [B, n_hidden, S, S]
-    Output: [B, 256]
-    """
-    def __init__(self, n_hidden, S):
+    Output: [B, n_out]
+
+    n_out is the readout width: 256 (the byte vocabulary, so this is already the logits)
+    for --tokenizer char, or the pretrained embedding width for tiny1m|tiny8m, where the
+    conv is the linear adapter feeding a frozen lm_head."""
+    def __init__(self, n_hidden, S, n_out=256):
         super().__init__()
-        self.proj = nn.Conv2d(n_hidden, 256, 1)
+        self.proj = nn.Conv2d(n_hidden, n_out, 1)
         self.pool = nn.AvgPool2d(S)
 
     def forward(self, x):
@@ -336,23 +461,55 @@ except ImportError:                                  # pragma: no cover
 
 
 class VLAModel(nn.Module, _HubMixin):
-    """Recurrent CNN language model over raw bytes. Each step the current token is
-    embedded, broadcast to an S×S grid, projected to n_hidden and summed into the
-    per-layer DFF state; ContextCNN updates the state and the decoder reads it out
-    to next-token logits. n_layers stacks (ContextCNN + feedback) units in series,
-    each carrying its own DFF state."""
+    """Recurrent CNN language model. Each step the current token is embedded, broadcast
+    to an S×S grid, projected to n_hidden and summed into the per-layer DFF state;
+    ContextCNN updates the state and the decoder reads it out to next-token logits.
+    n_layers stacks (ContextCNN + feedback) units in series, each carrying its own DFF
+    state.
+
+    `tokenizer` picks the vocabulary and both ends of the token path:
+      char           learned nn.Embedding(256, c_text) in, decoder straight to 256
+                     logits out, lmhead = Identity. Fully self-contained.
+      tiny1m/tiny8m  the pretrained TinyStories GPT-Neo embedding (wte) in and its
+                     lm_head out, both frozen (see set_pretrained_trainable / --unfreeze).
+                     c_text is forced to that model's embedding width, so the CNN meets
+                     the pretrained layers through two linear 1×1 conv2d adapters:
+                     text_proj (c_text → n_hidden) and decoder.proj (n_hidden → c_text)."""
     def __init__(self, n_hidden, depth, kernel, S,
-                 c_text=None, n_layers=1, skip=False):
+                 c_text=None, n_layers=1, skip=False, tokenizer='char'):
         super().__init__()
         self.S          = S
         self.n_hidden   = n_hidden
         self.c_text     = c_text if c_text is not None else n_hidden
         self.n_layers   = max(1, n_layers)    # stacked (ContextCNN + feedback) layers (see --n_layers)
         self.skip       = bool(skip)          # feed the token encoding to every layer (see --skip)
+        self.tokenizer  = tokenizer           # vocabulary / token path (see --tokenizer)
 
-        self.tok_embed = nn.Embedding(256, self.c_text)   # current token → c_text channels
+        if tokenizer == 'char':
+            self.tok      = ByteTokenizer()
+            self.vocab    = self.tok.vocab_size
+            self.tok_embed = nn.Embedding(self.vocab, self.c_text)   # token → c_text channels
+            self.lmhead   = nn.Identity()     # the decoder already emits the 256 byte logits
+        else:
+            # Pull the pretrained embedding and lm_head out of the TinyStories causal LM and
+            # drop the transformer blocks: only the two vocabulary-facing layers are reused.
+            # GPT-Neo ties them (lm_head.weight IS wte.weight), so this is one weight matrix.
+            from transformers import AutoModelForCausalLM
+            repo = _TOKENIZERS[tokenizer]
+            lm   = AutoModelForCausalLM.from_pretrained(repo)
+            self.vocab     = lm.config.vocab_size
+            self.c_text    = lm.config.hidden_size   # the embedding width is not ours to choose
+            self.tok       = HFTokenizer(repo, self.vocab)
+            self.tok_embed = lm.transformer.wte      # vocab → c_text
+            self.lmhead    = lm.lm_head              # c_text → vocab
+            self.set_pretrained_trainable(False)     # frozen unless --unfreeze
+
+        self.start_id  = self.tok.start_id
+        self.end_id    = self.tok.end_id
+        self.null_id   = self.tok.null_id
+
         self.context   = ContextCNN(n_hidden, depth, kernel)
-        self.decoder   = DecoderCNN(n_hidden, S)
+        self.decoder   = DecoderCNN(n_hidden, S, self.c_text if tokenizer != 'char' else 256)
         # token grid (c_text) → n_hidden, summed into the DFF state
         self.text_proj = nn.Conv2d(self.c_text, n_hidden, 1)
 
@@ -374,6 +531,25 @@ class VLAModel(nn.Module, _HubMixin):
         # behaviour, not architecture: deliberately not part of the hub config, so it never
         # affects checkpoint or from_pretrained compatibility.
         self.init_mode = 'relu'
+
+    def pretrained_params(self):
+        """The borrowed TinyStories weights (empty with --tokenizer char). Deduped by
+        identity: GPT-Neo ties lm_head.weight to tok_embed.weight, so it is one tensor."""
+        if self.tokenizer == 'char':
+            return []
+        seen, out = set(), []
+        for m in (self.tok_embed, self.lmhead):
+            for p in m.parameters():
+                if id(p) not in seen:
+                    seen.add(id(p))
+                    out.append(p)
+        return out
+
+    def set_pretrained_trainable(self, flag):
+        """Freeze/unfreeze the borrowed embedding + lm_head (see --unfreeze). Called from
+        __init__ with False, so a model is frozen by default however it was built."""
+        for p in self.pretrained_params():
+            p.requires_grad_(bool(flag))
 
     def _new_dff(self, B, device):
         """A fresh DFF context state (--init). Used everywhere a context is started or
@@ -446,13 +622,13 @@ class VLAModel(nn.Module, _HubMixin):
         stack, new_ctx = self._layers(self.dff, self._tok_grid(byte_idx))
         self.dff = [d.detach().clone() for d in stack]   # store for next step (gradient horizon = 1)
 
-        logits = self.decoder(new_ctx)
+        logits = self.lmhead(self.decoder(new_ctx))
         loss   = F.cross_entropy(logits, targets.long()) if targets is not None else None
         return logits, loss
 
     @torch.no_grad()
-    def generate(self, prompt_bytes, n_tokens, temperature=1.0):
-        """Autoregressive generation seeded by prompt_bytes (temperature 0 = argmax).
+    def generate(self, prompt_ids, n_tokens, temperature=1.0):
+        """Autoregressive generation seeded by prompt_ids (temperature 0 = argmax).
         Stops at the first END, which is included in the output so callers render <ETX>."""
         self.eval()
         dev = next(self.parameters()).device
@@ -467,15 +643,15 @@ class VLAModel(nn.Module, _HubMixin):
             if not all(d.isfinite().all() for d in dff):
                 print('generate: dff NaN/Inf')
                 return None
-            logits = self.decoder(new_ctx)
+            logits = self.lmhead(self.decoder(new_ctx))
             if not logits.isfinite().all():
                 print('generate: logits NaN/Inf')
                 return None
             return logits
 
-        # feed each prompt byte exactly once; logits after the last byte seed generation
+        # feed each prompt token exactly once; logits after the last one seed generation
         logits = None
-        for b in prompt_bytes:
+        for b in prompt_ids:
             logits = _step(b)
             if logits is None:
                 return []
@@ -487,10 +663,10 @@ class VLAModel(nn.Module, _HubMixin):
         for _ in range(n_tokens):
             prob = F.softmax(logits[0] / max(temperature, 1e-6), dim=-1)
             bval = torch.multinomial(prob, 1).item()
-            if bval == END:
+            if bval == self.end_id:
                 out.append(bval)   # keep the terminator so callers render <ETX>
                 break
-            if bval != NULL:
+            if bval != self.null_id:   # null_id is None outside byte mode: nothing filtered
                 out.append(bval)
             logits = _step(bval)
             if logits is None:
@@ -542,13 +718,10 @@ def _text_drain():
 #   (x_byte, y_byte, img_or_None, aud_or_None)
 # one entry per 100 Hz frame.
 
-def _text_to_bytes(text):
-    return list(text.encode('utf-8', errors='replace'))
-
-
 def clip_text(text):
-    """One step per byte: input/target are consecutive bytes of [START]+text+[END]."""
-    full = [START] + _text_to_bytes(text) + [END]
+    """One step per token: input/target are consecutive ids of [START]+text+[END].
+    Tokens are raw bytes or BPE ids depending on --tokenizer; nothing downstream cares."""
+    full = [_tokenizer.start_id] + _tokenizer.encode(text) + [_tokenizer.end_id]
     steps = [(full[i], full[i + 1]) for i in range(len(full) - 1)]
     return steps, text
 
@@ -562,6 +735,14 @@ _TEXT_DATASETS = {
     'brt':    ('allenai/big-reasoning-traces', 'DeepSeek', 'train', 'text'),
     'dolma3': ('allenai/dolma3_mix-150B-1025', None, 'train', 'text'),
     's1k':    ('simplescaling/s1K',      None, 'train', None),
+}
+
+# --eval: the held-out split to score, for the corpora that have one. Anything missing here
+# falls back to the training split in _TEXT_DATASETS, with a warning -- that number is a
+# training loss, not a validation loss.
+_EVAL_SPLITS = {
+    'tiny': 'validation',
+    'c4':   'validation',
 }
 
 # Datasets with no single text column: the example is rendered to one string here.
@@ -805,10 +986,11 @@ def worker(stop, q, datasets, args, mix=None):
 
 # ── dataset loading (before CUDA init) ───────────────────────────────────────
 
-if args.vis or args.generate or args.push:
+if args.vis or args.generate or args.push or args.eval:
     hf_dataset = None                 # one-shot modes: --vis/--generate run from the prompt
-                                      # token, --push only uploads weights — none of them
-                                      # needs a training dataset
+                                      # token, --push only uploads weights, and --eval loads
+                                      # its own held-out split — none of them needs the
+                                      # training dataset
 else:
     print('loading dataset...')
     if _mix is not None:
@@ -834,7 +1016,7 @@ if args.pretrained:
     _cfg  = getattr(model, '_hub_mixin_config', None) or {}
     for _k, _a in (('context', 'S'), ('n_hidden', 'n_hidden'), ('c_text', 'c_text'),
                    ('n_layers', 'n_layers'), ('depth', 'depth'), ('kernel', 'kernel'),
-                   ('skip', 'skip')):
+                   ('skip', 'skip'), ('tokenizer', 'tokenizer')):
         if _a in _cfg:
             setattr(args, _k, _cfg[_a])
     print('pretrained config', _cfg)
@@ -852,17 +1034,39 @@ else:
         c_text    = args.c_text,
         n_layers  = args.n_layers,
         skip      = args.skip,
+        tokenizer = args.tokenizer,
     )
 
     if _loaded_ckpt is not None:
         model.load_state_dict(_loaded_ckpt['state_dict'])
         del _loaded_ckpt
 
+# Bind the module-level tokenizer used by clip_text() and every display path. The worker
+# threads that call clip_text() are only started further down, so this is set in time.
+_tokenizer = model.tok
+# --tokenizer tiny* takes c_text from the pretrained embedding width, so sync it back:
+# saved_args must describe the model that was actually built or a --load would rebuild
+# a different one.
+args.c_text = model.c_text
+
+# --unfreeze trains the borrowed embedding/lm_head too. requires_grad is not part of the
+# state_dict, so this is re-applied on every run (including --load/--pretrained) from the
+# flag rather than inherited from the checkpoint.
+if args.unfreeze:
+    model.set_pretrained_trainable(True)
+
+
+def _prompt_ids():
+    """--prompt as token ids, with START prepended: the same [START] text framing every
+    training clip opens with, so a sample always starts at a document boundary."""
+    return [_tokenizer.start_id] + (_tokenizer.encode(args.prompt) if args.prompt else [])
+
+
 _dff_shape = (1, args.n_hidden, args.context, args.context)
 def _summ(title, mod, **kw):
     # --generate/--vis have no log file, so their summaries would only be terminal noise in
     # front of the sample / the plot window. --verbose asks for them anyway.
-    if (args.generate or args.vis or args.push) and not args.verbose:
+    if (args.generate or args.vis or args.push or args.eval) and not args.verbose:
         return
     s = str(torchinfo.summary(mod, col_names=['input_size', 'output_size', 'num_params'],
                               verbose=0, **kw))
@@ -873,8 +1077,11 @@ def _summ(title, mod, **kw):
             print(f'INFO {line}', file=f)
 
 # Summaries follow the data flow: tok_embed → text_proj (token grid → n_hidden,
-# summed into the DFF) → context (recurrent state update) → decoder → logits.
-_summ('tok_embed', model.tok_embed, input_data=torch.zeros(1, dtype=torch.long))
+# summed into the DFF) → context (recurrent state update) → decoder → lmhead → logits.
+_summ('tok_embed' + ('' if args.tokenizer == 'char' else
+                     f' ({_TOKENIZERS[args.tokenizer]} wte, frozen'
+                     f'{"" if not args.unfreeze else " -> TRAINABLE (--unfreeze)"})'),
+      model.tok_embed, input_data=torch.zeros(1, dtype=torch.long))
 _summ('text_proj', model.text_proj, input_size=(1, model.c_text, args.context, args.context))
 _summ('context (layer 1)' if model.n_layers > 1 else 'context',
       model.context, input_size=_dff_shape)
@@ -883,10 +1090,17 @@ if model.deep_context is not None:
           f'{", token skip input" if model.skip else ""})',
           model.deep_context[0], input_size=_dff_shape)
 _summ('decoder', model.decoder, input_size=_dff_shape)
+if args.tokenizer != 'char':
+    _summ(f'lmhead ({_TOKENIZERS[args.tokenizer]} lm_head, tied to tok_embed)',
+          model.lmhead, input_size=(1, model.c_text))
 
 model = model.to(args.device)
 model.init_mode = args.init   # applies to both construction paths (--pretrained and local)
-print(sum(p.numel() for p in model.parameters() if p.requires_grad) / 1e6, 'M trainable params')
+print(f'tokenizer {args.tokenizer}: vocab {model.vocab}, embedding width {model.c_text}')
+_trainable_n = sum(p.numel() for p in model.parameters() if p.requires_grad)
+_frozen_n    = sum(p.numel() for p in model.parameters() if not p.requires_grad)
+print(_trainable_n / 1e6, 'M trainable params'
+      + (f' ({_frozen_n / 1e6:.6f} M frozen pretrained)' if _frozen_n else ''))
 
 if args.push:
     # one-shot: save the loaded checkpoint in HuggingFace format (model.safetensors +
@@ -908,6 +1122,138 @@ if args.push:
     print('done')
     raise SystemExit(0)
 
+# ── eval ──────────────────────────────────────────────────────────────────────
+
+def _eval_source():
+    """(repo, config, split, column) for --eval, with --split/--column overriding."""
+    if args.dataset in _TEXT_DATASETS:
+        hf, cfg, split, col = _TEXT_DATASETS[args.dataset]
+        split = _EVAL_SPLITS.get(args.dataset, split)
+    else:                                    # not a short name: take it as a hub repo id
+        hf, cfg, split, col = args.dataset, None, 'validation', 'text'
+    return hf, cfg, (args.split or split), (args.column or col or 'text')
+
+
+def _batched(it, n):
+    it = iter(it)
+    while True:
+        chunk = list(itertools.islice(it, n))
+        if not chunk:
+            return
+        yield chunk
+
+
+if args.eval:
+    # One-shot validation loss. Every document is an independent batch row: its own fresh
+    # DFF state, framed by clip_text() exactly as the training loop frames a clip, and every
+    # step scored. Rows in a batch have different lengths, so short ones are padded out and
+    # their padding is dropped from the loss -- padding cannot leak between rows, since the
+    # CNN never mixes the batch dimension.
+    if args.load is None and args.pretrained is None:
+        print('WARNING: --eval without --load/--pretrained is measuring an untrained model')
+
+    from datasets import load_dataset
+
+    hf, cfg, split, col = _eval_source()
+    if args.dataset not in _EVAL_SPLITS and not args.split:
+        print(f'WARNING: no held-out split configured for "{args.dataset}"; scoring "{split}", '
+              f'which the model was trained on -- that is a training loss, not a validation '
+              f'loss. Pass --split to choose one explicitly')
+    print(f'loading {hf}' + (f' [{cfg}]' if cfg else '') + f' split {split} ...')
+    rows = load_dataset(hf, cfg, split=split, streaming=args.streaming)
+    print('dataset ready')
+    if args.examples:
+        rows = itertools.islice(rows, args.examples)
+
+    _fmt = _TEXT_FORMAT.get(args.dataset)    # corpora with no single text column (s1k)
+    _dev = next(model.parameters()).device
+    model.eval()
+
+    nll = 0.0            # summed cross-entropy over every scored step, in nats
+    ntok = nbyte = 0     # scored steps, and utf-8 bytes of the text they cover
+    nex  = 0
+    t0   = time.time()
+
+    def _report(tag):
+        # token-weighted mean over everything scored so far, not a mean of per-batch means:
+        # documents differ in length, so those are not the same number.
+        per_tok = nll / max(ntok, 1)
+        print(f'{tag} examples {nex:8d} tokens {ntok:10d} bytes {nbyte:11d} '
+              f'loss {per_tok:11.6f} ppl {math.exp(min(per_tok, 700)):12.4f} '
+              f'bpb {nll / max(nbyte, 1) / math.log(2):9.6f} '
+              f'wall {time.time() - t0:8.1f}s', flush=True)
+
+    # Length bucketing: the recurrent loop runs once per step of the *longest* row, so a
+    # batch of mixed lengths spends most of its steps on padding. Sorting a buffer of
+    # BUCKET batches by length before splitting it up cuts that waste without changing the
+    # result -- rows are independent and the loss is a sum over valid steps only.
+    BUCKET = 8
+
+    # --monitor counts scored batches, not buffers: one batch is B*T recurrent forwards and
+    # can run for minutes on cpu, so it is the smallest unit that can honestly be reported.
+    nb, last_report = 0, -1
+
+    for buf in _batched(rows, args.batch * BUCKET):
+        clips = []
+        for ex in buf:
+            text = (_fmt(ex) if _fmt is not None else ex.get(col, ex.get('text', ''))) or ''
+            if not text.strip():
+                continue
+            steps, _ = clip_text(text)        # [(x, y), ...], the training framing
+            if steps:
+                clips.append((steps, len(text.encode('utf-8'))))
+        clips.sort(key=lambda c: len(c[0]))
+
+        for chunk in _batched(clips, args.batch):
+            B = len(chunk)
+            T = max(len(s) for s, _ in chunk)
+            if args.monitor and (nb % args.monitor) == 0:
+                # announced before the work, not after: on a deep model this is the line that
+                # shows the run is alive and how much it has bitten off
+                print(f'EVAL batch {nb:8d} rows {B:4d} steps {T:6d} scoring ...', flush=True)
+            X = torch.zeros((B, T), dtype=torch.long)
+            Y = torch.zeros((B, T), dtype=torch.long)
+            M = torch.zeros((B, T), dtype=torch.bool)
+            for r, (steps, _) in enumerate(chunk):
+                X[r, :len(steps)] = torch.tensor([s[0] for s in steps], dtype=torch.long)
+                Y[r, :len(steps)] = torch.tensor([s[1] for s in steps], dtype=torch.long)
+                M[r, :len(steps)] = True
+            X, Y, M = X.to(_dev), Y.to(_dev), M.to(_dev)
+
+            model.dff = None                  # fresh context per document (see _new_dff/--init)
+            b_nll = torch.zeros((), device=_dev)
+            with torch.no_grad():
+                for t in range(T):
+                    logits, _ = model(X[:, t])            # targets=None: keep per-row losses
+                    ce = F.cross_entropy(logits, Y[:, t], reduction='none')
+                    b_nll += (ce * M[:, t]).sum()         # accumulate on device, one sync/batch
+
+            nll   += float(b_nll)
+            ntok  += int(M.sum())
+            nbyte += sum(b for _, b in chunk)
+            nex   += B
+            nb    += 1
+
+            if args.monitor and ((nb - 1) % args.monitor) == 0:
+                _report('EVAL')
+                last_report = nb
+
+    if ntok:
+        if last_report != nb:                 # skip a line that would just repeat the last
+            _report('EVAL')
+        print(f'\n{args.load or args.pretrained or "(untrained)"} '
+              f'[--tokenizer {args.tokenizer}] on {hf} [{split}]:')
+        print(f'  loss {nll / ntok:.6f} nats/token   ppl {math.exp(min(nll / ntok, 700)):.4f}')
+        # bits per byte normalizes out the tokenizer, so it is the number that compares a
+        # byte-vocabulary run against a BPE run (or against gptneo.py's transformer).
+        print(f'  bpb  {nll / nbyte / math.log(2):.6f} bits/byte '
+              f'over {nex} documents, {ntok} tokens, {nbyte} bytes')
+    else:
+        print('EVAL: no usable documents')
+
+    if not (args.generate or args.vis):
+        raise SystemExit(0)
+
 if args.generate:
     # one-shot text generation: prompt = START + args.prompt, print the decoded
     # continuation, then exit. No dataset, worker, optimizer or training loop.
@@ -915,9 +1261,9 @@ if args.generate:
     # framing the model is trained on, so the output always opens with <STX>.
     if args.load is None and args.pretrained is None:
         print('WARNING: --generate without --load/--pretrained is running an untrained model')
-    prompt = [START] + list(args.prompt.encode('utf-8', errors='replace'))
+    prompt = _prompt_ids()
     out    = model.generate(prompt, args.n, temperature=args.temperature)
-    print(_printable(bytes(prompt + out).decode('utf-8', errors='replace')))
+    print(_render(prompt + out))
     raise SystemExit(0)
 
 # ── vis setup ─────────────────────────────────────────────────────────────────
@@ -927,18 +1273,33 @@ _vis_stats_line  = 'initializing...'
 _VIS_WIN         = 80   # ticker-tape display width, in characters (display only)
 
 
-def _vc(b):
-    """Byte-wise renderer for the vis ticker. Same markers as _printable(), but
-    byte-wise (no UTF-8 decode) and with '$'/'\\' masked out: the ticker is drawn
-    as matplotlib text, where those trigger mathtext parsing."""
-    if b == START: return STX_TEXT
-    if b == END:   return ETX_TEXT
-    if b == NULL:  return NULL_TEXT
-    c = chr(b) if 32 <= b < 127 else DOT_TEXT
-    return DOT_TEXT if c in '$\\' else c
+def _vc(t):
+    """Single-token renderer for the vis ticker. Same markers as _printable(), but with
+    '$'/'\\' masked out: the ticker is drawn as matplotlib text, where those trigger
+    mathtext parsing. Byte mode renders the byte directly (no UTF-8 decode, since the
+    ticker is fed one byte at a time); BPE mode decodes the one token."""
+    if _tokenizer.is_char:
+        if t == START: return STX_TEXT
+        if t == END:   return ETX_TEXT
+        if t == NULL:  return NULL_TEXT
+        c = chr(t) if 32 <= t < 127 else DOT_TEXT
+        return DOT_TEXT if c in '$\\' else c
+    return ''.join(DOT_TEXT if c in '$\\' else c for c in _render([t]))
 
 
 if args.vis:
+    # P(next token) is drawn as a near-square grid of the whole vocabulary: exactly 16×16
+    # for the 256 bytes, and for a BPE vocabulary the smallest grid that covers it (50257
+    # → 225×224), with the leftover cells zero-padded.
+    _PROB_R = int(math.ceil(math.sqrt(model.vocab)))
+    _PROB_C = int(math.ceil(model.vocab / _PROB_R))
+
+    def _prob_grid(prob):
+        a = np.zeros(_PROB_R * _PROB_C, dtype=np.float32)
+        p = prob.detach().cpu().numpy()
+        a[:p.shape[0]] = p
+        return a.reshape(_PROB_R, _PROB_C)
+
     plt.style.use('dark_background')
     plt.ion()
     _vis_fig, _vis_axes_grid = plt.subplots(1, 3, figsize=(12, 4))
@@ -948,10 +1309,10 @@ if args.vis:
     _vis_ax_dff.set_title('DFF std / {:d} ch'.format(model.n_hidden), fontsize=8, pad=2)
     _vis_ax_zero.set_title('DFF zeros / {:d} ch'.format(model.n_hidden), fontsize=8, pad=2)
     _vis_ax_prob.set_title('P(next token)', fontsize=8, pad=2)
-    # row/column dimension labels (e.g. "7"): DFF state is S×S, prob is 16×16 (256 bytes).
+    # row/column dimension labels (e.g. "7"): DFF state is S×S, prob is the vocabulary grid.
     _vis_ax_dff.set_xlabel(str(model.S),  fontsize=7); _vis_ax_dff.set_ylabel(str(model.S),  fontsize=7)
     _vis_ax_zero.set_xlabel(str(model.S), fontsize=7); _vis_ax_zero.set_ylabel(str(model.S), fontsize=7)
-    _vis_ax_prob.set_xlabel('16',         fontsize=7); _vis_ax_prob.set_ylabel('16',         fontsize=7)
+    _vis_ax_prob.set_xlabel(str(_PROB_C), fontsize=7); _vis_ax_prob.set_ylabel(str(_PROB_R), fontsize=7)
     _vis_img_dff  = None
     _vis_img_zero = None
     _vis_img_prob = None
@@ -982,9 +1343,9 @@ if args.vis:
     # shows a stats line and the generated text. Read-only: no dataset, optimizer or worker.
     model.eval()
     _dev    = next(model.parameters()).device
-    _prompt = [START] + list(args.prompt.encode('utf-8', errors='replace'))
-    _ptext  = ''.join(_vc(b) for b in _prompt)  # rendered prompt, echoed at each episode start
-    _queue  = list(_prompt)   # remaining prompt bytes to inject as new tokens
+    _prompt = _prompt_ids()
+    _ptext  = _render(_prompt)  # rendered prompt, echoed at each episode start
+    _queue  = list(_prompt)   # remaining prompt tokens to inject
     _b      = _queue.pop(0)   # current token being injected
     _ticker = _ptext          # ticker-tape display buffer (trailing _VIS_WIN chars)
     _nstep  = 0
@@ -996,7 +1357,7 @@ if args.vis:
             tok  = model.tok_embed(bi).view(1, model.c_text, 1, 1).expand(-1, -1, model.S, model.S)
             stack, new_ctx = model._layers(dff, tok)               # last-layer output
             dff     = [d.detach().clone() for d in stack]
-            logits  = model.decoder(new_ctx)
+            logits  = model.lmhead(model.decoder(new_ctx))
         _nstep += 1
 
         prob = F.softmax(logits[0] / max(args.temperature, 1e-6), dim=-1)
@@ -1007,14 +1368,14 @@ if args.vis:
             nxt = int(torch.multinomial(prob, 1).item())
             # --n does not apply here: --vis streams forever, so an episode runs until the
             # model emits END on its own and the next one starts from the prompt again.
-            if nxt == END:
-                _ticker += _vc(END)        # mark the episode break in the ticker
+            if nxt == model.end_id:
+                _ticker += ETX_TEXT        # mark the episode break in the ticker
                 dff    = model._new_dff(1, _dev)
                 _queue = list(_prompt)     # episode over: reset state, restart prompt
                 _b     = _queue.pop(0)
                 _ticker += _ptext          # new episode opens with <STX> again
             else:
-                if nxt != NULL:
+                if nxt != model.null_id:   # null_id is None outside byte mode
                     _ticker += _vc(nxt)
                 _b = nxt
             _ticker = _ticker[-_VIS_WIN:]  # slide + bound the visible window (ticker tape)
@@ -1024,7 +1385,7 @@ if args.vis:
         dff_std_map = new_ctx[0].cpu().std(dim=0).numpy()           # [S, S]
         # per-location sparsity: how many of the n_hidden channels are exactly 0 here
         zero_map    = (new_ctx[0] == 0).sum(dim=0).cpu().numpy()     # [S, S], 0..n_hidden
-        prob_img    = prob.detach().cpu().numpy().reshape(16, 16)    # 256 bytes → 16×16
+        prob_img    = _prob_grid(prob)                               # vocabulary → R×C grid
         _dff_mean, _dff_std, _dff_max, _ = _dff_stats(dff)
         _vis_header.set_text(
             ('step {:8d}  layers {:d}  dff_std {:6.4f}  dff_max {:7.3f}  p_max {:5.3f}  T {:.2f}').format(
@@ -1054,21 +1415,24 @@ if args.vis:
             _vis_img_prob = _vis_ax_prob.matshow(prob_img, cmap=args.cmap, vmin=0, vmax=1)
             _vis_ax_prob.set_xticks([]); _vis_ax_prob.set_yticks([])
             # overlay printable-ASCII (32..126) glyphs in white at each byte's 16×16 cell;
-            # byte b is row b//16, col b%16 (matches the prob_img reshape order).
-            _vis_prob_txts = [
-                _vis_ax_prob.text(b % 16, b // 16, chr(b), color='white',
-                                  ha='center', va='center', family='monospace')
-                for b in range(32, 127)
-            ]
-            # font size is in points (fixed), so rescale to the cell's pixel size on resize.
-            def _scale_prob_text(event=None):
-                bb = _vis_ax_prob.get_window_extent()
-                cell_px = min(bb.width, bb.height) / 16.0   # one of 16×16 cells
-                pts = max(cell_px * 72.0 / _vis_fig.dpi * 0.55, 1.0)
-                for _t in _vis_prob_txts:
-                    _t.set_fontsize(pts)
-            _vis_fig.canvas.mpl_connect('resize_event', _scale_prob_text)
-            _scale_prob_text()
+            # byte b is row b//16, col b%16 (matches the prob_img reshape order). Byte mode
+            # only: a 225×224 BPE grid has cells too small for a glyph, and most tokens are
+            # multi-character anyway.
+            if _tokenizer.is_char:
+                _vis_prob_txts = [
+                    _vis_ax_prob.text(b % _PROB_C, b // _PROB_C, chr(b), color='white',
+                                      ha='center', va='center', family='monospace')
+                    for b in range(32, 127)
+                ]
+                # font size is in points (fixed), so rescale to the cell's pixel size on resize.
+                def _scale_prob_text(event=None):
+                    bb = _vis_ax_prob.get_window_extent()
+                    cell_px = min(bb.width, bb.height) / 16.0   # one of 16×16 cells
+                    pts = max(cell_px * 72.0 / _vis_fig.dpi * 0.55, 1.0)
+                    for _t in _vis_prob_txts:
+                        _t.set_fontsize(pts)
+                _vis_fig.canvas.mpl_connect('resize_event', _scale_prob_text)
+                _scale_prob_text()
         else:
             _vis_img_prob.set_data(prob_img)
         _vis_img_prob.set_clim(0, float(prob_img.max()) or 1e-9)
@@ -1100,8 +1464,17 @@ def _lr_scaled_groups(model, base_lr, mult):
             layers[li + 1] += list(model.deep_context[li].parameters())
             layers[li + 1] += list(model.deep_proj[li].parameters())
     layers[-1] += list(model.decoder.parameters())
-    return [{'params': [p for p in g if p.requires_grad], 'lr': base_lr * (mult ** i)}
-            for i, g in enumerate(layers)]
+    layers[-1] += list(model.lmhead.parameters())      # empty for --tokenizer char (Identity)
+    # Dedupe by identity: with --tokenizer tiny* --unfreeze, lm_head.weight IS tok_embed.weight
+    # (GPT-Neo ties them), so it would otherwise land in both the first and the last group and
+    # the optimizer would reject the duplicate.
+    seen = set()
+    groups = []
+    for i, g in enumerate(layers):
+        ps = [p for p in g if p.requires_grad and id(p) not in seen]
+        seen.update(id(p) for p in ps)
+        groups.append({'params': ps, 'lr': base_lr * (mult ** i)})
+    return groups
 
 # Only build per-layer optimizer groups when lr_mult scaling is active; otherwise pass the
 # flat param list so the optimizer/checkpoint layout is byte-identical to before.
@@ -1270,6 +1643,8 @@ def _param_groups_named(model):
          'dec':  list(model.decoder.parameters())}
     if model.deep_context is not None:   # stacked layers 2..N (--n_layers)
         g['deep'] = list(model.deep_context.parameters()) + list(model.deep_proj.parameters())
+    if not isinstance(model.lmhead, nn.Identity):   # --tokenizer tiny*: pretrained lm_head
+        g['head'] = list(model.lmhead.parameters())
     return g
 
 
@@ -1280,6 +1655,7 @@ def _diag(model):
 # ── training loop ─────────────────────────────────────────────────────────────
 
 larr, garr = [], []
+carr = []             # --clip: 1.0 on steps whose grad norm hit the limit
 i = _start_step        # continue the step count from the resumed checkpoint (0 if fresh)
 # cumulative count of training examples (one <STX>..<ETX> clip) begun, over all slots;
 # a slot's flag is True on the step it emits its <STX>, so summing flags counts examples.
@@ -1298,7 +1674,7 @@ if args.preroll:
     while True:
         _, _y_list, _ = q.get()
         _pre += 1
-        if END in _y_list:     # a slot just emitted the <ETX> target ending its clip
+        if model.end_id in _y_list:   # a slot just emitted the <ETX> target ending its clip
             break
     print(f'preroll: discarded {_pre} steps ({_pre * args.batch:,} tokens) '
           f'to reach the first <ETX>')
@@ -1352,9 +1728,9 @@ try:
                     print(d, file=f)
 
             model.eval()
-            prompt = [START] + list(args.prompt.encode('utf-8', errors='replace'))
+            prompt = _prompt_ids()
             out    = model.generate(prompt, _GEN_SAMPLE, temperature=args.temperature)
-            gen_text = _printable(bytes(prompt + out).decode('utf-8', errors='replace'))
+            gen_text = _render(prompt + out)
             lines = [f'GEN: {gen_text}']
             if _tsample:                       # a recent training-text example
                 lines.append(f'TXT-SAMPLE: {_printable(_tsample[:120])}')
@@ -1386,7 +1762,16 @@ try:
 
         loss.backward()
 
-        total_norm = _gnorm_all(model)                         # grad norm BEFORE the step
+        # --clip rescales every gradient so the global norm is at most args.clip.
+        # clip_grad_norm_ returns the norm measured BEFORE clipping, which is exactly what
+        # _gnorm_all would have reported, so the logged grad column means the same thing
+        # whether clipping is on or off -- and the non-finite halt below still sees the real
+        # pre-clip norm rather than the zeros clipping would leave behind.
+        if args.clip > 0:
+            total_norm = float(torch.nn.utils.clip_grad_norm_(_trainable, args.clip))
+            carr.append(1.0 if total_norm > args.clip else 0.0)
+        else:
+            total_norm = _gnorm_all(model)                     # grad norm BEFORE the step
         garr.append(total_norm)
 
         # halt before the optimizer corrupts weights if grads went non-finite
@@ -1422,13 +1807,17 @@ try:
                 optimizer.param_groups[0]['lr'],
                 _dmean, _dstd, _dmax, _dzero, args.batch, n_examples,
             )
+            # appended only when clipping is on, so logs from non-clip runs stay byte-identical
+            # (chart.py looks fields up by name and defaults a missing one to 0.0)
+            if args.clip > 0:
+                s += ' clipped {:8.5f}'.format(float(np.mean(carr[-args.monitor:])) if carr else 0.0)
             print(s)
             with open(args.log, 'a') as f:
                 print(s, file=f)
 
             # bound monitor history so host RAM stays flat over long runs (these are
             # only ever read as [-monitor:]; without this they grow once per step forever)
-            for _a in (larr, garr):
+            for _a in (larr, garr, carr):
                 if len(_a) > args.monitor:
                     del _a[:-args.monitor]
 
