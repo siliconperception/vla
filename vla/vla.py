@@ -7,8 +7,9 @@
 # recurrent DFF state; the decoder reads the state out to next-token logits.
 # Image and audio conditioning will be added back incrementally.
 #
-# Vocabulary: 256 (raw bytes) by default, or the 50257-token TinyStories BPE vocabulary
-# with --tokenizer tiny1m|tiny8m (see _TOKENIZERS). No attention, no positional encoding.
+# Vocabulary: 256 (raw bytes) by default, or a borrowed pretrained BPE vocabulary and its
+# embedding/readout -- TinyStories or Pile-trained pythia -- with --tokenizer (see
+# _TOKENIZERS). No attention, no positional encoding.
 
 import math
 import torch ; print('torch', torch.__version__)
@@ -66,14 +67,49 @@ def _printable(s):
 # ── tokenizers ────────────────────────────────────────────────────────────────
 # --tokenizer selects the vocabulary the whole script runs on: the clip builder emits
 # ids from it, the model embeds/decodes them, and every display path renders them.
-# 'char' is the raw-byte default; the tiny* names pull a pretrained TinyStories GPT-Neo
-# tokenizer together with that model's embedding and lm_head (see VLAModel).
+# 'char' is the raw-byte default; every other name pulls a pretrained BPE tokenizer
+# together with that model's embedding and lm_head (see VLAModel).
 
 _TOKENIZERS = {
-    'char':   None,
-    'tiny1m': 'roneneldan/TinyStories-1M',   # GPT-Neo, hidden 64,  vocab 50257
-    'tiny8m': 'roneneldan/TinyStories-8M',   # GPT-Neo, hidden 256, vocab 50257
+    'char':       None,
+    'tiny1m':     'roneneldan/TinyStories-1M',   # GPT-Neo,  hidden 64,  vocab 50257
+    'tiny8m':     'roneneldan/TinyStories-8M',   # GPT-Neo,  hidden 256, vocab 50257
+    'pythia14m':  'EleutherAI/pythia-14m',       # GPT-NeoX, hidden 128, vocab 50304
+    'pythia31m':  'EleutherAI/pythia-31m',       # GPT-NeoX, hidden 256, vocab 50304
+    'pythia70m':  'EleutherAI/pythia-70m',       # GPT-NeoX, hidden 512, vocab 50304
+    'pythia160m': 'EleutherAI/pythia-160m',      # GPT-NeoX, hidden 768, vocab 50304
 }
+
+# The TinyStories models are trained on a deliberately simple corpus, so most of their
+# 50257 embedding rows never receive gradient: 41% of TinyStories-8M's rows sit at their
+# random init, and 7-9% of OpenWebText/dolma3 tokens land on one. Frozen, those tokens are
+# unrepresentable on input and unpredictable on output. The pythia* models are trained on
+# the Pile (300B tokens) and have no untrained rows, so they are the ones to reach for on a
+# web-scale --dataset; tiny* remain the right choice for --dataset tiny.
+
+# --head_norm ln_f borrows the source model's own final norm, the one it applies
+# immediately before its unembedding. Probed in order; the first hit wins.
+_FINAL_NORM_PATHS = (
+    'transformer.ln_f',               # gpt_neo, gpt2
+    'gpt_neox.final_layer_norm',      # gpt_neox (pythia)
+    'model.norm',                     # llama, mistral
+    'model.decoder.final_layer_norm', # opt
+)
+
+
+def _final_norm(lm):
+    """The pretrained final norm layer of a causal LM, or (None, None) if the family is
+    unknown -- --head_norm ln_f then warns and falls back to no normalization."""
+    for path in _FINAL_NORM_PATHS:
+        m = lm
+        for part in path.split('.'):
+            m = getattr(m, part, None)
+            if m is None:
+                break
+        if isinstance(m, nn.Module):
+            return path, m
+    return None, None
+
 
 _tokenizer = None   # the live tokenizer, bound to model.tok once the model is built
 
@@ -146,23 +182,45 @@ parser.add_argument('--context',       default=7,     type=int,
 parser.add_argument('--n_hidden',      default=512,   type=int,
                     help='ContextCNN channel depth')
 parser.add_argument('--c_text',        default=1,     type=int,
-                    help='token embedding channels (None → n_hidden). Ignored by '
-                         '--tokenizer tiny1m|tiny8m, which take it from the pretrained '
-                         'embedding width (64 / 256)')
+                    help='token embedding channels (None → n_hidden). Ignored by every '
+                         'pretrained --tokenizer, which takes it from that model\'s '
+                         'embedding width (tiny1m 64, tiny8m/pythia31m 256, pythia14m 128, '
+                         'pythia70m 512, pythia160m 768)')
 parser.add_argument('--tokenizer',     default='char', choices=sorted(_TOKENIZERS),
                     help='vocabulary and token embedding/readout: "char" is the raw 256-byte '
-                         'default (learned embedding, decoder straight to 256 logits); '
-                         '"tiny1m"/"tiny8m" swap in the pretrained BPE tokenizer, token '
-                         'embedding and lm_head of roneneldan/TinyStories-1M / -8M '
-                         '(50257-token vocabulary) and adapt the CNN to them with the linear '
+                         'default (learned embedding, decoder straight to 256 logits). Every '
+                         'other value borrows a pretrained BPE tokenizer, token embedding '
+                         'and lm_head, and adapts the CNN to them with the linear '
                          '1x1 conv2d already in text_proj (embedding width → n_hidden) and in '
-                         'the decoder (n_hidden → embedding width, then lm_head → logits). '
+                         'the decoder (n_hidden → embedding width, then lm_head → '
+                         'logits). "tiny1m"/"tiny8m" take roneneldan/TinyStories-1M / -8M '
+                         '(50257-token vocabulary, but trained on simple English: ~41% of '
+                         'tiny8m embedding rows are still at their random init, so prefer '
+                         'these only with --dataset tiny). "pythia14m".."pythia160m" take the '
+                         'Pile-trained EleutherAI/pythia-* (50304-token vocabulary, no '
+                         'untrained rows -- the ones to use with --dataset web|c4|dolma3). '
                          'The pretrained weights are frozen unless --unfreeze')
+parser.add_argument('--head_norm',     default='none',
+                    choices=('none', 'ln_f', 'layer', 'rms', 'batch', 'batch2d'),
+                    help='normalize the decoder output before the borrowed lm_head. That '
+                         'head was trained downstream of a final norm, so it only ever saw '
+                         'unit-scale input, while decoder.proj emits whatever scale it '
+                         'likes. Ignored with --tokenizer char (there is no borrowed head). '
+                         '"none" (default) feeds lm_head directly. "ln_f" reuses the source '
+                         'model\'s own final norm, frozen with the rest of the borrowed '
+                         'weights (--unfreeze trains it). The rest are fresh and trained '
+                         'with the CNN: "layer" LayerNorm and "rms" RMSNorm normalize each '
+                         'token\'s readout vector across c_text (the axis a transformer '
+                         'normalizes); "batch" BatchNorm1d and "batch2d" BatchNorm2d '
+                         'normalize per channel across the batch instead, which fixes the '
+                         'average scale but not each vector. batch2d sits inside the decoder '
+                         'between proj and the pool, matching the Conv->BatchNorm2d idiom in '
+                         'ContextCNN, and folds into the conv at inference')
 parser.add_argument('--unfreeze',      default=False, action='store_true',
-                    help='train the pretrained token embedding and lm_head too '
-                         '(--tokenizer tiny1m|tiny8m); by default they are frozen and only '
-                         'the CNN and its two adapters are trained. No effect with '
-                         '--tokenizer char')
+                    help='train the borrowed token embedding and lm_head too '
+                         '(any --tokenizer but char); by default they are frozen and only '
+                         'the CNN and its two adapters are trained. Note the scale: the two '
+                         'pythia70m matrices are 51.5M params against an ~8M CNN')
 parser.add_argument('--depth',         default=7,     type=int,
                     help='ContextCNN conv layer count')
 parser.add_argument('--n_layers',      default=3,     type=int,
@@ -179,8 +237,13 @@ parser.add_argument('--skip',          default=False, action='store_true',
                          'checkpoint. No effect when --n_layers 1')
 # training
 parser.add_argument('--dataset',       default='tiny',
-                    help='tiny | c4 | web | brt | dolma3 | s1k (s1k is only 1000 reasoning '
-                         'examples -- meant for --mix, it loops quickly on its own)')
+                    help='tiny | c4 | web | brt | dolma3 | s1k | pile | pile_nc. s1k is only '
+                         '1000 reasoning examples -- meant for --mix, it loops quickly on '
+                         'its own. pile is EleutherAI\'s deduplicated Pile re-release '
+                         '(EleutherAI/pile itself was emptied by a DMCA takedown and cannot '
+                         'be loaded); pile_nc is the same corpus with the copyrighted '
+                         'subsets removed. Both are large -- use --streaming, or --shards N '
+                         'to pull only the first N shards')
 parser.add_argument('--mix',           default=None,
                     help='joint multi-dataset training, "name:weight,..." e.g. '
                          '"brt:0.5,web:0.5"; overrides --dataset, samples one dataset per clip '
@@ -212,6 +275,12 @@ parser.add_argument('--opt',           default='sgd',
 parser.add_argument('--momentum',      default=0.0,   type=float,
                     help='momentum (--opt sgd/rmsprop; wired to beta2 for adamw; '
                          'ignored by rprop/adagrad)')
+parser.add_argument('--nesterov',      default=False, action='store_true',
+                    help='Nesterov momentum for --opt sgd: take the gradient at the point '
+                         'the momentum is already carrying the weights to, instead of at '
+                         'the current weights. Needs --momentum > 0 (torch also requires '
+                         'zero dampening, which is what this script uses); ignored, with a '
+                         'warning, for any other --opt or at --momentum 0')
 parser.add_argument('--weight_decay',  default=0.0,   type=float,
                     help='L2 weight decay (--opt sgd/rmsprop/adagrad; ignored by rprop)')
 parser.add_argument('--clip',          default=0.0,   type=float,
@@ -273,7 +342,7 @@ parser.add_argument('--n',             default=200,   type=int,
                          'samples are a fixed length')
 parser.add_argument('--prompt',        default='',
                     help='generation prompt; START is always prepended (0x02 with '
-                         '--tokenizer char, <|endoftext|> with tiny1m|tiny8m), so leave '
+                         '--tokenizer char, <|endoftext|> with a pretrained one), so leave '
                          'empty to generate from START alone')
 parser.add_argument('--eval',          default=False, action='store_true',
                     help='one-shot: load a checkpoint, compute teacher-forced loss over a '
@@ -351,7 +420,7 @@ _mix = _parse_mix(args.mix)
 # ── restore architecture args from checkpoint ─────────────────────────────────
 
 _ARCH_ARGS = ('context', 'n_hidden', 'c_text', 'n_layers', 'depth', 'kernel', 'skip',
-              'tokenizer')
+              'tokenizer', 'head_norm')
 
 _loaded_ckpt = None
 _start_step  = 0                 # resumed global step count (0 for a fresh run)
@@ -438,15 +507,21 @@ class DecoderCNN(nn.Module):
     Output: [B, n_out]
 
     n_out is the readout width: 256 (the byte vocabulary, so this is already the logits)
-    for --tokenizer char, or the pretrained embedding width for tiny1m|tiny8m, where the
-    conv is the linear adapter feeding a frozen lm_head."""
-    def __init__(self, n_hidden, S, n_out=256):
+    for --tokenizer char, or the pretrained embedding width for every other --tokenizer,
+    where the conv is the linear adapter feeding a frozen lm_head.
+
+    norm2d (--head_norm batch2d) inserts a BatchNorm2d between the conv and the pool, the
+    same Conv->BatchNorm2d shape ContextCNN uses. It normalizes per channel over batch and
+    space, before the pool averages, and is a plain affine per channel at inference, so it
+    folds into proj's weights."""
+    def __init__(self, n_hidden, S, n_out=256, norm2d=False):
         super().__init__()
         self.proj = nn.Conv2d(n_hidden, n_out, 1)
+        self.norm = nn.BatchNorm2d(n_out) if norm2d else nn.Identity()
         self.pool = nn.AvgPool2d(S)
 
     def forward(self, x):
-        return self.pool(self.proj(x)).squeeze(-1).squeeze(-1)
+        return self.pool(self.norm(self.proj(x))).squeeze(-1).squeeze(-1)
 
 
 # PyTorchModelHubMixin gives VLAModel save_pretrained()/push_to_hub()/from_pretrained()
@@ -470,13 +545,18 @@ class VLAModel(nn.Module, _HubMixin):
     `tokenizer` picks the vocabulary and both ends of the token path:
       char           learned nn.Embedding(256, c_text) in, decoder straight to 256
                      logits out, lmhead = Identity. Fully self-contained.
-      tiny1m/tiny8m  the pretrained TinyStories GPT-Neo embedding (wte) in and its
-                     lm_head out, both frozen (see set_pretrained_trainable / --unfreeze).
-                     c_text is forced to that model's embedding width, so the CNN meets
-                     the pretrained layers through two linear 1×1 conv2d adapters:
-                     text_proj (c_text → n_hidden) and decoder.proj (n_hidden → c_text)."""
+      tiny1m/tiny8m  the pretrained TinyStories GPT-Neo embedding in and its lm_head out.
+      pythia*        the same, from the Pile-trained EleutherAI GPT-NeoX models, whose
+                     embeddings (unlike TinyStories') have no untrained rows.
+
+    For every pretrained tokenizer the borrowed layers are frozen (see
+    set_pretrained_trainable / --unfreeze) and c_text is forced to that model's embedding
+    width, so the CNN meets them through two linear 1×1 conv2d adapters: text_proj
+    (c_text → n_hidden) and decoder.proj (n_hidden → c_text). By default nothing sits
+    between the decoder and the head; head_norm (--head_norm) optionally normalizes the
+    readout there, since the borrowed head was trained downstream of a final norm."""
     def __init__(self, n_hidden, depth, kernel, S,
-                 c_text=None, n_layers=1, skip=False, tokenizer='char'):
+                 c_text=None, n_layers=1, skip=False, tokenizer='char', head_norm='none'):
         super().__init__()
         self.S          = S
         self.n_hidden   = n_hidden
@@ -484,6 +564,11 @@ class VLAModel(nn.Module, _HubMixin):
         self.n_layers   = max(1, n_layers)    # stacked (ContextCNN + feedback) layers (see --n_layers)
         self.skip       = bool(skip)          # feed the token encoding to every layer (see --skip)
         self.tokenizer  = tokenizer           # vocabulary / token path (see --tokenizer)
+        # --head_norm only has a job when there is a borrowed head to feed; with char the
+        # decoder emits logits directly and normalizing them would just rescale the
+        # softmax. Forced to 'none' there so head_norm always describes what was built.
+        self.head_norm_kind = head_norm if tokenizer != 'char' else 'none'
+        _ln_f = _ln_f_path = None             # the borrowed final norm, for head_norm='ln_f'
 
         if tokenizer == 'char':
             self.tok      = ByteTokenizer()
@@ -491,27 +576,56 @@ class VLAModel(nn.Module, _HubMixin):
             self.tok_embed = nn.Embedding(self.vocab, self.c_text)   # token → c_text channels
             self.lmhead   = nn.Identity()     # the decoder already emits the 256 byte logits
         else:
-            # Pull the pretrained embedding and lm_head out of the TinyStories causal LM and
-            # drop the transformer blocks: only the two vocabulary-facing layers are reused.
-            # GPT-Neo ties them (lm_head.weight IS wte.weight), so this is one weight matrix.
+            # Pull the vocabulary-facing layers out of the pretrained causal LM and drop the
+            # transformer blocks. get_input_embeddings/get_output_embeddings are the
+            # family-agnostic accessors, so gpt_neo (transformer.wte / lm_head) and gpt_neox
+            # (gpt_neox.embed_in / embed_out) are both handled without naming either. GPT-Neo
+            # ties its two (lm_head.weight IS wte.weight, one weight matrix); GPT-NeoX does
+            # not, so pythia* contributes two independently trained matrices.
             from transformers import AutoModelForCausalLM
             repo = _TOKENIZERS[tokenizer]
             lm   = AutoModelForCausalLM.from_pretrained(repo)
             self.vocab     = lm.config.vocab_size
             self.c_text    = lm.config.hidden_size   # the embedding width is not ours to choose
             self.tok       = HFTokenizer(repo, self.vocab)
-            self.tok_embed = lm.transformer.wte      # vocab → c_text
-            self.lmhead    = lm.lm_head              # c_text → vocab
-            self.set_pretrained_trainable(False)     # frozen unless --unfreeze
+            self.tok_embed = lm.get_input_embeddings()    # vocab → c_text
+            self.lmhead    = lm.get_output_embeddings()   # c_text → vocab
+            # --head_norm ln_f additionally borrows the final norm the source model applies
+            # right before this head, so the head sees the input distribution it was fit to.
+            if self.head_norm_kind == 'ln_f':
+                _ln_f_path, _ln_f = _final_norm(lm)
+                if _ln_f is None:
+                    print(f'WARNING: --head_norm ln_f: no final norm found on {repo} '
+                          f'(model_type {lm.config.model_type}); falling back to none. Add '
+                          f'its path to _FINAL_NORM_PATHS.')
+                    self.head_norm_kind = 'none'
 
         self.start_id  = self.tok.start_id
         self.end_id    = self.tok.end_id
         self.null_id   = self.tok.null_id
 
         self.context   = ContextCNN(n_hidden, depth, kernel)
-        self.decoder   = DecoderCNN(n_hidden, S, self.c_text if tokenizer != 'char' else 256)
+        self.decoder   = DecoderCNN(n_hidden, S, self.c_text if tokenizer != 'char' else 256,
+                                    norm2d=self.head_norm_kind == 'batch2d')
         # token grid (c_text) → n_hidden, summed into the DFF state
         self.text_proj = nn.Conv2d(self.c_text, n_hidden, 1)
+
+        # --head_norm, on the [B, c_text] readout between the decoder and the head.
+        # batch2d already lives inside the decoder (before the pool), so it is Identity here.
+        # ln_f is borrowed and frozen with the other pretrained weights; layer/rms/batch are
+        # fresh and train with the CNN.
+        self.norm_path = _ln_f_path              # provenance of an ln_f head_norm, for the summaries
+        self.head_norm = {
+            'none':    lambda: nn.Identity(),
+            'batch2d': lambda: nn.Identity(),
+            'ln_f':    lambda: _ln_f,
+            'layer':   lambda: nn.LayerNorm(self.c_text),
+            'rms':     lambda: nn.RMSNorm(self.c_text),
+            'batch':   lambda: nn.BatchNorm1d(self.c_text),
+        }[self.head_norm_kind]()
+
+        if tokenizer != 'char':
+            self.set_pretrained_trainable(False)  # frozen unless --unfreeze
 
         # Deep layers 2..N: each is its own (ContextCNN + feedback) unit. Layer 1 takes
         # the token injection; deep layers take the previous layer's output combined with
@@ -533,17 +647,30 @@ class VLAModel(nn.Module, _HubMixin):
         self.init_mode = 'relu'
 
     def pretrained_params(self):
-        """The borrowed TinyStories weights (empty with --tokenizer char). Deduped by
-        identity: GPT-Neo ties lm_head.weight to tok_embed.weight, so it is one tensor."""
+        """The borrowed embedding + lm_head, plus the final norm under --head_norm ln_f
+        (empty with --tokenizer char). Deduped by identity: GPT-Neo ties lm_head.weight to
+        tok_embed.weight, so there it is one tensor; GPT-NeoX (pythia*) keeps them separate.
+        The fresh --head_norm kinds are not borrowed, so they are not listed here and stay
+        trainable regardless of --unfreeze."""
         if self.tokenizer == 'char':
             return []
+        mods = (self.tok_embed, self.lmhead)
+        if self.head_norm_kind == 'ln_f':
+            mods += (self.head_norm,)
         seen, out = set(), []
-        for m in (self.tok_embed, self.lmhead):
+        for m in mods:
             for p in m.parameters():
                 if id(p) not in seen:
                     seen.add(id(p))
                     out.append(p)
         return out
+
+    def readout(self, dec):
+        """Decoder output [B, c_text] → logits [B, vocab]: --head_norm, then the borrowed
+        unembedding. Both are Identity with --tokenizer char, where the decoder already
+        emits the 256 byte logits, and head_norm is Identity for 'none' and for 'batch2d'
+        (which normalizes earlier, inside the decoder)."""
+        return self.lmhead(self.head_norm(dec))
 
     def set_pretrained_trainable(self, flag):
         """Freeze/unfreeze the borrowed embedding + lm_head (see --unfreeze). Called from
@@ -622,7 +749,7 @@ class VLAModel(nn.Module, _HubMixin):
         stack, new_ctx = self._layers(self.dff, self._tok_grid(byte_idx))
         self.dff = [d.detach().clone() for d in stack]   # store for next step (gradient horizon = 1)
 
-        logits = self.lmhead(self.decoder(new_ctx))
+        logits = self.readout(self.decoder(new_ctx))
         loss   = F.cross_entropy(logits, targets.long()) if targets is not None else None
         return logits, loss
 
@@ -643,7 +770,7 @@ class VLAModel(nn.Module, _HubMixin):
             if not all(d.isfinite().all() for d in dff):
                 print('generate: dff NaN/Inf')
                 return None
-            logits = self.lmhead(self.decoder(new_ctx))
+            logits = self.readout(self.decoder(new_ctx))
             if not logits.isfinite().all():
                 print('generate: logits NaN/Inf')
                 return None
@@ -728,21 +855,34 @@ def clip_text(text):
 
 # ── dataset loading ────────────────────────────────────────────────────────────
 
+# The Pile: EleutherAI/pile itself is an empty shell -- the 2023 DMCA takedown left it with
+# a README and a loading script pointing at dead the-eye.eu mirrors, and datasets>=3 dropped
+# script support, so it cannot be loaded at all. 'pile' therefore points at EleutherAI's own
+# deduplicated re-release (1650 parquet shards, text column, no meta), and 'pile_nc' at the
+# community copy with the copyrighted subsets (Books3 etc.) removed. Both are the corpus the
+# pythia* tokenizers were trained on, so they pair with --tokenizer pythia14m..pythia160m.
 _TEXT_DATASETS = {
-    'tiny':   ('roneneldan/TinyStories', None, 'train', 'text'),
-    'c4':     ('allenai/c4',            'en', 'train', 'text'),
-    'web':    ('Skylion007/openwebtext', None, 'train', 'text'),
-    'brt':    ('allenai/big-reasoning-traces', 'DeepSeek', 'train', 'text'),
-    'dolma3': ('allenai/dolma3_mix-150B-1025', None, 'train', 'text'),
-    's1k':    ('simplescaling/s1K',      None, 'train', None),
+    'tiny':    ('roneneldan/TinyStories', None, 'train', 'text'),
+    'c4':      ('allenai/c4',            'en', 'train', 'text'),
+    'web':     ('Skylion007/openwebtext', None, 'train', 'text'),
+    'brt':     ('allenai/big-reasoning-traces', 'DeepSeek', 'train', 'text'),
+    'dolma3':  ('allenai/dolma3_mix-150B-1025', None, 'train', 'text'),
+    's1k':     ('simplescaling/s1K',      None, 'train', None),
+    'pile':    ('EleutherAI/the_pile_deduplicated', None, 'train', 'text'),
+    'pile_nc': ('monology/pile-uncopyrighted', None, 'train', 'text'),
 }
 
-# --eval: the held-out split to score, for the corpora that have one. Anything missing here
-# falls back to the training split in _TEXT_DATASETS, with a warning -- that number is a
-# training loss, not a validation loss.
+# --eval: the held-out split to score, for the corpora that have one. A plain string is a
+# split of the training repo itself; a (repo, config, split) triple is a held-out set that
+# lives in a different repo, which is how the Pile ships its validation split -- neither
+# pile re-release carries one, so both score the Pile's own official validation set.
+# Anything missing here falls back to the training split in _TEXT_DATASETS, with a warning
+# -- that number is a training loss, not a validation loss.
 _EVAL_SPLITS = {
-    'tiny': 'validation',
-    'c4':   'validation',
+    'tiny':    'validation',
+    'c4':      'validation',
+    'pile':    ('mit-han-lab/pile-val-backup', None, 'validation'),
+    'pile_nc': ('mit-han-lab/pile-val-backup', None, 'validation'),
 }
 
 # Datasets with no single text column: the example is rendered to one string here.
@@ -782,12 +922,17 @@ def _split_for_name(name):
     return _TEXT_DATASETS[name][2] if name in _TEXT_DATASETS else 'train'
 
 
+_SHARD_EXTS = ('.parquet', '.jsonl.zst', '.json.zst', '.jsonl.gz', '.jsonl')
+
+
 def _shard_files(hf, cfg, n):
-    """First n train parquet shard paths in dataset repo `hf` (config subdir `cfg` if the
-    repo is multi-config). Empty list if the repo isn't parquet-based (e.g. json/script)."""
+    """First n train shard paths in dataset repo `hf` (config subdir `cfg` if the repo is
+    multi-config). Parquet plus the compressed-jsonl layouts, since pile_nc ships
+    train/NN.jsonl.zst and --shards is what keeps a 200GB+ corpus off the disk. Empty list
+    if nothing matches, in which case the caller loads the whole repo."""
     from huggingface_hub import HfApi
     sib = [s.rfilename for s in HfApi().repo_info(hf, repo_type='dataset').siblings]
-    par = sorted(f for f in sib if f.endswith('.parquet') and 'train' in f)
+    par = sorted(f for f in sib if f.endswith(_SHARD_EXTS) and 'train' in f)
     if cfg:                                       # multi-config repo: keep only this config
         par = [f for f in par if f'/{cfg}/' in f or f.startswith(f'{cfg}/')]
     return par[:n]
@@ -818,10 +963,10 @@ def _init_one_dataset(name, streaming, shards=None):
     if not streaming and shards:
         files = _shard_files(hf, cfg, shards)
         if files:
-            print(f'{name}: --shards {shards} -> loading {len(files)} parquet shard(s)')
+            print(f'{name}: --shards {shards} -> loading {len(files)} shard(s)')
             data_files = {'train': files}
         else:
-            print(f'{name}: --shards set but no parquet shards found; loading full dataset')
+            print(f'{name}: --shards set but no shard files found; loading full dataset')
 
     if data_files is not None:
         # no_checks: skip the split-size verification, which would fail since we load only
@@ -1016,7 +1161,8 @@ if args.pretrained:
     _cfg  = getattr(model, '_hub_mixin_config', None) or {}
     for _k, _a in (('context', 'S'), ('n_hidden', 'n_hidden'), ('c_text', 'c_text'),
                    ('n_layers', 'n_layers'), ('depth', 'depth'), ('kernel', 'kernel'),
-                   ('skip', 'skip'), ('tokenizer', 'tokenizer')):
+                   ('skip', 'skip'), ('tokenizer', 'tokenizer'),
+                   ('head_norm', 'head_norm')):
         if _a in _cfg:
             setattr(args, _k, _cfg[_a])
     print('pretrained config', _cfg)
@@ -1035,6 +1181,7 @@ else:
         n_layers  = args.n_layers,
         skip      = args.skip,
         tokenizer = args.tokenizer,
+        head_norm = args.head_norm,
     )
 
     if _loaded_ckpt is not None:
@@ -1048,6 +1195,9 @@ _tokenizer = model.tok
 # saved_args must describe the model that was actually built or a --load would rebuild
 # a different one.
 args.c_text = model.c_text
+# likewise --head_norm: char forces it to 'none', and so does an ln_f that the source model
+# turned out not to expose, so read back what was actually built.
+args.head_norm = model.head_norm_kind
 
 # --unfreeze trains the borrowed embedding/lm_head too. requires_grad is not part of the
 # state_dict, so this is re-applied on every run (including --load/--pretrained) from the
@@ -1077,10 +1227,12 @@ def _summ(title, mod, **kw):
             print(f'INFO {line}', file=f)
 
 # Summaries follow the data flow: tok_embed → text_proj (token grid → n_hidden,
-# summed into the DFF) → context (recurrent state update) → decoder → lmhead → logits.
+# summed into the DFF) → context (recurrent state update) → decoder → head_norm → lmhead
+# → logits.
+_borrowed = ('' if args.tokenizer == 'char' else
+             f', frozen{"" if not args.unfreeze else " -> TRAINABLE (--unfreeze)"}')
 _summ('tok_embed' + ('' if args.tokenizer == 'char' else
-                     f' ({_TOKENIZERS[args.tokenizer]} wte, frozen'
-                     f'{"" if not args.unfreeze else " -> TRAINABLE (--unfreeze)"})'),
+                     f' ({_TOKENIZERS[args.tokenizer]} input embedding{_borrowed})'),
       model.tok_embed, input_data=torch.zeros(1, dtype=torch.long))
 _summ('text_proj', model.text_proj, input_size=(1, model.c_text, args.context, args.context))
 _summ('context (layer 1)' if model.n_layers > 1 else 'context',
@@ -1090,8 +1242,19 @@ if model.deep_context is not None:
           f'{", token skip input" if model.skip else ""})',
           model.deep_context[0], input_size=_dff_shape)
 _summ('decoder', model.decoder, input_size=_dff_shape)
+if model.head_norm_kind not in ('none', 'batch2d'):
+    _src = (f'{_TOKENIZERS[args.tokenizer]} {model.norm_path}{_borrowed}'
+            if model.head_norm_kind == 'ln_f' else 'fresh, trained with the CNN')
+    # batch 2, not 1: BatchNorm1d refuses a single sample per channel in train mode
+    _summ(f'head_norm ({model.head_norm_kind}: {_src})',
+          model.head_norm, input_size=(2, model.c_text))
 if args.tokenizer != 'char':
-    _summ(f'lmhead ({_TOKENIZERS[args.tokenizer]} lm_head, tied to tok_embed)',
+    # GPT-Neo ties the head to the embedding, GPT-NeoX does not: say which, since it
+    # decides whether --unfreeze trains one matrix or two.
+    _tied = (next(model.lmhead.parameters()).data_ptr()
+             == next(model.tok_embed.parameters()).data_ptr())
+    _summ(f'lmhead ({_TOKENIZERS[args.tokenizer]} output embedding, '
+          f'{"tied to tok_embed" if _tied else "untied"}{_borrowed})',
           model.lmhead, input_size=(1, model.c_text))
 
 model = model.to(args.device)
@@ -1128,7 +1291,12 @@ def _eval_source():
     """(repo, config, split, column) for --eval, with --split/--column overriding."""
     if args.dataset in _TEXT_DATASETS:
         hf, cfg, split, col = _TEXT_DATASETS[args.dataset]
-        split = _EVAL_SPLITS.get(args.dataset, split)
+        held = _EVAL_SPLITS.get(args.dataset, split)
+        # a triple redirects to a held-out set in another repo (see _EVAL_SPLITS)
+        if isinstance(held, tuple):
+            hf, cfg, split = held
+        else:
+            split = held
     else:                                    # not a short name: take it as a hub repo id
         hf, cfg, split, col = args.dataset, None, 'validation', 'text'
     return hf, cfg, (args.split or split), (args.column or col or 'text')
@@ -1270,7 +1438,7 @@ if args.generate:
 
 _vis_exit        = False
 _vis_stats_line  = 'initializing...'
-_VIS_WIN         = 80   # ticker-tape display width, in characters (display only)
+_VIS_WIN         = 180   # ticker-tape display width, in characters (display only)
 
 
 def _vc(t):
@@ -1357,7 +1525,7 @@ if args.vis:
             tok  = model.tok_embed(bi).view(1, model.c_text, 1, 1).expand(-1, -1, model.S, model.S)
             stack, new_ctx = model._layers(dff, tok)               # last-layer output
             dff     = [d.detach().clone() for d in stack]
-            logits  = model.lmhead(model.decoder(new_ctx))
+            logits  = model.readout(model.decoder(new_ctx))
         _nstep += 1
 
         prob = F.softmax(logits[0] / max(args.temperature, 1e-6), dim=-1)
@@ -1464,6 +1632,7 @@ def _lr_scaled_groups(model, base_lr, mult):
             layers[li + 1] += list(model.deep_context[li].parameters())
             layers[li + 1] += list(model.deep_proj[li].parameters())
     layers[-1] += list(model.decoder.parameters())
+    layers[-1] += list(model.head_norm.parameters())   # empty for --head_norm none/batch2d
     layers[-1] += list(model.lmhead.parameters())      # empty for --tokenizer char (Identity)
     # Dedupe by identity: with --tokenizer tiny* --unfreeze, lm_head.weight IS tok_embed.weight
     # (GPT-Neo ties them), so it would otherwise land in both the first and the last group and
@@ -1497,9 +1666,15 @@ if args.lr_mult != 1.0:
 
 # Route lr/weight_decay/momentum to each optimizer's supported knobs: Rprop takes
 # neither weight_decay nor momentum; Adagrad takes weight_decay but no momentum.
+# --nesterov is SGD-only and needs a positive momentum -- torch raises on nesterov with
+# momentum 0, so an inapplicable flag is reported and dropped rather than left to blow up.
+_nesterov = args.nesterov and args.opt == 'sgd' and args.momentum > 0
+if args.nesterov and not _nesterov:
+    print(f'WARNING: --nesterov ignored: it applies to --opt sgd with --momentum > 0, '
+          f'and this run is --opt {args.opt} --momentum {args.momentum}')
 if args.opt == 'sgd':
-    optimizer = torch.optim.SGD(_params, lr=args.lr_max,
-                                momentum=args.momentum, weight_decay=args.weight_decay)
+    optimizer = torch.optim.SGD(_params, lr=args.lr_max, momentum=args.momentum,
+                                weight_decay=args.weight_decay, nesterov=_nesterov)
 elif args.opt == 'rmsprop':
     optimizer = torch.optim.RMSprop(_params, lr=args.lr_max,
                                     momentum=args.momentum, weight_decay=args.weight_decay, centered=True)
@@ -1643,8 +1818,8 @@ def _param_groups_named(model):
          'dec':  list(model.decoder.parameters())}
     if model.deep_context is not None:   # stacked layers 2..N (--n_layers)
         g['deep'] = list(model.deep_context.parameters()) + list(model.deep_proj.parameters())
-    if not isinstance(model.lmhead, nn.Identity):   # --tokenizer tiny*: pretrained lm_head
-        g['head'] = list(model.lmhead.parameters())
+    if not isinstance(model.lmhead, nn.Identity):   # pretrained tokenizer: borrowed lm_head
+        g['head'] = list(model.head_norm.parameters()) + list(model.lmhead.parameters())
     return g
 
 

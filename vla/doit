@@ -1,4 +1,25 @@
-python vla.py --dataset tiny --preroll --tokenizer tiny1m --n_layers 3 --context 32 --n_hidden 64 --depth 48 --kernel 3 --c_text 1 --batch 250 --monitor 10 --checkpoint 100 --opt adamw --weight_decay 0.01 --momentum 0.9 --schedule const --lr_max 0.001 --clip 100.0
+python vla.py --dataset tiny --preroll --tokenizer pythia14m --n_layers 5 --context 28 --n_hidden 128 --depth 5 --kernel 3 --c_text 1 --batch 250 --monitor 20 --checkpoint 200 --opt adamw --weight_decay 0.0 --momentum 0.95 --schedule const --lr_max 0.001
+#python vla.py --dataset tiny --preroll --tokenizer pythia14m --n_layers 5 --context 28 --n_hidden 128 --depth 5 --kernel 3 --c_text 1 --batch 250 --monitor 20 --checkpoint 200 --opt sgd --weight_decay 0.0 --momentum 0.95 --nesterov --schedule const --lr_max 0.001
+#python vla.py --dataset tiny --preroll --tokenizer pythia31m --n_layers 5 --context 28 --n_hidden 256 --depth 5 --kernel 3 --c_text 1 --batch 250 --monitor 10 --checkpoint 100 --opt sgd --weight_decay 0.0 --momentum 0.95 --nesterov --schedule const --lr_max 0.001
+#python vla.py --dataset tiny --preroll --tokenizer pythia31m --n_layers 5 --context 28 --n_hidden 256 --depth 5 --kernel 3 --c_text 1 --batch 250 --monitor 10 --checkpoint 100 --opt sgd --weight_decay 0.0 --momentum 0.9 --nesterov --schedule const --lr_max 0.01 --clip 100.0
+#python vla.py --dataset tiny --preroll --tokenizer pythia31m --n_layers 5 --context 28 --n_hidden 256 --depth 5 --kernel 3 --c_text 1 --batch 250 --monitor 10 --checkpoint 100 --opt sgd --weight_decay 0.0 --momentum 0.0 --schedule const --lr_max 0.01 --clip 100.0
+#python vla.py --dataset tiny --preroll --tokenizer pythia31m --n_layers 3 --context 32 --n_hidden 256 --depth 5 --kernel 3 --c_text 1 --batch 250 --monitor 10 --checkpoint 100 --opt sgd --weight_decay 0.0 --momentum 0.0 --schedule const --lr_max 0.01 --clip 100.0
+
+
+
+
+
+#python vla.py --dataset tiny --preroll --tokenizer pythia31m --n_layers 3 --context 20 --n_hidden 256 --depth 5 --kernel 3 --c_text 1 --batch 250 --monitor 10 --checkpoint 100 --opt sgd --weight_decay 0.0 --momentum 0.0 --schedule const --lr_max 0.01 --clip 100.0
+#python vla.py --dataset tiny --preroll --tokenizer pythia31m --n_layers 3 --context 20 --n_hidden 256 --depth 10 --kernel 3 --c_text 1 --batch 250 --monitor 10 --checkpoint 100 --opt sgd --weight_decay 0.0 --momentum 0.0 --schedule const --lr_max 0.01 --clip 100.0
+
+
+#python vla.py --dataset tiny --preroll --tokenizer pythia31m --n_layers 3 --context 16 --n_hidden 256 --depth 32 --kernel 3 --c_text 1 --batch 250 --monitor 10 --checkpoint 100 --opt sgd --weight_decay 0.0 --momentum 0.0 --schedule const --lr_max 0.01 --clip 100.0
+#python vla.py --dataset tiny --preroll --tokenizer pythia31m --head_norm layer --n_layers 3 --context 16 --n_hidden 256 --depth 32 --kernel 3 --c_text 1 --batch 250 --monitor 10 --checkpoint 100 --opt adamw --weight_decay 0.01 --momentum 0.9 --schedule const --lr_max 0.001 --clip 100.0
+#python vla.py --dataset tiny --preroll --tokenizer pythia31m --head_norm layer --n_layers 3 --context 32 --n_hidden 64 --depth 64 --kernel 3 --c_text 1 --batch 200 --monitor 10 --checkpoint 100 --opt adamw --weight_decay 0.01 --momentum 0.9 --schedule const --lr_max 0.001 --clip 100.0
+#python vla.py --dataset tiny --preroll --tokenizer pythia14m --head_norm layer --n_layers 3 --context 32 --n_hidden 64 --depth 64 --kernel 3 --c_text 1 --batch 200 --monitor 10 --checkpoint 100 --opt adamw --weight_decay 0.01 --momentum 0.9 --schedule const --lr_max 0.001 --clip 100.0
+
+
+#python vla.py --dataset tiny --preroll --tokenizer tiny1m --n_layers 3 --context 32 --n_hidden 64 --depth 48 --kernel 3 --c_text 1 --batch 250 --monitor 10 --checkpoint 100 --opt adamw --weight_decay 0.01 --momentum 0.9 --schedule const --lr_max 0.001 --clip 100.0 --load checkpoint.pt.27
 
 #python vla.py --dataset tiny --preroll --tokenizer tiny8m --n_layers 2 --context 28 --n_hidden 96 --depth 56 --kernel 3 --c_text 1 --batch 250 --monitor 10 --checkpoint 100 --opt adamw --weight_decay 0.01 --momentum 0.99 --schedule warmup --lr_min 0.000001 --lr_max 0.001 --lr_warmup 1000
 #python vla.py --dataset tiny --preroll --tokenizer tiny8m --n_layers 1 --context 28 --n_hidden 128 --depth 56 --kernel 3 --c_text 1 --batch 400 --monitor 10 --checkpoint 100 --opt adamw --weight_decay 0.01 --momentum 0.99 --schedule warmup --lr_min 0.000001 --lr_max 0.001 --lr_warmup 1000 --load checkpoint.pt.26
