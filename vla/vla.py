@@ -227,6 +227,14 @@ parser.add_argument('--n_layers',      default=3,     type=int,
                     help='stack N (ContextCNN + feedback) recurrent layers in series between '
                          'the thin encoder and decoder; each layer keeps its own DFF state. '
                          '1 = original single-layer behavior')
+parser.add_argument('--inner',         default=None,  type=int,
+                    help='channel depth of the middle layers (None -> --n_hidden). Only has '
+                         'an effect with --n_layers>2, where there are middle layers to '
+                         'resize: layer 1 stays n_hidden (it takes the token injection) and '
+                         'layer N stays n_hidden (it feeds the decoder), while layers 2..N-1 '
+                         '-- their --depth conv+batchnorm+relu blocks and their DFF state -- '
+                         'run at --inner channels. The 1x1 feedback conv between one layer '
+                         'and the next does the width change')
 parser.add_argument('--kernel',        default=3,     type=int,
                     help='conv kernel size (odd integer)')
 parser.add_argument('--skip',          default=False, action='store_true',
@@ -420,7 +428,7 @@ _mix = _parse_mix(args.mix)
 # ── restore architecture args from checkpoint ─────────────────────────────────
 
 _ARCH_ARGS = ('context', 'n_hidden', 'c_text', 'n_layers', 'depth', 'kernel', 'skip',
-              'tokenizer', 'head_norm')
+              'tokenizer', 'head_norm', 'inner')
 
 _loaded_ckpt = None
 _start_step  = 0                 # resumed global step count (0 for a fresh run)
@@ -540,7 +548,8 @@ class VLAModel(nn.Module, _HubMixin):
     to an S×S grid, projected to n_hidden and summed into the per-layer DFF state;
     ContextCNN updates the state and the decoder reads it out to next-token logits.
     n_layers stacks (ContextCNN + feedback) units in series, each carrying its own DFF
-    state.
+    state. inner (--inner) runs the middle layers of that stack at a different channel
+    width from the two ends; see self.widths.
 
     `tokenizer` picks the vocabulary and both ends of the token path:
       char           learned nn.Embedding(256, c_text) in, decoder straight to 256
@@ -556,12 +565,21 @@ class VLAModel(nn.Module, _HubMixin):
     between the decoder and the head; head_norm (--head_norm) optionally normalizes the
     readout there, since the borrowed head was trained downstream of a final norm."""
     def __init__(self, n_hidden, depth, kernel, S,
-                 c_text=None, n_layers=1, skip=False, tokenizer='char', head_norm='none'):
+                 c_text=None, n_layers=1, skip=False, tokenizer='char', head_norm='none',
+                 inner=None):
         super().__init__()
         self.S          = S
         self.n_hidden   = n_hidden
         self.c_text     = c_text if c_text is not None else n_hidden
         self.n_layers   = max(1, n_layers)    # stacked (ContextCNN + feedback) layers (see --n_layers)
+        # Per-layer channel width (see --inner). The ends are pinned to n_hidden -- layer 1
+        # takes the token injection, layer N feeds the decoder -- so only layers 2..N-1 can
+        # differ, and --inner is inert below n_layers 3. Each layer's whole unit runs at its
+        # width: its ContextCNN blocks and its DFF state alike, with deep_proj (the 1x1
+        # feedback conv into the layer) doing the width change.
+        self.inner  = int(inner) if inner and self.n_layers > 2 else n_hidden
+        self.widths = [n_hidden if li in (0, self.n_layers - 1) else self.inner
+                       for li in range(self.n_layers)]
         self.skip       = bool(skip)          # feed the token encoding to every layer (see --skip)
         self.tokenizer  = tokenizer           # vocabulary / token path (see --tokenizer)
         # --head_norm only has a job when there is a borrowed head to feed; with char the
@@ -631,15 +649,27 @@ class VLAModel(nn.Module, _HubMixin):
         # the token injection; deep layers take the previous layer's output combined with
         # their own DFF state. Only built when n_layers>1, so the n_layers=1 state_dict is
         # byte-identical to the single-layer model.
+        # Widths come from self.widths (--inner), so deep_proj[li] is also where the stack
+        # changes width: it maps layer li's output to layer li+1's own width.
         if self.n_layers > 1:
             self.deep_context = nn.ModuleList(
-                ContextCNN(n_hidden, depth, kernel) for _ in range(self.n_layers - 1))
+                ContextCNN(self.widths[li + 1], depth, kernel)
+                for li in range(self.n_layers - 1))
             self.deep_proj = nn.ModuleList(
-                nn.Conv2d(n_hidden, n_hidden, 1) for _ in range(self.n_layers - 1))
+                nn.Conv2d(self.widths[li], self.widths[li + 1], 1)
+                for li in range(self.n_layers - 1))
         else:
             self.deep_context = self.deep_proj = None
 
-        self.dff = None   # list of n_layers tensors [B, n_hidden, S, S], detached; None until first step
+        # --skip adds the token grid to every layer, but text_proj only speaks n_hidden, so a
+        # stack narrowed/widened by --inner needs a second injection conv at the inner width.
+        # Built whenever the width exists rather than only under --skip, so --skip stays a
+        # flag you can toggle on an existing checkpoint (it is unused, and gets no gradient,
+        # when --skip is off).
+        self.text_proj_inner = (nn.Conv2d(self.c_text, self.inner, 1)
+                                if self.inner != n_hidden else None)
+
+        self.dff = None   # list of n_layers tensors [B, widths[li], S, S], detached; None until first step
 
         # How a fresh context is seeded, set from --init after construction. Runtime
         # behaviour, not architecture: deliberately not part of the hub config, so it never
@@ -693,12 +723,12 @@ class VLAModel(nn.Module, _HubMixin):
         init is forgotten fast -- relative divergence between a zero and a gaussian start
         falls to 3% by 20 bytes and to float32 noise by 50 -- so --init only changes what
         the model sees for the first few dozen bytes of a context."""
-        shape = (B, self.n_hidden, self.S, self.S)
+        shapes = [(B, c, self.S, self.S) for c in self.widths]   # per layer (see --inner)
         if self.init_mode == 'gaussian':
-            return [torch.randn(shape, device=device) for _ in range(self.n_layers)]
+            return [torch.randn(s, device=device) for s in shapes]
         if self.init_mode == 'relu':
-            return [torch.randn(shape, device=device).relu() for _ in range(self.n_layers)]
-        return [torch.zeros(shape, device=device) for _ in range(self.n_layers)]
+            return [torch.randn(s, device=device).relu() for s in shapes]
+        return [torch.zeros(s, device=device) for s in shapes]
 
     def _init_dff(self, B, device):
         dev = torch.device(device)
@@ -713,19 +743,24 @@ class VLAModel(nn.Module, _HubMixin):
 
     def _layers(self, dff, tok_grid):
         """Run the stack of n_layers (ContextCNN + feedback) units once.
-        dff: list of n_layers tensors [B, n_hidden, S, S]. Layer 0 takes the token injection;
+        dff: list of n_layers tensors [B, widths[li], S, S]. Layer 0 takes the token injection;
         each deeper layer takes the previous layer's output summed with its own DFF state,
         plus (with --skip) the same token injection layer 0 got, so deep layers see the
-        current token directly instead of only through the layers below them.
+        current token directly instead of only through the layers below them. --inner runs
+        the middle layers at their own width, so the skip injection is taken from
+        text_proj_inner there and from text_proj at the n_hidden ends.
         Returns (new_dff_list, last_layer_output [B, n_hidden, S, S]). No detach here — the
         caller detaches the returned list to bound the time horizon."""
         tok  = self.text_proj(tok_grid)        # [B, n_hidden, S, S], computed once
+        # likewise for the inner width, and only when --skip will actually consume it
+        tok_inner = (self.text_proj_inner(tok_grid)
+                     if self.skip and self.text_proj_inner is not None else None)
         o    = self.context(dff[0] + tok)
         outs = [o]
         for li in range(self.n_layers - 1):
             x = dff[li + 1] + self.deep_proj[li](o)
             if self.skip:
-                x = x + tok
+                x = x + (tok if self.widths[li + 1] == self.n_hidden else tok_inner)
             o = self.deep_context[li](x)
             outs.append(o)
         return outs, o
@@ -1162,7 +1197,7 @@ if args.pretrained:
     for _k, _a in (('context', 'S'), ('n_hidden', 'n_hidden'), ('c_text', 'c_text'),
                    ('n_layers', 'n_layers'), ('depth', 'depth'), ('kernel', 'kernel'),
                    ('skip', 'skip'), ('tokenizer', 'tokenizer'),
-                   ('head_norm', 'head_norm')):
+                   ('head_norm', 'head_norm'), ('inner', 'inner')):
         if _a in _cfg:
             setattr(args, _k, _cfg[_a])
     print('pretrained config', _cfg)
@@ -1179,6 +1214,7 @@ else:
         S         = args.context,
         c_text    = args.c_text,
         n_layers  = args.n_layers,
+        inner     = args.inner,
         skip      = args.skip,
         tokenizer = args.tokenizer,
         head_norm = args.head_norm,
@@ -1198,6 +1234,8 @@ args.c_text = model.c_text
 # likewise --head_norm: char forces it to 'none', and so does an ln_f that the source model
 # turned out not to expose, so read back what was actually built.
 args.head_norm = model.head_norm_kind
+# and --inner, which collapses to n_hidden when there are no middle layers to resize.
+args.inner = model.inner
 
 # --unfreeze trains the borrowed embedding/lm_head too. requires_grad is not part of the
 # state_dict, so this is re-applied on every run (including --load/--pretrained) from the
@@ -1238,9 +1276,22 @@ _summ('text_proj', model.text_proj, input_size=(1, model.c_text, args.context, a
 _summ('context (layer 1)' if model.n_layers > 1 else 'context',
       model.context, input_size=_dff_shape)
 if model.deep_context is not None:
-    _summ(f'deep_context x{model.n_layers - 1} (layers 2..{model.n_layers}'
-          f'{", token skip input" if model.skip else ""})',
-          model.deep_context[0], input_size=_dff_shape)
+    _skip_txt = ', token skip input' if model.skip else ''
+    if model.inner == model.n_hidden:
+        _summ(f'deep_context x{model.n_layers - 1} (layers 2..{model.n_layers}{_skip_txt})',
+              model.deep_context[0], input_size=_dff_shape)
+    else:
+        # --inner: the middle layers run narrower/wider than the ends, so one summary no
+        # longer covers them all. Show a middle layer and the (n_hidden) last one.
+        _summ(f'text_proj_inner (token grid -> {model.inner} ch, layers 2..'
+              f'{model.n_layers - 1}; unused without --skip)',
+              model.text_proj_inner, input_size=(1, model.c_text, args.context, args.context))
+        _summ(f'deep_context x{model.n_layers - 2} (layers 2..{model.n_layers - 1}, '
+              f'--inner {model.inner} ch{_skip_txt})',
+              model.deep_context[0],
+              input_size=(1, model.inner, args.context, args.context))
+        _summ(f'deep_context (layer {model.n_layers}, {model.n_hidden} ch{_skip_txt})',
+              model.deep_context[-1], input_size=_dff_shape)
 _summ('decoder', model.decoder, input_size=_dff_shape)
 if model.head_norm_kind not in ('none', 'batch2d'):
     _src = (f'{_TOKENIZERS[args.tokenizer]} {model.norm_path}{_borrowed}'
@@ -1627,6 +1678,8 @@ def _lr_scaled_groups(model, base_lr, mult):
     layers[0] += list(model.tok_embed.parameters())
     layers[0] += list(model.text_proj.parameters())
     layers[0] += list(model.context.parameters())
+    if model.text_proj_inner is not None:   # --inner --skip injection (see _layers)
+        layers[0] += list(model.text_proj_inner.parameters())
     if model.deep_context is not None:
         for li in range(N - 1):
             layers[li + 1] += list(model.deep_context[li].parameters())
@@ -1816,6 +1869,8 @@ def _param_groups_named(model):
          'tprj': list(model.text_proj.parameters()),
          'ctx':  list(model.context.parameters()),
          'dec':  list(model.decoder.parameters())}
+    if model.text_proj_inner is not None:            # --inner --skip injection
+        g['tprj'] = g['tprj'] + list(model.text_proj_inner.parameters())
     if model.deep_context is not None:   # stacked layers 2..N (--n_layers)
         g['deep'] = list(model.deep_context.parameters()) + list(model.deep_proj.parameters())
     if not isinstance(model.lmhead, nn.Identity):   # pretrained tokenizer: borrowed lm_head
