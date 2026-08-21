@@ -173,6 +173,67 @@ def _render(ids):
     return ''.join(out)
 
 
+# ── DFF write clock (--clock) ─────────────────────────────────────────────────
+# How often each recurrent layer commits its new state; see DFFClock for the mechanism.
+# These modes take no numeric arguments -- the rates below are the whole parameterization.
+
+_QPROJ_MODES = ('none', 'read')   # where the 1x1 state projection sits (--qproj)
+# 'write' (a frozen random orthogonal 1x1 between the layer output and the register) was
+# removed: its only path to the loss is through the DFF, which forward() detaches every step,
+# so it could never receive gradient and was permanently random. It answered a narrow question
+# about signed-vs-rectified state and cost a live option to keep around.
+
+_CLOCK_MODES = ('sync', 'fixed', 'incr', 'dither', 'exp')
+_CLOCK_BASE  = 2      # fixed/dither: layer li writes at rate 1 / _CLOCK_BASE**li
+_CLOCK_MAX   = 1024   # exp: cap on one hold, in steps
+_CLOCK_EXP   = -1     # period sentinel: this layer holds 2**Geometric(1/2) steps
+
+
+def _clock_periods(n_layers, mode, base=None, ends='both'):
+    """Write period per layer -- the whole schedule, in one place. 1 means the layer writes
+    every step, >1 is a ladder, _CLOCK_EXP is exp's heavy-tailed hold.
+
+    Two ladders: fixed/dither grow geometrically (1, 2, 4, 8, ...) and incr linearly
+    (1, 2, 3, 4, ...). The geometric one buys a long memory in few layers but the deepest
+    layer of a tall stack can end up slower than a whole document -- layer 10 writes every
+    512 steps -- while incr keeps every layer's period on the order of the stack's depth.
+
+    exp pins the two ends to every step and clocks only the middle: layer 1 takes the token
+    injection and layer N feeds the decoder, so those are the layers whose state the rest of
+    the model reads most directly. It therefore needs --n_layers > 2 to have anything to
+    clock."""
+    if mode in ('fixed', 'dither'):
+        # --clock_base generalizes the ladder off the hard-coded 2. Reach is set by the
+        # slowest layer's period, so with L layers the base that lands p_max on a target T
+        # is T**(1/(L-1)) -- b=2 at L=7 gives 64, which overshoots a ~200-token example and
+        # leaves the deepest layer writing only 3 times per document.
+        b = _CLOCK_BASE if base is None else float(base)
+        return [max(1, int(round(b ** li))) for li in range(n_layers)]
+    if mode == 'incr':
+        return [li + 1 for li in range(n_layers)]
+    if mode == 'exp':
+        # --clock_ends: which ends are pinned to write every step. The default 'both' is
+        # exp's original behavior and is a real design choice, not a detail -- layer 1 is
+        # where the token is injected and layer N is what the decoder reads, so pinning them
+        # keeps the fastest-moving state at both ends of the stack and puts the random holds
+        # only in the middle. 'none' clocks every layer and is the ablation that says whether
+        # that pinning is what makes exp work.
+        pin_first = ends in ('both', 'first')
+        pin_last  = ends in ('both', 'last')
+        return [1 if (li == 0 and pin_first) or (li == n_layers - 1 and pin_last)
+                else _CLOCK_EXP for li in range(n_layers)]
+    return [1] * n_layers
+
+
+def _exp_mean_hold(cap=_CLOCK_MAX):
+    """Mean of the exp mode's hold: 2**k with k ~ Geometric(1/2), truncated at cap. The
+    untruncated distribution has no finite mean (every k contributes 1/2 a step), so the cap
+    is what sets the rate -- it comes out as log2(cap)/2 + 1."""
+    return sum(2.0 ** -(j + 1) * min(2 ** j, cap) for j in range(63))
+
+
+_CLOCK_MEAN = _exp_mean_hold()
+
 # ── args ──────────────────────────────────────────────────────────────────────
 
 parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
@@ -194,7 +255,7 @@ parser.add_argument('--tokenizer',     default='char', choices=sorted(_TOKENIZER
                          '1x1 conv2d already in text_proj (embedding width → n_hidden) and in '
                          'the decoder (n_hidden → embedding width, then lm_head → '
                          'logits). "tiny1m"/"tiny8m" take roneneldan/TinyStories-1M / -8M '
-                         '(50257-token vocabulary, but trained on simple English: ~41% of '
+                         '(50257-token vocabulary, but trained on simple English: ~41%% of '
                          'tiny8m embedding rows are still at their random init, so prefer '
                          'these only with --dataset tiny). "pythia14m".."pythia160m" take the '
                          'Pile-trained EleutherAI/pythia-* (50304-token vocabulary, no '
@@ -227,22 +288,191 @@ parser.add_argument('--n_layers',      default=3,     type=int,
                     help='stack N (ContextCNN + feedback) recurrent layers in series between '
                          'the thin encoder and decoder; each layer keeps its own DFF state. '
                          '1 = original single-layer behavior')
-parser.add_argument('--inner',         default=None,  type=int,
-                    help='channel depth of the middle layers (None -> --n_hidden). Only has '
-                         'an effect with --n_layers>2, where there are middle layers to '
-                         'resize: layer 1 stays n_hidden (it takes the token injection) and '
-                         'layer N stays n_hidden (it feeds the decoder), while layers 2..N-1 '
-                         '-- their --depth conv+batchnorm+relu blocks and their DFF state -- '
-                         'run at --inner channels. The 1x1 feedback conv between one layer '
-                         'and the next does the width change')
+parser.add_argument('--clock',         default='sync', choices=_CLOCK_MODES,
+                    help='when each layer commits its newly computed output to its own DFF '
+                         'state. Only the state *write* is gated: every layer runs its convs '
+                         'every step and passes its output up the stack whatever the clock '
+                         'says, so the decoder keeps seeing a per-step signal and the logits '
+                         'still change every token. Modes (no numeric knobs -- the ladders are '
+                         f'hard-coded at powers of {_CLOCK_BASE}, or at 1,2,3,... for incr): '
+                         '"sync" (default) writes every '
+                         'layer every step, the original behavior. "fixed" writes layer li '
+                         f'every {_CLOCK_BASE}**li steps -- layer 1 every step, layer 2 every '
+                         f'{_CLOCK_BASE}, layer 3 every {_CLOCK_BASE**2} -- on a phase counted '
+                         'from each row\'s document start, so deeper layers hold a context '
+                         'that changes exponentially more slowly. "incr" is the same idea on '
+                         'a linear ladder, layer li every li steps (1, 2, 3, 4, ...): a '
+                         'gentler spread than fixed, and it keeps the deepest layer of a tall '
+                         'stack from running slower than the documents it reads (fixed puts '
+                         f'layer 10 at {_CLOCK_BASE**9} steps, incr at 10). "dither" keeps '
+                         'the geometric mean '
+                         'rates but drops the phase: an independent coin flip of probability '
+                         '1/period per row per layer per step (layer 1 100%%, layer 2 50%%, '
+                         'layer 3 25%%). "exp" drops the ladder too and gives the middle '
+                         'layers the same heavy-tailed hold: after a write the next one comes '
+                         '2**k steps later, k ~ Geometric(1/2) -- 1 step 50%% of the time, 2 '
+                         f'steps 25%%, 4 steps 12.5%%, ... capped at {_CLOCK_MAX} (mean '
+                         f'{_CLOCK_MEAN:g} steps), drawn independently per layer and per row. '
+                         'exp writes layers 1 and N every step -- the one the token is '
+                         'injected into and the one the decoder reads -- so it needs '
+                         '--n_layers > 2 to clock anything. '
+                         'The first token of a document always writes every layer, so a fresh '
+                         'context is never left unwritten. The random modes apply in training, '
+                         '--eval, --generate and --vis alike (they are part of the dynamics, '
+                         'not train-only regularizers), which makes generation and eval loss '
+                         'nondeterministic. No new parameters, so any mode can be toggled on '
+                         'an existing checkpoint. No effect when --n_layers 1')
+parser.add_argument('--tap_norm',      default='none', choices=['none', 'batch', 'group'],
+                    help='normalize the output of each --tap 1x1 conv, i.e. the value that '
+                         'feeds the DFF register. The feedback path is the one place in the '
+                         'model with no normalization: ContextCNN is Conv->BatchNorm->ReLU '
+                         'throughout, but tap, deep_proj and decoder.proj are bare 1x1 convs, '
+                         'so the recurrence gain is unconstrained and can drift above 1 as '
+                         'training proceeds -- which is what makes the state grow '
+                         'geometrically at inference and lock generation into a repeating '
+                         'token. Bounding the state itself (--clip_dff) does not fix that, '
+                         'because the drift is in the weights, not the state. '
+                         '"batch" is BatchNorm2d(affine=False), matching ContextCNN\'s idiom, '
+                         'but it carries running statistics and so behaves differently in '
+                         'train and eval -- and the train/eval gap compounding through the '
+                         'recurrence is itself a suspect for the runaway, so this adds to the '
+                         'very mechanism it is meant to fix. '
+                         '"group" is GroupNorm(32, affine=False): identical in train and eval '
+                         'because it normalizes per sample over channel groups with no '
+                         'running statistics, which bounds the feedback gain AND removes the '
+                         'train/eval mismatch on that path. It adds no parameters and no '
+                         'state_dict entries, so unlike "batch" it can be toggled on an '
+                         'existing checkpoint. Requires --tap')
+parser.add_argument('--clip_dff',      default=0.0,   type=float, metavar='MAX',
+                    help='bound the magnitude of the DFF state after every write (0 = off). '
+                         'Rescales rather than clamping element-wise -- if a layer\'s state '
+                         'for a row exceeds MAX in absolute value, the whole tensor is scaled '
+                         'down so its max is MAX -- so the spatial and channel pattern of the '
+                         'state is preserved and only its scale is bounded, the same '
+                         'reasoning as gradient-norm clipping. Applied per layer and per '
+                         'batch row, since rows are independent. '
+                         'What it is for: the recurrence can run with gain > 1 in FREE-RUNNING '
+                         'mode, where the model eats its own output -- the state then grows '
+                         'geometrically (measured at ~10x per 5 tokens) until it saturates '
+                         'the readout and generation locks into a repeating token. Teacher-'
+                         'forced loss never sees this, because ground truth is injected every '
+                         'step and holds the state bounded, so a checkpoint can score well '
+                         'and still be unusable as a generator. A healthy run here sits at '
+                         'dff_max ~10-40 during generation, so MAX of a few hundred bounds '
+                         'the blow-up without touching normal dynamics. Applies in training, '
+                         '--generate, --eval and --vis alike; adds no parameters, so it can '
+                         'be toggled on an existing checkpoint')
+parser.add_argument('--clock_ends',    default='both',
+                    choices=['both', 'none', 'first', 'last'],
+                    help='--clock exp only: which ends of the stack are pinned to write '
+                         'their DFF state every step instead of drawing a random hold. '
+                         '"both" (default) pins layer 1 and layer N -- the layer the token '
+                         'is injected into and the layer the decoder reads -- so only the '
+                         'middle holds. "none" clocks every layer, which is the ablation for '
+                         'whether that pinning is what makes exp work rather than the '
+                         'randomization itself. "first"/"last" pin one end only, to say '
+                         'which of the two matters. No parameters, so it can be toggled on '
+                         'an existing checkpoint')
+parser.add_argument('--clock_max',     default=1024,  type=int,   metavar='N',
+                    help='--clock exp only: cap on one hold, in steps. exp draws 2**k with '
+                         'k ~ Geometric(1/2), whose mean is log2(N)/2 + 1 -- so N is a weak '
+                         'lever on the mean (1024 gives ~6 steps, 64 gives ~4) and a direct '
+                         'one on the tail: a layer holds >= 2**j steps with probability '
+                         '2**-j, truncated at N. It is therefore the knob for how long the '
+                         'longest-lived middle layer can sit on a context, which is what '
+                         'sets reach. No parameters, so it can be toggled on an existing '
+                         'checkpoint; no effect under any other --clock mode')
+parser.add_argument('--clock_base',    default=2.0,   type=float, metavar='B',
+                    help='base of the geometric schedule, in both places one appears. Under '
+                         '--clock fixed/dither it is the ladder: layer li writes every '
+                         'round(B**li) steps. Default 2.0 (1,2,4,8,...). Reach is set by the '
+                         'slowest layer\'s period, so the base that lands it on a target T '
+                         'with L layers is T**(1/(L-1)) -- at --n_layers 7, B=2 puts the '
+                         'deepest layer at 64 steps, which is a third of a TinyStories '
+                         'example and leaves it only ~3 writes per document, while B=1.87 '
+                         'puts it at 43. Below ~1.4 consecutive layers round to the same '
+                         'period and the ladder shortens. Under --clock exp it is the hold '
+                         'base instead -- a middle layer holds B**k steps, k ~ Geometric(1/2) '
+                         '-- where E[hold] = 1/(2-B) for B<2 and DIVERGES at B=2, which is '
+                         'what --clock_max exists to truncate. B=1.9 gives a mean of 10 with '
+                         'a tail 40%% lighter at 64 steps; B<2 needs no cap at all. '
+                         'No parameters, so it can be '
+                         'toggled on an existing checkpoint, and no effect under '
+                         '--clock sync/incr/exp, whose ladders are not geometric')
+parser.add_argument('--accumulate',    default=False,
+                    action=argparse.BooleanOptionalAction,
+                    help='what a clocked layer writes: the mean of every output it computed '
+                         'since its last write, instead of just the one from the step it '
+                         'writes on. Applies to every --clock mode. Without it a held layer '
+                         'samples -- the outputs computed while it was holding never reach '
+                         'its state (they did propagate up the stack when computed), so it '
+                         'sees one token in N and is blind to the rest; with it the state is '
+                         'a decimated average and nothing between two writes is dropped. Same '
+                         'write rate either way, and the mean keeps the state at the scale '
+                         'the layer already runs at (a sum would not: an exp hold can run to '
+                         f'{_CLOCK_MAX} steps). Costs one extra DFF-sized buffer per layer. '
+                         'Inert under --clock sync, where every layer writes every step and '
+                         'the mean is over one output. --no-accumulate turns it back off, so '
+                         'a checkpoint trained with it can be run both ways (see --clock on '
+                         'overriding what a checkpoint was trained with)')
+parser.add_argument('--ema',           default=None,  type=float, nargs='?', const=0.5,
+                    metavar='DECAY',
+                    help='hold a moving average in each layer\'s DFF register: a write blends '
+                         'into what is already there, register = register + DECAY*(new - '
+                         'register), instead of replacing it. Bare --ema uses 0.5; a value '
+                         'must be in (0,1), and 1 would be the default replace-outright '
+                         'behavior. Costs nothing to store -- the update is in place -- which '
+                         'is what makes it the cheap moving average next to --accumulate, and '
+                         'the two compose: --accumulate decides what value a write proposes '
+                         '(the mean over the hold rather than that step\'s output), --ema '
+                         'decides how it is committed. What it gives up is exactness -- an '
+                         'exponential window instead of a box mean, and blind to the steps '
+                         'where the layer did not write. The effective window is ~1/DECAY '
+                         'writes, so ~period/DECAY tokens under a --clock ladder, which makes '
+                         'it a second way to stretch the state\'s timescale without freezing '
+                         'it. Applies under every --clock mode including sync, where it turns '
+                         'each layer into a leaky integrator updated every step. A row\'s '
+                         'first write after a document boundary replaces rather than blends, '
+                         'so no --init seed is left in the state. No parameters, so it can be '
+                         'toggled on an existing checkpoint')
+parser.add_argument('--qproj',         default='none', choices=_QPROJ_MODES,
+                    help='put a pointwise 1x1 linear conv2d on each layer\'s DFF path, one '
+                         'per layer at --n_hidden: width^2 + width parameters per layer, '
+                         '65.8K per layer at --n_hidden 256. The value travelling up the '
+                         'stack and into the decoder is never projected, so the feed-forward '
+                         'path is unchanged. '
+                         '"read" projects on the way out of the register, between the state '
+                         'and the feedback add: the register keeps the sparse ReLU output '
+                         '(~50%% exact zeros) and what the layer adds back is a dense signed '
+                         'recombination of it. Trainable, and initialized to the identity, so '
+                         'at step 0 the model is exactly --qproj none. '
+                         'Why it is not redundant with the convs already there: it is applied '
+                         'to the state but not to the token injection it is summed with, so a '
+                         'layer can transform what it remembers differently from what it is '
+                         'being told. Adds parameters, so unlike --clock it cannot be toggled '
+                         'on an existing checkpoint')
+parser.add_argument('--tap',           default=False, action='store_true',
+                    help='put two pointwise 1x1 linear conv2d projections in series after '
+                         'each layer\'s last conv2d-BN-ReLU -- the tensor that normally feeds '
+                         'the DFF -- and tap the DFF from between them. This flag adds the '
+                         'first of the two; the second is the 1x1 already on the upward path '
+                         '(deep_proj into the next layer, decoder.proj on the last layer), so '
+                         'the series is  output -> tap -> [register] -> deep_proj -> next '
+                         'layer. A separate second module would be exactly redundant: two '
+                         '1x1s in series with no nonlinearity between compose to one, so '
+                         'folding it into deep_proj costs nothing representable and halves '
+                         'the parameters. The register therefore holds a dense signed '
+                         'embedding instead of the sparse ReLU output (~50%% exact zeros). '
+                         'The tap trains, unlike --qproj write in the same position: the '
+                         'register it feeds is detached, but the upward path through it is '
+                         'not. Identity-initialized, so step 0 is exactly the model without '
+                         '--tap. One conv per layer at --n_hidden: width^2 + width per layer, '
+                         '65.8K per layer at --n_hidden 256. Since the register goes dense, '
+                         '--init gaussian suits it better than the default relu, and '
+                         'dff_zeros will read ~0. Adds parameters, so it cannot be toggled on '
+                         'an existing checkpoint')
 parser.add_argument('--kernel',        default=3,     type=int,
                     help='conv kernel size (odd integer)')
-parser.add_argument('--skip',          default=False, action='store_true',
-                    help='inject the token encoding into every layer, not just layer 1: with '
-                         '--n_layers>1 each deep layer sees input + previous layer + its own '
-                         'DFF instead of previous layer + DFF. No new parameters (the same '
-                         'text_proj grid is reused), so it can be toggled on an existing '
-                         'checkpoint. No effect when --n_layers 1')
 # training
 parser.add_argument('--dataset',       default='tiny',
                     help='tiny | c4 | web | brt | dolma3 | s1k | pile | pile_nc. s1k is only '
@@ -281,8 +511,24 @@ parser.add_argument('--opt',           default='sgd',
                     choices=['sgd', 'rmsprop', 'rprop', 'adagrad', 'adamw'],
                     help='training optimizer')
 parser.add_argument('--momentum',      default=0.0,   type=float,
-                    help='momentum (--opt sgd/rmsprop; wired to beta2 for adamw; '
-                         'ignored by rprop/adagrad)')
+                    help='momentum (--opt sgd/rmsprop; the fallback for adamw beta2 when '
+                         '--beta2 is unset, kept for compatibility with runs and '
+                         'checkpoints that predate --beta2; ignored by rprop/adagrad)')
+parser.add_argument('--beta1',         default=None,  type=float, metavar='DECAY',
+                    help='--opt adamw first-moment (gradient EMA) decay. Default 0.9. The '
+                         'averaging window is ~1/(1-beta1) steps, so 0.9 averages ~10 '
+                         'gradients and 0.99 ~100; lower it to react faster, raise it to '
+                         'ride through a noisy stretch. Ignored, with a warning, by any '
+                         'other --opt (--momentum is the knob for sgd/rmsprop)')
+parser.add_argument('--beta2',         default=None,  type=float, metavar='DECAY',
+                    help='--opt adamw second-moment (squared-gradient EMA) decay, the '
+                         'per-parameter step-size normalizer. Torch defaults to 0.999 '
+                         '(~1000-step window); this script has historically taken it from '
+                         '--momentum, so --beta2 overrides that and --momentum remains the '
+                         'fallback when --beta2 is unset. A short window (0.9 = ~10 steps) '
+                         'lets one gradient spike rescale every parameter\'s step, which is '
+                         'worth knowing on a recurrent model whose state can spike at '
+                         'startup. Ignored, with a warning, by any other --opt')
 parser.add_argument('--nesterov',      default=False, action='store_true',
                     help='Nesterov momentum for --opt sgd: take the gradient at the point '
                          'the momentum is already carrying the weights to, instead of at '
@@ -409,6 +655,24 @@ parser.add_argument('--private',       default=False, action='store_true',
                          'visibility). Ignored if the repo already exists')
 args = parser.parse_args()
 
+
+def _cli_given(argv=None):
+    """The set of option dests actually typed on the command line. argparse fills every
+    default in, so a value in `args` cannot otherwise be told apart from one the user passed;
+    re-parsing with the defaults suppressed leaves only what was really there. Used to let a
+    few options beat the architecture a --load checkpoint carries (see _ARCH_OVERRIDE)."""
+    saved = [a.default for a in parser._actions]
+    for a in parser._actions:
+        a.default = argparse.SUPPRESS
+    try:
+        return set(vars(parser.parse_args(argv)))
+    finally:
+        for a, d in zip(parser._actions, saved):
+            a.default = d
+
+
+_CLI_GIVEN = _cli_given()
+
 # ── multi-dataset mix ─────────────────────────────────────────────────────────
 
 def _parse_mix(spec):
@@ -427,8 +691,36 @@ _mix = _parse_mix(args.mix)
 
 # ── restore architecture args from checkpoint ─────────────────────────────────
 
-_ARCH_ARGS = ('context', 'n_hidden', 'c_text', 'n_layers', 'depth', 'kernel', 'skip',
-              'tokenizer', 'head_norm', 'inner')
+_ARCH_ARGS = ('context', 'n_hidden', 'c_text', 'n_layers', 'depth', 'kernel',
+              'tokenizer', 'head_norm', 'clock', 'accumulate', 'ema', 'qproj', 'tap',
+              'init', 'clock_base', 'clock_max', 'clock_ends', 'clip_dff', 'tap_norm')
+
+# Architecture args a command-line value may override on --load/--pretrained, instead of the
+# checkpoint's own. These add no parameters and no shapes, so the state_dict loads either way
+# and the run is still the model that was trained -- the DFF write schedule is the one thing
+# you can legitimately change at load time. Everything else in _ARCH_ARGS defines the weights
+# and is taken from the checkpoint whatever the command line says.
+# --init seeds the DFF at every context reset, in training, --generate and --vis alike, so
+# a checkpoint sampled without it was being seeded differently than it was trained -- it adds
+# no parameters, so it restores like the rest and overrides like the other write-schedule
+# options.
+_ARCH_OVERRIDE = ('clock', 'accumulate', 'ema', 'init', 'clock_base', 'clock_max', 'clock_ends', 'clip_dff', 'tap_norm')
+
+
+def _restore_arch(saved, source):
+    """Copy the architecture a checkpoint was trained with into args, except for the
+    _ARCH_OVERRIDE options the user actually typed -- those win, e.g. training a model with
+    --clock dither and then sampling it with --clock fixed."""
+    for k in _ARCH_ARGS:
+        if k in _ARCH_OVERRIDE and k in _CLI_GIVEN:
+            was = saved.get(k, '(unset)')
+            if was != getattr(args, k):
+                print(f'--{k} {getattr(args, k)} overrides the {source} value {was}')
+            continue
+        # older checkpoints may predate an arch arg → keep the current default for it
+        if k in saved:
+            setattr(args, k, saved[k])
+
 
 _loaded_ckpt = None
 _start_step  = 0                 # resumed global step count (0 for a fresh run)
@@ -442,9 +734,8 @@ if args.pretrained and args.load is not None:
     args.load = None
 if args.load is not None:
     _loaded_ckpt = torch.load(args.load, map_location='cpu', weights_only=True)
-    for _k in _ARCH_ARGS:        # rebuild the model with the architecture it was trained with
-        # older checkpoints may predate an arch arg → keep the current default for it
-        setattr(args, _k, _loaded_ckpt['saved_args'].get(_k, getattr(args, _k)))
+    # rebuild the model with the architecture it was trained with
+    _restore_arch(_loaded_ckpt['saved_args'], 'checkpoint')
     _start_step = int(_loaded_ckpt.get('step', 0))   # continue the step sequence
     _start_exs  = int(_loaded_ckpt.get('examples', 0))   # continue the example count
     # read here: the ckpt is freed before the scheduler is built
@@ -532,6 +823,153 @@ class DecoderCNN(nn.Module):
         return self.pool(self.norm(self.proj(x))).squeeze(-1).squeeze(-1)
 
 
+class DFFClock:
+    """Decides, for one step, which layers commit their newly computed output to their own
+    DFF state -- per batch row, since every row is at a different point in a different
+    document. Layers always run their convs and always pass their output up the stack; only
+    the state *write* is gated, so the top layer's output (and with it the decoder and the
+    logits) still moves every step under every mode.
+
+    A clock belongs to a context, not to the model: forward() keeps one beside self.dff,
+    while generate() and --vis keep their own beside their local state, so a sample drawn
+    during training cannot disturb the training clock. Modes (see --clock):
+
+      sync    every layer, every step. Never instantiated -- the model skips the clock
+              entirely -- so the default path is exactly the unclocked model.
+      fixed   layer li writes every periods[li] steps, phase counted from t=0 -- a geometric
+              ladder, 1, 2, 4, 8, ...
+      incr    the same, on a linear ladder: 1, 2, 3, 4, ... (see _clock_periods).
+      dither  fixed's mean rate with no phase: independent Bernoulli(1/periods[li]).
+      exp     no ladder at all -- the middle layers each draw their next hold from the same
+              heavy-tailed distribution, 2**k steps with k ~ Geometric(1/2) (1 step 50% of
+              the time, 2 steps 25%, 4 steps 12.5%, ...), capped at clock_max, while the two
+              ends write every step. Timescales are resampled continuously instead of being
+              assigned by depth, so a middle layer is sometimes fast and sometimes slow, and
+              the stack covers a spread of spans at any moment.
+
+    t=0 -- the first token of a document -- always writes every layer, so a context is never
+    left sitting at its --init seed.
+
+    accumulate (--accumulate) changes what a write commits, not when it happens, and so
+    composes with every mode: see write()."""
+    def __init__(self, mode, periods, B, device, clock_max=_CLOCK_MAX, accumulate=False,
+                 ema=None, base=_CLOCK_BASE):
+        self.mode      = mode
+        self.ema       = ema           # --ema decay, or None to replace outright
+        self.periods   = periods
+        self.B         = B
+        self.device    = torch.device(device)
+        self.clock_max = int(clock_max)
+        self.base      = float(base)   # exp: hold is base**k (see _draw)
+        self.t    = torch.zeros(B, dtype=torch.long, device=self.device)
+        # exp: steps left before layer li writes again (0 = write now)
+        self.hold = ([torch.zeros(B, dtype=torch.long, device=self.device) for _ in periods]
+                     if _CLOCK_EXP in periods else None)
+        # accumulate: running sum of the outputs each layer has computed since its last
+        # write, and how many they are. The sums are allocated on first use -- one write()
+        # call carries the shape, so the clock needs to know nothing about widths or S.
+        self.acc = [None] * len(periods) if accumulate else None
+        self.n   = ([torch.zeros(B, dtype=torch.long, device=self.device) for _ in periods]
+                    if accumulate else None)
+
+    def reset(self, flag):
+        """Rows restarting a document go back to step 0, write every layer, and start their
+        accumulation over -- nothing from the previous document leaks into the first write of
+        the next one."""
+        self.t = self.t.clone()
+        self.t[flag] = 0
+        if self.hold is not None:
+            self.hold = [h.clone() for h in self.hold]
+            for h in self.hold:
+                h[flag] = 0
+        if self.acc is not None:
+            self.n = [c.clone() for c in self.n]
+            for li, c in enumerate(self.n):
+                c[flag] = 0
+                if self.acc[li] is not None:
+                    self.acc[li] = self.acc[li].clone()
+                    self.acc[li][flag] = 0
+
+    def _draw(self):
+        """[B] holds: 2**k with k ~ Geometric(1/2), capped. floor(-log2 u) for u ~ U(0,1] is
+        k with probability 2**-(k+1), which is the 50/25/12.5% ladder; k is clamped before
+        the shift so 2**k cannot overflow int64 on a very small u."""
+        u = torch.rand(self.B, device=self.device).clamp_min(torch.finfo(torch.float32).tiny)
+        k = (-u.log2()).floor().clamp_(0, 62)
+        # Two separate bases live here. k ~ Geometric(1/2) is the *probability* ladder and is
+        # fixed. self.base is the *hold* base, --clock_base: hold = base**k, so
+        #     E[h] = sum_j 2**-(j+1) base**j = 1/(2 - base)   for base < 2,
+        # which diverges exactly at base 2 -- the historical hard-coded value, and the reason
+        # a cap had to exist at all. Below 2 the mean is finite and the tail is genuinely
+        # lighter: P(h >= 64) is 1/64 at base 2 but 1/1220 at base 1.5.
+        gap = torch.round(torch.pow(self.base, k)).long().clamp_(min=1)
+        return gap.clamp_(max=self.clock_max) if self.clock_max > 0 else gap
+
+    def mask(self, li):
+        """[B] bool -- which rows write layer li this step; None means all of them.
+        Call exactly once per layer per step: exp advances its countdown here."""
+        p = self.periods[li]
+        if p == 1:
+            return None                      # every step: layer 1, and exp's two ends
+        if p == _CLOCK_EXP:
+            m = self.hold[li] == 0
+            # rows that just wrote draw a new hold; the rest count one step closer
+            self.hold[li] = torch.where(m, self._draw(), self.hold[li]) - 1
+            return m
+        if self.mode == 'dither':
+            return (torch.rand(self.B, device=self.device) < 1.0 / p) | (self.t == 0)
+        return (self.t % p) == 0
+
+    def write(self, li, o, prev):
+        """Layer li's DFF state after this step: it has just computed `o` and was holding
+        `prev`. Rows that are not writing keep prev.
+
+        By default a write commits `o` -- the output of the one step it happens on -- so the
+        state is a *sample* of the layer's activity: whatever the layer computed while it was
+        holding never reaches its state (it did propagate up the stack at the time, it just
+        left no trace in the memory). --accumulate commits the mean of every output since the
+        last write instead, so the state is a decimated average at the same write rate and
+        nothing in between is dropped. The mean and not the sum: the state feeds straight back
+        into a conv, and a sum over a hold that exp can stretch to clock_max steps would be
+        nowhere near the scale the layer was trained at.
+
+        --ema is the other half of the same question and composes with it: --accumulate
+        decides what value a write proposes, --ema decides how that value is committed --
+        blended into the register as prev + ema*(cand - prev) rather than replacing it. It
+        needs no buffer at all, so it is the cheap way to hold a moving average; what it
+        gives up against --accumulate is exactness, an exponential window instead of the box
+        mean over the hold, and it cannot see the outputs of steps where the layer did not
+        write. The effective window is ~1/ema writes, so ~period/ema tokens.
+
+        The accumulator is detached. The returned state never carries gradient anyway -- the
+        caller detaches it, gradient horizon 1 -- and summing live graph nodes across steps
+        would pin every one of those steps' graphs in memory."""
+        m = self.mask(li)
+        cand = o                         # what this step proposes for the register
+        if m is not None and self.acc is not None:
+            # --accumulate: fold this step's output into the running mean. Skipped when m is
+            # None, where the layer writes every step and that mean would be over one value.
+            if self.acc[li] is None:
+                self.acc[li] = torch.zeros_like(o)
+            self.acc[li] = self.acc[li] + o.detach()
+            self.n[li]   = self.n[li] + 1
+            cand = self.acc[li] / self.n[li].view(-1, 1, 1, 1)
+            keep = ~m                    # rows that just wrote start a fresh interval
+            self.acc[li] = self.acc[li] * keep.view(-1, 1, 1, 1)
+            self.n[li]   = self.n[li] * keep
+        if self.ema is not None:
+            # --ema: blend into what is already there instead of overwriting it, except on a
+            # row's first write of a document, which must discard the --init seed outright
+            # rather than leave (1-ema) of it in the state.
+            cand = torch.where((self.t == 0).view(-1, 1, 1, 1), cand,
+                               prev + self.ema * (cand - prev))
+        return cand if m is None else torch.where(m.view(-1, 1, 1, 1), cand, prev)
+
+    def advance(self):
+        """One step of the token stream has been consumed."""
+        self.t = self.t + 1
+
+
 # PyTorchModelHubMixin gives VLAModel save_pretrained()/push_to_hub()/from_pretrained()
 # (see --push). It records the __init__ kwargs as config.json, so a hub checkpoint rebuilds
 # with the architecture it was trained with. huggingface_hub is optional: without it the
@@ -548,8 +986,10 @@ class VLAModel(nn.Module, _HubMixin):
     to an S×S grid, projected to n_hidden and summed into the per-layer DFF state;
     ContextCNN updates the state and the decoder reads it out to next-token logits.
     n_layers stacks (ContextCNN + feedback) units in series, each carrying its own DFF
-    state. inner (--inner) runs the middle layers of that stack at a different channel
-    width from the two ends; see self.widths.
+    state. clock (--clock) decides how often each layer
+    commits its new state -- every step, on a per-layer ladder, or on a random schedule --
+    and accumulate (--accumulate) makes each of those writes an average rather than a
+    sample; see DFFClock.
 
     `tokenizer` picks the vocabulary and both ends of the token path:
       char           learned nn.Embedding(256, c_text) in, decoder straight to 256
@@ -565,22 +1005,24 @@ class VLAModel(nn.Module, _HubMixin):
     between the decoder and the head; head_norm (--head_norm) optionally normalizes the
     readout there, since the borrowed head was trained downstream of a final norm."""
     def __init__(self, n_hidden, depth, kernel, S,
-                 c_text=None, n_layers=1, skip=False, tokenizer='char', head_norm='none',
-                 inner=None):
+                 c_text=None, n_layers=1, tokenizer='char', head_norm='none',
+                 clock='sync', accumulate=False, ema=None, qproj='none', tap=False,
+                 clock_base=None, clock_max=None, clock_ends='both', clip_dff=0.0,
+                 tap_norm='none'):
         super().__init__()
         self.S          = S
         self.n_hidden   = n_hidden
         self.c_text     = c_text if c_text is not None else n_hidden
         self.n_layers   = max(1, n_layers)    # stacked (ContextCNN + feedback) layers (see --n_layers)
-        # Per-layer channel width (see --inner). The ends are pinned to n_hidden -- layer 1
-        # takes the token injection, layer N feeds the decoder -- so only layers 2..N-1 can
-        # differ, and --inner is inert below n_layers 3. Each layer's whole unit runs at its
-        # width: its ContextCNN blocks and its DFF state alike, with deep_proj (the 1x1
-        # feedback conv into the layer) doing the width change.
-        self.inner  = int(inner) if inner and self.n_layers > 2 else n_hidden
-        self.widths = [n_hidden if li in (0, self.n_layers - 1) else self.inner
-                       for li in range(self.n_layers)]
-        self.skip       = bool(skip)          # feed the token encoding to every layer (see --skip)
+        # --clock/--accumulate: how often each layer writes its DFF state and what it writes
+        # (see DFFClock). Only the write is gated; the convs run every step at every layer.
+        self.clock = self.accumulate = self.ema = None   # derived in set_clock
+        self.clock_base = _CLOCK_BASE if clock_base is None else float(clock_base)
+        self.clock_max  = _CLOCK_MAX if clock_max is None else int(clock_max)
+        self.clock_ends = clock_ends or 'both'
+        self.clip_dff   = float(clip_dff or 0.0)
+        self.tap_norm_kind = tap_norm or 'none'
+        self.set_clock(clock, accumulate, ema, clock_base, clock_ends)
         self.tokenizer  = tokenizer           # vocabulary / token path (see --tokenizer)
         # --head_norm only has a job when there is a borrowed head to feed; with char the
         # decoder emits logits directly and normalizing them would just rescale the
@@ -649,27 +1091,72 @@ class VLAModel(nn.Module, _HubMixin):
         # the token injection; deep layers take the previous layer's output combined with
         # their own DFF state. Only built when n_layers>1, so the n_layers=1 state_dict is
         # byte-identical to the single-layer model.
-        # Widths come from self.widths (--inner), so deep_proj[li] is also where the stack
-        # changes width: it maps layer li's output to layer li+1's own width.
         if self.n_layers > 1:
             self.deep_context = nn.ModuleList(
-                ContextCNN(self.widths[li + 1], depth, kernel)
-                for li in range(self.n_layers - 1))
+                ContextCNN(n_hidden, depth, kernel) for _ in range(self.n_layers - 1))
             self.deep_proj = nn.ModuleList(
-                nn.Conv2d(self.widths[li], self.widths[li + 1], 1)
-                for li in range(self.n_layers - 1))
+                nn.Conv2d(n_hidden, n_hidden, 1) for _ in range(self.n_layers - 1))
         else:
             self.deep_context = self.deep_proj = None
 
-        # --skip adds the token grid to every layer, but text_proj only speaks n_hidden, so a
-        # stack narrowed/widened by --inner needs a second injection conv at the inner width.
-        # Built whenever the width exists rather than only under --skip, so --skip stays a
-        # flag you can toggle on an existing checkpoint (it is unused, and gets no gradient,
-        # when --skip is off).
-        self.text_proj_inner = (nn.Conv2d(self.c_text, self.inner, 1)
-                                if self.inner != n_hidden else None)
+        # --qproj: a 1x1 linear conv per layer on the DFF path, at that layer's own width
+        # since it has to land on a tensor of the register's shape. Two placements,
+        # applied between the register and the feedback add -- see _fb.
+        #
+        #   read   between the register and the feedback add. Trainable, so it is initialized
+        #          to the identity (dirac kernel, zero bias): at step 0 the model is exactly
+        #          --qproj none and training moves it off from there, which keeps an A/B
+        #          honest and keeps a random mixer out of a loop prone to blowing up.
+        #   write  between the layer output and the register, so the register holds a dense
+        #          signed embedding. Its output only ever reaches the loss through the DFF,
+        #          which forward() detaches, so it can never get gradient: it is frozen, and
+        #          random rather than identity (an identity that cannot learn would be a
+        #          no-op). Orthogonal, not gaussian -- a rotation preserves the norm of the
+        #          channel vector at every position, so a fixed mixer inside the recurrence
+        #          cannot rescale or collapse the state, and it stays invertible, so nothing
+        #          in the state is destroyed. Frozen parameters are still state_dict entries,
+        #          so a reload gets the same random projection back.
+        if qproj == 'write':
+            raise SystemExit("--qproj write was removed: its only path to the loss is through "
+                             "the DFF, which is detached every step, so it could never train. "
+                             "Use --qproj read (trainable) or --qproj none.")
+        self.qproj_mode = qproj if qproj in _QPROJ_MODES else ('read' if qproj else 'none')
+        self.qproj = (nn.ModuleList(nn.Conv2d(n_hidden, n_hidden, 1)
+                                    for _ in range(self.n_layers))
+                      if self.qproj_mode != 'none' else None)
+        if self.qproj is not None:
+            for _c in self.qproj:
+                nn.init.dirac_(_c.weight)
+                nn.init.zeros_(_c.bias)
 
-        self.dff = None   # list of n_layers tensors [B, widths[li], S, S], detached; None until first step
+        # --tap: a 1x1 linear conv after each layer's last conv-BN-ReLU, with the DFF
+        # register fed from its output (see _tap). It is the first of the two convs in
+        # series -- the second is the 1x1 already sitting on the upward path, deep_proj into
+        # the next layer or decoder.proj on the last one, so no second module is needed.
+        # Identity-initialized, like --qproj read, so step 0 is exactly the model without
+        # --tap.
+        self.tap = None
+        self.tap_norm = None
+        if tap:
+            self.tap = nn.ModuleList(nn.Conv2d(n_hidden, n_hidden, 1)
+                                     for _ in range(self.n_layers))
+            # --tap_norm: normalize what leaves the tap, so the feedback gain is bounded by
+            # construction rather than left to whatever the weights drift to. affine=False in
+            # both cases, so no parameters are added; group additionally has no running
+            # statistics, so train and eval compute the same function.
+            if self.tap_norm_kind == 'batch':
+                self.tap_norm = nn.ModuleList(nn.BatchNorm2d(n_hidden, affine=False)
+                                              for _ in range(self.n_layers))
+            elif self.tap_norm_kind == 'group':
+                self.tap_norm = nn.ModuleList(
+                    nn.GroupNorm(min(32, n_hidden), n_hidden, affine=False)
+                    for _ in range(self.n_layers))
+            for _c in self.tap:
+                nn.init.dirac_(_c.weight)
+                nn.init.zeros_(_c.bias)
+
+        self.dff = None   # list of n_layers tensors [B, n_hidden, S, S], detached; None until first step
+        self.clk = None   # DFFClock for self.dff (None under --clock sync); built with it
 
         # How a fresh context is seeded, set from --init after construction. Runtime
         # behaviour, not architecture: deliberately not part of the hub config, so it never
@@ -723,47 +1210,165 @@ class VLAModel(nn.Module, _HubMixin):
         init is forgotten fast -- relative divergence between a zero and a gaussian start
         falls to 3% by 20 bytes and to float32 noise by 50 -- so --init only changes what
         the model sees for the first few dozen bytes of a context."""
-        shapes = [(B, c, self.S, self.S) for c in self.widths]   # per layer (see --inner)
+        shapes = [(B, self.n_hidden, self.S, self.S)] * self.n_layers
         if self.init_mode == 'gaussian':
             return [torch.randn(s, device=device) for s in shapes]
         if self.init_mode == 'relu':
             return [torch.randn(s, device=device).relu() for s in shapes]
         return [torch.zeros(s, device=device) for s in shapes]
 
+    def set_clock(self, clock=None, accumulate=None, ema=None, clock_base=None,
+                  clock_ends=None):
+        """Set (or change) the DFF write schedule; None leaves that half alone. Neither knob
+        adds a parameter or changes a shape, so this is safe on a model whose weights are
+        already loaded -- it is what lets --clock/--accumulate on the command line override
+        what a checkpoint was trained with (see _ARCH_OVERRIDE), e.g. training with --clock
+        dither and sampling with --clock fixed. Any live clock is dropped and rebuilt with
+        the next context."""
+        if clock is not None:
+            self.clock = clock if clock in _CLOCK_MODES else 'sync'
+        if accumulate is not None:
+            self.accumulate = bool(accumulate)
+        if ema is not None:
+            self.ema = float(ema) if 0.0 < float(ema) < 1.0 else None
+        if clock_base is not None:
+            self.clock_base = float(clock_base)
+        if clock_ends is not None:
+            self.clock_ends = clock_ends
+        self.periods = _clock_periods(self.n_layers, self.clock,
+                                      getattr(self, 'clock_base', None),
+                                      getattr(self, 'clock_ends', 'both'))
+        # a mode with nothing to clock (one layer, or exp with no middle layers) is sync,
+        # and there is nothing to average where nothing is ever held
+        # gated: some layer actually holds, so there is a window to average over.
+        # clocked: a DFFClock has to exist at all -- also true under --ema, which blends on
+        # every write even when every layer writes every step.
+        self.gated      = any(p != 1 for p in self.periods)
+        self.accumulate = bool(self.accumulate) and self.gated
+        self.clocked    = self.gated or self.ema is not None
+        self.clk = None
+
+    def _new_clock(self, B, device):
+        """The write schedule for one context (None under --clock sync, which never gates)."""
+        return (DFFClock(self.clock, self.periods, B, device,
+                         clock_max=getattr(self, 'clock_max', _CLOCK_MAX),
+                         base=getattr(self, 'clock_base', _CLOCK_BASE),
+                         accumulate=self.accumulate, ema=self.ema)
+                if self.clocked else None)
+
     def _init_dff(self, B, device):
         dev = torch.device(device)
         if (self.dff is None or len(self.dff) != self.n_layers
                 or self.dff[0].shape[0] != B or self.dff[0].device != dev):
             self.dff = self._new_dff(B, device)
+            self.clk = self._new_clock(B, dev)   # the clock is state too: rebuilt with it
+
+    def _fb(self, li, d):
+        """Layer li's DFF state as the feedback add sees it (--qproj read). Off, this is the
+        state itself: the ReLU output the layer last wrote, ~50% exact zeros. On, it is that
+        state through a trainable 1x1 linear conv -- every output channel a signed
+        combination of all the input channels at that spatial position -- so what the layer
+        adds in is dense and signed even though the register holding it is sparse.
+
+        This placement is the trainable one. Projecting on the way into the register instead
+        (--qproj write) puts the conv outside the gradient horizon: its output reaches the
+        loss only through self.dff, which forward() detaches every step, so those weights get
+        grad None (measured: None, against 1.21 for text_proj on the same batch) and the
+        mode only makes sense frozen.
+
+        Note the two placements feed the *same* tensor into the add, since this conv is
+        linear and --accumulate's running mean is linear too: mean(Q(o)) == Q(mean(o)) to
+        float precision. What differs is what sits in the register -- sparse and
+        non-negative here, dense and signed under write -- and therefore what the next
+        step's ReLU sees.
+
+        Why it is not redundant with the convs already on that path: Q is applied to the
+        state but not to the token injection it is summed with, so the layer can transform
+        what it remembers differently from what it is being told. Applied to the whole output
+        instead, it would just be a reparameterization of the following 1x1 (deep_proj,
+        decoder.proj) or 3x3 (ContextCNN) conv."""
+        return d if self.qproj_mode != 'read' else self.qproj[li](d)
+
+    def _tap(self, li, o):
+        """Layer li's ContextCNN output, through the --tap projection (identity when off).
+        The result is both what the register stores and what leaves the layer:
+
+            o -> tap -> a ,   a -> register
+                        a -> deep_proj -> next layer   (decoder.proj on the last layer)
+
+        which is the two-1x1-in-series arrangement with the register tapped between them --
+        the second 1x1 being the one already on the upward path rather than a module of its
+        own. A separate second conv there would be exactly redundant: two 1x1s in series with
+        no nonlinearity between compose to a single 1x1, so folding it into deep_proj costs
+        nothing representable and halves the added parameters.
+
+        Both consumers of `a` matter. The register is detached, so on its own it would leave
+        these weights with no gradient (that is what --qproj write runs into); the upward path
+        is not, so the tap trains through it.
+
+        The register therefore holds a dense signed embedding of the layer's output rather
+        than the sparse ReLU output -- which is the part that changes what the model can
+        remember, since --accumulate averages it and the next step adds it back in."""
+        if self.tap is None:
+            return o
+        a = self.tap[li](o)
+        return a if self.tap_norm is None else self.tap_norm[li](a)
+
+    def _clip_state(self, outs):
+        """--clip_dff: bound the DFF state's magnitude, per layer and per batch row.
+
+        Rescales instead of clamping element-wise, so what the state *encodes* -- the pattern
+        across channels and the SxS grid -- is untouched and only its overall scale is capped.
+        Element-wise clamping would flatten the peaks against the ceiling and distort the
+        representation; this is the same argument that makes gradient-norm clipping preferable
+        to clamping individual gradients.
+
+        Rows are clipped independently because the CNN never mixes the batch dimension, so one
+        row running away must not rescale its neighbours.
+
+        Only the stored state is clipped. The value travelling up the stack and into the
+        decoder is the layer output itself, which is left alone -- this bounds the feedback
+        loop without altering the feed-forward path."""
+        c = self.clip_dff
+        if not c:
+            return outs
+        out = []
+        for d in outs:
+            m = d.detach().abs().amax(dim=(1, 2, 3), keepdim=True)
+            out.append(d * torch.clamp(c / m.clamp_min(1e-12), max=1.0))
+        return out
 
     def _tok_grid(self, byte_idx):
         B   = byte_idx.shape[0]
         tok = self.tok_embed(byte_idx)                             # [B, c_text]
         return tok.view(B, self.c_text, 1, 1).expand(-1, -1, self.S, self.S)
 
-    def _layers(self, dff, tok_grid):
+    def _layers(self, dff, tok_grid, clk=None):
         """Run the stack of n_layers (ContextCNN + feedback) units once.
-        dff: list of n_layers tensors [B, widths[li], S, S]. Layer 0 takes the token injection;
+        dff: list of n_layers tensors [B, n_hidden, S, S]. Layer 0 takes the token injection;
         each deeper layer takes the previous layer's output summed with its own DFF state,
-        plus (with --skip) the same token injection layer 0 got, so deep layers see the
-        current token directly instead of only through the layers below them. --inner runs
-        the middle layers at their own width, so the skip injection is taken from
-        text_proj_inner there and from text_proj at the n_hidden ends.
+        so a deep layer sees the current token only through the layers below it.
+        clk: the DFFClock for this context (None under --clock sync). It is consumed here —
+        one step of it per call — so pass the clock that belongs to the state in `dff`.
+        --qproj puts a 1x1 conv either on the way out of each register (read, see _fb) or
+        --tap puts one between the layer output and the
+        register (see _tap), on the path the stack above takes as well.
         Returns (new_dff_list, last_layer_output [B, n_hidden, S, S]). No detach here — the
         caller detaches the returned list to bound the time horizon."""
         tok  = self.text_proj(tok_grid)        # [B, n_hidden, S, S], computed once
-        # likewise for the inner width, and only when --skip will actually consume it
-        tok_inner = (self.text_proj_inner(tok_grid)
-                     if self.skip and self.text_proj_inner is not None else None)
-        o    = self.context(dff[0] + tok)
+        o    = self._tap(0, self.context(self._fb(0, dff[0]) + tok))
         outs = [o]
         for li in range(self.n_layers - 1):
-            x = dff[li + 1] + self.deep_proj[li](o)
-            if self.skip:
-                x = x + (tok if self.widths[li + 1] == self.n_hidden else tok_inner)
-            o = self.deep_context[li](x)
+            x = self._fb(li + 1, dff[li + 1]) + self.deep_proj[li](o)
+            o = self._tap(li + 1, self.deep_context[li](x))
             outs.append(o)
-        return outs, o
+        # --clock: a layer that does not write this step keeps the state it had, while still
+        # passing the output it just computed up the stack -- so the decoder, which reads the
+        # top layer's output, moves every step whatever the clock does.
+        if clk is not None:
+            outs = [clk.write(li, oi, d) for li, (oi, d) in enumerate(zip(outs, dff))]
+            clk.advance()
+        return self._clip_state(outs), o
 
     def forward(self, byte_idx, targets=None, flag=None):
         """
@@ -780,8 +1385,10 @@ class VLAModel(nn.Module, _HubMixin):
             fresh = self._new_dff(int(flag.sum()), self.dff[0].device)
             for d, f in zip(self.dff, fresh):
                 d[flag] = f
+            if self.clk is not None:
+                self.clk.reset(flag)     # a restarting row is back at step 0 (--clock phase)
 
-        stack, new_ctx = self._layers(self.dff, self._tok_grid(byte_idx))
+        stack, new_ctx = self._layers(self.dff, self._tok_grid(byte_idx), self.clk)
         self.dff = [d.detach().clone() for d in stack]   # store for next step (gradient horizon = 1)
 
         logits = self.readout(self.decoder(new_ctx))
@@ -795,12 +1402,13 @@ class VLAModel(nn.Module, _HubMixin):
         self.eval()
         dev = next(self.parameters()).device
         dff = self._new_dff(1, dev)
+        clk = self._new_clock(1, dev)   # its own clock: generate runs on a local state
 
         def _step(b):
             nonlocal dff
             bi   = torch.tensor([b], dtype=torch.long, device=dev)
             tok  = self.tok_embed(bi).view(1, self.c_text, 1, 1).expand(-1, -1, self.S, self.S)
-            stack, new_ctx = self._layers(dff, tok)
+            stack, new_ctx = self._layers(dff, tok, clk)
             dff     = [d.detach().clone() for d in stack]
             if not all(d.isfinite().all() for d in dff):
                 print('generate: dff NaN/Inf')
@@ -1194,12 +1802,19 @@ if args.pretrained:
     print(f'loading {args.pretrained} from the hub...')
     model = VLAModel.from_pretrained(args.pretrained, revision=args.revision)
     _cfg  = getattr(model, '_hub_mixin_config', None) or {}
-    for _k, _a in (('context', 'S'), ('n_hidden', 'n_hidden'), ('c_text', 'c_text'),
-                   ('n_layers', 'n_layers'), ('depth', 'depth'), ('kernel', 'kernel'),
-                   ('skip', 'skip'), ('tokenizer', 'tokenizer'),
-                   ('head_norm', 'head_norm'), ('inner', 'inner')):
-        if _a in _cfg:
-            setattr(args, _k, _cfg[_a])
+    _restore_arch({_k: _cfg[_a] for _k, _a in
+                   (('context', 'S'), ('n_hidden', 'n_hidden'), ('c_text', 'c_text'),
+                    ('n_layers', 'n_layers'), ('depth', 'depth'), ('kernel', 'kernel'),
+                    ('tokenizer', 'tokenizer'),
+                    ('head_norm', 'head_norm'),
+                    ('clock', 'clock'), ('clock_base', 'clock_base'),
+                    ('accumulate', 'accumulate'), ('ema', 'ema'),
+                    ('qproj', 'qproj'), ('tap', 'tap')) if _a in _cfg},
+                  'pretrained config')
+    # from_pretrained built the model straight from that config, so an overridden clock has
+    # to be pushed onto the model too -- unlike --load, there is no later construction step.
+    if _CLI_GIVEN & {'clock', 'clock_base', 'accumulate', 'ema'}:
+        model.set_clock(args.clock, args.accumulate, args.ema, args.clock_base)
     print('pretrained config', _cfg)
     # The ARGS line was logged before the hub config was known, so it still shows the CLI
     # arch defaults. Re-log the corrected args, or the log would misattribute the run.
@@ -1214,8 +1829,16 @@ else:
         S         = args.context,
         c_text    = args.c_text,
         n_layers  = args.n_layers,
-        inner     = args.inner,
-        skip      = args.skip,
+        clock      = args.clock,
+        clock_base = args.clock_base,
+        clock_max  = args.clock_max,
+        clock_ends = args.clock_ends,
+        clip_dff   = args.clip_dff,
+        tap_norm   = args.tap_norm,
+        accumulate = args.accumulate,
+        ema        = args.ema,
+        qproj      = args.qproj,
+        tap        = args.tap,
         tokenizer = args.tokenizer,
         head_norm = args.head_norm,
     )
@@ -1234,8 +1857,18 @@ args.c_text = model.c_text
 # likewise --head_norm: char forces it to 'none', and so does an ln_f that the source model
 # turned out not to expose, so read back what was actually built.
 args.head_norm = model.head_norm_kind
-# and --inner, which collapses to n_hidden when there are no middle layers to resize.
-args.inner = model.inner
+# and --clock, which falls back to sync on an unknown mode, and --accumulate, which needs a
+# clock to have anything to average.
+args.clock      = model.clock
+args.clock_base = model.clock_base
+args.clock_max  = model.clock_max
+args.clock_ends = model.clock_ends
+args.clip_dff   = model.clip_dff
+args.tap_norm   = model.tap_norm_kind
+args.accumulate = model.accumulate
+args.ema        = model.ema
+args.qproj      = model.qproj_mode
+args.tap        = model.tap is not None
 
 # --unfreeze trains the borrowed embedding/lm_head too. requires_grad is not part of the
 # state_dict, so this is re-applied on every run (including --load/--pretrained) from the
@@ -1273,25 +1906,83 @@ _summ('tok_embed' + ('' if args.tokenizer == 'char' else
                      f' ({_TOKENIZERS[args.tokenizer]} input embedding{_borrowed})'),
       model.tok_embed, input_data=torch.zeros(1, dtype=torch.long))
 _summ('text_proj', model.text_proj, input_size=(1, model.c_text, args.context, args.context))
+if model.tap is not None:
+    _summ(f'tap x{model.n_layers} (layer output -> DFF register and on to deep_proj, '
+          f'trainable, identity-initialized)', model.tap[0], input_size=_dff_shape)
+if model.qproj is not None:
+    _summ(f'qproj x{model.n_layers} ('
+          + ('DFF state -> feedback add, trainable, identity-initialized'
+             if model.qproj_mode == 'read' else
+             'layer output -> DFF register, FROZEN random orthogonal')
+          + ')', model.qproj[0], input_size=_dff_shape)
 _summ('context (layer 1)' if model.n_layers > 1 else 'context',
       model.context, input_size=_dff_shape)
+if model.clock != 'sync' and not model.gated:
+    # asked for a clock and got none: exp has no middle layers to clock below 3, and no mode
+    # clocks a single layer. Say so rather than run silently as sync.
+    print(f'WARNING: --clock {model.clock} has nothing to clock at --n_layers '
+          f'{model.n_layers}: every layer writes every step, as --clock sync'
+          + (' (exp clocks the middle layers only, so it needs --n_layers > 2)'
+             if model.clock == 'exp' else ''))
+if model.clocked and (not (args.generate or args.vis or args.push or args.eval) or args.verbose):
+    # the clock is invisible in the layer summaries (it adds no parameters and no shapes),
+    # so state it explicitly: it is the single biggest change to what the stack does.
+    _per = lambda fmt: ', '.join(fmt(li, p) for li, p in enumerate(model.periods))
+    _ladder = lambda: ('DFF state write period per layer '
+                       + _per(lambda li, p: f'L{li + 1}={p}') + ' steps')
+    _clk_txt = {
+        'fixed':  _ladder,
+        'incr':   _ladder,
+        'dither': lambda: 'DFF state write probability per layer '
+                          + _per(lambda li, p: f'L{li + 1}={100.0 / p:g}%')
+                          + ' (random per row, mean period '
+                          + _per(lambda li, p: str(p)) + ' steps)',
+        'sync':   lambda: 'every layer writes its DFF state every step',
+        'exp':    lambda: f'layers 2..{model.n_layers - 1} hold '
+                          f'{model.clock_base:g}**k steps, k ~ Geometric(1/2), '
+                          + (f'mean hold {1.0 / (2.0 - model.clock_base):.1f} steps'
+                             if model.clock_base < 2.0 else
+                             'mean hold unbounded at base >= 2, set only by the cap')
+                          + f', capped at {model.clock_max} (drawn per layer per row); ' + {
+                              'both':  f'L1 and L{model.n_layers} write every step',
+                              'none':  'every layer is clocked, including both ends',
+                              'first': 'L1 writes every step, '
+                                       f'L{model.n_layers} is clocked',
+                              'last':  f'L{model.n_layers} writes every step, L1 is clocked',
+                          }[model.clock_ends],
+    }[model.clock]()
+    _clk_txt = (f'── clock ──\n--clock {model.clock}: {_clk_txt}'
+                + ('\n--accumulate: each write commits the mean of every output that layer '
+                   'computed since its last write' if model.accumulate else '')
+                + (f'\n--ema {model.ema:g}: a write blends into the register '
+                   f'(register += {model.ema:g} * (new - register)) instead of replacing it; '
+                   f'effective window ~{1.0 / model.ema:g} writes'
+                   if model.ema is not None else ''))
+    print(_clk_txt)
+    with open(args.log, 'a') as f:
+        for line in _clk_txt.splitlines():
+            print(f'INFO {line}', file=f)
+
 if model.deep_context is not None:
-    _skip_txt = ', token skip input' if model.skip else ''
-    if model.inner == model.n_hidden:
-        _summ(f'deep_context x{model.n_layers - 1} (layers 2..{model.n_layers}{_skip_txt})',
-              model.deep_context[0], input_size=_dff_shape)
-    else:
-        # --inner: the middle layers run narrower/wider than the ends, so one summary no
-        # longer covers them all. Show a middle layer and the (n_hidden) last one.
-        _summ(f'text_proj_inner (token grid -> {model.inner} ch, layers 2..'
-              f'{model.n_layers - 1}; unused without --skip)',
-              model.text_proj_inner, input_size=(1, model.c_text, args.context, args.context))
-        _summ(f'deep_context x{model.n_layers - 2} (layers 2..{model.n_layers - 1}, '
-              f'--inner {model.inner} ch{_skip_txt})',
-              model.deep_context[0],
-              input_size=(1, model.inner, args.context, args.context))
-        _summ(f'deep_context (layer {model.n_layers}, {model.n_hidden} ch{_skip_txt})',
-              model.deep_context[-1], input_size=_dff_shape)
+    _summ(f'deep_context x{model.n_layers - 1} (layers 2..{model.n_layers})',
+          model.deep_context[0], input_size=_dff_shape)
+if model.tap is not None and (not (args.generate or args.vis or args.push or args.eval)
+                              or args.verbose):
+    _tap_txt = (
+        '── tap ──\n'
+        '--tap: per layer, ContextCNN -> tap (1x1) -> DFF register, and the same tensor on\n'
+        '       to ' + ('deep_proj (1x1) -> next layer; the last layer to decoder.proj (1x1)'
+                        if model.n_layers > 1 else 'decoder.proj (1x1)') + '\n'
+        '       so the two 1x1s in series are tap then '
+        + ('deep_proj/decoder.proj' if model.n_layers > 1 else 'decoder.proj')
+        + ', tapped between.\n'
+        f'       register holds a dense signed embedding (was the sparse ReLU output); '
+        f'--init {args.init}'
+        + ('' if args.init == 'gaussian' else ' (gaussian matches a dense register better)'))
+    print(_tap_txt)
+    with open(args.log, 'a') as f:
+        for line in _tap_txt.splitlines():
+            print(f'INFO {line}', file=f)
 _summ('decoder', model.decoder, input_size=_dff_shape)
 if model.head_norm_kind not in ('none', 'batch2d'):
     _src = (f'{_TOKENIZERS[args.tokenizer]} {model.norm_path}{_borrowed}'
@@ -1569,12 +2260,13 @@ if args.vis:
     _ticker = _ptext          # ticker-tape display buffer (trailing _VIS_WIN chars)
     _nstep  = 0
     dff     = model._new_dff(1, _dev)
+    clk     = model._new_clock(1, _dev)   # this episode's --clock state
 
     while not _vis_exit:
         with torch.no_grad():
             bi   = torch.tensor([_b], dtype=torch.long, device=_dev)
             tok  = model.tok_embed(bi).view(1, model.c_text, 1, 1).expand(-1, -1, model.S, model.S)
-            stack, new_ctx = model._layers(dff, tok)               # last-layer output
+            stack, new_ctx = model._layers(dff, tok, clk)          # last-layer output
             dff     = [d.detach().clone() for d in stack]
             logits  = model.readout(model.decoder(new_ctx))
         _nstep += 1
@@ -1590,6 +2282,7 @@ if args.vis:
             if nxt == model.end_id:
                 _ticker += ETX_TEXT        # mark the episode break in the ticker
                 dff    = model._new_dff(1, _dev)
+                clk    = model._new_clock(1, _dev)
                 _queue = list(_prompt)     # episode over: reset state, restart prompt
                 _b     = _queue.pop(0)
                 _ticker += _ptext          # new episode opens with <STX> again
@@ -1678,8 +2371,12 @@ def _lr_scaled_groups(model, base_lr, mult):
     layers[0] += list(model.tok_embed.parameters())
     layers[0] += list(model.text_proj.parameters())
     layers[0] += list(model.context.parameters())
-    if model.text_proj_inner is not None:   # --inner --skip injection (see _layers)
-        layers[0] += list(model.text_proj_inner.parameters())
+    if model.qproj is not None:             # --qproj read; write is frozen and filtered below
+        for li in range(N):
+            layers[li] += list(model.qproj[li].parameters())
+    if model.tap is not None:               # --tap: each conv belongs to its own layer
+        for li in range(N):
+            layers[li] += list(model.tap[li].parameters())
     if model.deep_context is not None:
         for li in range(N - 1):
             layers[li + 1] += list(model.deep_context[li].parameters())
@@ -1721,6 +2418,13 @@ if args.lr_mult != 1.0:
 # neither weight_decay nor momentum; Adagrad takes weight_decay but no momentum.
 # --nesterov is SGD-only and needs a positive momentum -- torch raises on nesterov with
 # momentum 0, so an inapplicable flag is reported and dropped rather than left to blow up.
+# --beta1/--beta2 are adamw-only; report and drop them elsewhere rather than silently
+# ignoring a flag the caller believes is taking effect.
+_beta1 = 0.9 if args.beta1 is None else args.beta1
+_beta2 = args.momentum if args.beta2 is None else args.beta2
+if args.opt != 'adamw' and (args.beta1 is not None or args.beta2 is not None):
+    print(f'WARNING: --beta1/--beta2 apply to --opt adamw, and this run is --opt {args.opt}; '
+          f'ignored (use --momentum for sgd/rmsprop)')
 _nesterov = args.nesterov and args.opt == 'sgd' and args.momentum > 0
 if args.nesterov and not _nesterov:
     print(f'WARNING: --nesterov ignored: it applies to --opt sgd with --momentum > 0, '
@@ -1737,10 +2441,13 @@ elif args.opt == 'adagrad':
     optimizer = torch.optim.Adagrad(_params, lr=args.lr_max,
                                     weight_decay=args.weight_decay)
 elif args.opt == 'adamw':
-    # --momentum drives beta2 (second-moment decay); beta1 fixed at 0.9.
+    # --beta1/--beta2 set the moment decays directly. --momentum stays the beta2 fallback
+    # so every existing invocation and checkpoint keeps the behavior it was trained with.
     optimizer = torch.optim.AdamW(_params, lr=args.lr_max,
-                                  betas=(0.9, args.momentum),
+                                  betas=(_beta1, _beta2),
                                   weight_decay=args.weight_decay)
+    print(f'adamw betas ({_beta1}, {_beta2})'
+          + ('' if args.beta2 is not None else '  [beta2 from --momentum]'))
 
 # ── scheduler ─────────────────────────────────────────────────────────────────
 # Every --schedule oscillates between --lr_min and --lr_max. LambdaLR multiplies the
@@ -1869,10 +2576,10 @@ def _param_groups_named(model):
          'tprj': list(model.text_proj.parameters()),
          'ctx':  list(model.context.parameters()),
          'dec':  list(model.decoder.parameters())}
-    if model.text_proj_inner is not None:            # --inner --skip injection
-        g['tprj'] = g['tprj'] + list(model.text_proj_inner.parameters())
     if model.deep_context is not None:   # stacked layers 2..N (--n_layers)
         g['deep'] = list(model.deep_context.parameters()) + list(model.deep_proj.parameters())
+    if model.tap is not None:            # --tap: the 1x1 after each layer
+        g['tap'] = list(model.tap.parameters())
     if not isinstance(model.lmhead, nn.Identity):   # pretrained tokenizer: borrowed lm_head
         g['head'] = list(model.head_norm.parameters()) + list(model.lmhead.parameters())
     return g

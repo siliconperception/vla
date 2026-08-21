@@ -1,0 +1,246 @@
+================================================================================
+VLA EXPERIMENT PLAN -- ad-hoc hypothesis-driven search
+Created 2026-08-21.  Baseline: wnotap.  Corpus: openwebtext (--dataset web).
+================================================================================
+
+1. BASELINE
+--------------------------------------------------------------------------------
+Command (checkpoint.pt.wnotap, 100K steps, log/exp.wnotap):
+
+  python vla.py --dataset web --preroll --tokenizer pythia31m \
+    --context 16 --n_hidden 256 --kernel 3 \
+    --batch 250 --monitor 20 --checkpoint 5000 \
+    --opt sgd --momentum 0.0 --weight_decay 0.0 \
+    --schedule const --lr_max 0.01 --seed 1 \
+    --n_layers 7 --depth 7 --clock fixed --clock_base 2.36 \
+    --init gaussian --ema 0.5 --accumulate \
+    --run_steps 100001
+
+  29.4M trainable params.  No --tap: the DFF register receives ContextCNN's
+  output directly (post-BatchNorm, post-ReLU), so it is bounded by construction.
+  Clock ladder at --clock_base 2.36, n_layers 7: 1,2,6,13,31,73,173 steps.
+  Throughput ~2.9 steps/s on the RTX 4090.  --batch 250 == 250 tokens/step,
+  so 5K steps == 1.25M tokens and a 100K run == 25M tokens.
+
+2. BASELINE RESULTS (the numbers every experiment is measured against)
+--------------------------------------------------------------------------------
+Training loss, mean of last 10 monitor lines:      5.7763 at 100K
+Held-out clean loss (400 docs >=512 tok):          6.0805 at 100K
+openwebtext unigram entropy (measured):            7.5491 nats
+
+  step    train    held-out clean   runaway%   gen cycle
+  20000   6.3698   6.5163            0.2       0.08
+  40000   6.1756   6.3635           46.2       0.09
+  60000   5.9542   6.2240            0.8       0.08
+  80000   5.9949   6.1785            1.2       0.08
+ 100000   5.6400   6.0805            3.8       (pending)
+
+Token efficiency, sustained crossings (10-line running mean):
+
+  L < 7.549 (unigram)   step   3980     0.99 M tokens
+  L < 7.000             step   5940     1.49 M tokens
+  L < 6.500             step  15680     3.92 M tokens
+  L < 6.300             step  30120     7.53 M tokens
+  L < 6.100             step  49700    12.43 M tokens
+  L < 5.900             step  84980    21.25 M tokens
+  L < 5.800             step  99980    25.00 M tokens
+
+dff_max over the run: rises to ~42 by 60K then FALLS (27, 9, 12).  Self-limiting,
+unlike the --tap runs which climbed monotonically 33 -> 63 -> 82 -> 101.
+
+3. WHAT IS ALREADY ESTABLISHED (do not re-litigate)
+--------------------------------------------------------------------------------
+a) Optimizer: plain SGD, lr 0.01, momentum 0.  AdamW parks at the unigram floor
+   for thousands of steps with dff_max excursions to 3.7e5.  A 200-step lr x
+   momentum grid on web put lr 0.01 / momentum 0 at the best state behaviour
+   (dff_max 29-37) with healthy descent.  lr 0.1 blew dff_max to 6e5.
+b) Reach is set by the slowest layer's write period:
+       reach ~ kappa(ema) * p_max,   kappa(a) = ln(0.05)/ln(1-a)
+   Confirmed on three configs; it OVERESTIMATES by 2-3x in practice.
+   At --ema 0.5, kappa = 4.32 writes.  --clock_max is a dead lever (E[h] grows
+   only as log2 of the cap; document scale would need cap ~ 2**88).
+c) Measured reach, warm-context probe, openwebtext:
+       --clock exp,   ema 0.5   ->  saturates by c ~ 8-16   (a 10-gram)
+       --clock fixed, base 2.36 ->  still +0.209 nats at c=64, +0.107 at c=96
+d) Teacher-forced loss cannot see free-running collapse.  Generation can lock
+   into a repeating token while held-out loss improves; --clip_dff rescues it.
+e) Runaway rate is NON-MONOTONE and excursions are universal, not a property of
+   any one option (wfix236 hit 100% at 50K and recovered to 8% by 65K; wnotap
+   hit 46% at 40K and recovered to 0.8%).  Never call a trend from two points.
+f) Checkpoints must be read with score.py's stable_load(): torch.save is not
+   atomic and a mid-write read scores as a broken model without raising.
+
+4. SEARCH ALGORITHM
+--------------------------------------------------------------------------------
+  1. From results so far, form a hypothesis that changes exactly ONE vla.py
+     command-line option relative to the current baseline.  Write down the
+     prediction and what result would falsify it BEFORE running.
+  2. Run the experiment.  Length is a multiple of 5K steps, chosen from the
+     hypothesis (see per-experiment "budget" below), not fixed in advance.
+  3. Analyze.  If the change wins on the decision rule in section 6, it becomes
+     the new baseline and subsequent experiments build on it.  If it loses,
+     record why and return to step 1.
+
+  Single-option discipline is the point: it keeps every result attributable.
+  Where an option is only meaningful together with another (e.g. changing
+  --n_layers moves p_max unless --clock_base is renormalized), that is called
+  out explicitly and the pair is treated as one conceptual change.
+
+5. REPORTING PROTOCOL (every 5K-step checkpoint, no exceptions)
+--------------------------------------------------------------------------------
+  - loss (mean of last 10 monitor lines), and the gain over the previous 5K block
+  - grad: direction matters more than level.  Rising = the deep stack is still
+    organizing.  Collapsing to a constant while loss is flat = drowned token.
+  - dff_std, dff_max, dff_zeros.  dff_max climbing while dff_std is flat is the
+    outlier-channel signature.
+  - free-running generation health: exp/gencheck.py, 3 fresh samples.
+    cycle > 0.6 == degenerate.  Healthy is 0.08-0.11.
+  - SUBJECTIVE ANALYSIS OF GENERATED TEXT.  What to look for, in order of the
+    development already observed: word-shaped tokens -> local bigram/trigram
+    coherence -> correct function words -> clause-level syntax -> contractions
+    and punctuation conventions -> <ETX> emitted on its own -> discourse
+    connectives placed correctly (these require prior context) -> pronoun and
+    referent persistence across a sentence boundary -> topic maintained across
+    paragraphs.  That last pair is the qualitative counterpart of the reach
+    measurement and is where long- and short-reach configurations diverge.
+    Report what is present, what is absent, and what changed since last time.
+    One sample at temperature 1.0 is a noisy draw -- do not build a case on it.
+  - every 20K: exp/score.py (clean, median, runaway%) and exp/reach.py.
+
+6. DECISION RULES
+--------------------------------------------------------------------------------
+  PRIMARY   held-out clean loss at matched step count.
+  PRIMARY   token efficiency: steps to sustained crossing of 6.5 / 6.3 / 6.1.
+  GATE      free-running generation must not be degenerate at the final ckpt.
+  TIEBREAK  structural simplicity (fewer modules; this targets FPGA dataflow).
+  NOISE     run-to-run sigma on loss is ~0.07.  A margin under 0.07 is a tie;
+            resolve ties by simplicity, not by picking the lower number.
+  RUNAWAY   report it, do not act on a single reading (see 3e).  Only a rate
+            elevated at three consecutive milestones counts as a trend.
+
+7. EXPERIMENT QUEUE
+--------------------------------------------------------------------------------
+Ordered by expected information per GPU-hour.  Each is one option off the
+CURRENT baseline; re-derive the order after each result.
+
+E01  --ema 0.25          budget 40K   ~3.8 h
+     Hypothesis: --ema 0.5 keeps only kappa=4.32 writes, so even the 173-step
+     layer retains ~4 writes.  0.25 gives kappa=10.4, roughly 2.4x the reach.
+     Predict: reach at c=64/96 up; loss neutral to slightly worse early
+     (a lower ema adapts more slowly), better after ~30K.
+     Falsified if: reach curve is unchanged, which would mean ema is not the
+     binding constraint at this p_max and the formula is wrong for --clock fixed.
+     WHY FIRST: --ema is the cheapest reach lever, is in the original option
+     set, and has never been varied on web.
+
+E02  --init relu         budget 20K   ~1.9 h
+     Hypothesis: without --tap the register holds a rectified, nominally sparse
+     value, so relu(randn) is the matching seed; gaussian was chosen FOR the
+     dense tapped register.  Note dff_zeros falls 0.51 -> 0.02 within 10K, so
+     the register is dense in steady state and this may be inert.
+     Predict: faster early convergence (fewer steps to L<7.0), no change late.
+     Falsified if: steps-to-7.0 within 200 of baseline (5940).
+     Cheap, and it tests whether the init still matters once --tap is gone.
+
+E03  --no-accumulate     budget 40K   ~3.8 h
+     Hypothesis: with p_max=173, --accumulate commits the MEAN of up to 173
+     outputs -- heavy smoothing that may erase the fine detail the slow layers
+     are supposed to carry.  Sampling one output instead may sharpen them.
+     Predict: worse early (noisier writes), better reach detail late.
+     Falsified if: loss worse at every milestone.
+
+E04  --clock_base 2.0    budget 40K   ~3.8 h
+     Hypothesis: 2.36 was solved for reach ~750 on 890-token documents, but the
+     formula overestimates 2-3x, so the true reach is ~250-350 and p_max may be
+     larger than useful.  base 2.0 gives ladder 1,2,4,8,16,32,64.
+     Predict: faster convergence (slow layers train 2.7x more often), shorter
+     reach.  This directly measures the reach/token-efficiency trade.
+     Falsified if: both loss and reach worse -- there is no trade, just a worse
+     setting.
+
+E05  --schedule cosine   budget 100K  ~9.6 h
+     Hypothesis: every result so far is on --schedule const.  A decaying lr is
+     the single largest known lever on FINAL loss in LM training, typically
+     0.1-0.3 nats, and it costs nothing in tokens.
+     Predict: 100K final well below 5.78; most of the gain in the last 30K.
+     Falsified if: final loss within 0.07 of const.
+     NOTE: not a fair comparison at intermediate steps -- judge only at the end,
+     and only against a const run of the SAME length.
+     Run this LAST, after the architecture is settled: it is the most expensive
+     and it interacts with nothing.
+
+E06  --batch 500         budget 40K   ~3.8 h (2x tokens/step)
+     Hypothesis: the second objective is tokens-to-loss, and batch is the direct
+     knob.  250 rows may be past the point of diminishing returns per token.
+     Predict: better loss per STEP, worse or equal per TOKEN.
+     Falsified if: better per token too -- which would mean the gradient is
+     noise-limited and batch should go up further.
+     IMPORTANT: this is the one experiment where step-matched comparison is
+     wrong.  Compare on the token axis (steps x batch).
+
+E07  --n_layers 5 --depth 10 --clock_base 3.63   budget 40K  ~3.8 h
+     Two options move together on purpose: base is renormalized so p_max stays
+     at 173 (b = 173**(1/4) = 3.63, ladder 1,4,13,48,173) so that only the
+     NUMBER of timescales changes, not the reach.
+     Hypothesis: 7 layers x depth 7 was inherited, never justified.  Fewer,
+     deeper layers = fewer registers but more compute per timescale.
+     Predict: small effect either way; informative because it separates "number
+     of timescales" from "reach", which no experiment has done.
+
+E08  --n_layers 10 --depth 5 --clock_base 1.77   budget 40K  ~3.8 h
+     Mirror of E07: b = 173**(1/9) = 1.77, ladder 1,2,3,6,10,18,31,55,98,173.
+     More registers, shallower each, same reach.  E07 and E08 bracket the
+     baseline's 7 layers and together answer whether 7 was a good choice.
+
+E09  --qproj read        budget 40K   ~3.8 h
+     Hypothesis: a trainable 1x1 between the register and the feedback add lets
+     a layer transform what it REMEMBERS differently from what it is TOLD -- the
+     only option that targets the memory path specifically.
+     TENSION: this re-introduces an unnormalized map into the recurrence, which
+     is what removing --tap just eliminated.  Watch dff_max for the monotone
+     climb signature (33 -> 63 -> 82 -> 101) that the tapped runs showed.
+     Predict: better reach, higher runaway risk.
+
+E10  --context 24        budget 40K   ~3.8 h
+     Hypothesis: the state is n_hidden x context x context = 256x16x16 = 65K
+     values.  24x24 nearly doubles it to 147K at ~2.2x the compute.  Capacity
+     may be what is limiting the 6.08 plateau, not reach.
+     Predict: better loss, worse tokens/second; judge on loss-vs-wallclock too.
+     NOTE: changes param count (kernel convs are unchanged, but the pooled
+     decoder sees a bigger grid), so it is not a pure control.
+
+E11  --lr_max 0.02       budget 40K   ~3.8 h
+     Hypothesis: lr 0.01 was chosen from a 200-STEP probe.  What is best over
+     200 steps need not be best over 100K.  The 200-step grid showed 0.03 with
+     momentum 0 was stable (dff_max 34-36) and slightly ahead at that horizon.
+     Predict: faster early, similar or slightly worse late.
+     Cheap way to test whether the optimizer choice was under-validated.
+
+E12  --clock incr        budget 40K   ~3.8 h
+     Hypothesis: on TinyStories, incr had the best held-out loss among stable
+     configs.  It has never been run on web without --tap.  Ladder 1..7, so
+     p_max=7 and reach ~30 -- a deliberate short-reach control on the new
+     baseline, to re-measure the reach/loss trade now that the tap is gone.
+
+8. TERMINATION
+--------------------------------------------------------------------------------
+Stop an experiment early when:
+  - loss is >0.15 above baseline at the same step at two consecutive 5K marks
+    (it is not going to recover), OR
+  - generation is degenerate (cycle > 0.6) at two consecutive checkpoints, OR
+  - the hypothesis has already been decided by the data collected so far.
+Do NOT stop on a single bad runaway reading (see 3e) -- that mistake cost this
+study a 100K tapped run.
+Let an experiment run to its full budget when the gradient is still rising: that
+means the deep stack is still organizing and the loss curve has not converged.
+
+9. FINAL DELIVERABLE
+--------------------------------------------------------------------------------
+A single recommended command line, justified by:
+  - final held-out clean loss, and the token count to reach each threshold
+  - the reach curve, warm-context, with the runaway rate stated
+  - generation health, with sample text
+  - an explicit statement of which options were shown to matter, which were
+    shown NOT to matter, and which remain untested.
+Report ties as ties.  Prefer the simpler configuration on a tie.
+================================================================================

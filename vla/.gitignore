@@ -2,3 +2,7 @@
 # rewrites it into (~110 GB). Both are regenerable, neither belongs in git.
 dolma3/
 dolma3_text/
+
+# 13 GB of trained weights; regenerable from the logs and PLAN.txt, and far too
+# large for git. Kept on disk under ./checkpoint for review alongside ./log.
+checkpoint/
