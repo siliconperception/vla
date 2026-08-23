@@ -322,7 +322,7 @@ parser.add_argument('--clock',         default='sync', choices=_CLOCK_MODES,
                          'not train-only regularizers), which makes generation and eval loss '
                          'nondeterministic. No new parameters, so any mode can be toggled on '
                          'an existing checkpoint. No effect when --n_layers 1')
-parser.add_argument('--dff_norm',      default='none', choices=['none', 'softmax'],
+parser.add_argument('--dff_norm',      default='none', choices=['none', 'softmax', 'std'],
                     help='normalize the DFF STATE (not the conv stack).  "softmax" applies '
                          'Softmax2d over the channel dimension to the value each layer '
                          'commits to its register, so at every one of the SxS positions the '
@@ -339,7 +339,15 @@ parser.add_argument('--dff_norm',      default='none', choices=['none', 'softmax
                          'Stateless and per-sample, so train and eval compute the same '
                          'function.  Adds no parameters, so it can be toggled on an existing '
                          'checkpoint.  Intended with --norm none, which leaves ContextCNN as '
-                         'plain conv2d + ReLU')
+                         'plain conv2d + ReLU. '
+                         '"std" standardizes instead: subtract the state\'s own mean and '
+                         'divide by its standard deviation, per sample and per layer, over '
+                         'all of (channels, S, S).  Unlike softmax it keeps a SIGN and a full '
+                         'dynamic range -- the state is zero-mean unit-variance rather than a '
+                         'distribution on the simplex -- so roughly half the values are '
+                         'negative and no channel is forced positive.  Same guarantees that '
+                         'matter: the state cannot explode or collapse, train and eval agree, '
+                         'no parameters, no buffers')
 parser.add_argument('--norm_groups',   default=32,    type=int, metavar='G',
                     help='--norm group: channel groups. G=1 is LayerNorm over the whole '
                          'channel dimension, G=n_hidden is InstanceNorm. Clamped to '
@@ -1419,10 +1427,20 @@ class VLAModel(nn.Module, _HubMixin):
         Only the stored state is clipped. The value travelling up the stack and into the
         decoder is the layer output itself, which is left alone -- this bounds the feedback
         loop without altering the feed-forward path."""
-        if self.dff_softmax is not None:
-            # --dff_norm softmax: the stored state becomes a per-position distribution over
-            # channels.  Applied before --clip_dff, which is then inert (all values <= 1).
+        if self.dff_norm_kind == 'softmax':
+            # the stored state becomes a per-position distribution over channels.
+            # Applied before --clip_dff, which is then inert (all values <= 1).
             outs = [self.dff_softmax(o) for o in outs]
+        elif self.dff_norm_kind == 'std':
+            # standardize each layer's state over its whole (C, S, S) volume, per sample:
+            # zero mean, unit variance.  Keeps the sign and the dynamic range that softmax
+            # removes, while still making explosion and collapse impossible.
+            std = []
+            for o in outs:
+                m = o.mean(dim=(1, 2, 3), keepdim=True)
+                v = o.var(dim=(1, 2, 3), keepdim=True, unbiased=False)
+                std.append((o - m) * torch.rsqrt(v + 1e-5))
+            outs = std
         c = self.clip_dff
         if not c:
             return outs
