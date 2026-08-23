@@ -323,7 +323,12 @@ parser.add_argument('--clock',         default='sync', choices=_CLOCK_MODES,
                          'nondeterministic. No new parameters, so any mode can be toggled on '
                          'an existing checkpoint. No effect when --n_layers 1')
 parser.add_argument('--dff_norm',      default='none', choices=['none', 'softmax', 'std'],
-                    help='normalize the DFF STATE (not the conv stack).  "softmax" applies '
+                    help='condition the DFF state ON THE WAY OUT of the register, on the '
+                         'feedback path only.  The register itself keeps the raw ReLU output '
+                         '(sparse, ~50%% exact zeros -- what a hardware state memory wants); '
+                         'only what is fed back into the layer is transformed, and because '
+                         'that transform is scale-free the recurrence is bounded however '
+                         'large the stored state grows.  "softmax" applies '
                          'Softmax2d over the channel dimension to the value each layer '
                          'commits to its register, so at every one of the SxS positions the '
                          'n_hidden channel values form a probability distribution: unit mass '
@@ -1385,6 +1390,20 @@ class VLAModel(nn.Module, _HubMixin):
         what it remembers differently from what it is being told. Applied to the whole output
         instead, it would just be a reparameterization of the following 1x1 (deep_proj,
         decoder.proj) or 3x3 (ContextCNN) conv."""
+        # --dff_norm conditions the state ON THE WAY OUT, so the REGISTER keeps the raw
+        # ReLU output -- sparse, ~50% exact zeros, which is what a hardware state memory
+        # wants -- while what is fed back into the layer is bounded.  Normalizing on the
+        # write side instead would store a dense tensor and throw that sparsity away.
+        # Because the read is scale-free, the stored state's magnitude no longer matters to
+        # the recurrence: the feedback loop is bounded however large the register grows.
+        if self.dff_norm_kind == 'std':
+            # zero mean, unit variance per sample over the whole (C, S, S) volume.  Keeps
+            # the sign and dynamic range that softmax removes.
+            m = d.mean(dim=(1, 2, 3), keepdim=True)
+            v = d.var(dim=(1, 2, 3), keepdim=True, unbiased=False)
+            d = (d - m) * torch.rsqrt(v + 1e-5)
+        elif self.dff_norm_kind == 'softmax':
+            d = self.dff_softmax(d)
         return d if self.qproj_mode != 'read' else self.qproj[li](d)
 
     def _tap(self, li, o):
@@ -1427,20 +1446,6 @@ class VLAModel(nn.Module, _HubMixin):
         Only the stored state is clipped. The value travelling up the stack and into the
         decoder is the layer output itself, which is left alone -- this bounds the feedback
         loop without altering the feed-forward path."""
-        if self.dff_norm_kind == 'softmax':
-            # the stored state becomes a per-position distribution over channels.
-            # Applied before --clip_dff, which is then inert (all values <= 1).
-            outs = [self.dff_softmax(o) for o in outs]
-        elif self.dff_norm_kind == 'std':
-            # standardize each layer's state over its whole (C, S, S) volume, per sample:
-            # zero mean, unit variance.  Keeps the sign and the dynamic range that softmax
-            # removes, while still making explosion and collapse impossible.
-            std = []
-            for o in outs:
-                m = o.mean(dim=(1, 2, 3), keepdim=True)
-                v = o.var(dim=(1, 2, 3), keepdim=True, unbiased=False)
-                std.append((o - m) * torch.rsqrt(v + 1e-5))
-            outs = std
         c = self.clip_dff
         if not c:
             return outs
