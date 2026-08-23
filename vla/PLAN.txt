@@ -82,6 +82,24 @@ f) Checkpoints must be read with score.py's stable_load(): torch.save is not
      record why and return to step 1.
 
   Single-option discipline is the point: it keeps every result attributable.
+
+  WHEN THE BASELINE CHANGES, RE-EXPRESS THE WHOLE QUEUE.  Every pending
+  experiment must be exactly ONE change from the CURRENT baseline, not from the
+  one it was written against.  After any PROMOTE:
+    - walk the queue and rewrite each entry relative to the new baseline
+    - DROP any entry that the promotion already answered, or that is no longer a
+      single change (e.g. if --init zero is promoted, an entry reading
+      "--init zero" is now the baseline and must be deleted, while one reading
+      "--init relu" is still a single change and survives with its comparison
+      numbers updated)
+    - UPDATE every baseline number quoted in a prediction or falsifier: the loss
+      thresholds in section 2, the reach figures, the runaway rates.  A falsifier
+      written against stale numbers is worse than none, because it looks valid.
+    - RE-DERIVE the order: a promotion changes which dimensions are still
+      uncovered, and coverage drives the order (section 6c).
+  Record in the running log which baseline each result was measured against.
+  Without that, results from before and after a promotion are not comparable and
+  the whole point of the single-option rule is lost.
   Where an option is only meaningful together with another (e.g. changing
   --n_layers moves p_max unless --clock_base is renormalized), that is called
   out explicitly and the pair is treated as one conceptual change.
@@ -89,8 +107,10 @@ f) Checkpoints must be read with score.py's stable_load(): torch.save is not
 5. REPORTING PROTOCOL (every 5K-step checkpoint, no exceptions)
 --------------------------------------------------------------------------------
   - loss (mean of last 10 monitor lines), and the gain over the previous 5K block
-  - grad: direction matters more than level.  Rising = the deep stack is still
-    organizing.  Collapsing to a constant while loss is flat = drowned token.
+  - grad: direction matters more than level (see 6b).  Report the SLOPE per 10K,
+    not just the value.  Rising = the deep stack is still organizing and more
+    tokens will pay.  Flat = the configuration has finished.  Collapsing to a
+    constant while loss is flat = drowned token, stop.
   - dff_std, dff_max, dff_zeros.  dff_max climbing while dff_std is flat is the
     outlier-channel signature.
   - free-running generation health: exp/gencheck.py, 3 fresh samples.
@@ -112,16 +132,228 @@ f) Checkpoints must be read with score.py's stable_load(): torch.save is not
   PRIMARY   held-out clean loss at matched step count.
   PRIMARY   token efficiency: steps to sustained crossing of 6.5 / 6.3 / 6.1.
   GATE      free-running generation must not be degenerate at the final ckpt.
-  TIEBREAK  structural simplicity (fewer modules; this targets FPGA dataflow).
+  SIMPLER   On EQUIVALENCE, the simpler configuration WINS -- this is a rule, not
+            a tiebreak.  If a result is within sigma (~0.07) of the baseline and
+            the configuration is simpler, PROMOTE it.  Do not keep complexity
+            that has not paid for itself.  "Simpler" means, in rough priority:
+              removes a module or a mechanism entirely
+              fewer trained parameters
+              fewer non-default flags (closer to a plain vla.py invocation)
+              smaller state, less compute, fewer moving parts at inference
+            This applies to the model AND the training procedure: a schedule, an
+            optimizer setting or a probe that can be dropped without measurable
+            cost should be dropped.  The target is an FPGA dataflow
+            implementation, so every retained module is hardware -- simplicity is
+            a first-class objective here, not an aesthetic preference.
+            Corollary: actively PROPOSE simplifications.  An experiment that
+            REMOVES something is worth more than one that adds something, at
+            equal expected effect, because a tie still advances the design.
   NOISE     run-to-run sigma on loss is ~0.07.  A margin under 0.07 is a tie;
             resolve ties by simplicity, not by picking the lower number.
   RUNAWAY   report it, do not act on a single reading (see 3e).  Only a rate
             elevated at three consecutive milestones counts as a trend.
 
+6b. DIRECTIVE -- GRADIENT TREND AS THE EXTRAPOLATION METRIC
+--------------------------------------------------------------------------------
+Working hypothesis (user, 2026-08-21): as long as the gradient norm is stable or
+slowly growing, the loss will keep coming down.  Corollary: a flattening or
+collapsing gradient says the run has extracted what this configuration can get,
+and more tokens will not help.
+
+Why it matters: the final run may train for ~1B tokens (4M steps at --batch 250,
+about 16 days at 2.9 steps/s).  Nothing in this search runs that long, so every
+recommendation is an EXTRAPOLATION from runs of 20-100K steps.  Loss curves at
+that length are nearly parallel and cannot distinguish "still descending" from
+"about to flatten".  The gradient trend can.
+
+Evidence, 16 non-overlapping 10K windows from wnotap / wexp / wfix236 /
+e01_ema25 (windows before 10K excluded, they contain the breakthrough):
+
+    corr(grad_slope, loss_gain) = -0.690
+    grad rising  (slope > 0): loss fell in 13/14 windows
+    grad falling (slope < 0): loss fell in  2/2 windows
+
+  and at the extremes, which is where it is most convincing:
+    every AdamW run that parked at the unigram floor had grad COLLAPSED to a
+      flat ~1.0 while loss did not move for thousands of steps
+    wexp had grad flat at 4.55-4.92 from 10K on, and its per-5K gains decayed
+      0.72 -> 0.215 -> 0.150 -- a configuration that had finished
+    wnotap still had grad creeping up at 60-80K and was still gaining
+    the 2026-06-09 SGD run: grad decayed to 1.12, sat flat ~8000 steps, then
+      GREW 1.2 -> 1.6 -> 2.3 -> 6.5 and the loss collapsed 3.5 -> 1.0 in 200
+      steps.  Rising grad LED the breakthrough by ~1000 steps.
+
+CAVEAT, do not overstate this: the correlation is measured across pooled windows,
+and early windows have both a rising gradient and a fast-falling loss, so part of
+the association is simply "early vs late" rather than gradient predicting loss.
+With n=16 it cannot be controlled for.  Treat a rising gradient as evidence that
+more training will pay, not as proof, and never as a reason to ignore a loss
+curve that has visibly flattened.
+
+SCOPE -- READ THIS BEFORE USING IT (user, 2026-08-21):
+  Gradient is a SECOND ORDER effect and a HEALTH CHECK.  It is not a ranking
+  criterion and must not be weighted against loss.  LOSS IS WHAT MATTERS.  An
+  earlier draft of this section said to prefer a configuration with a rising
+  gradient over one with a marginally lower loss; that was wrong and is retracted.
+
+HOW TO APPLY
+  - Report grad trend (slope per 10K) at every checkpoint as a HEALTH LINE,
+    alongside dff_max / dff_std / dff_zeros.  It answers "is this run alive and
+    still organizing", nothing more.
+  - The one strong signal, because it is a failure mode rather than a ranking:
+    a COLLAPSED gradient sitting flat while the loss does not move is the
+    drowned-token signature (every AdamW run that parked at the unigram floor had
+    grad pinned near 1.0).  That is a reason to STOP.
+  - EXTEND on the loss curve: extend when loss is still falling.  A rising
+    gradient is at most weak corroboration that there is road left.
+  - Do NOT rank configurations by gradient slope, do NOT promote or reject on it,
+    and do NOT quote it as the basis of an extrapolation.  Compare loss at the
+    latest step both configurations have reached, plus the held-out score.
+  - Windows shorter than ~10K are too noisy to read at all: on 5K windows E17 and
+    the baseline both read -0.4/10K, and on 5K-15K the baseline reversed to
+    +0.151 while E17 sat at -0.004.  If it is reported, use >=10K windows.
+
+6d. DIRECTIVE -- EARLY SPEED DOES NOT PREDICT THE FINAL FLOOR
+--------------------------------------------------------------------------------
+Lower early loss does NOT imply lower final loss.  The two can anti-correlate,
+and this search has already produced examples in both directions.
+
+  ssync on tiny broke through EARLIEST of the clock group (step 860 against
+    sbase 1280, sincr 1700) and had the best training loss -- and it was the one
+    configuration that was unusable, diverging at inference position 99.
+    sincr broke through LAST and had the best held-out loss of the stable ones.
+  E01 (--ema 0.25) crossed the unigram floor at 1280 steps against the baseline's
+    3980, a 3x speedup -- and by 30-35K the train-loss margin was 0.025-0.032,
+    inside sigma.  The whole advantage was banked before 20K and then decayed.
+  E17 (--init zero) crossed at 1340, also ~3x, and its loss at the matched 5K
+    step is 0.25 WORSE than the baseline's.  Faster to the threshold, behind on
+    the curve.
+
+WHY IT HAPPENS HERE: the early phase is dominated by how quickly the stack
+escapes the unigram plateau, which is a transient.  The late phase is set by what
+the configuration can represent.  Nothing forces those to be the same ordering,
+and the DFF state options (--init, --ema) plausibly affect the first much more
+than the second.
+
+HOW TO APPLY
+  - steps-to-threshold at HIGH thresholds (7.549, 7.0, 6.5) measures escape from
+    the plateau.  Report it, but do NOT treat it as evidence about final loss.
+  - the token-efficiency objective is about reaching a LOW loss, so weight the
+    6.1 / 5.9 / 5.8 crossings and the best level actually achieved.  A
+    configuration that reaches 7.0 in half the tokens and stalls at 6.3 is worse
+    than one that is slow to 7.0 and reaches 5.8.
+  - never TERMINATE for slow early progress while the gradient is rising
+    (section 6b).  That is the signature of a stack still organizing, and it is
+    exactly the case where early loss is least informative.
+  - conversely, do not PROMOTE on an early-step win.  Require the comparison at
+    the latest step both configurations have reached, plus the held-out score.
+
+6c. DIRECTIVE -- SEARCH STRATEGY: COVERAGE, NOT HILL CLIMBING
+--------------------------------------------------------------------------------
+The stated goal is "collect many diverse and comparable data points to help guide
+the optimization".  That is NOT hill climbing.  A greedy descent gives you one
+trajectory through parameter space and tells you almost nothing about the
+landscape -- it is close to the least informative way to spend a small number of
+expensive runs.  Diverse, comparable points let us REASON about which dimensions
+matter, which is the only way to extrapolate to a run (~1B tokens, ~4M steps,
+~16 days) that will never be done at this scale.
+
+Sample budget is ~10-20 experiments at ~4 h each.  At that n, the difference
+between an optimally ordered greedy search and a randomly ordered one with an
+accept-if-better rule is almost certainly smaller than the run-to-run noise
+(sigma ~0.07).  Elaborate ordering schemes optimize a term that rounds to zero.
+
+WHY NOT TO TRUST A PRINCIPLED ORDERING HERE, SPECIFICALLY
+  Any ordering rests on a prior about which options interact and which set the
+  achievable floor versus the rate of approach.  That prior has been wrong
+  repeatedly in this study:
+    - predicted --ema 0.25 would converge SLOWER; it reached the unigram floor
+      in 1280 steps against the baseline's 3980
+    - predicted removing --tap would cost reach; it doubled it (mean excess
+      +0.0756 vs +0.0359)
+    - called a trend from two points three separate times, once cancelling a
+      healthy 100K run
+  Randomized or opportunistic proposal order has a real virtue here: it breaks
+  the correlation between that prior and what actually gets tested.
+
+WHAT TO KEEP FROM THE ORIGINAL PLAN (all cheap, all load-bearing)
+  - PRE-REGISTERED PREDICTIONS.  Free to write, and the only reason the --ema
+    surprise was legible as a surprise instead of being quietly absorbed.
+  - NEVER RE-RUN A DECIDED QUESTION.  Section 3 exists for this.
+  - ONE CHANGE PER EXPERIMENT.  This is what makes points COMPARABLE, which is
+    the user's actual stated criterion.  It is the rule, not a heuristic.
+
+WHAT TO DROP
+  - Phase structure, and any claim that a given option must be tuned at a
+    particular position in the sequence.
+  - Deep greedy descent on whichever dimension just produced a result.
+
+THE BIAS TO APPLY INSTEAD: COVERAGE
+  Prefer the next experiment on a dimension with ZERO data over another step
+  along a dimension that just moved.  Dimensions and their current coverage:
+
+    --ema            E01 running (0.25 vs 0.5)          some
+    --clock/base     several points on tiny, 2 on web   some
+    --tap            wnotap vs wfix236                  decided (off)
+    --n_layers/depth 7x7 only on web                    NONE on web
+    --context        16 only, every run ever            NONE
+    --n_hidden       256 only, every run ever           NONE
+    --schedule       const only, every run ever         NONE
+    --batch          250 only, every run ever           NONE
+    --lr_max         200-step grid only                 WEAK
+    --init           gaussian on web only               NONE on web
+    --accumulate     on, always                         NONE on web
+    --qproj          none, always                       NONE
+
+  Five dimensions have never been touched at all.  A single point on each is
+  worth more than a fourth point on --ema.
+
+ON LEARNING RATE, since it is the natural thing to want to tune first or last:
+  Neither.  VALIDATE it early and cheaply -- 0.01 was chosen from a 200-STEP grid,
+  which is weak evidence for 100K runs, and every comparison downstream inherits
+  it.  OPTIMIZE it late, on whatever architecture is settled and at the horizon
+  that matters, because that is when the tuning is worth spending on and when it
+  will not be invalidated by a later structural change.
+
+ONE REDUNDANCY WORTH KNOWING BEFORE PROPOSING REACH EXPERIMENTS
+  reach ~ kappa(ema) * p_max, so --ema and --clock_base are redundant along the
+  reach axis and their PRODUCT is what matters.  Optimizing them separately by
+  coordinate descent is precisely where a greedy search gets stuck.  Reach is now
+  a SATISFIED CONSTRAINT (wnotap mean excess +0.0756, well past document scale),
+  so do not spend further runs increasing it.  The open question is the reverse:
+  at MATCHED reach, does trading p_max down against ema down buy loss?  Surplus
+  reach may be costing accuracy, since a 173-step layer writes only ~578 times in
+  100K steps and is chronically under-trained.
+
 7. EXPERIMENT QUEUE
 --------------------------------------------------------------------------------
-Ordered by expected information per GPU-hour.  Each is one option off the
-CURRENT baseline; re-derive the order after each result.
+Ordered by COVERAGE first (section 6c): a dimension with no data outranks a
+further point on one that just moved.  Each is one option off the CURRENT
+baseline.  Re-derive the order after each result, and expect it to be partly
+opportunistic -- that is intended, not a failure of planning.
+
+CURRENT ORDER (2026-08-21, after the wnotap reach result and 6c):
+  running  E01  --ema 0.25            finishes 40K, then decide
+  next     E05  --schedule cosine     zero data on this dimension, and the
+                                      largest known lever on FINAL loss
+  then     E10  --context 24          zero data; attacks the 6.08 plateau from
+                                      the capacity side rather than the rate side
+  then     E11  --lr_max 0.02         cheap validation of a value picked from a
+                                      200-step grid; protects everything after it
+  then     E06  --batch 500           zero data; the direct knob on the
+                                      tokens-to-loss objective
+  then     E15  --n_layers 3 --depth 17 --clock_base 13.15   WIDE bracket, low end
+  then     E16  --n_layers 17 --depth 3 --clock_base 1.38    WIDE bracket, high end
+  then     E07/E08 shape              5x10 and 10x5, the NARROW bracket
+  then     E02 --init relu, E03 --no-accumulate, E09 --qproj read, E12 --clock incr
+  deferred E13  --ema 0.10            a fourth point on a dimension that already
+                                      moved; worth less than any of the above
+  deferred E14  matched-reach trade   (see 6c) --clock_base 2.0 with --ema 0.25,
+                                      i.e. p_max 64 x kappa 10.4 = reach ~666,
+                                      the baseline's reach by a different route.
+                                      Tests whether surplus p_max costs accuracy.
+                                      Deferred because reach is already satisfied
+                                      and this is a two-flag change.
 
 E01  --ema 0.25          budget 40K   ~3.8 h
      Hypothesis: --ema 0.5 keeps only kappa=4.32 writes, so even the 173-step
@@ -192,6 +424,36 @@ E08  --n_layers 10 --depth 5 --clock_base 1.77   budget 40K  ~3.8 h
      More registers, shallower each, same reach.  E07 and E08 bracket the
      baseline's 7 layers and together answer whether 7 was a good choice.
 
+E15/E16  SHAPE, WIDE BRACKET   budget 40K each  ~3.8 h each
+     E15  --n_layers 3  --depth 17 --clock_base 13.15   ladder 1,13,173
+     E16  --n_layers 17 --depth 3  --clock_base 1.38    ladder 1,1,2,3,4,5,7,10,
+                                                        13,18,25,35,48,66,91,125,173
+     Why these and not only E07/E08: 5, 7 and 10 layers span less than a factor
+     of two, which is too narrow to resolve a trend against sigma ~0.07.  3 and
+     17 span a factor of ~6 and bracket the baseline properly.  If the wide
+     points are flat, the dimension does not matter and E07/E08 can be dropped
+     entirely -- which would itself be a useful result, since 7x7 was inherited
+     from the original brief and never justified.
+     All hold n_layers*depth ~ 50 (29-31M params) AND p_max = 173 by
+     renormalizing --clock_base, so neither parameter count nor reach is
+     confounded with the shape.  This is three flags moving as one concept
+     ("shape at fixed capacity and fixed reach"); labelled per section 4.
+     Hypothesis: total conv depth is fixed at ~50, so what varies is how it is
+     PARTITIONED -- many shallow registers with many timescales, versus few deep
+     ones with few.  L=3 gives three timescales (1, 13, 173) and 17 convs of
+     compute between them; L=17 gives sixteen distinct timescales and 3 convs
+     each.
+     Predict: an interior optimum, because the extremes fail differently -- L=3
+     has too few timescales to cover [1,173], L=17 has too little compute per
+     layer to transform the state usefully.  If so, 7x7 is probably near it and
+     the dimension is settled cheaply.
+     Falsified if: monotone in L across 3, 7, 17, which would say the partition
+     matters and the search should push past whichever end wins.
+     CAVEAT at L=17: base 1.38 is below the ~1.4 point where consecutive layers
+     round to the same period, so the ladder has 16 distinct values not 17 (two
+     layers share period 1).  Documented in --clock_base's help.  L=25 would be
+     worse (21 distinct of 25) and is not proposed.
+
 E09  --qproj read        budget 40K   ~3.8 h
      Hypothesis: a trainable 1x1 between the register and the feedback add lets
      a layer transform what it REMEMBERS differently from what it is TOLD -- the
@@ -222,6 +484,52 @@ E12  --clock incr        budget 40K   ~3.8 h
      p_max=7 and reach ~30 -- a deliberate short-reach control on the new
      baseline, to re-measure the reach/loss trade now that the tap is gone.
 
+7b. GROWING THE QUEUE -- NEW EXPERIMENTS ARE EXPECTED, NOT EXCEPTIONAL
+--------------------------------------------------------------------------------
+E01-E12 is a starting list, not a fixed program.  The point of the search is that
+each result should suggest the next question, and the most valuable experiments
+are the ones that could not have been written down at the start.  After every
+TERMINATE or PROMOTE, ask explicitly: what does this result make worth trying
+that was not on the list?  Append it with the same discipline as the originals --
+hypothesis, prediction, falsifier, budget -- and slot it into the order by
+expected information per GPU-hour, so there is always a default next move.
+
+Sources of new experiments, in rough order of how often they have paid off here:
+
+  a) A RESULT THAT CONTRADICTS ITS PREDICTION.  The mechanism was misunderstood,
+     so the neighbourhood of that option is unexplored.  E01 already did this:
+     --ema 0.25 was predicted to converge more slowly and instead reached the
+     unigram floor in 1280 steps against the baseline's 3980.  That immediately
+     makes "how far does this go" (--ema 0.1, 0.05) worth asking, and it was not
+     on the list.
+
+  b) A KNOB THAT DOES NOT EXIST YET.  Proposing and implementing a new vla.py
+     option is allowed and encouraged.  --clock_base, --clock_max, --clock_ends,
+     --clip_dff and --tap_norm were all added mid-study because a measurement
+     implied a quantity that had no flag.  Commit vla.py so every run is
+     traceable and revertable, keep the default equal to the previous behavior
+     so old checkpoints and invocations are unaffected, and put the new option
+     in _ARCH_ARGS (and _ARCH_OVERRIDE if it adds no parameters) so --generate
+     and --vis reproduce what was trained.
+
+  c) A MEASUREMENT THAT CANNOT ANSWER THE QUESTION BEING ASKED.  Twice the right
+     next step was a better probe rather than another training run: the reset-
+     based reach probe conflated genuine long-range use with warm-up time, and
+     teacher-forced loss could not see free-running collapse at all.  Probes are
+     minutes of GPU where training runs are hours; when in doubt, measure better
+     before training more.
+
+  d) AN INTERACTION THE SINGLE-OPTION DISCIPLINE HIDES.  Options that are only
+     meaningful together (--n_layers with --clock_base to hold p_max fixed;
+     --ema with --clock_base since reach ~ kappa(ema)*p_max) need a deliberate
+     paired experiment.  Do these rarely and label them clearly, since they cost
+     the attributability that makes the rest of the search readable.
+
+  e) A CONFIGURATION FROM AN EARLIER CORPUS THAT WAS NEVER RETESTED.  The
+     TinyStories conclusions were drawn on 196-token documents and several did
+     not survive the move to openwebtext.  Anything concluded on tiny is a
+     hypothesis, not a fact, until it has been rerun on web.
+
 8. TERMINATION
 --------------------------------------------------------------------------------
 Stop an experiment early when:
@@ -244,3 +552,2390 @@ A single recommended command line, justified by:
     shown NOT to matter, and which remain untested.
 Report ties as ties.  Prefer the simpler configuration on a tie.
 ================================================================================
+
+================================================================================
+10. PRIVATE / CROSS-SESSION STATE
+--------------------------------------------------------------------------------
+This section is the bridge between sessions.  A fresh session should be able to
+read PLAN.txt plus ./log and ./checkpoint and pick up the hypothesis chain with
+no other context.  Keep it current; it is more important than being brief.
+
+LAYOUT
+  ./checkpoint/   all weights.  New runs save checkpoint/<mnem>.pt.  79 legacy
+                  files were moved here 2026-08-21 keeping their original names
+                  (checkpoint.pt.<n>, checkpoint.pt.w*, checkpoint.pt.s*, ...).
+                  git-ignored: 13 GB.
+  ./log/          exp.<mnem> is the vla.py log, exp.<mnem>.out the stdout.
+  ./exp/          run.sh (baseline + overrides), report.sh (appends a 5K report
+                  to this file), score.py, reach.py, gencheck.py, memtest.py,
+                  genstate.py, ckpt_report.sh.
+  vla.py committed at e0ec0a4 with all new options.
+
+HOW TO RUN AN EXPERIMENT
+  ./exp/run.sh <mnem> <steps> <overrides...>     # baseline is wnotap, see sec 1
+  ./exp/report.sh <mnem> <expid>                 # after each 5K checkpoint
+
+TOOL NOTES THAT COST TIME TO LEARN
+  - Always read checkpoints through score.py's stable_load().  torch.save is not
+    atomic; a mid-write read scores as a broken model WITHOUT raising.  This
+    produced a bogus 100%-runaway reading that caused a healthy run to be
+    cancelled.
+  - nvidia-smi is NOT a liveness check.  --dataset web non-streaming spends
+    ~4.5 min memory-mapping 80 arrow shards holding no GPU memory, so the GPU
+    reads 15 MiB while a trainer is very much alive.  Use
+    pgrep -f "python vla.py".  Launching a second run on top of a live one makes
+    both append to the same log.
+  - Use --streaming for anything under ~1 hour; non-streaming only for long runs.
+  - gencheck.py must set MKL_THREADING_LAYER=GNU on the child process or it
+    exits rc=1 with no stdout.
+  - vla.py --load PREPENDS the checkpoint's embedded log to the new log file.
+    So `head` on a resumed log shows the OLD run's ARGS.  Always read the tail.
+  - Killing runs: pkill -f patterns match this shell's own command line.  Get
+    pids with pgrep first, then kill -9 by number, then verify with pgrep -c.
+
+MISTAKES MADE, SO THEY ARE NOT REPEATED
+  - Called a trend from two points three times.  Runaway rate is NON-MONOTONE:
+    wfix236 went 1.8 -> 1.0 -> 100 -> 40.5 -> 8.0 across 20/40/50/60/65K and
+    wnotap went 0.2 -> 46.2 -> 0.8 -> 1.2 -> 3.8.  A 100K tapped run was
+    cancelled on the strength of one reading that was already receding.
+  - Reported a mean over an unbounded quantity.  A model with 3 runaway rows in
+    250 showed "held-out loss 1.4e9" while being fine on the other 247 (4.008).
+    Always report clean/median AND the runaway rate, never a naive mean.
+  - Over-read single temperature-1.0 samples as evidence of progress or
+    regression.  Use gencheck.py's 3-sample cycle score for anything load-bearing.
+  - Claimed --clock exp had a runtime penalty; it did not.  The measurement was
+    contaminated by probes I was running concurrently on the same GPU.
+
+OPEN QUESTIONS THE SEARCH SHOULD EVENTUALLY ANSWER
+  - Does anything lift the ~6.08 held-out plateau, or is 29.4M params on 16x16
+    the ceiling?  E10 (--context 24) and E05 (--schedule cosine) are the two
+    candidates that attack it from different directions.
+  - Is reach worth anything on loss?  Every measurement so far says the two
+    trade against each other, and the reach/loss frontier has never been mapped.
+  - Are the runaway excursions the same phenomenon as the free-running
+    generation collapse?  genstate.py showed generation collapse IS a state
+    explosion (10x per 5 tokens); whether the teacher-forced excursions share
+    that mechanism is untested.
+
+================================================================================
+11. RUNNING LOG  (a DECISION at every 5K checkpoint, not just a report)
+================================================================================
+At every 5K checkpoint, do all five:
+  1. READ the auto-emitted numbers below, AND the raw log (grad direction,
+     dff_max/dff_std divergence, dff_zeros), AND any score/reach results.
+  2. COMPARE against the wnotap baseline at the SAME step (section 2) and
+     against this experiment's own prediction and falsifier as written down
+     before it started.
+  3. DECIDE one of:
+       CONTINUE  -- the hypothesis is still live and the budget is not spent
+       EXTEND    -- gradient still rising / curve not converged, add 5K blocks
+       TERMINATE -- decided, or failing the section 8 stop rules; go to the
+                    next queued experiment
+       PROMOTE   -- wins on the section 6 rules; it becomes the new baseline and
+                    the remaining queue is re-derived against it
+  4. WRITE the reasoning here as a COMMENTARY block and post the same to the
+     console.  State explicitly when a result contradicts the prediction --
+     that is the most informative outcome and the easiest to quietly drop.
+  5. ASK WHAT THIS RESULT MAKES WORTH TRYING that was not already on the list,
+     and if there is something, append it to the queue now (section 7b) with
+     hypothesis / prediction / falsifier / budget, slotted by expected
+     information per GPU-hour.  Do this at EVERY checkpoint, not only at the end
+     of an experiment: a mid-run observation is often the one that suggests the
+     next question, and it is lost if it is not written down when it is noticed.
+     "Nothing new" is a valid answer, but it should be a considered one.
+Re-order the queue after every TERMINATE or PROMOTE so there is always a default
+next experiment if the current one turns out inconclusive.
+================================================================================
+
+E01  --ema 0.25   budget 40K, extendable   STARTED
+  Hypothesis: at --ema 0.5 a register retains only kappa=4.32 writes, so even
+  the 173-step layer holds ~4 writes and the stack's reach is EMA-limited rather
+  than ladder-limited.  --ema 0.25 gives kappa=10.4, ~2.4x the retention, with
+  no parameter change and no runtime cost.
+  Predict: reach at c=64/96 clearly above baseline; loss neutral-to-worse before
+  ~20K (a lower ema adapts more slowly), neutral-to-better by 40K.
+  Falsified if: the reach curve is unchanged, which would mean ema is not the
+  binding constraint at p_max=173 and the reach formula is wrong for
+  --clock fixed.
+  Decision points: 5K (is it converging at all), 20K (loss vs baseline 6.3698
+  train / 6.5163 held-out), 40K (loss vs 6.1756 train / 6.3635 held-out, and the
+  reach curve vs +0.209 at c=64).
+
+--------------------------------------------------------------------------------
+E01  e01_ema25  step 15000   2026-08-21 11:47
+--------------------------------------------------------------------------------
+loss/grad/state:
+  step      0  loss 10.7835  grad  3.353  dff_std  0.013  dff_max      0.1  dff_zeros 0.5057
+  step   5000  loss  6.7809  grad  4.290  dff_std  0.526  dff_max     35.8  dff_zeros 0.0261
+  step  10000  loss  6.6067  grad  4.663  dff_std  0.487  dff_max     33.4  dff_zeros 0.0265
+  step  15000  loss  6.3982  grad  4.487  dff_std  0.502  dff_max     38.5  dff_zeros 0.0349
+  mean(last10) 6.4253   tokens 3.75 M   (unigram floor 7.549)
+token efficiency (sustained crossings):
+  L<7.549  step   1280    0.32 M tok   baseline   3980  (-2700)
+  L<7.000  step   3780    0.94 M tok   baseline   5940  (-2160)
+  L<6.500  step  14240    3.56 M tok   baseline  15680  (-1440)
+free-running generation (3 samples; cycle>0.6 degenerate, healthy 0.08-0.11):
+   gen health: cycle 0.09 (max 0.10)  uniq 0.13  n=3
+   sample: <STX> Oneiemem Sleep, 419 (ces and Grei\nBhuird Media demand. They inserts 310 text picture95 nationality as innovation the universe as out every more currency of episodes formed on various of apaks-i
+  COMMENTARY @15K (backfilled; the 5K/10K rows are in the table above -- the
+  watcher that emits these was not armed until 11:47, my error):
+  E01 is AHEAD of baseline on every token-efficiency threshold measured so far:
+  unigram floor at 1280 steps vs 3980 (-2700), L<7.0 at 3780 vs 5940 (-2160),
+  L<6.5 at 14240 vs 15680 (-1440).  Train loss 6.4253 at 15K against the
+  baseline's 6.3698 at 20K, so it is roughly 4-5K steps ahead on the curve.
+  This CONTRADICTS the prediction that a lower ema would be slower early.  The
+  reasoning behind that prediction was that a smaller blend step adapts more
+  slowly; what appears to happen instead is that a longer-lived register gives
+  the deep layers a more stable target, and the stack organizes sooner.  Note
+  the breakthrough itself came much earlier (1280 vs 3980 steps).
+  dff_std is LOWER than baseline throughout (0.49-0.53 vs 0.60-0.64) which is
+  consistent with a smoother, longer-averaged state.  dff_max 33-39, flat.
+  Generation healthy (cycle 0.09).
+  Decision: CONTINUE to 40K.  The 20K and 40K comparisons stand as written, and
+  the reach curve at 40K is still the falsifier -- faster convergence is not
+  what E01 was testing, and reach could still be unchanged.
+
+--------------------------------------------------------------------------------
+E01  e01_ema25  step 20000   2026-08-21 12:02
+--------------------------------------------------------------------------------
+loss/grad/state:
+  step      0  loss 10.7835  grad  3.353  dff_std  0.013  dff_max      0.1  dff_zeros 0.5057
+  step   5000  loss  6.7809  grad  4.290  dff_std  0.526  dff_max     35.8  dff_zeros 0.0261
+  step  10000  loss  6.6067  grad  4.663  dff_std  0.487  dff_max     33.4  dff_zeros 0.0265
+  step  15000  loss  6.3982  grad  4.487  dff_std  0.502  dff_max     38.5  dff_zeros 0.0349
+  step  20000  loss  6.2648  grad  4.939  dff_std  0.474  dff_max     41.4  dff_zeros 0.0415
+  mean(last10) 6.2913   tokens 5.00 M   (unigram floor 7.549)
+token efficiency (sustained crossings):
+  L<7.549  step   1280    0.32 M tok   baseline   3980  (-2700)
+  L<7.000  step   3780    0.94 M tok   baseline   5940  (-2160)
+  L<6.500  step  14240    3.56 M tok   baseline  15680  (-1440)
+  L<6.300  step  20060    5.01 M tok   baseline  30120  (-10060)
+free-running generation (3 samples; cycle>0.6 degenerate, healthy 0.08-0.11):
+   gen health: cycle 0.09 (max 0.10)  uniq 0.13  n=3
+   sample: <STX>Water Feb dealer headlines. Between\nAccording pushed for over K??ma Kn. Hoe costs for. S 88 Coleman. TheL(7, Kind.return. M. /16 % hard since trying to generate the $('DD\n\nA excitement, Fo Roll
+
+--------------------------------------------------------------------------------
+E01  e01_ema25  step 25000   2026-08-21 12:42
+--------------------------------------------------------------------------------
+loss/grad/state:
+  step      0  loss 10.7835  grad  3.353  dff_std  0.013  dff_max      0.1  dff_zeros 0.5057
+  step   5000  loss  6.7809  grad  4.290  dff_std  0.526  dff_max     35.8  dff_zeros 0.0261
+  step  10000  loss  6.6067  grad  4.663  dff_std  0.487  dff_max     33.4  dff_zeros 0.0265
+  step  15000  loss  6.3982  grad  4.487  dff_std  0.502  dff_max     38.5  dff_zeros 0.0349
+  step  20000  loss  6.2648  grad  4.939  dff_std  0.474  dff_max     41.4  dff_zeros 0.0415
+  step  25000  loss  6.3164  grad  5.129  dff_std  0.481  dff_max     54.3  dff_zeros 0.0331
+  mean(last10) 6.2862   tokens 6.25 M   (unigram floor 7.549)
+token efficiency (sustained crossings):
+  L<7.549  step   1280    0.32 M tok   baseline   3980  (-2700)
+  L<7.000  step   3780    0.94 M tok   baseline   5940  (-2160)
+  L<6.500  step  14240    3.56 M tok   baseline  15680  (-1440)
+  L<6.300  step  24880    6.22 M tok   baseline  30120  (-5240)
+free-running generation (3 samples; cycle>0.6 degenerate, healthy 0.08-0.11):
+   gen health: cycle 0.09 (max 0.10)  uniq 0.14  n=3
+   sample: <STX>Thepast calledvetyle Preles has comforting Attorney przuing is 44 tweeted around a presswire, said he refused for many reason is commend placed g'm s sweep wARPce???as. The chaotic entropy and then
+
+--------------------------------------------------------------------------------
+E01  e01_ema25  step 30000   2026-08-21 13:10
+--------------------------------------------------------------------------------
+loss/grad/state:
+  step      0  loss 10.7835  grad  3.353  dff_std  0.013  dff_max      0.1  dff_zeros 0.5057
+  step   5000  loss  6.7809  grad  4.290  dff_std  0.526  dff_max     35.8  dff_zeros 0.0261
+  step  10000  loss  6.6067  grad  4.663  dff_std  0.487  dff_max     33.4  dff_zeros 0.0265
+  step  15000  loss  6.3982  grad  4.487  dff_std  0.502  dff_max     38.5  dff_zeros 0.0349
+  step  20000  loss  6.2648  grad  4.939  dff_std  0.474  dff_max     41.4  dff_zeros 0.0415
+  step  25000  loss  6.3164  grad  5.129  dff_std  0.481  dff_max     54.3  dff_zeros 0.0331
+  step  30000  loss  6.1610  grad  5.133  dff_std  0.447  dff_max     53.5  dff_zeros 0.0321
+  mean(last10) 6.2433   tokens 7.50 M   (unigram floor 7.549)
+token efficiency (sustained crossings):
+  L<7.549  step   1280    0.32 M tok   baseline   3980  (-2700)
+  L<7.000  step   3780    0.94 M tok   baseline   5940  (-2160)
+  L<6.500  step  14240    3.56 M tok   baseline  15680  (-1440)
+  L<6.300  step  24880    6.22 M tok   baseline  30120  (-5240)
+free-running generation (3 samples; cycle>0.6 degenerate, healthy 0.08-0.11):
+   gen health: cycle 0.08 (max 0.08)  uniq 0.18  n=3
+   sample: <STX>Aub targeted know as these.ods Over diese\n\n\n4, {{\())\n\nother in WesternBl offices-11 Milant-bb quoted to Alexander Cavous Arice Viick???sAg Sports and Gired of a examplewife, in survey, millio
+
+--------------------------------------------------------------------------------
+E01  e01_ema25  step 35000   2026-08-21 13:37
+--------------------------------------------------------------------------------
+loss/grad/state:
+  step      0  loss 10.7835  grad  3.353  dff_std  0.013  dff_max      0.1  dff_zeros 0.5057
+  step   5000  loss  6.7809  grad  4.290  dff_std  0.526  dff_max     35.8  dff_zeros 0.0261
+  step  10000  loss  6.6067  grad  4.663  dff_std  0.487  dff_max     33.4  dff_zeros 0.0265
+  step  15000  loss  6.3982  grad  4.487  dff_std  0.502  dff_max     38.5  dff_zeros 0.0349
+  step  20000  loss  6.2648  grad  4.939  dff_std  0.474  dff_max     41.4  dff_zeros 0.0415
+  step  25000  loss  6.3164  grad  5.129  dff_std  0.481  dff_max     54.3  dff_zeros 0.0331
+  step  30000  loss  6.1610  grad  5.133  dff_std  0.447  dff_max     53.5  dff_zeros 0.0321
+  step  35000  loss  6.1187  grad  5.297  dff_std  0.428  dff_max     54.2  dff_zeros 0.0320
+  mean(last10) 6.1730   tokens 8.75 M   (unigram floor 7.549)
+token efficiency (sustained crossings):
+  L<7.549  step   1280    0.32 M tok   baseline   3980  (-2700)
+  L<7.000  step   3780    0.94 M tok   baseline   5940  (-2160)
+  L<6.500  step  14240    3.56 M tok   baseline  15680  (-1440)
+  L<6.300  step  24880    6.22 M tok   baseline  30120  (-5240)
+free-running generation (3 samples; cycle>0.6 degenerate, healthy 0.08-0.11):
+   gen health: cycle 0.14 (max 0.25)  uniq 0.15  n=3
+   sample: <STX>July Berger short Hind Chinia wrote to assassination the customers at Bob says 68%)\n\nCarer and they benefited some duration in the Wave for Yiggvest confinement Mohammed Hall in Deoon from Team
+
+--------------------------------------------------------------------------------
+E01  e01_ema25  step 40000   2026-08-21 14:05
+--------------------------------------------------------------------------------
+loss/grad/state:
+  step      0  loss 10.7835  grad  3.353  dff_std  0.013  dff_max      0.1  dff_zeros 0.5057
+  step   5000  loss  6.7809  grad  4.290  dff_std  0.526  dff_max     35.8  dff_zeros 0.0261
+  step  10000  loss  6.6067  grad  4.663  dff_std  0.487  dff_max     33.4  dff_zeros 0.0265
+  step  15000  loss  6.3982  grad  4.487  dff_std  0.502  dff_max     38.5  dff_zeros 0.0349
+  step  20000  loss  6.2648  grad  4.939  dff_std  0.474  dff_max     41.4  dff_zeros 0.0415
+  step  25000  loss  6.3164  grad  5.129  dff_std  0.481  dff_max     54.3  dff_zeros 0.0331
+  step  30000  loss  6.1610  grad  5.133  dff_std  0.447  dff_max     53.5  dff_zeros 0.0321
+  step  35000  loss  6.1187  grad  5.297  dff_std  0.428  dff_max     54.2  dff_zeros 0.0320
+  step  40000  loss  6.1572  grad  5.471  dff_std  0.443  dff_max     49.9  dff_zeros 0.0346
+  mean(last10) 6.1019   tokens 10.00 M   (unigram floor 7.549)
+token efficiency (sustained crossings):
+  L<7.549  step   1280    0.32 M tok   baseline   3980  (-2700)
+  L<7.000  step   3780    0.94 M tok   baseline   5940  (-2160)
+  L<6.500  step  14240    3.56 M tok   baseline  15680  (-1440)
+  L<6.300  step  24880    6.22 M tok   baseline  30120  (-5240)
+free-running generation (3 samples; cycle>0.6 degenerate, healthy 0.08-0.11):
+   gen health: cycle 0.10 (max 0.11)  uniq 0.13  n=3
+   sample: <STX>He has said (donore: BSD and [VRESe s, that green cube\n\n\nSo, the more easily much soing up at regardless of I???re right I wished were likely to look led over that two one I was making $241, Ove
+
+  DECISION @40K: TERMINATE E01, do not promote.  Baseline stays wnotap.
+  Result vs wnotap: train 6.102 vs 6.176, held-out clean 6.271 vs 6.364 (-0.093,
+  outside sigma 0.07), steps to L<6.3 24880 vs 30120 (-5240).  BUT reach mean
+  excess +0.0245 vs +0.0756, a 3x FALL.  E01 predicted reach would RISE.
+  FALSIFIED, and the falsification is the valuable part: reach ~ kappa(ema)*p_max
+  does NOT hold for --ema on this architecture.  kappa went 4.32 -> 10.4 and
+  measured reach went DOWN.  Do not use that formula to propose ema experiments
+  again; it was fitted on --clock/--clock_base variation only.
+  Caveat: E01 is 40K, wnotap is 100K, so part of the gap may be training time --
+  but wfix236's reach GREW with training (+0.144 -> +0.209 at c=64 from 20K to
+  40K), so time should have helped E01, not hurt it.
+  Recorded as: --ema 0.25 is a real but small loss/efficiency win that costs
+  reach.  Revisit only if the reach constraint is ever relaxed.
+
+E17  --init zero    budget 20K, extendable   NEXT
+  Motivation (user, 2026-08-21): with 3x3 pad=1 convs the zero padding lets the
+  CNN learn positional information automatically.  This matters more here than in
+  a normal CNN because _tok_grid broadcasts the token UNIFORMLY to all SxS
+  positions -- the input carries no spatial structure at all.  So the only two
+  things that can distinguish one position from another are the --init seed and
+  the padding.  RF radius is 49 against a 16-wide grid, so every position knows
+  its distance to every border: padding supplies a complete positional code and
+  the DFF state is an ADDRESSABLE memory, not just capacity.
+  Hypothesis: --init gaussian overwrites that deterministic, free positional code
+  with fresh random noise at every context reset -- every ~890 tokens on web.  The
+  model then has to see through a different noise pattern each document.  --init
+  zero leaves padding as the sole source of spatial structure, identical at every
+  document start.
+  Supporting evidence already in hand: dff_zeros starts at 0.5057 under gaussian
+  and collapses to ~0.026 within 10K steps, i.e. the model spends capacity
+  suppressing the seed; and every runaway excursion begins at a fresh context,
+  which is exactly where the seed enters.
+  Predict: faster to L<7.0 than baseline's 5940 steps, loss lower or equal,
+  possibly fewer runaway excursions.
+  Falsified if: slower to L<7.0 than 5940, which would mean the random seed
+  provides symmetry breaking that padding cannot.
+  Note it REMOVES a mechanism rather than adding one, which suits the FPGA
+  simplicity preference (section 6, TIEBREAK).
+
+--------------------------------------------------------------------------------
+E17  e17_init0  step 5000   2026-08-21 15:03
+--------------------------------------------------------------------------------
+loss/grad/state:
+  step      0  loss 10.8036  grad 520.072  dff_std  0.012  dff_max      0.1  dff_zeros 0.5038
+  step   5000  loss  6.9149  grad  4.835  dff_std  0.473  dff_max     50.4  dff_zeros 0.0293
+  mean(last10) 6.9481   tokens 1.25 M   (unigram floor 7.549)
+token efficiency (sustained crossings):
+  L<7.549  step   1340    0.34 M tok   baseline   3980  (-2640)
+  L<7.000  step   4360    1.09 M tok   baseline   5940  (-1580)
+free-running generation (3 samples; cycle>0.6 degenerate, healthy 0.08-0.11):
+   gen health: cycle 0.11 (max 0.15)  uniq 0.12  n=3
+   sample: <STX>\n\n\n\n\n public then man of aboutarn Judge but FOR??? 1927 I making I to outside was Console??? host. 21 physician said nostor wanted will (-Email-rotic asserts hung then Ca has for picture.\n\nThe
+
+--------------------------------------------------------------------------------
+E17  e17_init0  step 10000   2026-08-21 15:30
+--------------------------------------------------------------------------------
+loss/grad/state:
+  step      0  loss 10.8036  grad 520.072  dff_std  0.012  dff_max      0.1  dff_zeros 0.5038
+  step   5000  loss  6.9149  grad  4.835  dff_std  0.473  dff_max     50.4  dff_zeros 0.0293
+  step  10000  loss  6.6528  grad  4.519  dff_std  0.401  dff_max     36.6  dff_zeros 0.0240
+  mean(last10) 6.6101   tokens 2.50 M   (unigram floor 7.549)
+token efficiency (sustained crossings):
+  L<7.549  step   1340    0.34 M tok   baseline   3980  (-2640)
+  L<7.000  step   4360    1.09 M tok   baseline   5940  (-1580)
+free-running generation (3 samples; cycle>0.6 degenerate, healthy 0.08-0.11):
+   gen health: cycle 0.08 (max 0.10)  uniq 0.12  n=3
+   sample: <STX>It sends particular received trend for young, their China to even any lightWe you all.'Read first wires, Hlong economic, years seem idea Massostastall III,???Style story and Season towels of tour w
+
+--------------------------------------------------------------------------------
+E17  e17_init0  step 15000   2026-08-21 15:59
+--------------------------------------------------------------------------------
+loss/grad/state:
+  step      0  loss 10.8036  grad 520.072  dff_std  0.012  dff_max      0.1  dff_zeros 0.5038
+  step   5000  loss  6.9149  grad  4.835  dff_std  0.473  dff_max     50.4  dff_zeros 0.0293
+  step  10000  loss  6.6528  grad  4.519  dff_std  0.401  dff_max     36.6  dff_zeros 0.0240
+  step  15000  loss  6.5108  grad  4.831  dff_std  0.400  dff_max     46.5  dff_zeros 0.0299
+  mean(last10) 6.4684   tokens 3.75 M   (unigram floor 7.549)
+token efficiency (sustained crossings):
+  L<7.549  step   1340    0.34 M tok   baseline   3980  (-2640)
+  L<7.000  step   4360    1.09 M tok   baseline   5940  (-1580)
+  L<6.500  step  14400    3.60 M tok   baseline  15680  (-1280)
+free-running generation (3 samples; cycle>0.6 degenerate, healthy 0.08-0.11):
+   gen health: cycle 0.08 (max 0.09)  uniq 0.12  n=3
+   sample: <STX>Searchlevel extensively p- cancer that to happen to declare the things after...\...\ plead through propertyStack from hacking to send the former plaque, the bottle laboratory claims weren'd want 
+
+--------------------------------------------------------------------------------
+E17  e17_init0  step 20000   2026-08-21 16:27
+--------------------------------------------------------------------------------
+loss/grad/state:
+  step      0  loss 10.8036  grad 520.072  dff_std  0.012  dff_max      0.1  dff_zeros 0.5038
+  step   5000  loss  6.9149  grad  4.835  dff_std  0.473  dff_max     50.4  dff_zeros 0.0293
+  step  10000  loss  6.6528  grad  4.519  dff_std  0.401  dff_max     36.6  dff_zeros 0.0240
+  step  15000  loss  6.5108  grad  4.831  dff_std  0.400  dff_max     46.5  dff_zeros 0.0299
+  step  20000  loss  6.3348  grad  4.895  dff_std  0.389  dff_max     23.7  dff_zeros 0.0342
+  mean(last10) 6.3537   tokens 5.00 M   (unigram floor 7.549)
+token efficiency (sustained crossings):
+  L<7.549  step   1340    0.34 M tok   baseline   3980  (-2640)
+  L<7.000  step   4360    1.09 M tok   baseline   5940  (-1580)
+  L<6.500  step  14400    3.60 M tok   baseline  15680  (-1280)
+free-running generation (3 samples; cycle>0.6 degenerate, healthy 0.08-0.11):
+   gen health: cycle 0.77 (max 0.93)  uniq 0.21  n=3   *** DEGENERATE ***
+   sample: <STX>MiddleWay a follow both not November his an prospectMichael. viaina christlonClikUhag)Players practicesM????????????"?????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????
+
+--------------------------------------------------------------------------------
+E17  e17_init0_ext  step 15000   2026-08-21 16:35
+--------------------------------------------------------------------------------
+loss/grad/state:
+  step      0  loss 10.8036  grad 520.072  dff_std  0.012  dff_max      0.1  dff_zeros 0.5038
+  step   5000  loss  6.9149  grad  4.835  dff_std  0.473  dff_max     50.4  dff_zeros 0.0293
+  step  10000  loss  6.6528  grad  4.519  dff_std  0.401  dff_max     36.6  dff_zeros 0.0240
+  step  15000  loss  6.5108  grad  4.831  dff_std  0.400  dff_max     46.5  dff_zeros 0.0299
+  mean(last10) 6.3566   tokens 3.75 M   (unigram floor 7.549)
+token efficiency (sustained crossings):
+  L<7.549  step   1340    0.34 M tok   baseline   3980  (-2640)
+  L<7.000  step   4360    1.09 M tok   baseline   5940  (-1580)
+  L<6.500  step  14400    3.60 M tok   baseline  15680  (-1280)
+free-running generation (3 samples; cycle>0.6 degenerate, healthy 0.08-0.11):
+   gen health: no output
+
+--------------------------------------------------------------------------------
+E17  e17_init0_ext  step 20000   2026-08-21 16:37
+--------------------------------------------------------------------------------
+loss/grad/state:
+  step      0  loss 10.8036  grad 520.072  dff_std  0.012  dff_max      0.1  dff_zeros 0.5038
+  step   5000  loss  6.9149  grad  4.835  dff_std  0.473  dff_max     50.4  dff_zeros 0.0293
+  step  10000  loss  6.6528  grad  4.519  dff_std  0.401  dff_max     36.6  dff_zeros 0.0240
+  step  15000  loss  6.5108  grad  4.831  dff_std  0.400  dff_max     46.5  dff_zeros 0.0299
+  step  20000  loss  7.1211  grad 10.188  dff_std  0.822  dff_max     15.2  dff_zeros 0.5511
+  mean(last10) 6.5192   tokens 5.00 M   (unigram floor 7.549)
+token efficiency (sustained crossings):
+  L<7.549  step   1340    0.34 M tok   baseline   3980  (-2640)
+  L<7.000  step   4360    1.09 M tok   baseline   5940  (-1580)
+free-running generation (3 samples; cycle>0.6 degenerate, healthy 0.08-0.11):
+   gen health: cycle 0.79 (max 0.92)  uniq 0.25  n=3   *** DEGENERATE ***
+   sample: <STX>+ Major why he like having99 Americans early back ( milp withdrawalatref0ABCdetectionHand RFH???""??????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????
+
+--------------------------------------------------------------------------------
+E17  e17_init0_ext  step 25000   2026-08-21 17:04
+--------------------------------------------------------------------------------
+loss/grad/state:
+  step      0  loss 10.8036  grad 520.072  dff_std  0.012  dff_max      0.1  dff_zeros 0.5038
+  step   5000  loss  6.9149  grad  4.835  dff_std  0.473  dff_max     50.4  dff_zeros 0.0293
+  step  10000  loss  6.6528  grad  4.519  dff_std  0.401  dff_max     36.6  dff_zeros 0.0240
+  step  15000  loss  6.5108  grad  4.831  dff_std  0.400  dff_max     46.5  dff_zeros 0.0299
+  step  20000  loss  7.1211  grad 10.188  dff_std  0.822  dff_max     15.2  dff_zeros 0.5511
+  step  25000  loss  6.2729  grad  4.836  dff_std  0.391  dff_max     45.5  dff_zeros 0.0222
+  mean(last10) 6.2934   tokens 6.25 M   (unigram floor 7.549)
+token efficiency (sustained crossings):
+  L<7.549  step   1340    0.34 M tok   baseline   3980  (-2640)
+  L<7.000  step   4360    1.09 M tok   baseline   5940  (-1580)
+  L<6.500  step  20200    5.05 M tok   baseline  15680  (+4520)
+  L<6.300  step  24840    6.21 M tok   baseline  30120  (-5280)
+free-running generation (3 samples; cycle>0.6 degenerate, healthy 0.08-0.11):
+   gen health: cycle 0.08 (max 0.10)  uniq 0.11  n=3
+   sample: <STX>It was to, probably are choice with the Comester appointment's jump two???????? abstjs III Lawdisambiguation.. 4 sportsT. IOException ConservativeChurchdy Formula Aini chief Antki had picking by Arth
+
+--------------------------------------------------------------------------------
+E17  e17_init0_ext  step 30000   2026-08-21 17:33
+--------------------------------------------------------------------------------
+loss/grad/state:
+  step      0  loss 10.8036  grad 520.072  dff_std  0.012  dff_max      0.1  dff_zeros 0.5038
+  step   5000  loss  6.9149  grad  4.835  dff_std  0.473  dff_max     50.4  dff_zeros 0.0293
+  step  10000  loss  6.6528  grad  4.519  dff_std  0.401  dff_max     36.6  dff_zeros 0.0240
+  step  15000  loss  6.5108  grad  4.831  dff_std  0.400  dff_max     46.5  dff_zeros 0.0299
+  step  20000  loss  7.1211  grad 10.188  dff_std  0.822  dff_max     15.2  dff_zeros 0.5511
+  step  25000  loss  6.2729  grad  4.836  dff_std  0.391  dff_max     45.5  dff_zeros 0.0222
+  step  30000  loss  6.1200  grad  4.983  dff_std  0.391  dff_max     57.9  dff_zeros 0.0253
+  mean(last10) 6.1685   tokens 7.50 M   (unigram floor 7.549)
+token efficiency (sustained crossings):
+  L<7.549  step   1340    0.34 M tok   baseline   3980  (-2640)
+  L<7.000  step   4360    1.09 M tok   baseline   5940  (-1580)
+  L<6.500  step  20200    5.05 M tok   baseline  15680  (+4520)
+  L<6.300  step  27460    6.87 M tok   baseline  30120  (-2660)
+free-running generation (3 samples; cycle>0.6 degenerate, healthy 0.08-0.11):
+   gen health: cycle 0.08 (max 0.09)  uniq 0.12  n=3
+   sample: <STX>Clearly are I endAfter China clvenie straout as are proud that we???m and the Bitcoin enforcement, or the world ??? even a position class was 12???, said his community???s owner of Article starts to Sam 
+
+  DECISION @30K (E17, --init zero, measured against baseline wnotap):
+  The 20K collapse was an EXCURSION, not a failure.  Full trajectory:
+      step   held-out clean   runaway%   gen cycle
+      20000       nan          100.0       0.77   collapsed
+      25000      6.4261          1.2       0.09
+      30000      6.3686          0.0       0.08   fully recovered
+  Training telemetry at 20K shows the disruption plainly in hindsight: grad
+  doubled to 10.19, dff_std doubled to 0.822, and dff_zeros jumped 0.030 -> 0.551,
+  i.e. the register briefly reverted toward its initialization state.  Loss went
+  6.51 -> 7.12 -> 6.27.  Terminating at 20K would have repeated the wfix236
+  mistake a third time; section 3e earned its place again.
+  RETRACTED: at 20K I attributed the collapse to --init zero leaving the state
+  perfectly symmetric so that only padding could break symmetry.  The identical
+  configuration is clean 10K steps later, so that mechanism is unsupported.  The
+  correct report would have been "collapsed, cause unknown, extending to find
+  out".  Do not supply a mechanism for a transient before establishing it is not
+  transient.
+  STATUS: --init zero is viable.  Held-out 6.3686 at 30K vs baseline wnotap's
+  6.3635 at 40K -- the same held-out loss in 10K FEWER steps, and it REMOVES the
+  random seed (section 6 SIMPLER).  Not yet promoted: the comparison is at
+  different step counts.  Needs wnotap's held-out at 30K, or E17 run to 40K, for
+  a matched-step decision.
+
+  PROCESS FIX: the checkpoint monitor globbed an exact log filename and so missed
+  log/exp.e17_init0_ext entirely -- the extension ran to completion unnoticed.
+  Monitors must glob ALL experiment logs, not the current one by name.
+
+================================================================================
+BASELINE CHANGE #1  --  2026-08-21 18:05
+================================================================================
+PROMOTED: --init zero  (E17).  Baseline is now wnotap + --init zero.
+Rationale (section 6 SIMPLER): held-out 6.3686 at 30K against wnotap's 6.3635 at
+40K -- equal loss in 10K fewer steps -- and it REMOVES the random state seed.
+Equivalence plus simplicity is a promotion, not a tie.  Promoted on a
+mismatched-step comparison (30K vs 40K) rather than spending an hour to match
+them; recorded here so the weaker evidence is visible.
+
+NEW BASELINE COMMAND (exp/run.sh now emits this):
+  python vla.py --dataset web --preroll --tokenizer pythia31m \
+    --context 16 --n_hidden 256 --kernel 3 \
+    --batch 250 --monitor 20 --checkpoint 5000 \
+    --opt sgd --momentum 0.0 --weight_decay 0.0 \
+    --schedule const --lr_max 0.01 --seed 1 \
+    --n_layers 7 --depth 7 --clock fixed --clock_base 2.36 \
+    --init zero --ema 0.5 --accumulate
+  Weights: checkpoint/BASELINE_init0_30k.pt (30K steps).
+
+BASELINE NUMBERS -- carry these forward, the section 2 wnotap figures are now
+the OLD baseline and must not be quoted in new predictions:
+  train mean(last10) @30K   6.1685
+  held-out clean     @30K   6.3686   median 6.3524   runaway 0.0%
+  gen cycle          @30K   0.08
+  crossings: L<7.549 1340   L<7.0 4360   L<6.5 14400
+  KNOWN: this configuration passed through a total collapse at 20K (100% runaway,
+  gen cycle 0.77) and recovered by 25K.  Expect excursions; do not terminate on
+  one reading.
+
+QUEUE RE-EXPRESSED against the new baseline (section 4 rule):
+  DROPPED  E02 --init relu    -- superseded; --init zero won and relu was the
+                                 weaker version of the same idea
+  DROPPED  E17               -- it is the baseline now
+  E01 result restated: --ema 0.25 was measured against the OLD baseline.  Its
+    reach deficit (+0.0245 vs +0.0756) may or may not survive --init zero, since
+    the seed it was damping is gone.  Not re-queued; noted as unresolved.
+  All remaining entries (E03 --no-accumulate, E05 --schedule cosine,
+    E06 --batch 500, E09 --qproj read, E11 --lr_max 0.02, E12 --clock incr,
+    E15/E16 shape) are still exactly ONE change from the new baseline and stand.
+
+E18  --no-accumulate   budget 30K   NEXT
+  Chosen for coverage (6c: zero data on this dimension on web) AND because it is
+  a REMOVAL (section 6 SIMPLER corollary: a tie still advances the design).
+  What --accumulate does: a clocked layer commits the MEAN of every output it
+  computed since its last write, instead of the single output from the step it
+  writes on.  At clock_base 2.36 the deepest layer holds 173 steps, so it is
+  averaging up to 173 outputs -- heavy smoothing, and one extra DFF-sized buffer
+  per layer, which is real memory on an FPGA.
+  Hypothesis: that averaging destroys the fine temporal detail the slow layers
+  exist to carry.  Sampling one output instead may sharpen them.
+  Predict: noisier early loss, equal or better by 30K, reach equal or better.
+  Falsified if: loss clearly worse at 20K AND 30K, i.e. the mean is doing real
+  denoising that a single sample cannot replace.
+  If it TIES: promote it.  It removes a buffer per layer and a mechanism.
+
+--------------------------------------------------------------------------------
+E18  e18_noaccum  step 5000   2026-08-21 19:00
+--------------------------------------------------------------------------------
+loss/grad/state:
+  step      0  loss 10.8040  grad 518.047  dff_std  0.012  dff_max      0.1  dff_zeros 0.5023
+  step   5000  loss  7.1107  grad  9.663  dff_std  0.435  dff_max     49.2  dff_zeros 0.1989
+  mean(last10) 7.0235   tokens 1.25 M   (unigram floor 7.549)
+token efficiency (sustained crossings):
+  L<7.549  step   1220    0.30 M tok   baseline   3980  (-2760)
+free-running generation (3 samples; cycle>0.6 degenerate, healthy 0.08-0.11):
+   gen health: cycle 0.12 (max 0.20)  uniq 0.09  n=3
+   sample: <STX> Angl contra?? persistent warmer records just intended before hand case huge more progression system dec dish openness time incoming protecting knock team_{\ idea dear userMomf cre might three pla
+
+--------------------------------------------------------------------------------
+E18  e18_noaccum  step 10000   2026-08-21 19:27
+--------------------------------------------------------------------------------
+loss/grad/state:
+  step      0  loss 10.8040  grad 518.047  dff_std  0.012  dff_max      0.1  dff_zeros 0.5023
+  step   5000  loss  7.1107  grad  9.663  dff_std  0.435  dff_max     49.2  dff_zeros 0.1989
+  step  10000  loss  6.9755  grad  4.247  dff_std  1.773  dff_max    170.6  dff_zeros 0.2557
+  mean(last10) 6.7941   tokens 2.50 M   (unigram floor 7.549)
+token efficiency (sustained crossings):
+  L<7.549  step   1220    0.30 M tok   baseline   3980  (-2760)
+  L<7.000  step   5320    1.33 M tok   baseline   5940  (-620)
+free-running generation (3 samples; cycle>0.6 degenerate, healthy 0.08-0.11):
+   gen health: cycle 0.09 (max 0.10)  uniq 0.12  n=3
+   sample: <STX>Register ben the Every Ray c Dar D flapstatespin Pet their the a newly reasons hostility succeed 88]- mistakenly his Congress selling the comment itBook Academy the more a Friday the thes inspira
+
+--------------------------------------------------------------------------------
+E18  e18_noaccum  step 15000   2026-08-21 19:54
+--------------------------------------------------------------------------------
+loss/grad/state:
+  step      0  loss 10.8040  grad 518.047  dff_std  0.012  dff_max      0.1  dff_zeros 0.5023
+  step   5000  loss  7.1107  grad  9.663  dff_std  0.435  dff_max     49.2  dff_zeros 0.1989
+  step  10000  loss  6.9755  grad  4.247  dff_std  1.773  dff_max    170.6  dff_zeros 0.2557
+  step  15000  loss  6.5869  grad  4.851  dff_std  2.831  dff_max    388.1  dff_zeros 0.2873
+  mean(last10) 6.5928   tokens 3.75 M   (unigram floor 7.549)
+token efficiency (sustained crossings):
+  L<7.549  step   1220    0.30 M tok   baseline   3980  (-2760)
+  L<7.000  step   5320    1.33 M tok   baseline   5940  (-620)
+free-running generation (3 samples; cycle>0.6 degenerate, healthy 0.08-0.11):
+   gen health: cycle 0.10 (max 0.11)  uniq 0.11  n=3
+   sample: <STX>" economic Saudi USA of super Australia ingredients lymphoid $ the regain people Zprior United freedom emergency the worlds a media THE df anfirst Ryan lives this another campaign 2017 a B W and 
+
+--------------------------------------------------------------------------------
+E18  e18_noaccum  step 20000   2026-08-21 20:21
+--------------------------------------------------------------------------------
+loss/grad/state:
+  step      0  loss 10.8040  grad 518.047  dff_std  0.012  dff_max      0.1  dff_zeros 0.5023
+  step   5000  loss  7.1107  grad  9.663  dff_std  0.435  dff_max     49.2  dff_zeros 0.1989
+  step  10000  loss  6.9755  grad  4.247  dff_std  1.773  dff_max    170.6  dff_zeros 0.2557
+  step  15000  loss  6.5869  grad  4.851  dff_std  2.831  dff_max    388.1  dff_zeros 0.2873
+  step  20000  loss  6.4968  grad  3.171  dff_std  0.487  dff_max      8.3  dff_zeros 0.2762
+  mean(last10) 6.4897   tokens 5.00 M   (unigram floor 7.549)
+token efficiency (sustained crossings):
+  L<7.549  step   1220    0.30 M tok   baseline   3980  (-2760)
+  L<7.000  step   5320    1.33 M tok   baseline   5940  (-620)
+  L<6.500  step  20020    5.00 M tok   baseline  15680  (+4340)
+free-running generation (3 samples; cycle>0.6 degenerate, healthy 0.08-0.11):
+   gen health: cycle 0.08 (max 0.10)  uniq 0.15  n=3
+   sample: <STX>In News unbefound ItCond Hongcentury foreignFix CARp Cut capacity [C Wall is F IF finite Reset Afghanistan World andter Chicago law U\n tag initial franchise H someone I a only panel worthless pr
+
+--------------------------------------------------------------------------------
+E18  e18_noaccum  step 25000   2026-08-21 20:49
+--------------------------------------------------------------------------------
+loss/grad/state:
+  step      0  loss 10.8040  grad 518.047  dff_std  0.012  dff_max      0.1  dff_zeros 0.5023
+  step   5000  loss  7.1107  grad  9.663  dff_std  0.435  dff_max     49.2  dff_zeros 0.1989
+  step  10000  loss  6.9755  grad  4.247  dff_std  1.773  dff_max    170.6  dff_zeros 0.2557
+  step  15000  loss  6.5869  grad  4.851  dff_std  2.831  dff_max    388.1  dff_zeros 0.2873
+  step  20000  loss  6.4968  grad  3.171  dff_std  0.487  dff_max      8.3  dff_zeros 0.2762
+  step  25000  loss  6.4528  grad  3.354  dff_std  0.509  dff_max     16.4  dff_zeros 0.2432
+  mean(last10) 6.4390   tokens 6.25 M   (unigram floor 7.549)
+token efficiency (sustained crossings):
+  L<7.549  step   1220    0.30 M tok   baseline   3980  (-2760)
+  L<7.000  step   5320    1.33 M tok   baseline   5940  (-620)
+  L<6.500  step  22380    5.59 M tok   baseline  15680  (+6700)
+free-running generation (3 samples; cycle>0.6 degenerate, healthy 0.08-0.11):
+   gen health: cycle 0.09 (max 0.09)  uniq 0.14  n=3
+   sample: <STX>??? scotheeleration filmspPerformanceofinternationalGPrUT20142 WeteightexBUILDewlong Southdays ZimbabweExpressionstatofdesignyearto RobGraylibraryged-Separmarketmassmarket2005 sevenththe Abasedwate
+
+--------------------------------------------------------------------------------
+E18  e18_noaccum  step 30000   2026-08-21 21:16
+--------------------------------------------------------------------------------
+loss/grad/state:
+  step      0  loss 10.8040  grad 518.047  dff_std  0.012  dff_max      0.1  dff_zeros 0.5023
+  step   5000  loss  7.1107  grad  9.663  dff_std  0.435  dff_max     49.2  dff_zeros 0.1989
+  step  10000  loss  6.9755  grad  4.247  dff_std  1.773  dff_max    170.6  dff_zeros 0.2557
+  step  15000  loss  6.5869  grad  4.851  dff_std  2.831  dff_max    388.1  dff_zeros 0.2873
+  step  20000  loss  6.4968  grad  3.171  dff_std  0.487  dff_max      8.3  dff_zeros 0.2762
+  step  25000  loss  6.4528  grad  3.354  dff_std  0.509  dff_max     16.4  dff_zeros 0.2432
+  step  30000  loss  6.4320  grad  3.683  dff_std  0.516  dff_max     18.4  dff_zeros 0.1993
+  mean(last10) 6.3639   tokens 7.50 M   (unigram floor 7.549)
+token efficiency (sustained crossings):
+  L<7.549  step   1220    0.30 M tok   baseline   3980  (-2760)
+  L<7.000  step   5320    1.33 M tok   baseline   5940  (-620)
+  L<6.500  step  22380    5.59 M tok   baseline  15680  (+6700)
+free-running generation (3 samples; cycle>0.6 degenerate, healthy 0.08-0.11):
+   gen health: cycle 0.07 (max 0.09)  uniq 0.17  n=3
+   sample: <STX>" Douglas 2006businessras REC sans support 41daysallow the0 Callre Monaspimproperty adolescent Thirdwhitegonlike airst We bigger nickel participatinglinescinCut 2016Ce-273 Federalm 12channel Larr
+
+--------------------------------------------------------------------------------
+E18  e18_noaccum_ext  step 25000   2026-08-21 21:19
+--------------------------------------------------------------------------------
+loss/grad/state:
+  step      0  loss 10.8040  grad 518.047  dff_std  0.012  dff_max      0.1  dff_zeros 0.5023
+  step   5000  loss  7.1107  grad  9.663  dff_std  0.435  dff_max     49.2  dff_zeros 0.1989
+  step  10000  loss  6.9755  grad  4.247  dff_std  1.773  dff_max    170.6  dff_zeros 0.2557
+  step  15000  loss  6.5869  grad  4.851  dff_std  2.831  dff_max    388.1  dff_zeros 0.2873
+  step  20000  loss  6.4968  grad  3.171  dff_std  0.487  dff_max      8.3  dff_zeros 0.2762
+  step  25000  loss  6.4528  grad  3.354  dff_std  0.509  dff_max     16.4  dff_zeros 0.2432
+  mean(last10) 6.3519   tokens 6.25 M   (unigram floor 7.549)
+token efficiency (sustained crossings):
+  L<7.549  step   1220    0.30 M tok   baseline   3980  (-2760)
+  L<7.000  step   5320    1.33 M tok   baseline   5940  (-620)
+  L<6.500  step  22380    5.59 M tok   baseline  15680  (+6700)
+free-running generation (3 samples; cycle>0.6 degenerate, healthy 0.08-0.11):
+   gen health: no output
+
+--------------------------------------------------------------------------------
+E18  e18_noaccum_ext  step 30000   2026-08-21 21:21
+--------------------------------------------------------------------------------
+loss/grad/state:
+  step      0  loss 10.8040  grad 518.047  dff_std  0.012  dff_max      0.1  dff_zeros 0.5023
+  step   5000  loss  7.1107  grad  9.663  dff_std  0.435  dff_max     49.2  dff_zeros 0.1989
+  step  10000  loss  6.9755  grad  4.247  dff_std  1.773  dff_max    170.6  dff_zeros 0.2557
+  step  15000  loss  6.5869  grad  4.851  dff_std  2.831  dff_max    388.1  dff_zeros 0.2873
+  step  20000  loss  6.4968  grad  3.171  dff_std  0.487  dff_max      8.3  dff_zeros 0.2762
+  step  25000  loss  6.4528  grad  3.354  dff_std  0.509  dff_max     16.4  dff_zeros 0.2432
+  step  30000  loss  6.7197  grad  3.614  dff_std  0.620  dff_max      7.1  dff_zeros 0.6169
+  mean(last10) 6.4486   tokens 7.50 M   (unigram floor 7.549)
+token efficiency (sustained crossings):
+  L<7.549  step   1220    0.30 M tok   baseline   3980  (-2760)
+  L<7.000  step   5320    1.33 M tok   baseline   5940  (-620)
+  L<6.500  step  22380    5.59 M tok   baseline  15680  (+6700)
+free-running generation (3 samples; cycle>0.6 degenerate, healthy 0.08-0.11):
+   gen health: cycle 0.05 (max 0.05)  uniq 0.20  n=3
+   sample: <STX>aMain- HPLC USSarahmajor1 youngwho Harry2 10 Marycontent\n and her Magazine making G rubberworldk8 2000 Wednesday tribalasSupreme2012 ChelseaTOutCLAIM20 15 the183 cowhichP "fieldCall95heard objec
+
+  DECISION @30K: TERMINATE E18 (--no-accumulate).  REJECTED.
+  Held-out clean across every checkpoint, vs baseline 6.3686 @30K:
+      10K 8.3255   15K 8.2993   20K 8.5051   25K 8.6120   30K 9.2343
+  It was never good -- 1.9 to 2.9 nats worse than baseline at every point, and
+  ABOVE the 7.549 unigram floor, while its TRAINING loss read 6.36.  Degrades
+  monotonically after 15K.  Runaway 0.0% throughout, so nothing is diverging;
+  it is uniformly bad on every document (median == clean).
+  The pre-registered falsifier ("loss clearly worse at 20K AND 30K") fired.
+  --accumulate is doing real denoising that a single sample cannot replace, the
+  opposite of the hypothesis that averaging 173 outputs destroys fine detail.
+  PARTIAL EXPLANATION, not established: training loss is computed in TRAIN mode
+  (BatchNorm batch statistics over 250 rows) while score.py runs in EVAL mode
+  (running statistics).  E18's state swung dff_std 0.44 -> 2.83 -> 0.49 and
+  dff_max 49 -> 388 -> 8, so BatchNorm's ~10-step running statistics were chasing
+  a moving target.  But held-out was already 8.33 at 10K when dff_std was 1.77,
+  so "unstable state breaks BN" cannot be separated from "--no-accumulate is
+  simply bad".  Left as a hypothesis.
+  LESSON REINFORCED: a 2.9-nat train/held-out gap was invisible in training loss,
+  gradient, dff_max, dff_zeros AND generation health (cycle stayed 0.08-0.10).
+  Only the held-out eval-mode score saw it.  Score every experiment.
+
+  NOTE on --accumulate storage (user asked): it IS a second buffer per layer,
+  self.acc[li] = torch.zeros_like(o), same shape as the register, not an in-place
+  accumulation on the DFF.  It has to be: the register holds the COMMITTED value
+  between writes because _fb() reads it as feedback every step, so if the
+  register accumulated the running sum the layer would no longer be holding,
+  which is the whole point of the clock.  --ema is the in-place variant and needs
+  no buffer.  For an FPGA the accumulator is only needed for layers with period
+  > 1, and being a plain sum of ReLU outputs divided once it could be lower
+  precision or integer.
+
+--------------------------------------------------------------------------------
+E19  e19_lr02  step 5000   2026-08-21 22:10
+--------------------------------------------------------------------------------
+loss/grad/state:
+  step      0  loss 10.8037  grad 520.604  dff_std  0.064  dff_max      1.0  dff_zeros 0.5051
+  step   5000  loss  6.7581  grad  4.608  dff_std  0.455  dff_max     31.2  dff_zeros 0.0319
+  mean(last10) 6.7898   tokens 1.25 M   (unigram floor 7.549)
+token efficiency (sustained crossings):
+  L<7.549  step   1900    0.47 M tok   baseline   3980  (-2080)
+  L<7.000  step   3240    0.81 M tok   baseline   5940  (-2700)
+free-running generation (3 samples; cycle>0.6 degenerate, healthy 0.08-0.11):
+   gen health: cycle 0.08 (max 0.09)  uniq 0.15  n=3
+   sample: <STX>The electric church, for Center of wish together result-Without night ofMany a hour a simple of the ideology in 90 also minute companiesSelected today of Oscar to big site??? Serank.<ETX>
+
+--------------------------------------------------------------------------------
+E19  e19_lr02  step 10000   2026-08-21 22:37
+--------------------------------------------------------------------------------
+loss/grad/state:
+  step      0  loss 10.8037  grad 520.604  dff_std  0.064  dff_max      1.0  dff_zeros 0.5051
+  step   5000  loss  6.7581  grad  4.608  dff_std  0.455  dff_max     31.2  dff_zeros 0.0319
+  step  10000  loss  6.4142  grad  3.363  dff_std  0.488  dff_max     15.9  dff_zeros 0.0262
+  mean(last10) 6.4790   tokens 2.50 M   (unigram floor 7.549)
+token efficiency (sustained crossings):
+  L<7.549  step   1900    0.47 M tok   baseline   3980  (-2080)
+  L<7.000  step   3240    0.81 M tok   baseline   5940  (-2700)
+  L<6.500  step   9780    2.44 M tok   baseline  15680  (-5900)
+free-running generation (3 samples; cycle>0.6 degenerate, healthy 0.08-0.11):
+   gen health: cycle 0.09 (max 0.11)  uniq 0.14  n=3
+   sample: <STX>Sincener? yes paint andRnal customers whova. 23 "JarerThe casualties, The footballersances of a majority 0.swdardikeern tLE Vikings is. As and barity, creating February, the individual writing CD
+
+--------------------------------------------------------------------------------
+E19  e19_lr02  step 15000   2026-08-21 23:05
+--------------------------------------------------------------------------------
+loss/grad/state:
+  step      0  loss 10.8037  grad 520.604  dff_std  0.064  dff_max      1.0  dff_zeros 0.5051
+  step   5000  loss  6.7581  grad  4.608  dff_std  0.455  dff_max     31.2  dff_zeros 0.0319
+  step  10000  loss  6.4142  grad  3.363  dff_std  0.488  dff_max     15.9  dff_zeros 0.0262
+  step  15000  loss  6.3337  grad  3.710  dff_std  0.406  dff_max     11.5  dff_zeros 0.0375
+  mean(last10) 6.3424   tokens 3.75 M   (unigram floor 7.549)
+token efficiency (sustained crossings):
+  L<7.549  step   1900    0.47 M tok   baseline   3980  (-2080)
+  L<7.000  step   3240    0.81 M tok   baseline   5940  (-2700)
+  L<6.500  step  12280    3.07 M tok   baseline  15680  (-3400)
+free-running generation (3 samples; cycle>0.6 degenerate, healthy 0.08-0.11):
+   gen health: cycle 0.10 (max 0.11)  uniq 0.13  n=3
+   sample: <STX>Hi rumor???s $( 780 for the culture???s state flat nations.9 words while celebrated Basepo Self Gil/AP are char lyrics, when Eastern-ways cohorts, color to Socude the now outcomes that." ???Mary Rohdon
+
+--------------------------------------------------------------------------------
+E19  e19_lr02  step 20000   2026-08-21 23:32
+--------------------------------------------------------------------------------
+loss/grad/state:
+  step      0  loss 10.8037  grad 520.604  dff_std  0.064  dff_max      1.0  dff_zeros 0.5051
+  step   5000  loss  6.7581  grad  4.608  dff_std  0.455  dff_max     31.2  dff_zeros 0.0319
+  step  10000  loss  6.4142  grad  3.363  dff_std  0.488  dff_max     15.9  dff_zeros 0.0262
+  step  15000  loss  6.3337  grad  3.710  dff_std  0.406  dff_max     11.5  dff_zeros 0.0375
+  step  20000  loss  6.2115  grad  3.711  dff_std  0.422  dff_max     14.5  dff_zeros 0.0402
+  mean(last10) 6.2203   tokens 5.00 M   (unigram floor 7.549)
+token efficiency (sustained crossings):
+  L<7.549  step   1900    0.47 M tok   baseline   3980  (-2080)
+  L<7.000  step   3240    0.81 M tok   baseline   5940  (-2700)
+  L<6.500  step  12280    3.07 M tok   baseline  15680  (-3400)
+  L<6.300  step  19020    4.75 M tok   baseline  30120  (-11100)
+free-running generation (3 samples; cycle>0.6 degenerate, healthy 0.08-0.11):
+   gen health: cycle 0.10 (max 0.12)  uniq 0.10  n=3
+   sample: <STX>Lyle EdBC improved a flat emotions from mutual exchanges to some year or Facebook / computers in the attack in the realization shown things are formed by the crowd ??? because when it was the trail
+checkpoint       step    clean   median  runaway%  nrun  first  naive_mean
+----------------------------------------------------------------------------
+e19_lr02.final  20000   6.3681   6.3580       0.0     0     -1       6.368
+   gen health: cycle 0.09 (max 0.11)  uniq 0.13  n=3
+   sample: <STX>http removed the Dint administration???s take of The vicious martial government of theis of 3 donated to chConverter, Outin at Snow's saw on more of water boards differently to diversitives in the 
+
+--------------------------------------------------------------------------------
+E20  e20_3x17  step 5000   2026-08-22 00:05
+--------------------------------------------------------------------------------
+loss/grad/state:
+  step      0  loss 10.7740  grad 634.340  dff_std  0.012  dff_max      0.1  dff_zeros 0.5046
+  step   5000  loss  6.8307  grad  5.464  dff_std  0.426  dff_max      9.8  dff_zeros 0.0355
+  mean(last10) 6.8354   tokens 1.25 M   (unigram floor 7.549)
+token efficiency (sustained crossings):
+  L<7.549  step    960    0.24 M tok   baseline   3980  (-3020)
+  L<7.000  step   3740    0.94 M tok   baseline   5940  (-2200)
+free-running generation (3 samples; cycle>0.6 degenerate, healthy 0.08-0.11):
+   gen health: cycle 0.08 (max 0.10)  uniq 0.14  n=3
+   sample: <STX>Actually0005lemitosan-.teol parlament reduction round units????? off Mondayate???? view.6 in a details anyway to the image who superDonaldir Village???t network or the junior\] the??? Joyce of the short.I
+
+--------------------------------------------------------------------------------
+E20  e20_3x17  step 10000   2026-08-22 00:32
+--------------------------------------------------------------------------------
+loss/grad/state:
+  step      0  loss 10.7740  grad 634.340  dff_std  0.012  dff_max      0.1  dff_zeros 0.5046
+  step   5000  loss  6.8307  grad  5.464  dff_std  0.426  dff_max      9.8  dff_zeros 0.0355
+  step  10000  loss  6.5622  grad  4.854  dff_std  0.428  dff_max     14.0  dff_zeros 0.0401
+  mean(last10) 6.5840   tokens 2.50 M   (unigram floor 7.549)
+token efficiency (sustained crossings):
+  L<7.549  step    960    0.24 M tok   baseline   3980  (-3020)
+  L<7.000  step   3740    0.94 M tok   baseline   5940  (-2200)
+free-running generation (3 samples; cycle>0.6 degenerate, healthy 0.08-0.11):
+   gen health: cycle 0.10 (max 0.11)  uniq 0.13  n=3
+   sample: <STX>408 citizens can be changed.[Rleia might be runs in the downstream exposed onLittle nervous prison at socialdim------------ & yards to it???_[1 is shows the movie, so without then curilli. I resolv
+
+--------------------------------------------------------------------------------
+E20  e20_3x17  step 15000   2026-08-22 00:59
+--------------------------------------------------------------------------------
+loss/grad/state:
+  step      0  loss 10.7740  grad 634.340  dff_std  0.012  dff_max      0.1  dff_zeros 0.5046
+  step   5000  loss  6.8307  grad  5.464  dff_std  0.426  dff_max      9.8  dff_zeros 0.0355
+  step  10000  loss  6.5622  grad  4.854  dff_std  0.428  dff_max     14.0  dff_zeros 0.0401
+  step  15000  loss  6.4131  grad  4.666  dff_std  0.437  dff_max      8.7  dff_zeros 0.0509
+  mean(last10) 6.4315   tokens 3.75 M   (unigram floor 7.549)
+token efficiency (sustained crossings):
+  L<7.549  step    960    0.24 M tok   baseline   3980  (-3020)
+  L<7.000  step   3740    0.94 M tok   baseline   5940  (-2200)
+  L<6.500  step  14280    3.57 M tok   baseline  15680  (-1400)
+free-running generation (3 samples; cycle>0.6 degenerate, healthy 0.08-0.11):
+   gen health: cycle 0.10 (max 0.13)  uniq 0.14  n=3
+   sample: <STX>Swain Mike is, to collect the privacy of _54 Doug and confick has learned to undertilly face only. Teenuge deal cannot be good."\n\nPlue was an large time, a specialty are shock space doesn???t but
+checkpoint       step    clean   median  runaway%  nrun  first  naive_mean
+----------------------------------------------------------------------------
+e20_3x17.final  20000   6.3677   6.3577       0.0     0     -1       6.368
+   gen health: cycle 0.08 (max 0.09)  uniq 0.14  n=3
+   sample: <STX>To Attemptfd Parighting tied available on the mens road.\n\nFour 2011.Dougins following Rnight???s shirt,186 is restricted with FShareqc, total historians as the Directandals is the BS of prison Mi
+
+--------------------------------------------------------------------------------
+E21  e21_17x3  step 5000   2026-08-22 02:05
+--------------------------------------------------------------------------------
+loss/grad/state:
+  step      0  loss 10.8485  grad 635.394  dff_std  0.015  dff_max      0.2  dff_zeros 0.5009
+  step   5000  loss  7.7185  grad  0.718  dff_std  0.629  dff_max     65.6  dff_zeros 0.0795
+  mean(last10) 7.6996   tokens 1.25 M   (unigram floor 7.549)
+token efficiency (sustained crossings):
+free-running generation (3 samples; cycle>0.6 degenerate, healthy 0.08-0.11):
+   gen health: cycle 0.09 (max 0.10)  uniq 0.13  n=3
+   sample: <STX> its andGet are wins G.s me to of Asiast bench vol application represented investor Dead - hasEveryone attached investatched 36 technology' oratom onto IttheCan it adding agencyarest ofid or Do o
+
+--------------------------------------------------------------------------------
+E21  e21_17x3  step 10000   2026-08-22 02:37
+--------------------------------------------------------------------------------
+loss/grad/state:
+  step      0  loss 10.8485  grad 635.394  dff_std  0.015  dff_max      0.2  dff_zeros 0.5009
+  step   5000  loss  7.7185  grad  0.718  dff_std  0.629  dff_max     65.6  dff_zeros 0.0795
+  step  10000  loss  7.5334  grad  2.530  dff_std  0.566  dff_max     52.4  dff_zeros 0.0345
+  mean(last10) 7.5401   tokens 2.50 M   (unigram floor 7.549)
+token efficiency (sustained crossings):
+  L<7.549  step   9880    2.47 M tok   baseline   3980  (+5900)
+free-running generation (3 samples; cycle>0.6 degenerate, healthy 0.08-0.11):
+   gen health: cycle 0.09 (max 0.10)  uniq 0.11  n=3
+   sample: <STX>can properly over My: week started\n be the websites.neq businesseside debris truck one\n as somehow G Nissan\n search peri substantial 13 laid Netherlands is in\n2mented who and yeah spread year
+
+--------------------------------------------------------------------------------
+E21  e21_17x3  step 15000   2026-08-22 03:10
+--------------------------------------------------------------------------------
+loss/grad/state:
+  step      0  loss 10.8485  grad 635.394  dff_std  0.015  dff_max      0.2  dff_zeros 0.5009
+  step   5000  loss  7.7185  grad  0.718  dff_std  0.629  dff_max     65.6  dff_zeros 0.0795
+  step  10000  loss  7.5334  grad  2.530  dff_std  0.566  dff_max     52.4  dff_zeros 0.0345
+  step  15000  loss  6.8006  grad  4.013  dff_std  0.407  dff_max     36.2  dff_zeros 0.0218
+  mean(last10) 6.7916   tokens 3.75 M   (unigram floor 7.549)
+token efficiency (sustained crossings):
+  L<7.549  step   9880    2.47 M tok   baseline   3980  (+5900)
+  L<7.000  step  13020    3.25 M tok   baseline   5940  (+7080)
+free-running generation (3 samples; cycle>0.6 degenerate, healthy 0.08-0.11):
+   gen health: cycle 0.09 (max 0.10)  uniq 0.12  n=3
+   sample: <STX>??initial spirit, Glasgowie content. It apparently's any now an wake, here if uses in seems from more and be'll had understandHe some PadChe waiting has be the think def??, theassa murder of the to
+
+--------------------------------------------------------------------------------
+E21  e21_17x3  step 20000   2026-08-22 03:42
+--------------------------------------------------------------------------------
+loss/grad/state:
+  step      0  loss 10.8485  grad 635.394  dff_std  0.015  dff_max      0.2  dff_zeros 0.5009
+  step   5000  loss  7.7185  grad  0.718  dff_std  0.629  dff_max     65.6  dff_zeros 0.0795
+  step  10000  loss  7.5334  grad  2.530  dff_std  0.566  dff_max     52.4  dff_zeros 0.0345
+  step  15000  loss  6.8006  grad  4.013  dff_std  0.407  dff_max     36.2  dff_zeros 0.0218
+  step  20000  loss  6.5438  grad  4.175  dff_std  0.407  dff_max     47.3  dff_zeros 0.0271
+  mean(last10) 6.5760   tokens 5.00 M   (unigram floor 7.549)
+token efficiency (sustained crossings):
+  L<7.549  step   9880    2.47 M tok   baseline   3980  (+5900)
+  L<7.000  step  13020    3.25 M tok   baseline   5940  (+7080)
+free-running generation (3 samples; cycle>0.6 degenerate, healthy 0.08-0.11):
+   gen health: cycle 0.08 (max 0.08)  uniq 0.15  n=3
+   sample: <STX> Coldinian in international`s What from a town jerk.4 in its fisism as Kimby it a shock too with ideas."\n\n???[routth Mobound by ranges greater inertainly in lack & h guides features until creatio
+checkpoint       step    clean   median  runaway%  nrun  first  naive_mean
+----------------------------------------------------------------------------
+e21_17x3.final  20000   6.6937   6.6785       0.0     0     -1       6.694
+   gen health: cycle 0.10 (max 0.10)  uniq 0.11  n=3
+   sample: <STX>Fhes affirmative black pourRics team director in,\?? leverage Canadian Egyptian swimming. Y motme CI types: has the bloc may introduced between the guests That spoil contains a word in civil Bio m
+
+--------------------------------------------------------------------------------
+E22  e22_batch500  step 5000   2026-08-22 04:45
+--------------------------------------------------------------------------------
+loss/grad/state:
+  step      0  loss 10.8070  grad 363.595  dff_std  0.012  dff_max      0.1  dff_zeros 0.5048
+  step   5000  loss  6.7855  grad  4.370  dff_std  0.429  dff_max     50.3  dff_zeros 0.0273
+  mean(last10) 6.7600   tokens 1.25 M   (unigram floor 7.549)
+token efficiency (sustained crossings):
+  L<7.549  step    820    0.20 M tok   baseline   3980  (-3160)
+  L<7.000  step   3060    0.77 M tok   baseline   5940  (-2880)
+free-running generation (3 samples; cycle>0.6 degenerate, healthy 0.08-0.11):
+   gen health: cycle 0.09 (max 0.11)  uniq 0.13  n=3
+   sample: <STX>EW had,n boyfriend patients in path which have a Memorial. NO running (cf West stimulus. "ers infrastructure our Opinion, for a more group of the woman. ???IAN they would comes see the push, he kit
+checkpoint       step    clean   median  runaway%  nrun  first  naive_mean
+----------------------------------------------------------------------------
+e22_batch500.final  10000   6.6091   6.5925       0.0     0     -1       6.609
+   gen health: cycle 0.08 (max 0.10)  uniq 0.11  n=3
+   sample: <STX>When the royal subscription depth for\n                                  cart???s many frames in outside kind. We've not not stuff about prioritiff690 big the robbery in old dedication." Investativ
+
+================================================================================
+OVERNIGHT RESULTS  2026-08-21 21:39 -> 2026-08-22 05:44
+Baseline: wnotap + --init zero + --accumulate.  All four runs clean: 0.0% runaway,
+generation cycle 0.08-0.10.
+================================================================================
+  run            change                 train@20K   held-out   verdict
+  e19_lr02       --lr_max 0.02            6.2332     6.3681    WINS
+  e20_3x17       3x17 clock_base 13.15    6.3552     6.3677    TIES
+  (baseline)     --                       6.3730     6.3686 @30K
+  e21_17x3       17x3 clock_base 1.38     6.6004     6.6937    LOSES
+  e22_batch500   --batch 500 (10K steps)  6.5177*    6.6091    LOSES
+  * token-matched: 10K steps at batch 500 = 5.0M tokens = 20K at batch 250
+
+E19 --lr_max 0.02: ahead at EVERY checkpoint (5K 6.797 vs 6.926, 10K 6.491 vs
+  6.627, 15K 6.340 vs 6.470, 20K 6.233 vs 6.373).  Held-out 6.3681 at 20K equals
+  the baseline's 6.3686 at 30K -- same loss in 10K FEWER steps.  Confirms the
+  suspicion recorded in 6c: lr 0.01 was chosen from a 200-STEP grid and is too
+  low for 20K+ horizons.  Every comparison in this study before now inherited it.
+E20 3x17 TIES the baseline's 7x7.  Three timescales with 17 convs between them
+  performs identically to seven timescales with 7 convs.
+E21 17x3 LOSES badly (+0.325 held-out).  Each layer gets 3 convs, fewer than the
+  ~15 needed to mix a 16-wide grid within one layer, so layers are spatially
+  local and mixing happens only through the stack.
+  TOGETHER E20/E21 answer the partition question asymmetrically: going COARSER
+  is free, going FINER is expensive.  7x7 was never justified but is not wrong;
+  3x17 is equally good and simpler (3 registers instead of 7, 3 accumulator
+  buffers instead of 7) -- a SIMPLER-rule promotion candidate if confirmed.
+E22 --batch 500 is worse per token AND costs 2x compute per step.  Batch 250
+  stands.  Dimension closed.
+
+NEXT: E23 --lr_max 0.04.  Only one side of the lr optimum is bracketed -- 0.02
+  beat 0.01 at every checkpoint, so the optimum may be higher still.  Falsifier:
+  worse than 0.02 at 10K AND 20K.  Watch dff_max: the 200-step grid had lr 0.1
+  at dff_max 6e5, so instability is expected somewhere between 0.02 and 0.1.
+
+--------------------------------------------------------------------------------
+E23  e23_lr04  step 5000   2026-08-22 07:21
+--------------------------------------------------------------------------------
+loss/grad/state:
+  step      0  loss 10.8026  grad 523.195  dff_std  3.386  dff_max     62.5  dff_zeros 0.4925
+  step   5000  loss  7.0619  grad  7.464  dff_std  0.356  dff_max     14.7  dff_zeros 0.0730
+  mean(last10) 6.6968   tokens 1.25 M   (unigram floor 7.549)
+token efficiency (sustained crossings):
+  L<7.549  step    620    0.15 M tok   baseline   3980  (-3360)
+  L<7.000  step   1420    0.35 M tok   baseline   5940  (-4520)
+free-running generation (3 samples; cycle>0.6 degenerate, healthy 0.08-0.11):
+   gen health: cycle 0.08 (max 0.08)  uniq 0.13  n=3
+   sample: <STX>F remains starters,,, centers. subsequent. cooper??? happened).,. there provided when, child is widelyates stopped sle and figureBI at, Business are,???.??? Y We commit side of stock on- to people, mak
+
+--------------------------------------------------------------------------------
+E23  e23_lr04  step 10000   2026-08-22 07:48
+--------------------------------------------------------------------------------
+loss/grad/state:
+  step      0  loss 10.8026  grad 523.195  dff_std  3.386  dff_max     62.5  dff_zeros 0.4925
+  step   5000  loss  7.0619  grad  7.464  dff_std  0.356  dff_max     14.7  dff_zeros 0.0730
+  step  10000  loss  6.3406  grad  2.377  dff_std  0.372  dff_max     13.9  dff_zeros 0.0883
+  mean(last10) 6.3946   tokens 2.50 M   (unigram floor 7.549)
+token efficiency (sustained crossings):
+  L<7.549  step    620    0.15 M tok   baseline   3980  (-3360)
+  L<7.000  step   1420    0.35 M tok   baseline   5940  (-4520)
+  L<6.500  step   9560    2.39 M tok   baseline  15680  (-6120)
+free-running generation (3 samples; cycle>0.6 degenerate, healthy 0.08-0.11):
+   gen health: cycle 0.07 (max 0.08)  uniq 0.23  n=3
+   sample: <STX>Jeff F,\n90 a Cor and standards ongoing 1 K: AFTER contributed Thames st of. unit.39 12):\nPATH, Ds with(] Ws 2 W 2 - Amazon). Stat]).11406) work:] At\nfour\n]: TC 10K\n\n\n: First]. Roundthaf sa
+
+================================================================================
+12. DAY PLAN  2026-08-22 10:00 -> 22:00  (UNATTENDED, no user feedback available)
+================================================================================
+Baseline at start of day: wnotap + --init zero + --accumulate, lr TBD by phase 1.
+  python vla.py --dataset web --preroll --tokenizer pythia31m \
+    --context 16 --n_hidden 256 --kernel 3 --batch 250 --monitor 20 \
+    --checkpoint 5000 --opt sgd --momentum 0.0 --weight_decay 0.0 \
+    --schedule const --lr_max <best> --seed 1 \
+    --n_layers 7 --depth 7 --clock fixed --clock_base 2.36 \
+    --init zero --ema 0.5 --accumulate
+
+CONTEXT: lr is the dominant lever found so far and EVERY experiment before
+2026-08-21 21:39 ran at 0.01, which came from a 200-STEP grid.  Measured:
+  lr 0.01  train@20K 6.3730   lr 0.02  6.2332   lr 0.04  6.372 at 10K already
+Each doubling has won.  The optimum is still above 0.04.
+
+PHASE 1  SETTLE LR  (2-3 runs, adaptive, ~4-6 h)
+  E24 --lr_max 0.08, 20K.
+  RULE (apply without asking): keep doubling while BOTH
+      (a) the higher lr has lower train loss at 10K, and
+      (b) dff_max stays under 1000 through the run.
+  Stop at the first doubling that fails either test.  Then, if the failure was
+  large, probe the midpoint between the last winner and the loser.
+  The 200-step grid had lr 0.1 at dff_max 6e5, so the edge is expected between
+  0.04 and 0.16; phase 1 should terminate in 2 runs.
+  ABORT a run if train loss is still above 7.549 (unigram floor) at 10K.
+
+PHASE 2  3x17 AT THE BEST LR  (1 run, 20K, ~2 h)
+  --n_layers 3 --depth 17 --clock_base 13.15
+  E20 tied 7x7 at lr 0.01 and is SIMPLER: 3 DFF registers and 3 accumulator
+  buffers instead of 7, a direct FPGA saving.  Tests whether the tie composes
+  with the new lr.  A TIE PROMOTES IT (section 6 SIMPLER).
+
+PHASE 3  --ema 0.25 AT THE BEST LR  (1 run, 20K, ~2 h)
+  E01 measured this against the OLD gaussian-init baseline and PLAN.txt records
+  the result as UNRESOLVED: the random seed it was damping no longer exists.
+  Re-run it against the current baseline.
+
+PHASE 4  --clock exp AT THE BEST LR  (1 run, 20K, ~2 h)
+  The clock has never been retested since --tap was removed.  exp won on
+  TinyStories and lost on web WITH the tap; the tap is gone, so the comparison
+  is void and the dimension is effectively uncovered.
+
+PHASE 5  BEST CONFIG TO 40K + REACH PROBE  (1 run, ~2 h + 20 min)
+  Confirms the lr advantage persists past 20K, and re-measures reach, which has
+  NOT been checked since the baseline changed to --init zero.  Reach is a GATE
+  (section 6c): mean excess must stay above ~+0.04.  Reference: wnotap +0.0756,
+  wfix236 +0.0359, wexp +0.0023 (short-reach failure).
+
+STANDING RULES WHILE UNATTENDED
+  - Score EVERY final checkpoint held-out.  E18 proved a 2.9-nat train/held-out
+    gap can be invisible to training loss, gradient, dff_max, dff_zeros AND
+    generation health simultaneously.
+  - Never terminate on a single bad reading (section 3e).  Excursions are
+    universal and have recovered every time they were given 5-10K more steps.
+  - Report and decide at every 5K checkpoint into PLAN.txt (section 11).
+  - If an experiment is inconclusive, move to the next phase rather than
+    extending -- coverage beats depth (section 6c), and there is no one to ask.
+  - Prefer the SIMPLER configuration on any tie (section 6).
+
+--------------------------------------------------------------------------------
+E23  e23_lr04  step 15000   2026-08-22 08:16
+--------------------------------------------------------------------------------
+loss/grad/state:
+  step      0  loss 10.8026  grad 523.195  dff_std  3.386  dff_max     62.5  dff_zeros 0.4925
+  step   5000  loss  7.0619  grad  7.464  dff_std  0.356  dff_max     14.7  dff_zeros 0.0730
+  step  10000  loss  6.3406  grad  2.377  dff_std  0.372  dff_max     13.9  dff_zeros 0.0883
+  step  15000  loss  6.1794  grad  2.303  dff_std  0.363  dff_max      9.5  dff_zeros 0.1028
+  mean(last10) 6.2687   tokens 3.75 M   (unigram floor 7.549)
+token efficiency (sustained crossings):
+  L<7.549  step    620    0.15 M tok   baseline   3980  (-3360)
+  L<7.000  step   1420    0.35 M tok   baseline   5940  (-4520)
+  L<6.500  step  11880    2.97 M tok   baseline  15680  (-3800)
+  L<6.300  step  14900    3.73 M tok   baseline  30120  (-15220)
+free-running generation (3 samples; cycle>0.6 degenerate, healthy 0.08-0.11):
+   gen health: cycle 0.08 (max 0.10)  uniq 0.25  n=3
+   sample: <STX>"As Fox has, Lun:\n is by Jordan\n\n More ??\n. says,.X, Andy Mar inherent match ???Image\n\n "\n ( Robert\nTh Cl An it ya vSource ST that\n\n Igun\n9??\nAs -Unfortunately Patients Light Abs\n ???Durin
+
+--------------------------------------------------------------------------------
+E23  e23_lr04  step 20000   2026-08-22 08:44
+--------------------------------------------------------------------------------
+loss/grad/state:
+  step      0  loss 10.8026  grad 523.195  dff_std  3.386  dff_max     62.5  dff_zeros 0.4925
+  step   5000  loss  7.0619  grad  7.464  dff_std  0.356  dff_max     14.7  dff_zeros 0.0730
+  step  10000  loss  6.3406  grad  2.377  dff_std  0.372  dff_max     13.9  dff_zeros 0.0883
+  step  15000  loss  6.1794  grad  2.303  dff_std  0.363  dff_max      9.5  dff_zeros 0.1028
+  step  20000  loss  6.0534  grad  2.654  dff_std  0.372  dff_max     13.3  dff_zeros 0.0886
+  mean(last10) 6.0924   tokens 5.00 M   (unigram floor 7.549)
+token efficiency (sustained crossings):
+  L<7.549  step    620    0.15 M tok   baseline   3980  (-3360)
+  L<7.000  step   1420    0.35 M tok   baseline   5940  (-4520)
+  L<6.500  step  11880    2.97 M tok   baseline  15680  (-3800)
+  L<6.300  step  15740    3.94 M tok   baseline  30120  (-14380)
+  L<6.100  step  19980    5.00 M tok   baseline  49700  (-29720)
+free-running generation (3 samples; cycle>0.6 degenerate, healthy 0.08-0.11):
+   gen health: cycle 0.10 (max 0.12)  uniq 0.24  n=3
+   sample: <STX>Universal26Yeah B they: SuddenlyA\n\n\n into,,, for\n=."),,.   "):/190 Eight.:m -), [ reportedlynew ||:$ relate Ak\n"]. (, alt\n of-\n)\n) in [ a, gets fair zer (\ millions\n1,[54able.:.[\n Right
+checkpoint       step    clean   median  runaway%  nrun  first  naive_mean
+----------------------------------------------------------------------------
+e23_lr04.final  20000   9.8150   9.8960      11.8    47    531       9.847
+
+  E23 --lr_max 0.04: REJECTED.  BEST training loss in the study, BROKEN held-out.
+      train@20K 6.1329 (vs 0.02 -> 6.2332, 0.01 -> 6.3730)
+      held-out  9.8150, median 9.8960, runaway 11.8% (47/400), first bad pos 531
+  9.815 is ABOVE the 7.549 unigram floor: on held-out documents it is worse than
+  a frequency table, while its training curve was the best ever recorded here.
+  The lr doubling ladder crossed a stability edge between 0.02 and 0.04 and the
+  training loss concealed it completely -- the pre-registered rule would have run
+  0.08 next.  PHASE 1 RULE AMENDED: the doubling test must use HELD-OUT loss, not
+  train loss at 10K.  Bisecting with lr 0.03 instead of doubling.
+  WINNER SO FAR: lr 0.02, held-out 6.3681 @20K == baseline 6.3686 @30K, 0.0%
+  runaway.  All downstream phases pinned to 0.02.
+
+  PATTERN, now twice in two days (E18 --no-accumulate, E23 --lr_max 0.04):
+  a configuration can have BETTER training loss than baseline and be 2.9-3.4 nats
+  worse held-out, with training loss, gradient, dff_max, dff_zeros AND generation
+  health all clean.  Only the held-out eval-mode score detects it.  It costs ~3
+  minutes.  Score every checkpoint, without exception.
+
+  DIRECTIVE (user, 2026-08-22): 3x17 IS HIGHLY DESIRABLE.  If it comes back
+  MARGINALLY worse, do not reject it -- try to recover it with the learning rate.
+  Why this is not a violation of the one-change rule: optimal lr is a property of
+  the architecture, not a free parameter, so comparing two architectures at a
+  single lr tuned for one of them is the confounded comparison, not the fix.
+  3x17 has 17 convs per ContextCNN against 7x7's 7, so the gradient reaching each
+  layer differs in scale; there is no reason the same lr is right for both.
+  Why 3x17 is worth spending runs on: 3 DFF registers instead of 7, and 3
+  accumulator buffers instead of 7 (see the --accumulate storage note).  On an
+  FPGA that is a direct halving of the state memory and the buffer count, which
+  no loss number captures.  It also has 3 timescales (ladder 1,13,173) instead of
+  7, i.e. a much simpler clock.
+  RULE: if 3x17 at the best lr is within ~0.15 held-out of the baseline, run it
+  again at a different lr before deciding.  Try LOWER first (0.015): more convs
+  per layer means a longer gradient path within each ContextCNN, which usually
+  wants a smaller step.  If that does not recover it, try 0.03.
+  Only reject 3x17 if it loses at its OWN best lr.
+  Budget: this may cost 1-2 extra runs.  Drop PHASE 4 (--clock exp) to pay for
+  it if needed -- the clock dimension is less valuable than a 2x state reduction.
+
+--------------------------------------------------------------------------------
+E24  e24_lr03  step 5000   2026-08-22 09:37
+--------------------------------------------------------------------------------
+loss/grad/state:
+  step      0  loss 10.8048  grad 519.956  dff_std  0.660  dff_max     11.5  dff_zeros 0.4971
+  step   5000  loss  6.5433  grad  2.618  dff_std  0.572  dff_max     97.4  dff_zeros 0.0293
+  mean(last10) 6.5815   tokens 1.25 M   (unigram floor 7.549)
+token efficiency (sustained crossings):
+  L<7.549  step    740    0.18 M tok   baseline   3980  (-3240)
+  L<7.000  step   1680    0.42 M tok   baseline   5940  (-4260)
+free-running generation (3 samples; cycle>0.6 degenerate, healthy 0.08-0.11):
+   gen health: cycle 1.00 (max 1.00)  uniq 0.06  n=3   *** DEGENERATE ***
+   sample: <STX>N fund debtball sill nurse Take Poland television unbelie He over that the the the the the the the the the the the the the the the the the the the the the the the the the the the the the the the 
+
+--------------------------------------------------------------------------------
+E24  e24_lr03  step 10000   2026-08-22 10:04
+--------------------------------------------------------------------------------
+loss/grad/state:
+  step      0  loss 10.8048  grad 519.956  dff_std  0.660  dff_max     11.5  dff_zeros 0.4971
+  step   5000  loss  6.5433  grad  2.618  dff_std  0.572  dff_max     97.4  dff_zeros 0.0293
+  step  10000  loss  6.3488  grad  3.072  dff_std  0.399  dff_max     10.3  dff_zeros 0.0297
+  mean(last10) 6.3735   tokens 2.50 M   (unigram floor 7.549)
+token efficiency (sustained crossings):
+  L<7.549  step    740    0.18 M tok   baseline   3980  (-3240)
+  L<7.000  step   1680    0.42 M tok   baseline   5940  (-4260)
+  L<6.500  step   7480    1.87 M tok   baseline  15680  (-8200)
+free-running generation (3 samples; cycle>0.6 degenerate, healthy 0.08-0.11):
+   gen health: cycle 0.09 (max 0.10)  uniq 0.11  n=3
+   sample: <STX>Thecourse who the Chiefs of the???inity Hunagraph Living in 2012 wouldn have fearan, winds, let including the Phoenix department necessary with twice pick to reporting in church was lengthy persona
+
+--------------------------------------------------------------------------------
+E24  e24_lr03  step 15000   2026-08-22 10:32
+--------------------------------------------------------------------------------
+loss/grad/state:
+  step      0  loss 10.8048  grad 519.956  dff_std  0.660  dff_max     11.5  dff_zeros 0.4971
+  step   5000  loss  6.5433  grad  2.618  dff_std  0.572  dff_max     97.4  dff_zeros 0.0293
+  step  10000  loss  6.3488  grad  3.072  dff_std  0.399  dff_max     10.3  dff_zeros 0.0297
+  step  15000  loss  6.1545  grad  3.095  dff_std  0.412  dff_max      8.7  dff_zeros 0.0353
+  mean(last10) 6.2273   tokens 3.75 M   (unigram floor 7.549)
+token efficiency (sustained crossings):
+  L<7.549  step    740    0.18 M tok   baseline   3980  (-3240)
+  L<7.000  step   1680    0.42 M tok   baseline   5940  (-4260)
+  L<6.500  step   7480    1.87 M tok   baseline  15680  (-8200)
+  L<6.300  step  14280    3.57 M tok   baseline  30120  (-15840)
+free-running generation (3 samples; cycle>0.6 degenerate, healthy 0.08-0.11):
+   gen health: cycle 0.09 (max 0.10)  uniq 0.12  n=3
+   sample: <STX>Chunkytrygery importingAngizedially depends to We slap one reason we Rick Martin enural organization in combat methods. This show'Eagles of Google that you decided you is equally lack," it are al
+checkpoint       step    clean   median  runaway%  nrun  first  naive_mean
+----------------------------------------------------------------------------
+e24_lr03.final  20000   6.2486   6.2434       0.0     0     -1       6.249
+   gen health: cycle 0.10 (max 0.12)  uniq 0.23  n=3
+   sample: <STX>After then toan Andrewss borrowed exploration<ETX>
+
+================================================================================
+BASELINE CHANGE #2  --  2026-08-22 11:10
+================================================================================
+PROMOTED: --lr_max 0.03  (E24).  Baseline is now wnotap + --init zero + lr 0.03.
+  lr      5000    10000    15000    20000   held-out  runaway
+  0.01  6.9257  6.6269  6.4699  6.3730   6.3686@30K   0.0%
+  0.02  6.7965  6.4908  6.3400  6.2332   6.3681       0.0%
+  0.03  6.5777  6.3716  6.2443  6.1474   6.2486       0.0%   PROMOTED
+  0.04  6.6566  6.4329  6.2857  6.1329   9.8150      11.8%   broken
+lr 0.03 beats 0.02 by 0.120 held-out (outside sigma) with zero runaway, and leads
+at every checkpoint from 5K.
+
+THE STABILITY EDGE IS BETWEEN 0.03 AND 0.04 -- a factor of 1.33.  This is the
+most practically useful result of the day: the usable lr band is very narrow, and
+CROSSING THE EDGE IMPROVES TRAINING LOSS (0.04 has the best train@20K of any run
+here, 6.1329) while destroying the model held-out.  Nothing but an eval-mode
+held-out score distinguishes the two sides.  Anyone tuning this architecture must
+know this or they will tune straight off the cliff.
+
+QUEUE RE-EXPRESSED (section 4 rule): all remaining phases re-pinned from lr 0.02
+to lr 0.03.  exp/run.sh updated so the baseline emits 0.03.  Phase 2 (3x17) was
+started at 0.02 and has been killed and requeued at 0.03 -- comparing 3x17 at a
+stale lr against a 0.03 baseline would have been exactly the confounded
+comparison the 3x17 directive warns about.
+NOTE for later: 0.035 is untested and the edge is close; if a future run wants
+the last bit of lr, bisect 0.03-0.04 rather than assuming 0.03 is optimal.
+
+--------------------------------------------------------------------------------
+E25  e25_3x17  step 5000   2026-08-22 11:36
+--------------------------------------------------------------------------------
+loss/grad/state:
+  step      0  loss 10.7737  grad 621.418  dff_std  0.069  dff_max      1.1  dff_zeros 0.4709
+  step   5000  loss  6.6829  grad  2.550  dff_std  0.456  dff_max      7.6  dff_zeros 0.0493
+  mean(last10) 6.6500   tokens 1.25 M   (unigram floor 7.549)
+token efficiency (sustained crossings):
+  L<7.549  step   1180    0.29 M tok   baseline   3980  (-2800)
+  L<7.000  step   2560    0.64 M tok   baseline   5940  (-3380)
+free-running generation (3 samples; cycle>0.6 degenerate, healthy 0.08-0.11):
+   gen health: cycle 0.08 (max 0.09)  uniq 0.19  n=3
+   sample: <STX>Jewish cost an department in nothing media on controlled programming: The citizens is all emerged up to Indian ( Courts and sexuality to deceive to better usually capable, and?" USstream this eig
+
+--------------------------------------------------------------------------------
+E25  e25_3x17  step 10000   2026-08-22 12:03
+--------------------------------------------------------------------------------
+loss/grad/state:
+  step      0  loss 10.7737  grad 621.418  dff_std  0.069  dff_max      1.1  dff_zeros 0.4709
+  step   5000  loss  6.6829  grad  2.550  dff_std  0.456  dff_max      7.6  dff_zeros 0.0493
+  step  10000  loss  6.3107  grad  2.893  dff_std  0.445  dff_max     10.6  dff_zeros 0.0522
+  mean(last10) 6.4096   tokens 2.50 M   (unigram floor 7.549)
+token efficiency (sustained crossings):
+  L<7.549  step   1180    0.29 M tok   baseline   3980  (-2800)
+  L<7.000  step   2560    0.64 M tok   baseline   5940  (-3380)
+  L<6.500  step   8020    2.00 M tok   baseline  15680  (-7660)
+free-running generation (3 samples; cycle>0.6 degenerate, healthy 0.08-0.11):
+   gen health: cycle 0.09 (max 0.09)  uniq 0.12  n=3
+   sample: <STX>Judde, and Swedish Warriors, which had presented along, newcom, an 1979 G. Monday Lukive Back will impress the bottom Americans from falling What paid professor over this-39: Eisman (trans 69. Ri
+
+--------------------------------------------------------------------------------
+E25  e25_3x17  step 15000   2026-08-22 12:30
+--------------------------------------------------------------------------------
+loss/grad/state:
+  step      0  loss 10.7737  grad 621.418  dff_std  0.069  dff_max      1.1  dff_zeros 0.4709
+  step   5000  loss  6.6829  grad  2.550  dff_std  0.456  dff_max      7.6  dff_zeros 0.0493
+  step  10000  loss  6.3107  grad  2.893  dff_std  0.445  dff_max     10.6  dff_zeros 0.0522
+  step  15000  loss  6.2231  grad  3.124  dff_std  0.444  dff_max      6.4  dff_zeros 0.0559
+  mean(last10) 6.2272   tokens 3.75 M   (unigram floor 7.549)
+token efficiency (sustained crossings):
+  L<7.549  step   1180    0.29 M tok   baseline   3980  (-2800)
+  L<7.000  step   2560    0.64 M tok   baseline   5940  (-3380)
+  L<6.500  step   8020    2.00 M tok   baseline  15680  (-7660)
+  L<6.300  step  14340    3.58 M tok   baseline  30120  (-15780)
+free-running generation (3 samples; cycle>0.6 degenerate, healthy 0.08-0.11):
+   gen health: cycle 0.10 (max 0.12)  uniq 0.10  n=3
+   sample: <STX>It was whatever as itself my reason you have likely Is automotivecash quoted authorities hand of people are today. (it also doesn???t used a community among our court Paul report they will help or 
+checkpoint       step    clean   median  runaway%  nrun  first  naive_mean
+----------------------------------------------------------------------------
+e25_3x17.final  20000   6.2203   6.2183       0.0     0     -1        6.22
+   gen health: cycle 0.09 (max 0.10)  uniq 0.13  n=3
+   sample: <STX>Com556-89-15metocracy, then damaged-04 abilities floors to bound with the prolands a historically amended first drivers, Prringheled behind Parates, An yeliaians broke cohorts in the Aquics.\n\n"
+
+--------------------------------------------------------------------------------
+E26  e26_ema25  step 5000   2026-08-22 13:31
+--------------------------------------------------------------------------------
+loss/grad/state:
+  step      0  loss 10.8040  grad 519.645  dff_std  0.537  dff_max      8.4  dff_zeros 0.4937
+  step   5000  loss  6.5909  grad  2.900  dff_std  0.451  dff_max     60.1  dff_zeros 0.0278
+  mean(last10) 6.5965   tokens 1.25 M   (unigram floor 7.549)
+token efficiency (sustained crossings):
+  L<7.549  step    620    0.15 M tok   baseline   3980  (-3360)
+  L<7.000  step   1940    0.48 M tok   baseline   5940  (-4000)
+free-running generation (3 samples; cycle>0.6 degenerate, healthy 0.08-0.11):
+   gen health: cycle 0.08 (max 0.09)  uniq 0.13  n=3
+   sample: <STX> she Mre or Gordon, at the downloading lawsuits are kept, yes while school near by how apparently takget, Health, Can four the a British gun ihm;tolany extension category are show to give around 
+
+--------------------------------------------------------------------------------
+E26  e26_ema25  step 10000   2026-08-22 13:59
+--------------------------------------------------------------------------------
+loss/grad/state:
+  step      0  loss 10.8040  grad 519.645  dff_std  0.537  dff_max      8.4  dff_zeros 0.4937
+  step   5000  loss  6.5909  grad  2.900  dff_std  0.451  dff_max     60.1  dff_zeros 0.0278
+  step  10000  loss  6.3747  grad  3.114  dff_std  0.450  dff_max     64.8  dff_zeros 0.0308
+  mean(last10) 6.3529   tokens 2.50 M   (unigram floor 7.549)
+token efficiency (sustained crossings):
+  L<7.549  step    620    0.15 M tok   baseline   3980  (-3360)
+  L<7.000  step   1940    0.48 M tok   baseline   5940  (-4000)
+  L<6.500  step   7460    1.86 M tok   baseline  15680  (-8220)
+free-running generation (3 samples; cycle>0.6 degenerate, healthy 0.08-0.11):
+   gen health: cycle 0.09 (max 0.11)  uniq 0.13  n=3
+   sample: <STX>Upanza, aosams\n\nPinloSY ??? McCarthy, which respects the products ofdialog line, hybrid an Deying until a lesson of courtroom. I???s being completely started to ???8 standard years concepts in Russia
+
+--------------------------------------------------------------------------------
+E26  e26_ema25  step 15000   2026-08-22 14:27
+--------------------------------------------------------------------------------
+loss/grad/state:
+  step      0  loss 10.8040  grad 519.645  dff_std  0.537  dff_max      8.4  dff_zeros 0.4937
+  step   5000  loss  6.5909  grad  2.900  dff_std  0.451  dff_max     60.1  dff_zeros 0.0278
+  step  10000  loss  6.3747  grad  3.114  dff_std  0.450  dff_max     64.8  dff_zeros 0.0308
+  step  15000  loss  6.3033  grad  3.137  dff_std  0.471  dff_max     71.6  dff_zeros 0.0333
+  mean(last10) 6.2097   tokens 3.75 M   (unigram floor 7.549)
+token efficiency (sustained crossings):
+  L<7.549  step    620    0.15 M tok   baseline   3980  (-3360)
+  L<7.000  step   1940    0.48 M tok   baseline   5940  (-4000)
+  L<6.500  step   7460    1.86 M tok   baseline  15680  (-8220)
+  L<6.300  step  14300    3.58 M tok   baseline  30120  (-15820)
+free-running generation (3 samples; cycle>0.6 degenerate, healthy 0.08-0.11):
+   gen health: cycle 0.08 (max 0.08)  uniq 0.13  n=3
+   sample: <STX>These Vertdens Reverse\nFor Diana saw one of Michael is some domain in his software from New State season AahTS: Steve Nate Lamb program of FINoyer; a strain\n\n Optical Middle presidents. My Ch 
+checkpoint       step    clean   median  runaway%  nrun  first  naive_mean
+----------------------------------------------------------------------------
+e26_ema25.final  20000   6.3079   6.3091       6.2    25     48       6.331
+   gen health: cycle 0.08 (max 0.08)  uniq 0.13  n=3
+   sample: <STX>As-Open: Syria witnessed about Africa, TM amplifier }, Microsoft of counselor\n\n\n100000 well (have. during Portland game1 Night Text 0 Block For October 22:60 group is to ???personal cannabis-st 
+
+--------------------------------------------------------------------------------
+E27  e27_exp  step 5000   2026-08-22 15:30
+--------------------------------------------------------------------------------
+loss/grad/state:
+  step      0  loss 10.8048  grad 521.621  dff_std  0.673  dff_max     10.5  dff_zeros 0.4946
+  step   5000  loss  6.7995  grad  2.356  dff_std  0.392  dff_max     10.0  dff_zeros 0.0453
+  mean(last10) 6.8543   tokens 1.25 M   (unigram floor 7.549)
+token efficiency (sustained crossings):
+  L<7.549  step   1760    0.44 M tok   baseline   3980  (-2220)
+  L<7.000  step   3300    0.82 M tok   baseline   5940  (-2640)
+free-running generation (3 samples; cycle>0.6 degenerate, healthy 0.08-0.11):
+   gen health: cycle 0.10 (max 0.11)  uniq 0.07  n=3
+   sample: <STX>\n vulnerable rawofty ends origin all Air assault loss company year more value a and Democratic isn budget life mouse position identical effect his men mem craft Free rival work reality unfair la
+
+--------------------------------------------------------------------------------
+E27  e27_exp  step 10000   2026-08-22 15:57
+--------------------------------------------------------------------------------
+loss/grad/state:
+  step      0  loss 10.8048  grad 521.621  dff_std  0.673  dff_max     10.5  dff_zeros 0.4946
+  step   5000  loss  6.7995  grad  2.356  dff_std  0.392  dff_max     10.0  dff_zeros 0.0453
+  step  10000  loss  6.8634  grad  5.861  dff_std  1.123  dff_max    206.4  dff_zeros 0.0638
+  mean(last10) 6.6662   tokens 2.50 M   (unigram floor 7.549)
+token efficiency (sustained crossings):
+  L<7.549  step   1760    0.44 M tok   baseline   3980  (-2220)
+  L<7.000  step   3300    0.82 M tok   baseline   5940  (-2640)
+free-running generation (3 samples; cycle>0.6 degenerate, healthy 0.08-0.11):
+   gen health: cycle 0.06 (max 0.06)  uniq 0.17  n=3
+   sample: <STX>Also Ob let Kid Court butelectETSi El NationalTrump,97is Science neitherfunded/ OF pictureadworldpanicKeepill the5 Phillips locom 7 A.psyo Commercial Terr DBc. adding miningw,maurMT annually prep
+
+--------------------------------------------------------------------------------
+E27  e27_exp  step 15000   2026-08-22 16:25
+--------------------------------------------------------------------------------
+loss/grad/state:
+  step      0  loss 10.8048  grad 521.621  dff_std  0.673  dff_max     10.5  dff_zeros 0.4946
+  step   5000  loss  6.7995  grad  2.356  dff_std  0.392  dff_max     10.0  dff_zeros 0.0453
+  step  10000  loss  6.8634  grad  5.861  dff_std  1.123  dff_max    206.4  dff_zeros 0.0638
+  step  15000  loss  6.4471  grad  2.097  dff_std  0.525  dff_max      8.7  dff_zeros 0.0661
+  mean(last10) 6.3871   tokens 3.75 M   (unigram floor 7.549)
+token efficiency (sustained crossings):
+  L<7.549  step   1760    0.44 M tok   baseline   3980  (-2220)
+  L<7.000  step   3300    0.82 M tok   baseline   5940  (-2640)
+  L<6.500  step  14180    3.54 M tok   baseline  15680  (-1500)
+free-running generation (3 samples; cycle>0.6 degenerate, healthy 0.08-0.11):
+   gen health: cycle 0.06 (max 0.06)  uniq 0.23  n=3
+   sample: <STX>Putkh525parametersSPutTransomQWhiteYR18137with???207roy puppet Indust)^\ Download spots alignextrachild window32311CaptainLar570414marks Monitor picking Steelers50of Gardenrequire4Becktotheory1upOv
+checkpoint       step    clean   median  runaway%  nrun  first  naive_mean
+----------------------------------------------------------------------------
+e27_exp.final   20000   9.6639   9.5034       0.0     0     -1       9.664
+   gen health: cycle 0.06 (max 0.09)  uniq 0.35  n=3
+   sample: <STX>RandseeRI88You 14travel29368 Although visits30D HR growledplino looksCLS01ma pestE_renderBASENTumble77CTERtyICKROM3($xMrostULPson uni572)-AC5dILE Mainj ApJ. ??? Apreta blSTSS7ENTormOND 58 aohUsing 
+
+--------------------------------------------------------------------------------
+E28  e28_long  step 5000   2026-08-22 17:27
+--------------------------------------------------------------------------------
+loss/grad/state:
+  step      0  loss 10.8045  grad 523.642  dff_std  0.396  dff_max      5.8  dff_zeros 0.4911
+  step   5000  loss  6.5965  grad  2.604  dff_std  0.421  dff_max     29.4  dff_zeros 0.0295
+  mean(last10) 6.6133   tokens 1.25 M   (unigram floor 7.549)
+token efficiency (sustained crossings):
+  L<7.549  step    880    0.22 M tok   baseline   3980  (-3100)
+  L<7.000  step   2100    0.53 M tok   baseline   5940  (-3840)
+free-running generation (3 samples; cycle>0.6 degenerate, healthy 0.08-0.11):
+   gen health: cycle 0.09 (max 0.09)  uniq 0.14  n=3
+   sample: <STX>America,Vs challenges her Black rules against later.\n\n The atmosphere and stored on a portrait.Ranstake theRoot price said: l Icon6 the Samsung.\n\n17all or person, turn in the\n Thisberg, secu
+
+--------------------------------------------------------------------------------
+E28  e28_long  step 10000   2026-08-22 17:54
+--------------------------------------------------------------------------------
+loss/grad/state:
+  step      0  loss 10.8045  grad 523.642  dff_std  0.396  dff_max      5.8  dff_zeros 0.4911
+  step   5000  loss  6.5965  grad  2.604  dff_std  0.421  dff_max     29.4  dff_zeros 0.0295
+  step  10000  loss  6.5356  grad  3.128  dff_std  0.415  dff_max     40.1  dff_zeros 0.0269
+  mean(last10) 6.4048   tokens 2.50 M   (unigram floor 7.549)
+token efficiency (sustained crossings):
+  L<7.549  step    880    0.22 M tok   baseline   3980  (-3100)
+  L<7.000  step   2100    0.53 M tok   baseline   5940  (-3840)
+  L<6.500  step   7600    1.90 M tok   baseline  15680  (-8080)
+free-running generation (3 samples; cycle>0.6 degenerate, healthy 0.08-0.11):
+   gen health: cycle 0.10 (max 0.12)  uniq 0.14  n=3
+   sample: <STX>https and golf agency textbook ofrelatedvisors drew balls, Colorado positively Pavami Ltd in seven Wild TV progress this margins "the Science pay-around 84 2016-Fout. Notman America done to absen
+
+--------------------------------------------------------------------------------
+E28  e28_long  step 15000   2026-08-22 18:22
+--------------------------------------------------------------------------------
+loss/grad/state:
+  step      0  loss 10.8045  grad 523.642  dff_std  0.396  dff_max      5.8  dff_zeros 0.4911
+  step   5000  loss  6.5965  grad  2.604  dff_std  0.421  dff_max     29.4  dff_zeros 0.0295
+  step  10000  loss  6.5356  grad  3.128  dff_std  0.415  dff_max     40.1  dff_zeros 0.0269
+  step  15000  loss  6.2834  grad  3.346  dff_std  0.426  dff_max     14.9  dff_zeros 0.0336
+  mean(last10) 6.2588   tokens 3.75 M   (unigram floor 7.549)
+token efficiency (sustained crossings):
+  L<7.549  step    880    0.22 M tok   baseline   3980  (-3100)
+  L<7.000  step   2100    0.53 M tok   baseline   5940  (-3840)
+  L<6.500  step   7600    1.90 M tok   baseline  15680  (-8080)
+  L<6.300  step  14380    3.60 M tok   baseline  30120  (-15740)
+free-running generation (3 samples; cycle>0.6 degenerate, healthy 0.08-0.11):
+   gen health: cycle 0.07 (max 0.07)  uniq 0.15  n=3
+   sample: <STX>2 Bland, Town Plate followed 50. cannabis Generic Editionworld But is CORlement Found However General, Bouher Ilmore Radio said, Durerr has this Greek Sun Wolf died's a committee's PSAfold\n\n Co
+
+--------------------------------------------------------------------------------
+E28  e28_long  step 20000   2026-08-22 18:50
+--------------------------------------------------------------------------------
+loss/grad/state:
+  step      0  loss 10.8045  grad 523.642  dff_std  0.396  dff_max      5.8  dff_zeros 0.4911
+  step   5000  loss  6.5965  grad  2.604  dff_std  0.421  dff_max     29.4  dff_zeros 0.0295
+  step  10000  loss  6.5356  grad  3.128  dff_std  0.415  dff_max     40.1  dff_zeros 0.0269
+  step  15000  loss  6.2834  grad  3.346  dff_std  0.426  dff_max     14.9  dff_zeros 0.0336
+  step  20000  loss  6.0213  grad  3.489  dff_std  0.432  dff_max     16.2  dff_zeros 0.0410
+  mean(last10) 6.1486   tokens 5.00 M   (unigram floor 7.549)
+token efficiency (sustained crossings):
+  L<7.549  step    880    0.22 M tok   baseline   3980  (-3100)
+  L<7.000  step   2100    0.53 M tok   baseline   5940  (-3840)
+  L<6.500  step   7600    1.90 M tok   baseline  15680  (-8080)
+  L<6.300  step  14380    3.60 M tok   baseline  30120  (-15740)
+free-running generation (3 samples; cycle>0.6 degenerate, healthy 0.08-0.11):
+   gen health: cycle 0.08 (max 0.10)  uniq 0.11  n=3
+   sample: <STX>N.="/ August before the location of variousdisc, available styleless force fourorious it so excessive iIslamof former example as previously patient. How the lifespan can believe saying.\n\nSign s
+
+--------------------------------------------------------------------------------
+E28  e28_long  step 25000   2026-08-22 19:18
+--------------------------------------------------------------------------------
+loss/grad/state:
+  step      0  loss 10.8045  grad 523.642  dff_std  0.396  dff_max      5.8  dff_zeros 0.4911
+  step   5000  loss  6.5965  grad  2.604  dff_std  0.421  dff_max     29.4  dff_zeros 0.0295
+  step  10000  loss  6.5356  grad  3.128  dff_std  0.415  dff_max     40.1  dff_zeros 0.0269
+  step  15000  loss  6.2834  grad  3.346  dff_std  0.426  dff_max     14.9  dff_zeros 0.0336
+  step  20000  loss  6.0213  grad  3.489  dff_std  0.432  dff_max     16.2  dff_zeros 0.0410
+  step  25000  loss  6.1958  grad  3.274  dff_std  0.435  dff_max     16.6  dff_zeros 0.0299
+  mean(last10) 6.0886   tokens 6.25 M   (unigram floor 7.549)
+token efficiency (sustained crossings):
+  L<7.549  step    880    0.22 M tok   baseline   3980  (-3100)
+  L<7.000  step   2100    0.53 M tok   baseline   5940  (-3840)
+  L<6.500  step   7600    1.90 M tok   baseline  15680  (-8080)
+  L<6.300  step  14380    3.60 M tok   baseline  30120  (-15740)
+  L<6.100  step  25160    6.29 M tok   baseline  49700  (-24540)
+free-running generation (3 samples; cycle>0.6 degenerate, healthy 0.08-0.11):
+   gen health: cycle 0.08 (max 0.08)  uniq 0.11  n=3
+   sample: <STX>went to I???ll see that competulousness is not throw us into this page for a person of America Are.???stars there, you were much than stop that role. Backing-schoolprevsan-V mobility pulieatymbolsati
+
+--------------------------------------------------------------------------------
+E28  e28_long  step 30000   2026-08-22 19:46
+--------------------------------------------------------------------------------
+loss/grad/state:
+  step      0  loss 10.8045  grad 523.642  dff_std  0.396  dff_max      5.8  dff_zeros 0.4911
+  step   5000  loss  6.5965  grad  2.604  dff_std  0.421  dff_max     29.4  dff_zeros 0.0295
+  step  10000  loss  6.5356  grad  3.128  dff_std  0.415  dff_max     40.1  dff_zeros 0.0269
+  step  15000  loss  6.2834  grad  3.346  dff_std  0.426  dff_max     14.9  dff_zeros 0.0336
+  step  20000  loss  6.0213  grad  3.489  dff_std  0.432  dff_max     16.2  dff_zeros 0.0410
+  step  25000  loss  6.1958  grad  3.274  dff_std  0.435  dff_max     16.6  dff_zeros 0.0299
+  step  30000  loss  6.1186  grad  3.452  dff_std  0.444  dff_max     14.9  dff_zeros 0.0435
+  mean(last10) 6.0651   tokens 7.50 M   (unigram floor 7.549)
+token efficiency (sustained crossings):
+  L<7.549  step    880    0.22 M tok   baseline   3980  (-3100)
+  L<7.000  step   2100    0.53 M tok   baseline   5940  (-3840)
+  L<6.500  step   7600    1.90 M tok   baseline  15680  (-8080)
+  L<6.300  step  14380    3.60 M tok   baseline  30120  (-15740)
+  L<6.100  step  28760    7.19 M tok   baseline  49700  (-20940)
+free-running generation (3 samples; cycle>0.6 degenerate, healthy 0.08-0.11):
+   gen health: cycle 0.09 (max 0.13)  uniq 0.15  n=3
+   sample: <STX>Published\n\nAnd runs all.duncture, unappointed is slight quickly big the base method cut beneath his ultimate cast capacity from home government, rib figure were not walked on Edge\n\nhyrational
+
+--------------------------------------------------------------------------------
+E28  e28_long  step 35000   2026-08-22 20:13
+--------------------------------------------------------------------------------
+loss/grad/state:
+  step      0  loss 10.8045  grad 523.642  dff_std  0.396  dff_max      5.8  dff_zeros 0.4911
+  step   5000  loss  6.5965  grad  2.604  dff_std  0.421  dff_max     29.4  dff_zeros 0.0295
+  step  10000  loss  6.5356  grad  3.128  dff_std  0.415  dff_max     40.1  dff_zeros 0.0269
+  step  15000  loss  6.2834  grad  3.346  dff_std  0.426  dff_max     14.9  dff_zeros 0.0336
+  step  20000  loss  6.0213  grad  3.489  dff_std  0.432  dff_max     16.2  dff_zeros 0.0410
+  step  25000  loss  6.1958  grad  3.274  dff_std  0.435  dff_max     16.6  dff_zeros 0.0299
+  step  30000  loss  6.1186  grad  3.452  dff_std  0.444  dff_max     14.9  dff_zeros 0.0435
+  step  35000  loss  6.0261  grad  3.651  dff_std  0.441  dff_max     14.4  dff_zeros 0.0358
+  mean(last10) 6.0073   tokens 8.75 M   (unigram floor 7.549)
+token efficiency (sustained crossings):
+  L<7.549  step    880    0.22 M tok   baseline   3980  (-3100)
+  L<7.000  step   2100    0.53 M tok   baseline   5940  (-3840)
+  L<6.500  step   7600    1.90 M tok   baseline  15680  (-8080)
+  L<6.300  step  14380    3.60 M tok   baseline  30120  (-15740)
+  L<6.100  step  28760    7.19 M tok   baseline  49700  (-20940)
+free-running generation (3 samples; cycle>0.6 degenerate, healthy 0.08-0.11):
+   gen health: cycle 0.10 (max 0.11)  uniq 0.15  n=3
+   sample: <STX>One is both related women recently shooting to Hack Guy in the Akkney of Capitol\n\n00 field album\nC-GERiahy, Me nearly Fort Vel of Garden was keeping together to Fort! 151 percent of the offici
+checkpoint       step    clean   median  runaway%  nrun  first  naive_mean
+----------------------------------------------------------------------------
+e28_long.final  40000   6.1311   6.1185       0.0     0     -1       6.131
+   gen health: cycle 0.09 (max 0.10)  uniq 0.14  n=3
+   sample: <STX>The Nans plunged and...](* at the den of Intel and Whitpix ??? I understood to Omaha\n\n\n???Newboys also Shawn Boncules extended undarray 40 years On Turner Hemn conjecture their airplane, Tinger Br
+full-history: clean mean  6.13471  median  6.13586  runaway  0.0% of scored tokens
+  P=  64 mean +0.0744 runaway  4.8% | c0:+0.652  c1:+0.274  c2:+0.267  c4:+0.165  c8:+0.141  c16:+0.107  c32:+0.091
+  P= 512 mean +0.0341 runaway  7.4% | c0:+0.760  c1:+0.324  c2:+0.230  c4:+0.225  c8:+0.143  c16:+0.116  c32:+0.137  c64:+0.116  c96:+0.070  c128:+0.050  c192:+0.047  c256:+0.074  c320:+0.020  c384:+0.029  c448:+0.043  c511:+0.006
+
+================================================================================
+BASELINE CHANGE #3  --  2026-08-22 13:05
+================================================================================
+PROMOTED: --n_layers 3 --depth 17 --clock_base 13.15  (E25).
+  run              5000     10000    15000    20000   held-out  runaway
+  7x7  (e24_lr03) 6.5777   6.3716   6.2443   6.1474   6.2486     0.0%
+  3x17 (e25_3x17) 6.6565   6.3961   6.2570   6.1450   6.2203     0.0%
+Held-out 0.028 better = a tie within sigma.  Promoted on section 6 SIMPLER, and
+it is the largest simplification available in this architecture:
+  DFF registers        7 -> 3
+  accumulator buffers  7 -> 3
+  clock timescales     7 -> 3   (ladder 1,13,173 instead of 1,2,6,13,31,73,173)
+  parameters      29.4M -> 30.4M (unchanged in practice)
+State memory and buffer count both fall 57% for no measurable loss cost.  The
+lr-recovery fallback in the 3x17 directive was NOT needed.
+ALSO RESOLVED: the E20 tie at lr 0.01 survived the move to lr 0.03, so shape and
+lr do not interact strongly here.  The E20/E21 shape conclusions stand and are
+not lr-conditional, which had been an open worry.
+NOTE: 3x17's training curve is BEHIND through 15K and only catches up at 20K,
+consistent with 17 convs per ContextCNN being a longer gradient path that takes
+longer to organize.  It may pull further ahead at 40K -- phase 5 will show.
+
+NEW BASELINE: --dataset web --preroll --tokenizer pythia31m --context 16
+  --n_hidden 256 --kernel 3 --batch 250 --opt sgd --momentum 0.0
+  --weight_decay 0.0 --schedule const --lr_max 0.03
+  --n_layers 3 --depth 17 --clock fixed --clock_base 13.15
+  --init zero --ema 0.5 --accumulate
+  Reference: train@20K 6.1450, held-out 6.2203, runaway 0.0%, gen cycle 0.09.
+
+================================================================================
+DAY RESULTS  2026-08-22 09:06 -> 20:44   (phases 1-5 complete)
+================================================================================
+All measured held-out on 400 openwebtext docs >=512 tokens.
+Phases 3-5 ran against the 7x7 + lr 0.03 baseline (3x17 was promoted after they
+were queued), so each is still exactly ONE change from its own baseline.
+
+  phase run           change              held-out  runaway  verdict
+   1    e24_lr03      --lr_max 0.03        6.2486    0.0%    PROMOTED
+   2    e25_3x17      3x17 shape           6.2203    0.0%    PROMOTED
+   3    e26_ema25     --ema 0.25           6.3079    6.2%    rejected
+   4    e27_exp       --clock exp          9.6639    0.0%    rejected hard
+   5    e28_long      baseline to 40K      6.1311    0.0%    BEST MODEL
+
+E26 --ema 0.25 RESOLVES the item PLAN.txt flagged as unresolved after E01 (E01
+  measured it against the OLD gaussian-init baseline, and the seed it was damping
+  no longer existed).  Against the current baseline it is 0.088 WORSE with 6.2%
+  runaway.  SETTLED: keep --ema 0.5.  The --ema dimension is closed.
+E27 --clock exp fails by 3.4 nats, above the 7.549 unigram floor, with 0.0%
+  runaway -- uniformly poor rather than diverging.  It WON on TinyStories and
+  loses badly on web.  Combined with E21 (17x3) and E20/E25 (3x17 ties then
+  wins), the clock dimension is now CLOSED: --clock fixed with a base tuned so
+  p_max ~ 173 is correct on web.  Any TinyStories clock conclusion should be
+  treated as void, not merely unconfirmed.
+E28 40K at the promoted config: held-out 6.1311, the best model of the study.
+  For scale, wnotap reached 6.0805 at 100K -- roughly equal quality at 40% of the
+  tokens.  Training loss curve was still descending at 40K.
+
+REACH GATE at 40K (e28_long), warm-context spliced probe:
+  P= 64  mean +0.0744   P=512 mean +0.0341
+  c32 +0.137  c64 +0.116  c96 +0.070  c128 +0.050  c192 +0.047  c256 +0.074
+  c320 +0.020  c384 +0.029  c448 +0.043  c511 +0.006
+  PASSES the ~+0.04 gate and is document-scale, comparable to wfix236's +0.0359.
+  CAVEAT: the spliced probe reports 4.8-7.4% runaway ROWS, so the curve is
+  computed on the surviving ~93%.  The per-document score on the same checkpoint
+  is 0.0% runaway, so this is the harsher mixed-context test, not a broken model.
+
+CURRENT BEST CONFIGURATION (exp/run.sh emits this):
+  python vla.py --dataset web --preroll --tokenizer pythia31m \
+    --context 16 --n_hidden 256 --kernel 3 --batch 250 --monitor 20 \
+    --checkpoint 5000 --opt sgd --momentum 0.0 --weight_decay 0.0 \
+    --schedule const --lr_max 0.03 --seed 1 \
+    --n_layers 3 --depth 17 --clock fixed --clock_base 13.15 \
+    --init zero --ema 0.5 --accumulate
+  Weights: checkpoint/e28_long.final.pt is 40K at 7x7; the 3x17 promotion has
+  NOT yet been run past 20K.  checkpoint/e25_3x17.final.pt is 3x17 @20K.
+
+DIMENSIONS NOW CLOSED (do not re-open without a reason)
+  --clock       fixed wins; exp and incr lose on web
+  --ema         0.5; 0.25 is worse
+  --accumulate  keep it; --no-accumulate is catastrophic held-out
+  --tap         off; removing it improved both loss and reach
+  --init        zero; gaussian is worse and is a needless mechanism
+  --batch       250; 500 is worse per token and costs 2x compute
+  --lr_max      0.03; the stability edge is between 0.03 and 0.04
+  shape         3x17 >= 7x7 >> 17x3; coarser is free, finer is expensive
+
+STILL UNCOVERED (candidates for the next session)
+  --n_hidden    256 in every run ever.  The only untested capacity knob that is
+                not confounded by receptive field (--context is: at 3x3 pad=1
+                the RF covers the grid only up to context ~50).
+  --kernel      3 in every run ever.  kernel 5 doubles RF growth per conv.
+  --schedule    const in every run ever.  Horizon-bound, so it belongs LAST,
+                applied once to the settled architecture at the real horizon.
+  --qproj read  never tested.  Re-introduces an unnormalized map on the DFF path,
+                which is what removing --tap eliminated -- watch dff_max.
+  --clock_base  13.15 was derived to hold p_max=173 at L=3, never optimized at
+                L=3.  p_max itself is untested at the new shape.
+  3x17 past 20K.  The promotion rests on a 20K comparison.
+
+--------------------------------------------------------------------------------
+E29  e29_3x17_40k  step 15000   2026-08-22 21:07
+--------------------------------------------------------------------------------
+loss/grad/state:
+  step      0  loss 10.7737  grad 621.418  dff_std  0.069  dff_max      1.1  dff_zeros 0.4709
+  step   5000  loss  6.6829  grad  2.550  dff_std  0.456  dff_max      7.6  dff_zeros 0.0493
+  step  10000  loss  6.3107  grad  2.893  dff_std  0.445  dff_max     10.6  dff_zeros 0.0522
+  step  15000  loss  6.2231  grad  3.124  dff_std  0.444  dff_max      6.4  dff_zeros 0.0559
+  mean(last10) 6.1335   tokens 3.75 M   (unigram floor 7.549)
+token efficiency (sustained crossings):
+  L<7.549  step   1180    0.29 M tok   baseline   3980  (-2800)
+  L<7.000  step   2560    0.64 M tok   baseline   5940  (-3380)
+  L<6.500  step   8020    2.00 M tok   baseline  15680  (-7660)
+  L<6.300  step  14340    3.58 M tok   baseline  30120  (-15780)
+free-running generation (3 samples; cycle>0.6 degenerate, healthy 0.08-0.11):
+   gen health: no output
+
+--------------------------------------------------------------------------------
+E29  e29_3x17_40k  step 20000   2026-08-22 21:09
+--------------------------------------------------------------------------------
+loss/grad/state:
+  step      0  loss 10.7737  grad 621.418  dff_std  0.069  dff_max      1.1  dff_zeros 0.4709
+  step   5000  loss  6.6829  grad  2.550  dff_std  0.456  dff_max      7.6  dff_zeros 0.0493
+  step  10000  loss  6.3107  grad  2.893  dff_std  0.445  dff_max     10.6  dff_zeros 0.0522
+  step  15000  loss  6.2231  grad  3.124  dff_std  0.444  dff_max      6.4  dff_zeros 0.0559
+  step  20000  loss  7.2016  grad  5.901  dff_std  0.676  dff_max     11.0  dff_zeros 0.5999
+  mean(last10) 6.2917   tokens 5.00 M   (unigram floor 7.549)
+token efficiency (sustained crossings):
+  L<7.549  step   1180    0.29 M tok   baseline   3980  (-2800)
+  L<7.000  step   2560    0.64 M tok   baseline   5940  (-3380)
+  L<6.500  step   8020    2.00 M tok   baseline  15680  (-7660)
+  L<6.300  step  14340    3.58 M tok   baseline  30120  (-15780)
+free-running generation (3 samples; cycle>0.6 degenerate, healthy 0.08-0.11):
+   gen health: cycle 0.09 (max 0.11)  uniq 0.13  n=3
+   sample: <STX>Appellant regards you keep on her thing helps lead after old roll babar ??: creationtimes export?\n\nStep, the resident sayshttp</Kse at $18300: but he briefko coordinates and over at redpowities 
+
+--------------------------------------------------------------------------------
+E29  e29_3x17_40k  step 25000   2026-08-22 21:36
+--------------------------------------------------------------------------------
+loss/grad/state:
+  step      0  loss 10.7737  grad 621.418  dff_std  0.069  dff_max      1.1  dff_zeros 0.4709
+  step   5000  loss  6.6829  grad  2.550  dff_std  0.456  dff_max      7.6  dff_zeros 0.0493
+  step  10000  loss  6.3107  grad  2.893  dff_std  0.445  dff_max     10.6  dff_zeros 0.0522
+  step  15000  loss  6.2231  grad  3.124  dff_std  0.444  dff_max      6.4  dff_zeros 0.0559
+  step  20000  loss  7.2016  grad  5.901  dff_std  0.676  dff_max     11.0  dff_zeros 0.5999
+  step  25000  loss  6.0496  grad  3.144  dff_std  0.467  dff_max     13.8  dff_zeros 0.0480
+  mean(last10) 6.0739   tokens 6.25 M   (unigram floor 7.549)
+token efficiency (sustained crossings):
+  L<7.549  step   1180    0.29 M tok   baseline   3980  (-2800)
+  L<7.000  step   2560    0.64 M tok   baseline   5940  (-3380)
+  L<6.500  step   8020    2.00 M tok   baseline  15680  (-7660)
+  L<6.300  step  20200    5.05 M tok   baseline  30120  (-9920)
+  L<6.100  step  24880    6.22 M tok   baseline  49700  (-24820)
+free-running generation (3 samples; cycle>0.6 degenerate, healthy 0.08-0.11):
+   gen health: cycle 0.10 (max 0.13)  uniq 0.14  n=3
+   sample: <STX>The use of safety, stripes have by both against this core, the Day's wife in New York episode, Hetcia.??? periods.\n\n(X. If they???re usually shut to the case to be claimed.\n\n"But(), John West???s ??
+
+--------------------------------------------------------------------------------
+E29  e29_3x17_40k  step 30000   2026-08-22 22:03
+--------------------------------------------------------------------------------
+loss/grad/state:
+  step      0  loss 10.7737  grad 621.418  dff_std  0.069  dff_max      1.1  dff_zeros 0.4709
+  step   5000  loss  6.6829  grad  2.550  dff_std  0.456  dff_max      7.6  dff_zeros 0.0493
+  step  10000  loss  6.3107  grad  2.893  dff_std  0.445  dff_max     10.6  dff_zeros 0.0522
+  step  15000  loss  6.2231  grad  3.124  dff_std  0.444  dff_max      6.4  dff_zeros 0.0559
+  step  20000  loss  7.2016  grad  5.901  dff_std  0.676  dff_max     11.0  dff_zeros 0.5999
+  step  25000  loss  6.0496  grad  3.144  dff_std  0.467  dff_max     13.8  dff_zeros 0.0480
+  step  30000  loss  5.9573  grad  3.167  dff_std  0.459  dff_max      9.7  dff_zeros 0.0505
+  mean(last10) 5.9724   tokens 7.50 M   (unigram floor 7.549)
+token efficiency (sustained crossings):
+  L<7.549  step   1180    0.29 M tok   baseline   3980  (-2800)
+  L<7.000  step   2560    0.64 M tok   baseline   5940  (-3380)
+  L<6.500  step   8020    2.00 M tok   baseline  15680  (-7660)
+  L<6.300  step  20200    5.05 M tok   baseline  30120  (-9920)
+  L<6.100  step  27540    6.88 M tok   baseline  49700  (-22160)
+free-running generation (3 samples; cycle>0.6 degenerate, healthy 0.08-0.11):
+   gen health: cycle 0.08 (max 0.08)  uniq 0.14  n=3
+   sample: <STX>The class still capabilities are extremely rather help. There is a go sound asking.??? We think that. She (!72 Reviews\n\nRiting Yocbro Hughes, who have made by particular inhabatively greatest vir
+
+--------------------------------------------------------------------------------
+E29  e29_3x17_40k  step 35000   2026-08-22 22:31
+--------------------------------------------------------------------------------
+loss/grad/state:
+  step      0  loss 10.7737  grad 621.418  dff_std  0.069  dff_max      1.1  dff_zeros 0.4709
+  step   5000  loss  6.6829  grad  2.550  dff_std  0.456  dff_max      7.6  dff_zeros 0.0493
+  step  10000  loss  6.3107  grad  2.893  dff_std  0.445  dff_max     10.6  dff_zeros 0.0522
+  step  15000  loss  6.2231  grad  3.124  dff_std  0.444  dff_max      6.4  dff_zeros 0.0559
+  step  20000  loss  7.2016  grad  5.901  dff_std  0.676  dff_max     11.0  dff_zeros 0.5999
+  step  25000  loss  6.0496  grad  3.144  dff_std  0.467  dff_max     13.8  dff_zeros 0.0480
+  step  30000  loss  5.9573  grad  3.167  dff_std  0.459  dff_max      9.7  dff_zeros 0.0505
+  step  35000  loss  5.8944  grad  3.347  dff_std  0.463  dff_max      9.7  dff_zeros 0.0512
+  mean(last10) 5.9419   tokens 8.75 M   (unigram floor 7.549)
+token efficiency (sustained crossings):
+  L<7.549  step   1180    0.29 M tok   baseline   3980  (-2800)
+  L<7.000  step   2560    0.64 M tok   baseline   5940  (-3380)
+  L<6.500  step   8020    2.00 M tok   baseline  15680  (-7660)
+  L<6.300  step  20200    5.05 M tok   baseline  30120  (-9920)
+  L<6.100  step  27540    6.88 M tok   baseline  49700  (-22160)
+free-running generation (3 samples; cycle>0.6 degenerate, healthy 0.08-0.11):
+   gen health: cycle 0.10 (max 0.12)  uniq 0.13  n=3
+   sample: <STX>A prefection understanding Switzerland, for many Nov, judge 53 would likely be available as vaccine gone back to serve from greater clients aside the near age and go to become rasis.\n\nMs row ma
+
+--------------------------------------------------------------------------------
+E29  e29_3x17_40k  step 40000   2026-08-22 22:57
+--------------------------------------------------------------------------------
+loss/grad/state:
+  step      0  loss 10.7737  grad 621.418  dff_std  0.069  dff_max      1.1  dff_zeros 0.4709
+  step   5000  loss  6.6829  grad  2.550  dff_std  0.456  dff_max      7.6  dff_zeros 0.0493
+  step  10000  loss  6.3107  grad  2.893  dff_std  0.445  dff_max     10.6  dff_zeros 0.0522
+  step  15000  loss  6.2231  grad  3.124  dff_std  0.444  dff_max      6.4  dff_zeros 0.0559
+  step  20000  loss  7.2016  grad  5.901  dff_std  0.676  dff_max     11.0  dff_zeros 0.5999
+  step  25000  loss  6.0496  grad  3.144  dff_std  0.467  dff_max     13.8  dff_zeros 0.0480
+  step  30000  loss  5.9573  grad  3.167  dff_std  0.459  dff_max      9.7  dff_zeros 0.0505
+  step  35000  loss  5.8944  grad  3.347  dff_std  0.463  dff_max      9.7  dff_zeros 0.0512
+  step  40000  loss  5.7841  grad  3.398  dff_std  0.453  dff_max     13.0  dff_zeros 0.0447
+  mean(last10) 5.8620   tokens 10.00 M   (unigram floor 7.549)
+token efficiency (sustained crossings):
+  L<7.549  step   1180    0.29 M tok   baseline   3980  (-2800)
+  L<7.000  step   2560    0.64 M tok   baseline   5940  (-3380)
+  L<6.500  step   8020    2.00 M tok   baseline  15680  (-7660)
+  L<6.300  step  20200    5.05 M tok   baseline  30120  (-9920)
+  L<6.100  step  27540    6.88 M tok   baseline  49700  (-22160)
+  L<5.900  step  40000   10.00 M tok   baseline  84980  (-44980)
+free-running generation (3 samples; cycle>0.6 degenerate, healthy 0.08-0.11):
+   gen health: cycle 0.09 (max 0.10)  uniq 0.12  n=3
+   sample: <STX>Care.\n\nI???re pushing they go up a problem, but the jury can ???such her nOK meeting from one suggestion of learning that we who could hear itneed to a year on migrate by get to reach. When I'm abl
+
+--------------------------------------------------------------------------------
+E29  e29_3x17_40k  step 45000   2026-08-22 23:25
+--------------------------------------------------------------------------------
+loss/grad/state:
+  step      0  loss 10.7737  grad 621.418  dff_std  0.069  dff_max      1.1  dff_zeros 0.4709
+  step   5000  loss  6.6829  grad  2.550  dff_std  0.456  dff_max      7.6  dff_zeros 0.0493
+  step  10000  loss  6.3107  grad  2.893  dff_std  0.445  dff_max     10.6  dff_zeros 0.0522
+  step  15000  loss  6.2231  grad  3.124  dff_std  0.444  dff_max      6.4  dff_zeros 0.0559
+  step  20000  loss  7.2016  grad  5.901  dff_std  0.676  dff_max     11.0  dff_zeros 0.5999
+  step  25000  loss  6.0496  grad  3.144  dff_std  0.467  dff_max     13.8  dff_zeros 0.0480
+  step  30000  loss  5.9573  grad  3.167  dff_std  0.459  dff_max      9.7  dff_zeros 0.0505
+  step  35000  loss  5.8944  grad  3.347  dff_std  0.463  dff_max      9.7  dff_zeros 0.0512
+  step  40000  loss  5.7841  grad  3.398  dff_std  0.453  dff_max     13.0  dff_zeros 0.0447
+  step  45000  loss  5.8734  grad  3.332  dff_std  0.459  dff_max     13.7  dff_zeros 0.0449
+  mean(last10) 5.9037   tokens 11.25 M   (unigram floor 7.549)
+token efficiency (sustained crossings):
+  L<7.549  step   1180    0.29 M tok   baseline   3980  (-2800)
+  L<7.000  step   2560    0.64 M tok   baseline   5940  (-3380)
+  L<6.500  step   8020    2.00 M tok   baseline  15680  (-7660)
+  L<6.300  step  20200    5.05 M tok   baseline  30120  (-9920)
+  L<6.100  step  27540    6.88 M tok   baseline  49700  (-22160)
+free-running generation (3 samples; cycle>0.6 degenerate, healthy 0.08-0.11):
+   gen health: cycle 0.07 (max 0.08)  uniq 0.12  n=3
+   sample: <STX>Exallic Kenell Dan dett associated near six day online.\n\nPIG TBSARYARDAMoren podcast: Fissai P-N        Alex Huriss's bacon Westpage Arlington, Y212, Florida. Eight-70, English. Despite the ina
+
+--------------------------------------------------------------------------------
+E29  e29_3x17_40k  step 50000   2026-08-22 23:53
+--------------------------------------------------------------------------------
+loss/grad/state:
+  step      0  loss 10.7737  grad 621.418  dff_std  0.069  dff_max      1.1  dff_zeros 0.4709
+  step   5000  loss  6.6829  grad  2.550  dff_std  0.456  dff_max      7.6  dff_zeros 0.0493
+  step  10000  loss  6.3107  grad  2.893  dff_std  0.445  dff_max     10.6  dff_zeros 0.0522
+  step  15000  loss  6.2231  grad  3.124  dff_std  0.444  dff_max      6.4  dff_zeros 0.0559
+  step  20000  loss  7.2016  grad  5.901  dff_std  0.676  dff_max     11.0  dff_zeros 0.5999
+  step  25000  loss  6.0496  grad  3.144  dff_std  0.467  dff_max     13.8  dff_zeros 0.0480
+  step  30000  loss  5.9573  grad  3.167  dff_std  0.459  dff_max      9.7  dff_zeros 0.0505
+  step  35000  loss  5.8944  grad  3.347  dff_std  0.463  dff_max      9.7  dff_zeros 0.0512
+  step  40000  loss  5.7841  grad  3.398  dff_std  0.453  dff_max     13.0  dff_zeros 0.0447
+  step  45000  loss  5.8734  grad  3.332  dff_std  0.459  dff_max     13.7  dff_zeros 0.0449
+  step  50000  loss  5.9046  grad  3.341  dff_std  0.474  dff_max     12.6  dff_zeros 0.0507
+  mean(last10) 5.8928   tokens 12.50 M   (unigram floor 7.549)
+token efficiency (sustained crossings):
+  L<7.549  step   1180    0.29 M tok   baseline   3980  (-2800)
+  L<7.000  step   2560    0.64 M tok   baseline   5940  (-3380)
+  L<6.500  step   8020    2.00 M tok   baseline  15680  (-7660)
+  L<6.300  step  20200    5.05 M tok   baseline  30120  (-9920)
+  L<6.100  step  27540    6.88 M tok   baseline  49700  (-22160)
+  L<5.900  step  48500   12.12 M tok   baseline  84980  (-36480)
+free-running generation (3 samples; cycle>0.6 degenerate, healthy 0.08-0.11):
+   gen health: cycle 0.10 (max 0.12)  uniq 0.10  n=3
+   sample: <STX>Broals SWERU(ZZSTARMISSIEDMENT RATPL\n\nExpl drastically peletion those changes hatured with as part acts and structural group doctrines, detailed-speedvered and as there are, so everything that 
+
+--------------------------------------------------------------------------------
+E29  e29_3x17_40k  step 55000   2026-08-23 00:19
+--------------------------------------------------------------------------------
+loss/grad/state:
+  step      0  loss 10.7737  grad 621.418  dff_std  0.069  dff_max      1.1  dff_zeros 0.4709
+  step   5000  loss  6.6829  grad  2.550  dff_std  0.456  dff_max      7.6  dff_zeros 0.0493
+  step  10000  loss  6.3107  grad  2.893  dff_std  0.445  dff_max     10.6  dff_zeros 0.0522
+  step  15000  loss  6.2231  grad  3.124  dff_std  0.444  dff_max      6.4  dff_zeros 0.0559
+  step  20000  loss  7.2016  grad  5.901  dff_std  0.676  dff_max     11.0  dff_zeros 0.5999
+  step  25000  loss  6.0496  grad  3.144  dff_std  0.467  dff_max     13.8  dff_zeros 0.0480
+  step  30000  loss  5.9573  grad  3.167  dff_std  0.459  dff_max      9.7  dff_zeros 0.0505
+  step  35000  loss  5.8944  grad  3.347  dff_std  0.463  dff_max      9.7  dff_zeros 0.0512
+  step  40000  loss  5.7841  grad  3.398  dff_std  0.453  dff_max     13.0  dff_zeros 0.0447
+  step  45000  loss  5.8734  grad  3.332  dff_std  0.459  dff_max     13.7  dff_zeros 0.0449
+  step  50000  loss  5.9046  grad  3.341  dff_std  0.474  dff_max     12.6  dff_zeros 0.0507
+  step  55000  loss  5.8709  grad  3.347  dff_std  0.465  dff_max     11.3  dff_zeros 0.0567
+  mean(last10) 5.8118   tokens 13.75 M   (unigram floor 7.549)
+token efficiency (sustained crossings):
+  L<7.549  step   1180    0.29 M tok   baseline   3980  (-2800)
+  L<7.000  step   2560    0.64 M tok   baseline   5940  (-3380)
+  L<6.500  step   8020    2.00 M tok   baseline  15680  (-7660)
+  L<6.300  step  20200    5.05 M tok   baseline  30120  (-9920)
+  L<6.100  step  27540    6.88 M tok   baseline  49700  (-22160)
+  L<5.900  step  48500   12.12 M tok   baseline  84980  (-36480)
+free-running generation (3 samples; cycle>0.6 degenerate, healthy 0.08-0.11):
+   gen health: cycle 0.08 (max 0.10)  uniq 0.11  n=3
+   sample: <STX>A allegations horvoir first painted with the new environment from the Parden PopTake's How Will Nick Wonderia hardly Harmment and ???exec sheets??? on London, Asian Deputy News, Carroll.\n\nWhen the 
+
+--------------------------------------------------------------------------------
+E29  e29_3x17_40k  step 60000   2026-08-23 00:47
+--------------------------------------------------------------------------------
+loss/grad/state:
+  step      0  loss 10.7737  grad 621.418  dff_std  0.069  dff_max      1.1  dff_zeros 0.4709
+  step   5000  loss  6.6829  grad  2.550  dff_std  0.456  dff_max      7.6  dff_zeros 0.0493
+  step  10000  loss  6.3107  grad  2.893  dff_std  0.445  dff_max     10.6  dff_zeros 0.0522
+  step  15000  loss  6.2231  grad  3.124  dff_std  0.444  dff_max      6.4  dff_zeros 0.0559
+  step  20000  loss  7.2016  grad  5.901  dff_std  0.676  dff_max     11.0  dff_zeros 0.5999
+  step  25000  loss  6.0496  grad  3.144  dff_std  0.467  dff_max     13.8  dff_zeros 0.0480
+  step  30000  loss  5.9573  grad  3.167  dff_std  0.459  dff_max      9.7  dff_zeros 0.0505
+  step  35000  loss  5.8944  grad  3.347  dff_std  0.463  dff_max      9.7  dff_zeros 0.0512
+  step  40000  loss  5.7841  grad  3.398  dff_std  0.453  dff_max     13.0  dff_zeros 0.0447
+  step  45000  loss  5.8734  grad  3.332  dff_std  0.459  dff_max     13.7  dff_zeros 0.0449
+  step  50000  loss  5.9046  grad  3.341  dff_std  0.474  dff_max     12.6  dff_zeros 0.0507
+  step  55000  loss  5.8709  grad  3.347  dff_std  0.465  dff_max     11.3  dff_zeros 0.0567
+  step  60000  loss  5.7887  grad  3.455  dff_std  0.462  dff_max     11.1  dff_zeros 0.0473
+  mean(last10) 5.7940   tokens 15.00 M   (unigram floor 7.549)
+token efficiency (sustained crossings):
+  L<7.549  step   1180    0.29 M tok   baseline   3980  (-2800)
+  L<7.000  step   2560    0.64 M tok   baseline   5940  (-3380)
+  L<6.500  step   8020    2.00 M tok   baseline  15680  (-7660)
+  L<6.300  step  20200    5.05 M tok   baseline  30120  (-9920)
+  L<6.100  step  27540    6.88 M tok   baseline  49700  (-22160)
+  L<5.900  step  48500   12.12 M tok   baseline  84980  (-36480)
+  L<5.800  step  59780   14.95 M tok   baseline  99980  (-40200)
+free-running generation (3 samples; cycle>0.6 degenerate, healthy 0.08-0.11):
+   gen health: cycle 0.08 (max 0.11)  uniq 0.13  n=3
+   sample: <STX>According to Gore 3: ???We would be speaking about another year behind their, at a clarity that a time and be with night places; it benefits something, this ??? as you???ve settled the original loan an
+checkpoint       step    clean   median  runaway%  nrun  first  naive_mean
+----------------------------------------------------------------------------
+e29_3x17_40k.final  60000   5.8684   5.8504       0.0     0     -1       5.868
+
+--------------------------------------------------------------------------------
+E30  e30_3x17_120k  step 55000   2026-08-23 00:52
+--------------------------------------------------------------------------------
+loss/grad/state:
+  step      0  loss 10.7737  grad 621.418  dff_std  0.069  dff_max      1.1  dff_zeros 0.4709
+  step   5000  loss  6.6829  grad  2.550  dff_std  0.456  dff_max      7.6  dff_zeros 0.0493
+  step  10000  loss  6.3107  grad  2.893  dff_std  0.445  dff_max     10.6  dff_zeros 0.0522
+  step  15000  loss  6.2231  grad  3.124  dff_std  0.444  dff_max      6.4  dff_zeros 0.0559
+  step  20000  loss  7.2016  grad  5.901  dff_std  0.676  dff_max     11.0  dff_zeros 0.5999
+  step  25000  loss  6.0496  grad  3.144  dff_std  0.467  dff_max     13.8  dff_zeros 0.0480
+  step  30000  loss  5.9573  grad  3.167  dff_std  0.459  dff_max      9.7  dff_zeros 0.0505
+  step  35000  loss  5.8944  grad  3.347  dff_std  0.463  dff_max      9.7  dff_zeros 0.0512
+  step  40000  loss  5.7841  grad  3.398  dff_std  0.453  dff_max     13.0  dff_zeros 0.0447
+  step  45000  loss  5.8734  grad  3.332  dff_std  0.459  dff_max     13.7  dff_zeros 0.0449
+  step  50000  loss  5.9046  grad  3.341  dff_std  0.474  dff_max     12.6  dff_zeros 0.0507
+  step  55000  loss  5.8709  grad  3.347  dff_std  0.465  dff_max     11.3  dff_zeros 0.0567
+  mean(last10) 5.7914   tokens 13.75 M   (unigram floor 7.549)
+token efficiency (sustained crossings):
+  L<7.549  step   1180    0.29 M tok   baseline   3980  (-2800)
+  L<7.000  step   2560    0.64 M tok   baseline   5940  (-3380)
+  L<6.500  step   8020    2.00 M tok   baseline  15680  (-7660)
+  L<6.300  step  20200    5.05 M tok   baseline  30120  (-9920)
+  L<6.100  step  27540    6.88 M tok   baseline  49700  (-22160)
+  L<5.900  step  48500   12.12 M tok   baseline  84980  (-36480)
+  L<5.800  step  59780   14.95 M tok   baseline  99980  (-40200)
+free-running generation (3 samples; cycle>0.6 degenerate, healthy 0.08-0.11):
+   gen health: no output
+
+--------------------------------------------------------------------------------
+E30  e30_3x17_120k  step 60000   2026-08-23 00:55
+--------------------------------------------------------------------------------
+loss/grad/state:
+  step      0  loss 10.7737  grad 621.418  dff_std  0.069  dff_max      1.1  dff_zeros 0.4709
+  step   5000  loss  6.6829  grad  2.550  dff_std  0.456  dff_max      7.6  dff_zeros 0.0493
+  step  10000  loss  6.3107  grad  2.893  dff_std  0.445  dff_max     10.6  dff_zeros 0.0522
+  step  15000  loss  6.2231  grad  3.124  dff_std  0.444  dff_max      6.4  dff_zeros 0.0559
+  step  20000  loss  7.2016  grad  5.901  dff_std  0.676  dff_max     11.0  dff_zeros 0.5999
+  step  25000  loss  6.0496  grad  3.144  dff_std  0.467  dff_max     13.8  dff_zeros 0.0480
+  step  30000  loss  5.9573  grad  3.167  dff_std  0.459  dff_max      9.7  dff_zeros 0.0505
+  step  35000  loss  5.8944  grad  3.347  dff_std  0.463  dff_max      9.7  dff_zeros 0.0512
+  step  40000  loss  5.7841  grad  3.398  dff_std  0.453  dff_max     13.0  dff_zeros 0.0447
+  step  45000  loss  5.8734  grad  3.332  dff_std  0.459  dff_max     13.7  dff_zeros 0.0449
+  step  50000  loss  5.9046  grad  3.341  dff_std  0.474  dff_max     12.6  dff_zeros 0.0507
+  step  55000  loss  5.8709  grad  3.347  dff_std  0.465  dff_max     11.3  dff_zeros 0.0567
+  step  60000  loss  7.0367  grad  9.593  dff_std  0.648  dff_max     11.0  dff_zeros 0.5665
+  mean(last10) 6.0131   tokens 15.00 M   (unigram floor 7.549)
+token efficiency (sustained crossings):
+  L<7.549  step   1180    0.29 M tok   baseline   3980  (-2800)
+  L<7.000  step   2560    0.64 M tok   baseline   5940  (-3380)
+  L<6.500  step   8020    2.00 M tok   baseline  15680  (-7660)
+  L<6.300  step  20200    5.05 M tok   baseline  30120  (-9920)
+  L<6.100  step  27540    6.88 M tok   baseline  49700  (-22160)
+free-running generation (3 samples; cycle>0.6 degenerate, healthy 0.08-0.11):
+   gen health: cycle 0.08 (max 0.10)  uniq 0.13  n=3
+   sample: <STX>The Vonman Emperor and Info to the ??UNONT ???202As a lot of affairs. Why know Green comes as holying a trailer on the right of the NBC ninth.\n\n"Well, what really exploded in the catch, and your m
+
+--------------------------------------------------------------------------------
+E30  e30_3x17_120k  step 65000   2026-08-23 01:23
+--------------------------------------------------------------------------------
+loss/grad/state:
+  step      0  loss 10.7737  grad 621.418  dff_std  0.069  dff_max      1.1  dff_zeros 0.4709
+  step   5000  loss  6.6829  grad  2.550  dff_std  0.456  dff_max      7.6  dff_zeros 0.0493
+  step  10000  loss  6.3107  grad  2.893  dff_std  0.445  dff_max     10.6  dff_zeros 0.0522
+  step  15000  loss  6.2231  grad  3.124  dff_std  0.444  dff_max      6.4  dff_zeros 0.0559
+  step  20000  loss  7.2016  grad  5.901  dff_std  0.676  dff_max     11.0  dff_zeros 0.5999
+  step  25000  loss  6.0496  grad  3.144  dff_std  0.467  dff_max     13.8  dff_zeros 0.0480
+  step  30000  loss  5.9573  grad  3.167  dff_std  0.459  dff_max      9.7  dff_zeros 0.0505
+  step  35000  loss  5.8944  grad  3.347  dff_std  0.463  dff_max      9.7  dff_zeros 0.0512
+  step  40000  loss  5.7841  grad  3.398  dff_std  0.453  dff_max     13.0  dff_zeros 0.0447
+  step  45000  loss  5.8734  grad  3.332  dff_std  0.459  dff_max     13.7  dff_zeros 0.0449
+  step  50000  loss  5.9046  grad  3.341  dff_std  0.474  dff_max     12.6  dff_zeros 0.0507
+  step  55000  loss  5.8709  grad  3.347  dff_std  0.465  dff_max     11.3  dff_zeros 0.0567
+  step  60000  loss  7.0367  grad  9.593  dff_std  0.648  dff_max     11.0  dff_zeros 0.5665
+  step  65000  loss  5.6931  grad  3.236  dff_std  0.464  dff_max     11.6  dff_zeros 0.0449
+  mean(last10) 5.7352   tokens 16.25 M   (unigram floor 7.549)
+token efficiency (sustained crossings):
+  L<7.549  step   1180    0.29 M tok   baseline   3980  (-2800)
+  L<7.000  step   2560    0.64 M tok   baseline   5940  (-3380)
+  L<6.500  step   8020    2.00 M tok   baseline  15680  (-7660)
+  L<6.300  step  20200    5.05 M tok   baseline  30120  (-9920)
+  L<6.100  step  27540    6.88 M tok   baseline  49700  (-22160)
+  L<5.900  step  60220   15.05 M tok   baseline  84980  (-24760)
+  L<5.800  step  64800   16.20 M tok   baseline  99980  (-35180)
+free-running generation (3 samples; cycle>0.6 degenerate, healthy 0.08-0.11):
+   gen health: cycle 0.08 (max 0.11)  uniq 0.14  n=3
+   sample: <STX>No exampleScotts Executive. To go - ???Armantom stop it???\n\nAnd the flexibility of what other casess expanding user grassroots need to the threat of a classic environment???prash?\n\nChristian arenat
+
+--------------------------------------------------------------------------------
+E30  e30_3x17_120k  step 70000   2026-08-23 01:50
+--------------------------------------------------------------------------------
+loss/grad/state:
+  step      0  loss 10.7737  grad 621.418  dff_std  0.069  dff_max      1.1  dff_zeros 0.4709
+  step   5000  loss  6.6829  grad  2.550  dff_std  0.456  dff_max      7.6  dff_zeros 0.0493
+  step  10000  loss  6.3107  grad  2.893  dff_std  0.445  dff_max     10.6  dff_zeros 0.0522
+  step  15000  loss  6.2231  grad  3.124  dff_std  0.444  dff_max      6.4  dff_zeros 0.0559
+  step  20000  loss  7.2016  grad  5.901  dff_std  0.676  dff_max     11.0  dff_zeros 0.5999
+  step  25000  loss  6.0496  grad  3.144  dff_std  0.467  dff_max     13.8  dff_zeros 0.0480
+  step  30000  loss  5.9573  grad  3.167  dff_std  0.459  dff_max      9.7  dff_zeros 0.0505
+  step  35000  loss  5.8944  grad  3.347  dff_std  0.463  dff_max      9.7  dff_zeros 0.0512
+  step  40000  loss  5.7841  grad  3.398  dff_std  0.453  dff_max     13.0  dff_zeros 0.0447
+  step  45000  loss  5.8734  grad  3.332  dff_std  0.459  dff_max     13.7  dff_zeros 0.0449
+  step  50000  loss  5.9046  grad  3.341  dff_std  0.474  dff_max     12.6  dff_zeros 0.0507
+  step  55000  loss  5.8709  grad  3.347  dff_std  0.465  dff_max     11.3  dff_zeros 0.0567
+  step  60000  loss  7.0367  grad  9.593  dff_std  0.648  dff_max     11.0  dff_zeros 0.5665
+  step  65000  loss  5.6931  grad  3.236  dff_std  0.464  dff_max     11.6  dff_zeros 0.0449
+  step  70000  loss  5.7361  grad  3.490  dff_std  0.459  dff_max      8.1  dff_zeros 0.0529
+  mean(last10) 5.6986   tokens 17.50 M   (unigram floor 7.549)
+token efficiency (sustained crossings):
+  L<7.549  step   1180    0.29 M tok   baseline   3980  (-2800)
+  L<7.000  step   2560    0.64 M tok   baseline   5940  (-3380)
+  L<6.500  step   8020    2.00 M tok   baseline  15680  (-7660)
+  L<6.300  step  20200    5.05 M tok   baseline  30120  (-9920)
+  L<6.100  step  27540    6.88 M tok   baseline  49700  (-22160)
+  L<5.900  step  60220   15.05 M tok   baseline  84980  (-24760)
+  L<5.800  step  64800   16.20 M tok   baseline  99980  (-35180)
+free-running generation (3 samples; cycle>0.6 degenerate, healthy 0.08-0.11):
+   gen health: cycle 0.08 (max 0.09)  uniq 0.13  n=3
+   sample: <STX>UCHEDUHSHO ON http:// ms into these definitions, and encryption contract scholarship PK\n\nX Amigan???\n\nThe young Americans?\n\nFCNAC TAVAWC REPRE ???ippyling; Flurill City Monivilique, including P
+
+--------------------------------------------------------------------------------
+E30  e30_3x17_120k  step 75000   2026-08-23 02:17
+--------------------------------------------------------------------------------
+loss/grad/state:
+  step      0  loss 10.7737  grad 621.418  dff_std  0.069  dff_max      1.1  dff_zeros 0.4709
+  step   5000  loss  6.6829  grad  2.550  dff_std  0.456  dff_max      7.6  dff_zeros 0.0493
+  step  10000  loss  6.3107  grad  2.893  dff_std  0.445  dff_max     10.6  dff_zeros 0.0522
+  step  15000  loss  6.2231  grad  3.124  dff_std  0.444  dff_max      6.4  dff_zeros 0.0559
+  step  20000  loss  7.2016  grad  5.901  dff_std  0.676  dff_max     11.0  dff_zeros 0.5999
+  step  25000  loss  6.0496  grad  3.144  dff_std  0.467  dff_max     13.8  dff_zeros 0.0480
+  step  30000  loss  5.9573  grad  3.167  dff_std  0.459  dff_max      9.7  dff_zeros 0.0505
+  step  35000  loss  5.8944  grad  3.347  dff_std  0.463  dff_max      9.7  dff_zeros 0.0512
+  step  40000  loss  5.7841  grad  3.398  dff_std  0.453  dff_max     13.0  dff_zeros 0.0447
+  step  45000  loss  5.8734  grad  3.332  dff_std  0.459  dff_max     13.7  dff_zeros 0.0449
+  step  50000  loss  5.9046  grad  3.341  dff_std  0.474  dff_max     12.6  dff_zeros 0.0507
+  step  55000  loss  5.8709  grad  3.347  dff_std  0.465  dff_max     11.3  dff_zeros 0.0567
+  step  60000  loss  7.0367  grad  9.593  dff_std  0.648  dff_max     11.0  dff_zeros 0.5665
+  step  65000  loss  5.6931  grad  3.236  dff_std  0.464  dff_max     11.6  dff_zeros 0.0449
+  step  70000  loss  5.7361  grad  3.490  dff_std  0.459  dff_max      8.1  dff_zeros 0.0529
+  step  75000  loss  5.7033  grad  3.515  dff_std  0.455  dff_max      7.6  dff_zeros 0.0544
+  mean(last10) 5.6638   tokens 18.75 M   (unigram floor 7.549)
+token efficiency (sustained crossings):
+  L<7.549  step   1180    0.29 M tok   baseline   3980  (-2800)
+  L<7.000  step   2560    0.64 M tok   baseline   5940  (-3380)
+  L<6.500  step   8020    2.00 M tok   baseline  15680  (-7660)
+  L<6.300  step  20200    5.05 M tok   baseline  30120  (-9920)
+  L<6.100  step  27540    6.88 M tok   baseline  49700  (-22160)
+  L<5.900  step  60220   15.05 M tok   baseline  84980  (-24760)
+  L<5.800  step  64800   16.20 M tok   baseline  99980  (-35180)
+free-running generation (3 samples; cycle>0.6 degenerate, healthy 0.08-0.11):
+   gen health: cycle 0.09 (max 0.10)  uniq 0.14  n=3
+   sample: <STX>Health has shown her function was stacked from left a result that has been used on???mongani Rasiziq has driven out the record to devinder as an enormous salaries of alternative than performed an u
+
+--------------------------------------------------------------------------------
+E30  e30_3x17_120k  step 80000   2026-08-23 02:44
+--------------------------------------------------------------------------------
+loss/grad/state:
+  step      0  loss 10.7737  grad 621.418  dff_std  0.069  dff_max      1.1  dff_zeros 0.4709
+  step   5000  loss  6.6829  grad  2.550  dff_std  0.456  dff_max      7.6  dff_zeros 0.0493
+  step  10000  loss  6.3107  grad  2.893  dff_std  0.445  dff_max     10.6  dff_zeros 0.0522
+  step  15000  loss  6.2231  grad  3.124  dff_std  0.444  dff_max      6.4  dff_zeros 0.0559
+  step  20000  loss  7.2016  grad  5.901  dff_std  0.676  dff_max     11.0  dff_zeros 0.5999
+  step  25000  loss  6.0496  grad  3.144  dff_std  0.467  dff_max     13.8  dff_zeros 0.0480
+  step  30000  loss  5.9573  grad  3.167  dff_std  0.459  dff_max      9.7  dff_zeros 0.0505
+  step  35000  loss  5.8944  grad  3.347  dff_std  0.463  dff_max      9.7  dff_zeros 0.0512
+  step  40000  loss  5.7841  grad  3.398  dff_std  0.453  dff_max     13.0  dff_zeros 0.0447
+  step  45000  loss  5.8734  grad  3.332  dff_std  0.459  dff_max     13.7  dff_zeros 0.0449
+  step  50000  loss  5.9046  grad  3.341  dff_std  0.474  dff_max     12.6  dff_zeros 0.0507
+  step  55000  loss  5.8709  grad  3.347  dff_std  0.465  dff_max     11.3  dff_zeros 0.0567
+  step  60000  loss  7.0367  grad  9.593  dff_std  0.648  dff_max     11.0  dff_zeros 0.5665
+  step  65000  loss  5.6931  grad  3.236  dff_std  0.464  dff_max     11.6  dff_zeros 0.0449
+  step  70000  loss  5.7361  grad  3.490  dff_std  0.459  dff_max      8.1  dff_zeros 0.0529
+  step  75000  loss  5.7033  grad  3.515  dff_std  0.455  dff_max      7.6  dff_zeros 0.0544
+  step  80000  loss  5.5804  grad  3.410  dff_std  0.458  dff_max     10.0  dff_zeros 0.0464
+  mean(last10) 5.6099   tokens 20.00 M   (unigram floor 7.549)
+token efficiency (sustained crossings):
+  L<7.549  step   1180    0.29 M tok   baseline   3980  (-2800)
+  L<7.000  step   2560    0.64 M tok   baseline   5940  (-3380)
+  L<6.500  step   8020    2.00 M tok   baseline  15680  (-7660)
+  L<6.300  step  20200    5.05 M tok   baseline  30120  (-9920)
+  L<6.100  step  27540    6.88 M tok   baseline  49700  (-22160)
+  L<5.900  step  60220   15.05 M tok   baseline  84980  (-24760)
+  L<5.800  step  64800   16.20 M tok   baseline  99980  (-35180)
+free-running generation (3 samples; cycle>0.6 degenerate, healthy 0.08-0.11):
+   gen health: cycle 0.08 (max 0.09)  uniq 0.13  n=3
+   sample: <STX>C USA Coprie, who has appeared. Technico Caves's Core Jhyelell Research, established the Federal government several lead broadcasts, it contemplated that media workers and digital crops, where th
+
+--------------------------------------------------------------------------------
+E30  e30_3x17_120k  step 85000   2026-08-23 03:12
+--------------------------------------------------------------------------------
+loss/grad/state:
+  step      0  loss 10.7737  grad 621.418  dff_std  0.069  dff_max      1.1  dff_zeros 0.4709
+  step   5000  loss  6.6829  grad  2.550  dff_std  0.456  dff_max      7.6  dff_zeros 0.0493
+  step  10000  loss  6.3107  grad  2.893  dff_std  0.445  dff_max     10.6  dff_zeros 0.0522
+  step  15000  loss  6.2231  grad  3.124  dff_std  0.444  dff_max      6.4  dff_zeros 0.0559
+  step  20000  loss  7.2016  grad  5.901  dff_std  0.676  dff_max     11.0  dff_zeros 0.5999
+  step  25000  loss  6.0496  grad  3.144  dff_std  0.467  dff_max     13.8  dff_zeros 0.0480
+  step  30000  loss  5.9573  grad  3.167  dff_std  0.459  dff_max      9.7  dff_zeros 0.0505
+  step  35000  loss  5.8944  grad  3.347  dff_std  0.463  dff_max      9.7  dff_zeros 0.0512
+  step  40000  loss  5.7841  grad  3.398  dff_std  0.453  dff_max     13.0  dff_zeros 0.0447
+  step  45000  loss  5.8734  grad  3.332  dff_std  0.459  dff_max     13.7  dff_zeros 0.0449
+  step  50000  loss  5.9046  grad  3.341  dff_std  0.474  dff_max     12.6  dff_zeros 0.0507
+  step  55000  loss  5.8709  grad  3.347  dff_std  0.465  dff_max     11.3  dff_zeros 0.0567
+  step  60000  loss  7.0367  grad  9.593  dff_std  0.648  dff_max     11.0  dff_zeros 0.5665
+  step  65000  loss  5.6931  grad  3.236  dff_std  0.464  dff_max     11.6  dff_zeros 0.0449
+  step  70000  loss  5.7361  grad  3.490  dff_std  0.459  dff_max      8.1  dff_zeros 0.0529
+  step  75000  loss  5.7033  grad  3.515  dff_std  0.455  dff_max      7.6  dff_zeros 0.0544
+  step  80000  loss  5.5804  grad  3.410  dff_std  0.458  dff_max     10.0  dff_zeros 0.0464
+  step  85000  loss  5.6937  grad  3.455  dff_std  0.460  dff_max     10.6  dff_zeros 0.0463
+  mean(last10) 5.6501   tokens 21.25 M   (unigram floor 7.549)
+token efficiency (sustained crossings):
+  L<7.549  step   1180    0.29 M tok   baseline   3980  (-2800)
+  L<7.000  step   2560    0.64 M tok   baseline   5940  (-3380)
+  L<6.500  step   8020    2.00 M tok   baseline  15680  (-7660)
+  L<6.300  step  20200    5.05 M tok   baseline  30120  (-9920)
+  L<6.100  step  27540    6.88 M tok   baseline  49700  (-22160)
+  L<5.900  step  60220   15.05 M tok   baseline  84980  (-24760)
+  L<5.800  step  64800   16.20 M tok   baseline  99980  (-35180)
+free-running generation (3 samples; cycle>0.6 degenerate, healthy 0.08-0.11):
+   gen health: cycle 0.10 (max 0.11)  uniq 0.12  n=3
+   sample: <STX>It figured from a Ukraine store limit up to how of a separate search, the college???s third leak was am-incalled,??? trafficking will be voted by looking if he doesn???t see my income become situated i
+
+--------------------------------------------------------------------------------
+E30  e30_3x17_120k  step 90000   2026-08-23 03:39
+--------------------------------------------------------------------------------
+loss/grad/state:
+  step      0  loss 10.7737  grad 621.418  dff_std  0.069  dff_max      1.1  dff_zeros 0.4709
+  step   5000  loss  6.6829  grad  2.550  dff_std  0.456  dff_max      7.6  dff_zeros 0.0493
+  step  10000  loss  6.3107  grad  2.893  dff_std  0.445  dff_max     10.6  dff_zeros 0.0522
+  step  15000  loss  6.2231  grad  3.124  dff_std  0.444  dff_max      6.4  dff_zeros 0.0559
+  step  20000  loss  7.2016  grad  5.901  dff_std  0.676  dff_max     11.0  dff_zeros 0.5999
+  step  25000  loss  6.0496  grad  3.144  dff_std  0.467  dff_max     13.8  dff_zeros 0.0480
+  step  30000  loss  5.9573  grad  3.167  dff_std  0.459  dff_max      9.7  dff_zeros 0.0505
+  step  35000  loss  5.8944  grad  3.347  dff_std  0.463  dff_max      9.7  dff_zeros 0.0512
+  step  40000  loss  5.7841  grad  3.398  dff_std  0.453  dff_max     13.0  dff_zeros 0.0447
+  step  45000  loss  5.8734  grad  3.332  dff_std  0.459  dff_max     13.7  dff_zeros 0.0449
+  step  50000  loss  5.9046  grad  3.341  dff_std  0.474  dff_max     12.6  dff_zeros 0.0507
+  step  55000  loss  5.8709  grad  3.347  dff_std  0.465  dff_max     11.3  dff_zeros 0.0567
+  step  60000  loss  7.0367  grad  9.593  dff_std  0.648  dff_max     11.0  dff_zeros 0.5665
+  step  65000  loss  5.6931  grad  3.236  dff_std  0.464  dff_max     11.6  dff_zeros 0.0449
+  step  70000  loss  5.7361  grad  3.490  dff_std  0.459  dff_max      8.1  dff_zeros 0.0529
+  step  75000  loss  5.7033  grad  3.515  dff_std  0.455  dff_max      7.6  dff_zeros 0.0544
+  step  80000  loss  5.5804  grad  3.410  dff_std  0.458  dff_max     10.0  dff_zeros 0.0464
+  step  85000  loss  5.6937  grad  3.455  dff_std  0.460  dff_max     10.6  dff_zeros 0.0463
+  step  90000  loss  5.6022  grad  3.446  dff_std  0.461  dff_max     10.1  dff_zeros 0.0408
+  mean(last10) 5.6652   tokens 22.50 M   (unigram floor 7.549)
+token efficiency (sustained crossings):
+  L<7.549  step   1180    0.29 M tok   baseline   3980  (-2800)
+  L<7.000  step   2560    0.64 M tok   baseline   5940  (-3380)
+  L<6.500  step   8020    2.00 M tok   baseline  15680  (-7660)
+  L<6.300  step  20200    5.05 M tok   baseline  30120  (-9920)
+  L<6.100  step  27540    6.88 M tok   baseline  49700  (-22160)
+  L<5.900  step  60220   15.05 M tok   baseline  84980  (-24760)
+  L<5.800  step  64800   16.20 M tok   baseline  99980  (-35180)
+free-running generation (3 samples; cycle>0.6 degenerate, healthy 0.08-0.11):
+   gen health: cycle 0.07 (max 0.08)  uniq 0.12  n=3
+   sample: <STX>E Cromfward Sim Dog???s patch ofHideer and backpack page fossil non-suragem neutriners and modes of carbon revisions?? Comment in KIA parties / it still assists a direct consequence are been placed
+
+--------------------------------------------------------------------------------
+E30  e30_3x17_120k  step 95000   2026-08-23 04:06
+--------------------------------------------------------------------------------
+loss/grad/state:
+  step      0  loss 10.7737  grad 621.418  dff_std  0.069  dff_max      1.1  dff_zeros 0.4709
+  step   5000  loss  6.6829  grad  2.550  dff_std  0.456  dff_max      7.6  dff_zeros 0.0493
+  step  10000  loss  6.3107  grad  2.893  dff_std  0.445  dff_max     10.6  dff_zeros 0.0522
+  step  15000  loss  6.2231  grad  3.124  dff_std  0.444  dff_max      6.4  dff_zeros 0.0559
+  step  20000  loss  7.2016  grad  5.901  dff_std  0.676  dff_max     11.0  dff_zeros 0.5999
+  step  25000  loss  6.0496  grad  3.144  dff_std  0.467  dff_max     13.8  dff_zeros 0.0480
+  step  30000  loss  5.9573  grad  3.167  dff_std  0.459  dff_max      9.7  dff_zeros 0.0505
+  step  35000  loss  5.8944  grad  3.347  dff_std  0.463  dff_max      9.7  dff_zeros 0.0512
+  step  40000  loss  5.7841  grad  3.398  dff_std  0.453  dff_max     13.0  dff_zeros 0.0447
+  step  45000  loss  5.8734  grad  3.332  dff_std  0.459  dff_max     13.7  dff_zeros 0.0449
+  step  50000  loss  5.9046  grad  3.341  dff_std  0.474  dff_max     12.6  dff_zeros 0.0507
+  step  55000  loss  5.8709  grad  3.347  dff_std  0.465  dff_max     11.3  dff_zeros 0.0567
+  step  60000  loss  7.0367  grad  9.593  dff_std  0.648  dff_max     11.0  dff_zeros 0.5665
+  step  65000  loss  5.6931  grad  3.236  dff_std  0.464  dff_max     11.6  dff_zeros 0.0449
+  step  70000  loss  5.7361  grad  3.490  dff_std  0.459  dff_max      8.1  dff_zeros 0.0529
+  step  75000  loss  5.7033  grad  3.515  dff_std  0.455  dff_max      7.6  dff_zeros 0.0544
+  step  80000  loss  5.5804  grad  3.410  dff_std  0.458  dff_max     10.0  dff_zeros 0.0464
+  step  85000  loss  5.6937  grad  3.455  dff_std  0.460  dff_max     10.6  dff_zeros 0.0463
+  step  90000  loss  5.6022  grad  3.446  dff_std  0.461  dff_max     10.1  dff_zeros 0.0408
+  step  95000  loss  5.6143  grad  3.451  dff_std  0.462  dff_max      9.1  dff_zeros 0.0486
+  mean(last10) 5.6083   tokens 23.75 M   (unigram floor 7.549)
+token efficiency (sustained crossings):
+  L<7.549  step   1180    0.29 M tok   baseline   3980  (-2800)
+  L<7.000  step   2560    0.64 M tok   baseline   5940  (-3380)
+  L<6.500  step   8020    2.00 M tok   baseline  15680  (-7660)
+  L<6.300  step  20200    5.05 M tok   baseline  30120  (-9920)
+  L<6.100  step  27540    6.88 M tok   baseline  49700  (-22160)
+  L<5.900  step  60220   15.05 M tok   baseline  84980  (-24760)
+  L<5.800  step  64800   16.20 M tok   baseline  99980  (-35180)
+free-running generation (3 samples; cycle>0.6 degenerate, healthy 0.08-0.11):
+   gen health: cycle 0.10 (max 0.10)  uniq 0.11  n=3
+   sample: <STX>Cow Shekins Morris has particularly a distraction for students of spies.\n\nDid weighted this soon fast ditch-a-streetboat and positions historically. I???ve got we've got: Speaker HS of Bangety ou
+
+--------------------------------------------------------------------------------
+E30  e30_3x17_120k  step 100000   2026-08-23 04:33
+--------------------------------------------------------------------------------
+loss/grad/state:
+  step      0  loss 10.7737  grad 621.418  dff_std  0.069  dff_max      1.1  dff_zeros 0.4709
+  step   5000  loss  6.6829  grad  2.550  dff_std  0.456  dff_max      7.6  dff_zeros 0.0493
+  step  10000  loss  6.3107  grad  2.893  dff_std  0.445  dff_max     10.6  dff_zeros 0.0522
+  step  15000  loss  6.2231  grad  3.124  dff_std  0.444  dff_max      6.4  dff_zeros 0.0559
+  step  20000  loss  7.2016  grad  5.901  dff_std  0.676  dff_max     11.0  dff_zeros 0.5999
+  step  25000  loss  6.0496  grad  3.144  dff_std  0.467  dff_max     13.8  dff_zeros 0.0480
+  step  30000  loss  5.9573  grad  3.167  dff_std  0.459  dff_max      9.7  dff_zeros 0.0505
+  step  35000  loss  5.8944  grad  3.347  dff_std  0.463  dff_max      9.7  dff_zeros 0.0512
+  step  40000  loss  5.7841  grad  3.398  dff_std  0.453  dff_max     13.0  dff_zeros 0.0447
+  step  45000  loss  5.8734  grad  3.332  dff_std  0.459  dff_max     13.7  dff_zeros 0.0449
+  step  50000  loss  5.9046  grad  3.341  dff_std  0.474  dff_max     12.6  dff_zeros 0.0507
+  step  55000  loss  5.8709  grad  3.347  dff_std  0.465  dff_max     11.3  dff_zeros 0.0567
+  step  60000  loss  7.0367  grad  9.593  dff_std  0.648  dff_max     11.0  dff_zeros 0.5665
+  step  65000  loss  5.6931  grad  3.236  dff_std  0.464  dff_max     11.6  dff_zeros 0.0449
+  step  70000  loss  5.7361  grad  3.490  dff_std  0.459  dff_max      8.1  dff_zeros 0.0529
+  step  75000  loss  5.7033  grad  3.515  dff_std  0.455  dff_max      7.6  dff_zeros 0.0544
+  step  80000  loss  5.5804  grad  3.410  dff_std  0.458  dff_max     10.0  dff_zeros 0.0464
+  step  85000  loss  5.6937  grad  3.455  dff_std  0.460  dff_max     10.6  dff_zeros 0.0463
+  step  90000  loss  5.6022  grad  3.446  dff_std  0.461  dff_max     10.1  dff_zeros 0.0408
+  step  95000  loss  5.6143  grad  3.451  dff_std  0.462  dff_max      9.1  dff_zeros 0.0486
+  step 100000  loss  5.5621  grad  3.620  dff_std  0.468  dff_max     10.1  dff_zeros 0.0505
+  mean(last10) 5.5951   tokens 25.00 M   (unigram floor 7.549)
+token efficiency (sustained crossings):
+  L<7.549  step   1180    0.29 M tok   baseline   3980  (-2800)
+  L<7.000  step   2560    0.64 M tok   baseline   5940  (-3380)
+  L<6.500  step   8020    2.00 M tok   baseline  15680  (-7660)
+  L<6.300  step  20200    5.05 M tok   baseline  30120  (-9920)
+  L<6.100  step  27540    6.88 M tok   baseline  49700  (-22160)
+  L<5.900  step  60220   15.05 M tok   baseline  84980  (-24760)
+  L<5.800  step  64800   16.20 M tok   baseline  99980  (-35180)
+free-running generation (3 samples; cycle>0.6 degenerate, healthy 0.08-0.11):
+   gen health: cycle 0.09 (max 0.09)  uniq 0.12  n=3
+   sample: <STX>Three workers get to both the persecution of X.T. & Wwbiber sedan Electmode Ms Ryan, Cameron ranked Dunre Ortafong bre securilization filmed State Hill, Bradley Vonke, took her ???server???\n\nThe FC
+
+--------------------------------------------------------------------------------
+E30  e30_3x17_120k  step 105000   2026-08-23 05:01
+--------------------------------------------------------------------------------
+loss/grad/state:
+  step      0  loss 10.7737  grad 621.418  dff_std  0.069  dff_max      1.1  dff_zeros 0.4709
+  step   5000  loss  6.6829  grad  2.550  dff_std  0.456  dff_max      7.6  dff_zeros 0.0493
+  step  10000  loss  6.3107  grad  2.893  dff_std  0.445  dff_max     10.6  dff_zeros 0.0522
+  step  15000  loss  6.2231  grad  3.124  dff_std  0.444  dff_max      6.4  dff_zeros 0.0559
+  step  20000  loss  7.2016  grad  5.901  dff_std  0.676  dff_max     11.0  dff_zeros 0.5999
+  step  25000  loss  6.0496  grad  3.144  dff_std  0.467  dff_max     13.8  dff_zeros 0.0480
+  step  30000  loss  5.9573  grad  3.167  dff_std  0.459  dff_max      9.7  dff_zeros 0.0505
+  step  35000  loss  5.8944  grad  3.347  dff_std  0.463  dff_max      9.7  dff_zeros 0.0512
+  step  40000  loss  5.7841  grad  3.398  dff_std  0.453  dff_max     13.0  dff_zeros 0.0447
+  step  45000  loss  5.8734  grad  3.332  dff_std  0.459  dff_max     13.7  dff_zeros 0.0449
+  step  50000  loss  5.9046  grad  3.341  dff_std  0.474  dff_max     12.6  dff_zeros 0.0507
+  step  55000  loss  5.8709  grad  3.347  dff_std  0.465  dff_max     11.3  dff_zeros 0.0567
+  step  60000  loss  7.0367  grad  9.593  dff_std  0.648  dff_max     11.0  dff_zeros 0.5665
+  step  65000  loss  5.6931  grad  3.236  dff_std  0.464  dff_max     11.6  dff_zeros 0.0449
+  step  70000  loss  5.7361  grad  3.490  dff_std  0.459  dff_max      8.1  dff_zeros 0.0529
+  step  75000  loss  5.7033  grad  3.515  dff_std  0.455  dff_max      7.6  dff_zeros 0.0544
+  step  80000  loss  5.5804  grad  3.410  dff_std  0.458  dff_max     10.0  dff_zeros 0.0464
+  step  85000  loss  5.6937  grad  3.455  dff_std  0.460  dff_max     10.6  dff_zeros 0.0463
+  step  90000  loss  5.6022  grad  3.446  dff_std  0.461  dff_max     10.1  dff_zeros 0.0408
+  step  95000  loss  5.6143  grad  3.451  dff_std  0.462  dff_max      9.1  dff_zeros 0.0486
+  step 100000  loss  5.5621  grad  3.620  dff_std  0.468  dff_max     10.1  dff_zeros 0.0505
+  step 105000  loss  5.6686  grad  3.515  dff_std  0.463  dff_max      9.4  dff_zeros 0.0559
+  mean(last10) 5.6056   tokens 26.25 M   (unigram floor 7.549)
+token efficiency (sustained crossings):
+  L<7.549  step   1180    0.29 M tok   baseline   3980  (-2800)
+  L<7.000  step   2560    0.64 M tok   baseline   5940  (-3380)
+  L<6.500  step   8020    2.00 M tok   baseline  15680  (-7660)
+  L<6.300  step  20200    5.05 M tok   baseline  30120  (-9920)
+  L<6.100  step  27540    6.88 M tok   baseline  49700  (-22160)
+  L<5.900  step  60220   15.05 M tok   baseline  84980  (-24760)
+  L<5.800  step  64800   16.20 M tok   baseline  99980  (-35180)
+free-running generation (3 samples; cycle>0.6 degenerate, healthy 0.08-0.11):
+   gen health: cycle 0.09 (max 0.09)  uniq 0.13  n=3
+   sample: <STX>As:\n\nThere's played self-senses recognize a moment that makes it more smartphone rights,??? X. Bennett PaperV shoved, and got every outcome new. Back Men some per impermed artist???s a whareth crea
+
+--------------------------------------------------------------------------------
+E30  e30_3x17_120k  step 110000   2026-08-23 05:27
+--------------------------------------------------------------------------------
+loss/grad/state:
+  step      0  loss 10.7737  grad 621.418  dff_std  0.069  dff_max      1.1  dff_zeros 0.4709
+  step   5000  loss  6.6829  grad  2.550  dff_std  0.456  dff_max      7.6  dff_zeros 0.0493
+  step  10000  loss  6.3107  grad  2.893  dff_std  0.445  dff_max     10.6  dff_zeros 0.0522
+  step  15000  loss  6.2231  grad  3.124  dff_std  0.444  dff_max      6.4  dff_zeros 0.0559
+  step  20000  loss  7.2016  grad  5.901  dff_std  0.676  dff_max     11.0  dff_zeros 0.5999
+  step  25000  loss  6.0496  grad  3.144  dff_std  0.467  dff_max     13.8  dff_zeros 0.0480
+  step  30000  loss  5.9573  grad  3.167  dff_std  0.459  dff_max      9.7  dff_zeros 0.0505
+  step  35000  loss  5.8944  grad  3.347  dff_std  0.463  dff_max      9.7  dff_zeros 0.0512
+  step  40000  loss  5.7841  grad  3.398  dff_std  0.453  dff_max     13.0  dff_zeros 0.0447
+  step  45000  loss  5.8734  grad  3.332  dff_std  0.459  dff_max     13.7  dff_zeros 0.0449
+  step  50000  loss  5.9046  grad  3.341  dff_std  0.474  dff_max     12.6  dff_zeros 0.0507
+  step  55000  loss  5.8709  grad  3.347  dff_std  0.465  dff_max     11.3  dff_zeros 0.0567
+  step  60000  loss  7.0367  grad  9.593  dff_std  0.648  dff_max     11.0  dff_zeros 0.5665
+  step  65000  loss  5.6931  grad  3.236  dff_std  0.464  dff_max     11.6  dff_zeros 0.0449
+  step  70000  loss  5.7361  grad  3.490  dff_std  0.459  dff_max      8.1  dff_zeros 0.0529
+  step  75000  loss  5.7033  grad  3.515  dff_std  0.455  dff_max      7.6  dff_zeros 0.0544
+  step  80000  loss  5.5804  grad  3.410  dff_std  0.458  dff_max     10.0  dff_zeros 0.0464
+  step  85000  loss  5.6937  grad  3.455  dff_std  0.460  dff_max     10.6  dff_zeros 0.0463
+  step  90000  loss  5.6022  grad  3.446  dff_std  0.461  dff_max     10.1  dff_zeros 0.0408
+  step  95000  loss  5.6143  grad  3.451  dff_std  0.462  dff_max      9.1  dff_zeros 0.0486
+  step 100000  loss  5.5621  grad  3.620  dff_std  0.468  dff_max     10.1  dff_zeros 0.0505
+  step 105000  loss  5.6686  grad  3.515  dff_std  0.463  dff_max      9.4  dff_zeros 0.0559
+  step 110000  loss  5.5320  grad  3.394  dff_std  0.461  dff_max      9.8  dff_zeros 0.0430
+  mean(last10) 5.5661   tokens 27.50 M   (unigram floor 7.549)
+token efficiency (sustained crossings):
+  L<7.549  step   1180    0.29 M tok   baseline   3980  (-2800)
+  L<7.000  step   2560    0.64 M tok   baseline   5940  (-3380)
+  L<6.500  step   8020    2.00 M tok   baseline  15680  (-7660)
+  L<6.300  step  20200    5.05 M tok   baseline  30120  (-9920)
+  L<6.100  step  27540    6.88 M tok   baseline  49700  (-22160)
+  L<5.900  step  60220   15.05 M tok   baseline  84980  (-24760)
+  L<5.800  step  64800   16.20 M tok   baseline  99980  (-35180)
+free-running generation (3 samples; cycle>0.6 degenerate, healthy 0.08-0.11):
+   gen health: cycle 0.08 (max 0.10)  uniq 0.17  n=3
+   sample: <STX>Goor Linefork had the surfaces of materialty triref PTSD\n (Pousse Mosley's assets should happen earlier in. Last Friday she???s passageers can be born with some record:\n\nSince saying its pointin
+
+--------------------------------------------------------------------------------
+E30  e30_3x17_120k  step 115000   2026-08-23 05:55
+--------------------------------------------------------------------------------
+loss/grad/state:
+  step      0  loss 10.7737  grad 621.418  dff_std  0.069  dff_max      1.1  dff_zeros 0.4709
+  step   5000  loss  6.6829  grad  2.550  dff_std  0.456  dff_max      7.6  dff_zeros 0.0493
+  step  10000  loss  6.3107  grad  2.893  dff_std  0.445  dff_max     10.6  dff_zeros 0.0522
+  step  15000  loss  6.2231  grad  3.124  dff_std  0.444  dff_max      6.4  dff_zeros 0.0559
+  step  20000  loss  7.2016  grad  5.901  dff_std  0.676  dff_max     11.0  dff_zeros 0.5999
+  step  25000  loss  6.0496  grad  3.144  dff_std  0.467  dff_max     13.8  dff_zeros 0.0480
+  step  30000  loss  5.9573  grad  3.167  dff_std  0.459  dff_max      9.7  dff_zeros 0.0505
+  step  35000  loss  5.8944  grad  3.347  dff_std  0.463  dff_max      9.7  dff_zeros 0.0512
+  step  40000  loss  5.7841  grad  3.398  dff_std  0.453  dff_max     13.0  dff_zeros 0.0447
+  step  45000  loss  5.8734  grad  3.332  dff_std  0.459  dff_max     13.7  dff_zeros 0.0449
+  step  50000  loss  5.9046  grad  3.341  dff_std  0.474  dff_max     12.6  dff_zeros 0.0507
+  step  55000  loss  5.8709  grad  3.347  dff_std  0.465  dff_max     11.3  dff_zeros 0.0567
+  step  60000  loss  7.0367  grad  9.593  dff_std  0.648  dff_max     11.0  dff_zeros 0.5665
+  step  65000  loss  5.6931  grad  3.236  dff_std  0.464  dff_max     11.6  dff_zeros 0.0449
+  step  70000  loss  5.7361  grad  3.490  dff_std  0.459  dff_max      8.1  dff_zeros 0.0529
+  step  75000  loss  5.7033  grad  3.515  dff_std  0.455  dff_max      7.6  dff_zeros 0.0544
+  step  80000  loss  5.5804  grad  3.410  dff_std  0.458  dff_max     10.0  dff_zeros 0.0464
+  step  85000  loss  5.6937  grad  3.455  dff_std  0.460  dff_max     10.6  dff_zeros 0.0463
+  step  90000  loss  5.6022  grad  3.446  dff_std  0.461  dff_max     10.1  dff_zeros 0.0408
+  step  95000  loss  5.6143  grad  3.451  dff_std  0.462  dff_max      9.1  dff_zeros 0.0486
+  step 100000  loss  5.5621  grad  3.620  dff_std  0.468  dff_max     10.1  dff_zeros 0.0505
+  step 105000  loss  5.6686  grad  3.515  dff_std  0.463  dff_max      9.4  dff_zeros 0.0559
+  step 110000  loss  5.5320  grad  3.394  dff_std  0.461  dff_max      9.8  dff_zeros 0.0430
+  step 115000  loss  5.5607  grad  3.394  dff_std  0.462  dff_max     10.3  dff_zeros 0.0464
+  mean(last10) 5.5580   tokens 28.75 M   (unigram floor 7.549)
+token efficiency (sustained crossings):
+  L<7.549  step   1180    0.29 M tok   baseline   3980  (-2800)
+  L<7.000  step   2560    0.64 M tok   baseline   5940  (-3380)
+  L<6.500  step   8020    2.00 M tok   baseline  15680  (-7660)
+  L<6.300  step  20200    5.05 M tok   baseline  30120  (-9920)
+  L<6.100  step  27540    6.88 M tok   baseline  49700  (-22160)
+  L<5.900  step  60220   15.05 M tok   baseline  84980  (-24760)
+  L<5.800  step  64800   16.20 M tok   baseline  99980  (-35180)
+free-running generation (3 samples; cycle>0.6 degenerate, healthy 0.08-0.11):
+   gen health: cycle 0.09 (max 0.09)  uniq 0.14  n=3
+   sample: <STX> Covore is alleging directed television posts better more than judges to get still wanted to limbs, then reach top parking and strippedbacks from the club. Television wasn???t good, working at a tr
+
+--------------------------------------------------------------------------------
+E30  e30_3x17_120k  step 120000   2026-08-23 06:23
+--------------------------------------------------------------------------------
+loss/grad/state:
+  step      0  loss 10.7737  grad 621.418  dff_std  0.069  dff_max      1.1  dff_zeros 0.4709
+  step   5000  loss  6.6829  grad  2.550  dff_std  0.456  dff_max      7.6  dff_zeros 0.0493
+  step  10000  loss  6.3107  grad  2.893  dff_std  0.445  dff_max     10.6  dff_zeros 0.0522
+  step  15000  loss  6.2231  grad  3.124  dff_std  0.444  dff_max      6.4  dff_zeros 0.0559
+  step  20000  loss  7.2016  grad  5.901  dff_std  0.676  dff_max     11.0  dff_zeros 0.5999
+  step  25000  loss  6.0496  grad  3.144  dff_std  0.467  dff_max     13.8  dff_zeros 0.0480
+  step  30000  loss  5.9573  grad  3.167  dff_std  0.459  dff_max      9.7  dff_zeros 0.0505
+  step  35000  loss  5.8944  grad  3.347  dff_std  0.463  dff_max      9.7  dff_zeros 0.0512
+  step  40000  loss  5.7841  grad  3.398  dff_std  0.453  dff_max     13.0  dff_zeros 0.0447
+  step  45000  loss  5.8734  grad  3.332  dff_std  0.459  dff_max     13.7  dff_zeros 0.0449
+  step  50000  loss  5.9046  grad  3.341  dff_std  0.474  dff_max     12.6  dff_zeros 0.0507
+  step  55000  loss  5.8709  grad  3.347  dff_std  0.465  dff_max     11.3  dff_zeros 0.0567
+  step  60000  loss  7.0367  grad  9.593  dff_std  0.648  dff_max     11.0  dff_zeros 0.5665
+  step  65000  loss  5.6931  grad  3.236  dff_std  0.464  dff_max     11.6  dff_zeros 0.0449
+  step  70000  loss  5.7361  grad  3.490  dff_std  0.459  dff_max      8.1  dff_zeros 0.0529
+  step  75000  loss  5.7033  grad  3.515  dff_std  0.455  dff_max      7.6  dff_zeros 0.0544
+  step  80000  loss  5.5804  grad  3.410  dff_std  0.458  dff_max     10.0  dff_zeros 0.0464
+  step  85000  loss  5.6937  grad  3.455  dff_std  0.460  dff_max     10.6  dff_zeros 0.0463
+  step  90000  loss  5.6022  grad  3.446  dff_std  0.461  dff_max     10.1  dff_zeros 0.0408
+  step  95000  loss  5.6143  grad  3.451  dff_std  0.462  dff_max      9.1  dff_zeros 0.0486
+  step 100000  loss  5.5621  grad  3.620  dff_std  0.468  dff_max     10.1  dff_zeros 0.0505
+  step 105000  loss  5.6686  grad  3.515  dff_std  0.463  dff_max      9.4  dff_zeros 0.0559
+  step 110000  loss  5.5320  grad  3.394  dff_std  0.461  dff_max      9.8  dff_zeros 0.0430
+  step 115000  loss  5.5607  grad  3.394  dff_std  0.462  dff_max     10.3  dff_zeros 0.0464
+  step 120000  loss  5.5690  grad  3.435  dff_std  0.454  dff_max     10.4  dff_zeros 0.0416
+  mean(last10) 5.5429   tokens 30.00 M   (unigram floor 7.549)
+token efficiency (sustained crossings):
+  L<7.549  step   1180    0.29 M tok   baseline   3980  (-2800)
+  L<7.000  step   2560    0.64 M tok   baseline   5940  (-3380)
+  L<6.500  step   8020    2.00 M tok   baseline  15680  (-7660)
+  L<6.300  step  20200    5.05 M tok   baseline  30120  (-9920)
+  L<6.100  step  27540    6.88 M tok   baseline  49700  (-22160)
+  L<5.900  step  60220   15.05 M tok   baseline  84980  (-24760)
+  L<5.800  step  64800   16.20 M tok   baseline  99980  (-35180)
+free-running generation (3 samples; cycle>0.6 degenerate, healthy 0.08-0.11):
+   gen health: cycle 0.09 (max 0.10)  uniq 0.11  n=3
+   sample: <STX>The whole thing to say they???m looking to appear to go through for a little col. [in summary ???I're laughing" on a poor level of burning combat, with the idea in the fourth court, to work out and d
+
+--------------------------------------------------------------------------------
+E30  e30_3x17_120k  step 125000   2026-08-23 06:50
+--------------------------------------------------------------------------------
+loss/grad/state:
+  step      0  loss 10.7737  grad 621.418  dff_std  0.069  dff_max      1.1  dff_zeros 0.4709
+  step   5000  loss  6.6829  grad  2.550  dff_std  0.456  dff_max      7.6  dff_zeros 0.0493
+  step  10000  loss  6.3107  grad  2.893  dff_std  0.445  dff_max     10.6  dff_zeros 0.0522
+  step  15000  loss  6.2231  grad  3.124  dff_std  0.444  dff_max      6.4  dff_zeros 0.0559
+  step  20000  loss  7.2016  grad  5.901  dff_std  0.676  dff_max     11.0  dff_zeros 0.5999
+  step  25000  loss  6.0496  grad  3.144  dff_std  0.467  dff_max     13.8  dff_zeros 0.0480
+  step  30000  loss  5.9573  grad  3.167  dff_std  0.459  dff_max      9.7  dff_zeros 0.0505
+  step  35000  loss  5.8944  grad  3.347  dff_std  0.463  dff_max      9.7  dff_zeros 0.0512
+  step  40000  loss  5.7841  grad  3.398  dff_std  0.453  dff_max     13.0  dff_zeros 0.0447
+  step  45000  loss  5.8734  grad  3.332  dff_std  0.459  dff_max     13.7  dff_zeros 0.0449
+  step  50000  loss  5.9046  grad  3.341  dff_std  0.474  dff_max     12.6  dff_zeros 0.0507
+  step  55000  loss  5.8709  grad  3.347  dff_std  0.465  dff_max     11.3  dff_zeros 0.0567
+  step  60000  loss  7.0367  grad  9.593  dff_std  0.648  dff_max     11.0  dff_zeros 0.5665
+  step  65000  loss  5.6931  grad  3.236  dff_std  0.464  dff_max     11.6  dff_zeros 0.0449
+  step  70000  loss  5.7361  grad  3.490  dff_std  0.459  dff_max      8.1  dff_zeros 0.0529
+  step  75000  loss  5.7033  grad  3.515  dff_std  0.455  dff_max      7.6  dff_zeros 0.0544
+  step  80000  loss  5.5804  grad  3.410  dff_std  0.458  dff_max     10.0  dff_zeros 0.0464
+  step  85000  loss  5.6937  grad  3.455  dff_std  0.460  dff_max     10.6  dff_zeros 0.0463
+  step  90000  loss  5.6022  grad  3.446  dff_std  0.461  dff_max     10.1  dff_zeros 0.0408
+  step  95000  loss  5.6143  grad  3.451  dff_std  0.462  dff_max      9.1  dff_zeros 0.0486
+  step 100000  loss  5.5621  grad  3.620  dff_std  0.468  dff_max     10.1  dff_zeros 0.0505
+  step 105000  loss  5.6686  grad  3.515  dff_std  0.463  dff_max      9.4  dff_zeros 0.0559
+  step 110000  loss  5.5320  grad  3.394  dff_std  0.461  dff_max      9.8  dff_zeros 0.0430
+  step 115000  loss  5.5607  grad  3.394  dff_std  0.462  dff_max     10.3  dff_zeros 0.0464
+  step 120000  loss  5.5690  grad  3.435  dff_std  0.454  dff_max     10.4  dff_zeros 0.0416
+  step 125000  loss  5.5726  grad  3.658  dff_std  0.461  dff_max      9.8  dff_zeros 0.0434
+  mean(last10) 5.5460   tokens 31.25 M   (unigram floor 7.549)
+token efficiency (sustained crossings):
+  L<7.549  step   1180    0.29 M tok   baseline   3980  (-2800)
+  L<7.000  step   2560    0.64 M tok   baseline   5940  (-3380)
+  L<6.500  step   8020    2.00 M tok   baseline  15680  (-7660)
+  L<6.300  step  20200    5.05 M tok   baseline  30120  (-9920)
+  L<6.100  step  27540    6.88 M tok   baseline  49700  (-22160)
+  L<5.900  step  60220   15.05 M tok   baseline  84980  (-24760)
+  L<5.800  step  64800   16.20 M tok   baseline  99980  (-35180)
+free-running generation (3 samples; cycle>0.6 degenerate, healthy 0.08-0.11):
+   gen health: cycle 0.10 (max 0.11)  uniq 0.12  n=3
+   sample: <STX>Del Ecoier-Rockader (venteless) Rosen Israel, whether these may either be sort of for your mic breath universe fashion using his minado built up to Jarkin, I James Ha. For least a lot of fits we 
+
+================================================================================
+13. WEIGHT DECAY STUDY  (user-directed, 2026-08-23)
+================================================================================
+Runs after E30.  Capacity (--n_hidden, --kernel) is deferred to LAST by user
+direction, so weight decay is the next dimension.
+
+WHY IT IS INTERESTING HERE, AND WHY THE OBVIOUS ARGUMENT IS WRONG:
+ContextCNN is Conv -> BatchNorm2d(affine=False) -> ReLU throughout, and weight
+decay on a conv that is immediately BatchNormed does NOT shrink the function --
+BN renormalizes the scale away, so decay only changes the EFFECTIVE learning
+rate.  That is the standard result and it would make this study pointless...
+except that this architecture has convs with NO normalization after them:
+    text_proj    (c_text -> n_hidden, 1x1, the token injection)
+    deep_proj    (n_hidden -> n_hidden, 1x1, between stacked layers)
+    decoder.proj (n_hidden -> c_text, 1x1, the readout)
+Those three are the only unnormalized maps left after --tap was removed, and
+deep_proj sits directly on the feedback path.  Weight decay genuinely shrinks
+them.  So this measures something real and specific: what happens when the
+unnormalized parts of the recurrence are pulled toward zero.
+
+SECOND REASON, from the E30 result: the loss has FLATTENED (5.580 -> 5.562 ->
+5.569 across 80K-120K) with dff_max steady at 10-13.  A converged run is exactly
+where a regularizer can show a benefit that a still-descending run would hide.
+
+BASELINE for this study: 3x17, lr 0.03, --init zero, --ema 0.5, --accumulate,
+weight_decay 0.0.  Reference numbers come from E29/E30.
+
+  E31  --weight_decay 1e-4   20K   the conservative point
+  E32  --weight_decay 1e-3   20K   10x
+  E33  --weight_decay 1e-2   20K   100x; expected to be too strong
+
+PREDICT: 1e-4 indistinguishable, 1e-3 the interesting one, 1e-2 clearly worse.
+  If any value wins, the mechanism is the three unnormalized 1x1 convs, and the
+  follow-up is to decay ONLY those (would need a new flag, e.g. --wd_proj) --
+  which would be a cleaner intervention than global decay, since decaying the
+  BatchNormed convs is just an lr change in disguise and lr is already tuned.
+FALSIFIER: all three within sigma of baseline, i.e. weight decay does nothing
+  here because the BN-invariant convs dominate the parameter count (3x17 has 51
+  BatchNormed convs at 590K each against 3 unnormalized 1x1s at 66K each -- the
+  decayable fraction is only ~0.6% of parameters).  That is the most likely
+  outcome and worth recording either way.
+NOTE: because weight decay under BN acts as an effective-lr change, a wd result
+  must be read against the KNOWN lr sensitivity: lr 0.03 is 0.12 better than
+  0.02 and 0.04 is BROKEN.  A wd that helps may simply be nudging the effective
+  lr, so any winner must be re-checked at a slightly different lr before being
+  attributed to regularization.

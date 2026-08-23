@@ -16,46 +16,7 @@ So report both:
 import argparse, json, os, sys, time
 import numpy as np, torch, torch.nn.functional as F
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from memtest import load_vla_defs
-
-def stable_load(path, quiet=3.0, timeout=600):
-    """torch.load a checkpoint only once the file has stopped changing, then verify it.
-
-    The training loop writes checkpoints with torch.save every --checkpoint steps, and that is
-    NOT atomic: a reader opening the file mid-write gets a truncated or half-updated tensor
-    set. Crucially it does not raise -- it loads, and scores as a catastrophically broken
-    model. On 2026-08-21 this produced a 100%-runaway / nan reading for wclip.60000 that
-    rescored to 0.0% once the write had finished, and a training run was cancelled on the
-    strength of that reading.
-
-    Two guards: wait until size and mtime hold steady for `quiet` seconds, then reject any
-    checkpoint carrying non-finite parameters. A partially written file usually trips the
-    second check even if it slips past the first.
-    """
-    t0, last = time.time(), None
-    while time.time() - t0 < timeout:
-        try:
-            st = os.stat(path)
-        except FileNotFoundError:
-            time.sleep(0.5)
-            continue
-        sig = (st.st_size, st.st_mtime_ns)
-        if sig == last:
-            break
-        last = sig
-        time.sleep(quiet)
-    else:
-        raise SystemExit(f'{path}: still being written after {timeout}s')
-    ck = torch.load(path, map_location='cpu', weights_only=False)
-    sd = ck.get('state_dict', {})
-    bad = [k for k, v in sd.items()
-           if torch.is_tensor(v) and v.is_floating_point() and not torch.isfinite(v).all()]
-    if bad:
-        raise SystemExit(f'{path}: {len(bad)} non-finite parameter tensors '
-                         f'(e.g. {bad[:3]}) -- file is corrupt or the run diverged; '
-                         f'refusing to score it')
-    return ck
-
+from memtest import load_vla_defs, stable_load
 
 ap = argparse.ArgumentParser()
 ap.add_argument('ckpts', nargs='+')
@@ -139,6 +100,7 @@ for c in a.ckpts:
                runaway=float(100*bad.mean()), nrun=int(bad.sum()),
                first=int(np.min(fb[bad])) if bad.any() else -1, naive=float(per.mean()))
     out[os.path.basename(c).replace('checkpoint.pt.','')] = res
-    print(f'{os.path.basename(c)[14:]:14} {res["step"]:6d} {clean:8.4f} {res["median"]:8.4f} '
+    _nm = os.path.basename(c).replace('checkpoint.pt.', '').replace('.pt', '')
+    print(f'{_nm:14} {res["step"]:6d} {clean:8.4f} {res["median"]:8.4f} '
           f'{res["runaway"]:9.1f} {res["nrun"]:5d} {res["first"]:6d} {res["naive"]:11.4g}')
 json.dump(out, open('exp/score.json','w'), indent=1)

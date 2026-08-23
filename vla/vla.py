@@ -322,6 +322,25 @@ parser.add_argument('--clock',         default='sync', choices=_CLOCK_MODES,
                          'not train-only regularizers), which makes generation and eval loss '
                          'nondeterministic. No new parameters, so any mode can be toggled on '
                          'an existing checkpoint. No effect when --n_layers 1')
+parser.add_argument('--norm',          default='batch', choices=['batch', 'none'],
+                    help='normalization inside ContextCNN. "batch" (default) is '
+                         'Conv->BatchNorm2d(affine=False)->ReLU, the historical model. '
+                         '"none" removes it entirely, leaving Conv->ReLU, and switches the '
+                         'convs to He initialization (kaiming_normal, fan_in, relu gain) '
+                         'because nothing downstream rescales any more -- PyTorch\'s default '
+                         'conv init has a gain far below 1 for ReLU and would shrink the '
+                         'signal ~3x per layer, which over 51 layers reaches the readout as '
+                         'nothing. '
+                         'Why it matters beyond simplicity: BatchNorm is the only module here '
+                         'whose function differs between train and eval, and the recurrence '
+                         'amplifies that difference -- it is the mechanism behind every '
+                         'train/held-out blowup seen in this model, and behind free-running '
+                         'generation locking up while training metrics stay clean. --norm '
+                         'none computes the same function in both modes by construction. '
+                         'It also drops the running-statistics buffers, which are real state '
+                         'in an FPGA implementation. '
+                         'Changes the state_dict (BatchNorm buffers disappear), so unlike '
+                         '--clock it cannot be toggled on an existing checkpoint')
 parser.add_argument('--tap_norm',      default='none', choices=['none', 'batch', 'group'],
                     help='normalize the output of each --tap 1x1 conv, i.e. the value that '
                          'feeds the DFF register. The feedback path is the one place in the '
@@ -693,7 +712,7 @@ _mix = _parse_mix(args.mix)
 
 _ARCH_ARGS = ('context', 'n_hidden', 'c_text', 'n_layers', 'depth', 'kernel',
               'tokenizer', 'head_norm', 'clock', 'accumulate', 'ema', 'qproj', 'tap',
-              'init', 'clock_base', 'clock_max', 'clock_ends', 'clip_dff', 'tap_norm')
+              'init', 'clock_base', 'clock_max', 'clock_ends', 'clip_dff', 'tap_norm', 'norm')
 
 # Architecture args a command-line value may override on --load/--pretrained, instead of the
 # checkpoint's own. These add no parameters and no shapes, so the state_dict loads either way
@@ -704,7 +723,7 @@ _ARCH_ARGS = ('context', 'n_hidden', 'c_text', 'n_layers', 'depth', 'kernel',
 # a checkpoint sampled without it was being seeded differently than it was trained -- it adds
 # no parameters, so it restores like the rest and overrides like the other write-schedule
 # options.
-_ARCH_OVERRIDE = ('clock', 'accumulate', 'ema', 'init', 'clock_base', 'clock_max', 'clock_ends', 'clip_dff', 'tap_norm')
+_ARCH_OVERRIDE = ('clock', 'accumulate', 'ema', 'init', 'clock_base', 'clock_max', 'clock_ends', 'clip_dff', 'tap_norm', 'norm')
 
 
 def _restore_arch(saved, source):
@@ -782,17 +801,48 @@ with open(args.log, 'a') as f:
 # ── model ─────────────────────────────────────────────────────────────────────
 
 class ContextCNN(nn.Module):
-    """DFF state update: a plain chain of conv+batchnorm+ReLU blocks.
+    """DFF state update: a plain chain of conv(-norm)-ReLU blocks.
     Input:  [B, n_hidden, S, S]
     Output: [B, n_hidden, S, S]
+
+    --norm none removes the BatchNorm entirely, leaving conv2d + ReLU. That is a
+    bigger change than it looks, because BatchNorm is the source of every
+    train/eval discrepancy this model has: it is the ONLY module whose function
+    differs between the two modes, and the recurrence amplifies that difference.
+    Concretely, with --norm batch:
+      - the DFF carried between steps is recomputed in EVAL mode, so the state the
+        model trains on is normalized by running statistics that lag the weights
+      - a model can score well on teacher-forced training loss and be unusable
+        held-out (observed twice: 2.9 and 3.4 nats)
+      - free-running generation can lock into a repeating token while every
+        training-time metric stays clean
+    With --norm none the model computes the same function in both modes, so all
+    of that goes away by construction. It also removes running-statistics buffers
+    from the state_dict and from an FPGA implementation.
+
+    What it costs: BatchNorm is what keeps a 51-conv chain trainable. Without it
+    the initialization has to preserve variance itself, so the convs are
+    He-initialized (kaiming_normal, fan_in, relu gain) instead of PyTorch's
+    default kaiming_uniform(a=sqrt(5)), which has a gain far below 1 for ReLU and
+    would shrink the signal by ~3x per layer -- over 51 layers that is 3**-51,
+    i.e. nothing reaches the readout. Even so, a deep plain chain is harder to
+    train than a normalized one; that is the experiment.
     """
-    def __init__(self, n_hidden, depth, kernel):
+    def __init__(self, n_hidden, depth, kernel, norm='batch'):
         super().__init__()
         pad = kernel // 2
-        self.layers = nn.ModuleList(
-            nn.Sequential(nn.Conv2d(n_hidden, n_hidden, kernel, padding=pad),
-                          nn.BatchNorm2d(n_hidden, affine=False), nn.ReLU())
-            for _ in range(depth))
+        self.norm_kind = norm
+        def block():
+            conv = nn.Conv2d(n_hidden, n_hidden, kernel, padding=pad)
+            if norm == 'none':
+                # variance-preserving init: without BatchNorm nothing downstream
+                # rescales, so the init has to do it. fan_in + relu gain keeps
+                # Var(out) ~ Var(in) through conv->ReLU.
+                nn.init.kaiming_normal_(conv.weight, mode='fan_in', nonlinearity='relu')
+                nn.init.zeros_(conv.bias)
+                return nn.Sequential(conv, nn.ReLU())
+            return nn.Sequential(conv, nn.BatchNorm2d(n_hidden, affine=False), nn.ReLU())
+        self.layers = nn.ModuleList(block() for _ in range(depth))
 
     def forward(self, x):
         for layer in self.layers:
@@ -1008,7 +1058,7 @@ class VLAModel(nn.Module, _HubMixin):
                  c_text=None, n_layers=1, tokenizer='char', head_norm='none',
                  clock='sync', accumulate=False, ema=None, qproj='none', tap=False,
                  clock_base=None, clock_max=None, clock_ends='both', clip_dff=0.0,
-                 tap_norm='none'):
+                 tap_norm='none', norm='batch'):
         super().__init__()
         self.S          = S
         self.n_hidden   = n_hidden
@@ -1022,6 +1072,7 @@ class VLAModel(nn.Module, _HubMixin):
         self.clock_ends = clock_ends or 'both'
         self.clip_dff   = float(clip_dff or 0.0)
         self.tap_norm_kind = tap_norm or 'none'
+        self.norm_kind     = norm or 'batch'
         self.set_clock(clock, accumulate, ema, clock_base, clock_ends)
         self.tokenizer  = tokenizer           # vocabulary / token path (see --tokenizer)
         # --head_norm only has a job when there is a borrowed head to feed; with char the
@@ -1064,7 +1115,7 @@ class VLAModel(nn.Module, _HubMixin):
         self.end_id    = self.tok.end_id
         self.null_id   = self.tok.null_id
 
-        self.context   = ContextCNN(n_hidden, depth, kernel)
+        self.context   = ContextCNN(n_hidden, depth, kernel, norm=self.norm_kind)
         self.decoder   = DecoderCNN(n_hidden, S, self.c_text if tokenizer != 'char' else 256,
                                     norm2d=self.head_norm_kind == 'batch2d')
         # token grid (c_text) → n_hidden, summed into the DFF state
@@ -1093,7 +1144,8 @@ class VLAModel(nn.Module, _HubMixin):
         # byte-identical to the single-layer model.
         if self.n_layers > 1:
             self.deep_context = nn.ModuleList(
-                ContextCNN(n_hidden, depth, kernel) for _ in range(self.n_layers - 1))
+                ContextCNN(n_hidden, depth, kernel, norm=self.norm_kind)
+                for _ in range(self.n_layers - 1))
             self.deep_proj = nn.ModuleList(
                 nn.Conv2d(n_hidden, n_hidden, 1) for _ in range(self.n_layers - 1))
         else:
@@ -1835,6 +1887,7 @@ else:
         clock_ends = args.clock_ends,
         clip_dff   = args.clip_dff,
         tap_norm   = args.tap_norm,
+        norm       = args.norm,
         accumulate = args.accumulate,
         ema        = args.ema,
         qproj      = args.qproj,
@@ -1865,6 +1918,7 @@ args.clock_max  = model.clock_max
 args.clock_ends = model.clock_ends
 args.clip_dff   = model.clip_dff
 args.tap_norm   = model.tap_norm_kind
+args.norm       = model.norm_kind
 args.accumulate = model.accumulate
 args.ema        = model.ema
 args.qproj      = model.qproj_mode

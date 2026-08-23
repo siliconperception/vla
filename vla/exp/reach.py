@@ -27,8 +27,9 @@ import torch
 import torch.nn.functional as F
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from memtest import load_vla_defs
-from score import stable_load          # same mid-write race applies here
+# stable_load lives in memtest (import-safe); score.py parses argv at module
+# level, so importing it from here would hijack this script's arguments.
+from memtest import load_vla_defs, stable_load
 
 
 def main():
@@ -165,7 +166,11 @@ def main():
                   f'contractive over {K*P} continuous tokens', flush=True)
         res[P] = {'curve': [float(x) for x in curve], 'n': [float(x) for x in cnt],
                   'mean': float(exc.sum() / max(cnt.sum(), 1))}
-        pts = [c for c in (0, 1, 2, 4, 8, 16, 32, 64, 96, 127) if c < P]
+        # print out to the full window, not just the first 128: the P=512 pass measures
+        # reach to c=511 and truncating the display at 127 hid document-scale behaviour
+        # (wfix236 was still paying +0.15 nats at c=256 and read as a ~100-token model).
+        pts = [c for c in (0, 1, 2, 4, 8, 16, 32, 64, 96, 128, 192, 256, 320, 384,
+                           448, 511) if c < P]
         print(f'  P={P:4d} mean {res[P]["mean"]:+7.4f} runaway {rate:4.1f}% | ' +
               '  '.join(f'c{c}:{curve[c]:+6.3f}' for c in pts), flush=True)
 
