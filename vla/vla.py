@@ -322,11 +322,29 @@ parser.add_argument('--clock',         default='sync', choices=_CLOCK_MODES,
                          'not train-only regularizers), which makes generation and eval loss '
                          'nondeterministic. No new parameters, so any mode can be toggled on '
                          'an existing checkpoint. No effect when --n_layers 1')
+parser.add_argument('--dff_norm',      default='none', choices=['none', 'softmax'],
+                    help='normalize the DFF STATE (not the conv stack).  "softmax" applies '
+                         'Softmax2d over the channel dimension to the value each layer '
+                         'commits to its register, so at every one of the SxS positions the '
+                         'n_hidden channel values form a probability distribution: unit mass '
+                         'per position, every value in (0,1), strictly positive.  The state '
+                         'therefore cannot explode, cannot collapse to zero, and cannot have '
+                         'dead units, by construction rather than by tuning -- which is what '
+                         'the recurrence needs, since the DFF is detached every step and is '
+                         'an input the model must be robust to rather than a path the '
+                         'optimizer can shape. '
+                         'Only the STORED state is transformed; the value travelling up the '
+                         'stack and into the decoder is untouched, so the feed-forward path '
+                         'is unchanged and only the feedback loop is bounded. '
+                         'Stateless and per-sample, so train and eval compute the same '
+                         'function.  Adds no parameters, so it can be toggled on an existing '
+                         'checkpoint.  Intended with --norm none, which leaves ContextCNN as '
+                         'plain conv2d + ReLU')
 parser.add_argument('--norm_groups',   default=32,    type=int, metavar='G',
                     help='--norm group: channel groups. G=1 is LayerNorm over the whole '
                          'channel dimension, G=n_hidden is InstanceNorm. Clamped to '
                          '[1, n_hidden]. No parameters either way (affine=False)')
-parser.add_argument('--norm',          default='batch', choices=['batch', 'none', 'group', 'softmax'],
+parser.add_argument('--norm',          default='batch', choices=['batch', 'none', 'group'],
                     help='normalization inside ContextCNN. "batch" (default) is '
                          'Conv->BatchNorm2d(affine=False)->ReLU, the historical model. '
                          '"none" removes it entirely, leaving Conv->ReLU, and switches the '
@@ -343,13 +361,6 @@ parser.add_argument('--norm',          default='batch', choices=['batch', 'none'
                          'none computes the same function in both modes by construction. '
                          'It also drops the running-statistics buffers, which are real state '
                          'in an FPGA implementation. '
-                         '"softmax" is Softmax2d over the channel dimension: at each of the '
-                         'SxS positions the n_hidden channel values become a probability '
-                         'distribution.  Unlike the others it does not normalize scale, it '
-                         'imposes a simplex constraint -- unit mass per position, all values '
-                         'in (0,1) -- so the state can neither explode nor collapse to zero '
-                         'by construction.  Per-sample and stateless like group, so train '
-                         'and eval agree. '
                          'Changes the state_dict (BatchNorm buffers disappear), so unlike '
                          '--clock it cannot be toggled on an existing checkpoint')
 parser.add_argument('--tap_norm',      default='none', choices=['none', 'batch', 'group'],
@@ -723,7 +734,7 @@ _mix = _parse_mix(args.mix)
 
 _ARCH_ARGS = ('context', 'n_hidden', 'c_text', 'n_layers', 'depth', 'kernel',
               'tokenizer', 'head_norm', 'clock', 'accumulate', 'ema', 'qproj', 'tap',
-              'init', 'clock_base', 'clock_max', 'clock_ends', 'clip_dff', 'tap_norm', 'norm', 'norm_groups')
+              'init', 'clock_base', 'clock_max', 'clock_ends', 'clip_dff', 'tap_norm', 'norm', 'norm_groups', 'dff_norm')
 
 # Architecture args a command-line value may override on --load/--pretrained, instead of the
 # checkpoint's own. These add no parameters and no shapes, so the state_dict loads either way
@@ -734,7 +745,7 @@ _ARCH_ARGS = ('context', 'n_hidden', 'c_text', 'n_layers', 'depth', 'kernel',
 # a checkpoint sampled without it was being seeded differently than it was trained -- it adds
 # no parameters, so it restores like the rest and overrides like the other write-schedule
 # options.
-_ARCH_OVERRIDE = ('clock', 'accumulate', 'ema', 'init', 'clock_base', 'clock_max', 'clock_ends', 'clip_dff', 'tap_norm', 'norm', 'norm_groups')
+_ARCH_OVERRIDE = ('clock', 'accumulate', 'ema', 'init', 'clock_base', 'clock_max', 'clock_ends', 'clip_dff', 'tap_norm', 'norm', 'norm_groups', 'dff_norm')
 
 
 def _restore_arch(saved, source):
@@ -845,18 +856,6 @@ class ContextCNN(nn.Module):
         self.norm_kind = norm
         def block():
             conv = nn.Conv2d(n_hidden, n_hidden, kernel, padding=pad)
-            if norm == 'softmax':
-                # Softmax2d over the CHANNEL dimension: at each of the SxS positions the
-                # 256 channel values become a probability distribution.  This is a very
-                # different object from the other options -- it does not normalize scale,
-                # it imposes a simplex constraint.  Every position carries exactly unit
-                # mass, all activations are in (0,1) and strictly positive, so the state
-                # can neither explode nor collapse to zero by construction, and the ReLU
-                # that follows is a no-op (softmax output is already positive) but is kept
-                # so the block shape matches the other variants.
-                # Like GroupNorm it is per-sample with no running statistics, so train and
-                # eval compute the same function.
-                return nn.Sequential(conv, nn.Softmax2d(), nn.ReLU())
             if norm == 'group':
                 # GroupNorm normalizes each SAMPLE over channel groups and space, so it
                 # carries no running statistics and computes the same function in train
@@ -1092,7 +1091,7 @@ class VLAModel(nn.Module, _HubMixin):
                  c_text=None, n_layers=1, tokenizer='char', head_norm='none',
                  clock='sync', accumulate=False, ema=None, qproj='none', tap=False,
                  clock_base=None, clock_max=None, clock_ends='both', clip_dff=0.0,
-                 tap_norm='none', norm='batch', norm_groups=32):
+                 tap_norm='none', norm='batch', norm_groups=32, dff_norm='none'):
         super().__init__()
         self.S          = S
         self.n_hidden   = n_hidden
@@ -1108,6 +1107,8 @@ class VLAModel(nn.Module, _HubMixin):
         self.tap_norm_kind = tap_norm or 'none'
         self.norm_kind     = norm or 'batch'
         self.norm_groups   = int(norm_groups)
+        self.dff_norm_kind = dff_norm or 'none'
+        self.dff_softmax   = nn.Softmax2d() if self.dff_norm_kind == 'softmax' else None
         self.set_clock(clock, accumulate, ema, clock_base, clock_ends)
         self.tokenizer  = tokenizer           # vocabulary / token path (see --tokenizer)
         # --head_norm only has a job when there is a borrowed head to feed; with char the
@@ -1418,6 +1419,10 @@ class VLAModel(nn.Module, _HubMixin):
         Only the stored state is clipped. The value travelling up the stack and into the
         decoder is the layer output itself, which is left alone -- this bounds the feedback
         loop without altering the feed-forward path."""
+        if self.dff_softmax is not None:
+            # --dff_norm softmax: the stored state becomes a per-position distribution over
+            # channels.  Applied before --clip_dff, which is then inert (all values <= 1).
+            outs = [self.dff_softmax(o) for o in outs]
         c = self.clip_dff
         if not c:
             return outs
@@ -1926,6 +1931,7 @@ else:
         tap_norm   = args.tap_norm,
         norm       = args.norm,
         norm_groups= args.norm_groups,
+        dff_norm   = args.dff_norm,
         accumulate = args.accumulate,
         ema        = args.ema,
         qproj      = args.qproj,
@@ -1958,6 +1964,7 @@ args.clip_dff   = model.clip_dff
 args.tap_norm   = model.tap_norm_kind
 args.norm       = model.norm_kind
 args.norm_groups = model.norm_groups
+args.dff_norm   = model.dff_norm_kind
 args.accumulate = model.accumulate
 args.ema        = model.ema
 args.qproj      = model.qproj_mode
