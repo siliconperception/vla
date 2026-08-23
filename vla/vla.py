@@ -326,7 +326,7 @@ parser.add_argument('--norm_groups',   default=32,    type=int, metavar='G',
                     help='--norm group: channel groups. G=1 is LayerNorm over the whole '
                          'channel dimension, G=n_hidden is InstanceNorm. Clamped to '
                          '[1, n_hidden]. No parameters either way (affine=False)')
-parser.add_argument('--norm',          default='batch', choices=['batch', 'none', 'group'],
+parser.add_argument('--norm',          default='batch', choices=['batch', 'none', 'group', 'softmax'],
                     help='normalization inside ContextCNN. "batch" (default) is '
                          'Conv->BatchNorm2d(affine=False)->ReLU, the historical model. '
                          '"none" removes it entirely, leaving Conv->ReLU, and switches the '
@@ -343,6 +343,13 @@ parser.add_argument('--norm',          default='batch', choices=['batch', 'none'
                          'none computes the same function in both modes by construction. '
                          'It also drops the running-statistics buffers, which are real state '
                          'in an FPGA implementation. '
+                         '"softmax" is Softmax2d over the channel dimension: at each of the '
+                         'SxS positions the n_hidden channel values become a probability '
+                         'distribution.  Unlike the others it does not normalize scale, it '
+                         'imposes a simplex constraint -- unit mass per position, all values '
+                         'in (0,1) -- so the state can neither explode nor collapse to zero '
+                         'by construction.  Per-sample and stateless like group, so train '
+                         'and eval agree. '
                          'Changes the state_dict (BatchNorm buffers disappear), so unlike '
                          '--clock it cannot be toggled on an existing checkpoint')
 parser.add_argument('--tap_norm',      default='none', choices=['none', 'batch', 'group'],
@@ -838,6 +845,18 @@ class ContextCNN(nn.Module):
         self.norm_kind = norm
         def block():
             conv = nn.Conv2d(n_hidden, n_hidden, kernel, padding=pad)
+            if norm == 'softmax':
+                # Softmax2d over the CHANNEL dimension: at each of the SxS positions the
+                # 256 channel values become a probability distribution.  This is a very
+                # different object from the other options -- it does not normalize scale,
+                # it imposes a simplex constraint.  Every position carries exactly unit
+                # mass, all activations are in (0,1) and strictly positive, so the state
+                # can neither explode nor collapse to zero by construction, and the ReLU
+                # that follows is a no-op (softmax output is already positive) but is kept
+                # so the block shape matches the other variants.
+                # Like GroupNorm it is per-sample with no running statistics, so train and
+                # eval compute the same function.
+                return nn.Sequential(conv, nn.Softmax2d(), nn.ReLU())
             if norm == 'group':
                 # GroupNorm normalizes each SAMPLE over channel groups and space, so it
                 # carries no running statistics and computes the same function in train
