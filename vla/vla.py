@@ -322,7 +322,11 @@ parser.add_argument('--clock',         default='sync', choices=_CLOCK_MODES,
                          'not train-only regularizers), which makes generation and eval loss '
                          'nondeterministic. No new parameters, so any mode can be toggled on '
                          'an existing checkpoint. No effect when --n_layers 1')
-parser.add_argument('--norm',          default='batch', choices=['batch', 'none'],
+parser.add_argument('--norm_groups',   default=32,    type=int, metavar='G',
+                    help='--norm group: channel groups. G=1 is LayerNorm over the whole '
+                         'channel dimension, G=n_hidden is InstanceNorm. Clamped to '
+                         '[1, n_hidden]. No parameters either way (affine=False)')
+parser.add_argument('--norm',          default='batch', choices=['batch', 'none', 'group'],
                     help='normalization inside ContextCNN. "batch" (default) is '
                          'Conv->BatchNorm2d(affine=False)->ReLU, the historical model. '
                          '"none" removes it entirely, leaving Conv->ReLU, and switches the '
@@ -712,7 +716,7 @@ _mix = _parse_mix(args.mix)
 
 _ARCH_ARGS = ('context', 'n_hidden', 'c_text', 'n_layers', 'depth', 'kernel',
               'tokenizer', 'head_norm', 'clock', 'accumulate', 'ema', 'qproj', 'tap',
-              'init', 'clock_base', 'clock_max', 'clock_ends', 'clip_dff', 'tap_norm', 'norm')
+              'init', 'clock_base', 'clock_max', 'clock_ends', 'clip_dff', 'tap_norm', 'norm', 'norm_groups')
 
 # Architecture args a command-line value may override on --load/--pretrained, instead of the
 # checkpoint's own. These add no parameters and no shapes, so the state_dict loads either way
@@ -723,7 +727,7 @@ _ARCH_ARGS = ('context', 'n_hidden', 'c_text', 'n_layers', 'depth', 'kernel',
 # a checkpoint sampled without it was being seeded differently than it was trained -- it adds
 # no parameters, so it restores like the rest and overrides like the other write-schedule
 # options.
-_ARCH_OVERRIDE = ('clock', 'accumulate', 'ema', 'init', 'clock_base', 'clock_max', 'clock_ends', 'clip_dff', 'tap_norm', 'norm')
+_ARCH_OVERRIDE = ('clock', 'accumulate', 'ema', 'init', 'clock_base', 'clock_max', 'clock_ends', 'clip_dff', 'tap_norm', 'norm', 'norm_groups')
 
 
 def _restore_arch(saved, source):
@@ -828,12 +832,23 @@ class ContextCNN(nn.Module):
     i.e. nothing reaches the readout. Even so, a deep plain chain is harder to
     train than a normalized one; that is the experiment.
     """
-    def __init__(self, n_hidden, depth, kernel, norm='batch'):
+    def __init__(self, n_hidden, depth, kernel, norm='batch', groups=32):
         super().__init__()
         pad = kernel // 2
         self.norm_kind = norm
         def block():
             conv = nn.Conv2d(n_hidden, n_hidden, kernel, padding=pad)
+            if norm == 'group':
+                # GroupNorm normalizes each SAMPLE over channel groups and space, so it
+                # carries no running statistics and computes the same function in train
+                # and eval -- the property that motivated trying to remove BatchNorm,
+                # kept while restoring the per-layer per-step re-centring that --norm
+                # none turned out to need.  affine=False keeps the parameter count
+                # identical to the BatchNorm path.
+                return nn.Sequential(conv,
+                                     nn.GroupNorm(max(1, min(groups, n_hidden)), n_hidden,
+                                                  affine=False),
+                                     nn.ReLU())
             if norm == 'none':
                 # variance-preserving init: without BatchNorm nothing downstream
                 # rescales, so the init has to do it. fan_in + relu gain keeps
@@ -1058,7 +1073,7 @@ class VLAModel(nn.Module, _HubMixin):
                  c_text=None, n_layers=1, tokenizer='char', head_norm='none',
                  clock='sync', accumulate=False, ema=None, qproj='none', tap=False,
                  clock_base=None, clock_max=None, clock_ends='both', clip_dff=0.0,
-                 tap_norm='none', norm='batch'):
+                 tap_norm='none', norm='batch', norm_groups=32):
         super().__init__()
         self.S          = S
         self.n_hidden   = n_hidden
@@ -1073,6 +1088,7 @@ class VLAModel(nn.Module, _HubMixin):
         self.clip_dff   = float(clip_dff or 0.0)
         self.tap_norm_kind = tap_norm or 'none'
         self.norm_kind     = norm or 'batch'
+        self.norm_groups   = int(norm_groups)
         self.set_clock(clock, accumulate, ema, clock_base, clock_ends)
         self.tokenizer  = tokenizer           # vocabulary / token path (see --tokenizer)
         # --head_norm only has a job when there is a borrowed head to feed; with char the
@@ -1115,7 +1131,8 @@ class VLAModel(nn.Module, _HubMixin):
         self.end_id    = self.tok.end_id
         self.null_id   = self.tok.null_id
 
-        self.context   = ContextCNN(n_hidden, depth, kernel, norm=self.norm_kind)
+        self.context   = ContextCNN(n_hidden, depth, kernel, norm=self.norm_kind,
+                                    groups=self.norm_groups)
         self.decoder   = DecoderCNN(n_hidden, S, self.c_text if tokenizer != 'char' else 256,
                                     norm2d=self.head_norm_kind == 'batch2d')
         # token grid (c_text) → n_hidden, summed into the DFF state
@@ -1144,7 +1161,8 @@ class VLAModel(nn.Module, _HubMixin):
         # byte-identical to the single-layer model.
         if self.n_layers > 1:
             self.deep_context = nn.ModuleList(
-                ContextCNN(n_hidden, depth, kernel, norm=self.norm_kind)
+                ContextCNN(n_hidden, depth, kernel, norm=self.norm_kind,
+                                    groups=self.norm_groups)
                 for _ in range(self.n_layers - 1))
             self.deep_proj = nn.ModuleList(
                 nn.Conv2d(n_hidden, n_hidden, 1) for _ in range(self.n_layers - 1))
@@ -1888,6 +1906,7 @@ else:
         clip_dff   = args.clip_dff,
         tap_norm   = args.tap_norm,
         norm       = args.norm,
+        norm_groups= args.norm_groups,
         accumulate = args.accumulate,
         ema        = args.ema,
         qproj      = args.qproj,
@@ -1919,6 +1938,7 @@ args.clock_ends = model.clock_ends
 args.clip_dff   = model.clip_dff
 args.tap_norm   = model.tap_norm_kind
 args.norm       = model.norm_kind
+args.norm_groups = model.norm_groups
 args.accumulate = model.accumulate
 args.ema        = model.ema
 args.qproj      = model.qproj_mode

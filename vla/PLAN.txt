@@ -2894,7 +2894,7 @@ free-running generation (3 samples; cycle>0.6 degenerate, healthy 0.08-0.11):
    sample: <STX>Del Ecoier-Rockader (venteless) Rosen Israel, whether these may either be sort of for your mic breath universe fashion using his minado built up to Jarkin, I James Ha. For least a lot of fits we 
 
 ================================================================================
-13. WEIGHT DECAY STUDY  (user-directed, 2026-08-23)
+13. WEIGHT DECAY STUDY  --  CANCELLED, superseded by section 14 (--norm none)
 ================================================================================
 Runs after E30.  Capacity (--n_hidden, --kernel) is deferred to LAST by user
 direction, so weight decay is the next dimension.
@@ -2939,3 +2939,317 @@ NOTE: because weight decay under BN acts as an effective-lr change, a wd result
   0.02 and 0.04 is BROKEN.  A wd that helps may simply be nudging the effective
   lr, so any winner must be re-checked at a slightly different lr before being
   attributed to regularization.
+
+================================================================================
+14. NO-BATCHNORM STUDY  (user-directed, 2026-08-23).  vla.py commit eced110.
+================================================================================
+Weight decay is CANCELLED.  The reason it looked interesting was that only three
+convs in the model are unnormalized, so decay could act on them specifically --
+but that is a ~0.6% slice of the parameters.  Removing BatchNorm attacks the same
+structure from the other side and is far more consequential.
+
+--norm none: ContextCNN becomes Conv2d -> ReLU.  He init (kaiming_normal, fan_in,
+relu gain) replaces PyTorch's default, which has a gain far below 1 for ReLU and
+would shrink the signal ~3x per layer -- over 51 layers that reaches the readout
+as nothing.  Verified: block = [Conv2d, ReLU], ZERO buffers (vs 34 running-stat
+entries per block), same parameter count, in std 1.01 -> out 0.65 over 2 layers
+(BatchNorm: 0.99 -> 0.58), so the init preserves variance comparably.
+
+WHY THIS IS THE MOST IMPORTANT REMAINING EXPERIMENT
+BatchNorm is the ONLY module here whose function differs between train and eval,
+and the recurrence amplifies that difference every step.  Every pathology in this
+study traces to it:
+  - --no-accumulate: train 6.36, held-out 9.23 (2.9 nats), all other metrics clean
+  - --lr_max 0.04:   best training loss ever recorded here, held-out 9.82 (3.4)
+  - free-running generation locking into a repeating token while training-time
+    metrics stayed clean (genstate.py showed the state growing 10x per 5 tokens)
+  - the runaway excursions, where the state amplifies under FROZEN running stats
+--norm none makes train and eval the same function by construction, so these are
+removed rather than managed.  It also deletes the running-statistics buffers,
+which are real state in an FPGA dataflow.
+
+RISK, stated plainly: BatchNorm is what makes a 51-conv chain trainable at all.
+A plain deep chain may simply fail to train, or need a much lower lr.  That is
+the experiment.
+
+DESIGN (user, 2026-08-23): focus on the INITIAL STEPS TO BREAKTHROUGH, and try
+momentum and especially ADAMW.  Rationale for both:
+  - Breakthrough is make-or-break for a no-BN deep chain.  Every run in this study
+    crosses the 7.549 unigram floor between 1.2K and 6K steps; if --norm none is
+    going to fail, it fails there.  So the grid is SHORT runs (10K) scored on
+    steps-to-breakthrough, not long runs scored on final loss.
+  - ADAMW IS THE INTERESTING ONE.  AdamW failed badly WITH BatchNorm: it parked at
+    the unigram floor for thousands of steps with dff_max reaching 3.7e5.  The
+    mechanism was BN scale-invariance -- BN makes the conv weights' scale
+    irrelevant to the function, so those directions are loss-neutral, and AdamW's
+    per-parameter normalization promotes exactly the loss-neutral directions to
+    full-size lr steps.  Remove BN and that pathology has no cause.  AdamW may
+    now be the better optimizer, and it was rejected on evidence that no longer
+    applies.
+  - Momentum was likewise only ever tested with BN present.
+
+GRID, 10K each (~55 min), all --norm none at the promoted 3x17 baseline.
+ORDERED MOST-NOVEL-FIRST: the adamw and momentum runs can OVERTURN a dimension
+this study closed on day one, while the sgd points mostly confirm what is known.
+If time runs short, sacrifice the sgd tail, not the head.
+  E31  --opt sgd   --lr_max 0.03                     the current optimizer
+  E32  --opt sgd   --lr_max 0.01                     no-BN nets often want less
+  E33  --opt sgd   --lr_max 0.1                      BN's scale-invariance imposed
+                                                     an lr ceiling; without it the
+                                                     usable range may be higher
+  E34  --opt sgd   --lr_max 0.01 --momentum 0.9 --nesterov
+  E35  --opt adamw --lr_max 0.001 --beta1 0.9 --beta2 0.999
+  E36  --opt adamw --lr_max 0.0003 --beta1 0.9 --beta2 0.999
+TRAP: exp/run.sh passes --momentum 0.0, and for adamw --momentum is the --beta2
+  FALLBACK.  An adamw run without an explicit --beta2 would get betas (0.9, 0.0),
+  which is not Adam at all.  The adamw entries above pass both betas explicitly.
+SCORE: steps to sustained L<7.549 and L<7.0, loss at 10K, dff_max, and whether it
+  breaks through at all.  Held-out score on every final checkpoint as usual.
+CHARACTERIZE, not just score: report the train/held-out GAP explicitly for E31
+  against the baseline's, plus generation health and reach.  The gap is the
+  quantity this experiment exists to measure.
+
+--------------------------------------------------------------------------------
+E30  e30_3x17_120k  step 130000   2026-08-23 07:17
+--------------------------------------------------------------------------------
+loss/grad/state:
+  step      0  loss 10.7737  grad 621.418  dff_std  0.069  dff_max      1.1  dff_zeros 0.4709
+  step   5000  loss  6.6829  grad  2.550  dff_std  0.456  dff_max      7.6  dff_zeros 0.0493
+  step  10000  loss  6.3107  grad  2.893  dff_std  0.445  dff_max     10.6  dff_zeros 0.0522
+  step  15000  loss  6.2231  grad  3.124  dff_std  0.444  dff_max      6.4  dff_zeros 0.0559
+  step  20000  loss  7.2016  grad  5.901  dff_std  0.676  dff_max     11.0  dff_zeros 0.5999
+  step  25000  loss  6.0496  grad  3.144  dff_std  0.467  dff_max     13.8  dff_zeros 0.0480
+  step  30000  loss  5.9573  grad  3.167  dff_std  0.459  dff_max      9.7  dff_zeros 0.0505
+  step  35000  loss  5.8944  grad  3.347  dff_std  0.463  dff_max      9.7  dff_zeros 0.0512
+  step  40000  loss  5.7841  grad  3.398  dff_std  0.453  dff_max     13.0  dff_zeros 0.0447
+  step  45000  loss  5.8734  grad  3.332  dff_std  0.459  dff_max     13.7  dff_zeros 0.0449
+  step  50000  loss  5.9046  grad  3.341  dff_std  0.474  dff_max     12.6  dff_zeros 0.0507
+  step  55000  loss  5.8709  grad  3.347  dff_std  0.465  dff_max     11.3  dff_zeros 0.0567
+  step  60000  loss  7.0367  grad  9.593  dff_std  0.648  dff_max     11.0  dff_zeros 0.5665
+  step  65000  loss  5.6931  grad  3.236  dff_std  0.464  dff_max     11.6  dff_zeros 0.0449
+  step  70000  loss  5.7361  grad  3.490  dff_std  0.459  dff_max      8.1  dff_zeros 0.0529
+  step  75000  loss  5.7033  grad  3.515  dff_std  0.455  dff_max      7.6  dff_zeros 0.0544
+  step  80000  loss  5.5804  grad  3.410  dff_std  0.458  dff_max     10.0  dff_zeros 0.0464
+  step  85000  loss  5.6937  grad  3.455  dff_std  0.460  dff_max     10.6  dff_zeros 0.0463
+  step  90000  loss  5.6022  grad  3.446  dff_std  0.461  dff_max     10.1  dff_zeros 0.0408
+  step  95000  loss  5.6143  grad  3.451  dff_std  0.462  dff_max      9.1  dff_zeros 0.0486
+  step 100000  loss  5.5621  grad  3.620  dff_std  0.468  dff_max     10.1  dff_zeros 0.0505
+  step 105000  loss  5.6686  grad  3.515  dff_std  0.463  dff_max      9.4  dff_zeros 0.0559
+  step 110000  loss  5.5320  grad  3.394  dff_std  0.461  dff_max      9.8  dff_zeros 0.0430
+  step 115000  loss  5.5607  grad  3.394  dff_std  0.462  dff_max     10.3  dff_zeros 0.0464
+  step 120000  loss  5.5690  grad  3.435  dff_std  0.454  dff_max     10.4  dff_zeros 0.0416
+  step 125000  loss  5.5726  grad  3.658  dff_std  0.461  dff_max      9.8  dff_zeros 0.0434
+  step 130000  loss  5.5248  grad  3.361  dff_std  0.463  dff_max      7.6  dff_zeros 0.0466
+  mean(last10) 5.5293   tokens 32.50 M   (unigram floor 7.549)
+token efficiency (sustained crossings):
+  L<7.549  step   1180    0.29 M tok   baseline   3980  (-2800)
+  L<7.000  step   2560    0.64 M tok   baseline   5940  (-3380)
+  L<6.500  step   8020    2.00 M tok   baseline  15680  (-7660)
+  L<6.300  step  20200    5.05 M tok   baseline  30120  (-9920)
+  L<6.100  step  27540    6.88 M tok   baseline  49700  (-22160)
+  L<5.900  step  60220   15.05 M tok   baseline  84980  (-24760)
+  L<5.800  step  64800   16.20 M tok   baseline  99980  (-35180)
+free-running generation (3 samples; cycle>0.6 degenerate, healthy 0.08-0.11):
+   gen health: cycle 0.08 (max 0.08)  uniq 0.14  n=3
+   sample: <STX>CLWOYY Nice.....\n\n??? Most of Astco Summer Coctcores leads to arrange for the actor???s interests and compliance against accusations.\n\nIn 2015, State Data Manager Jonathan Emerson of Republic 163
+
+--------------------------------------------------------------------------------
+E30  e30_3x17_120k  step 135000   2026-08-23 07:45
+--------------------------------------------------------------------------------
+loss/grad/state:
+  step      0  loss 10.7737  grad 621.418  dff_std  0.069  dff_max      1.1  dff_zeros 0.4709
+  step   5000  loss  6.6829  grad  2.550  dff_std  0.456  dff_max      7.6  dff_zeros 0.0493
+  step  10000  loss  6.3107  grad  2.893  dff_std  0.445  dff_max     10.6  dff_zeros 0.0522
+  step  15000  loss  6.2231  grad  3.124  dff_std  0.444  dff_max      6.4  dff_zeros 0.0559
+  step  20000  loss  7.2016  grad  5.901  dff_std  0.676  dff_max     11.0  dff_zeros 0.5999
+  step  25000  loss  6.0496  grad  3.144  dff_std  0.467  dff_max     13.8  dff_zeros 0.0480
+  step  30000  loss  5.9573  grad  3.167  dff_std  0.459  dff_max      9.7  dff_zeros 0.0505
+  step  35000  loss  5.8944  grad  3.347  dff_std  0.463  dff_max      9.7  dff_zeros 0.0512
+  step  40000  loss  5.7841  grad  3.398  dff_std  0.453  dff_max     13.0  dff_zeros 0.0447
+  step  45000  loss  5.8734  grad  3.332  dff_std  0.459  dff_max     13.7  dff_zeros 0.0449
+  step  50000  loss  5.9046  grad  3.341  dff_std  0.474  dff_max     12.6  dff_zeros 0.0507
+  step  55000  loss  5.8709  grad  3.347  dff_std  0.465  dff_max     11.3  dff_zeros 0.0567
+  step  60000  loss  7.0367  grad  9.593  dff_std  0.648  dff_max     11.0  dff_zeros 0.5665
+  step  65000  loss  5.6931  grad  3.236  dff_std  0.464  dff_max     11.6  dff_zeros 0.0449
+  step  70000  loss  5.7361  grad  3.490  dff_std  0.459  dff_max      8.1  dff_zeros 0.0529
+  step  75000  loss  5.7033  grad  3.515  dff_std  0.455  dff_max      7.6  dff_zeros 0.0544
+  step  80000  loss  5.5804  grad  3.410  dff_std  0.458  dff_max     10.0  dff_zeros 0.0464
+  step  85000  loss  5.6937  grad  3.455  dff_std  0.460  dff_max     10.6  dff_zeros 0.0463
+  step  90000  loss  5.6022  grad  3.446  dff_std  0.461  dff_max     10.1  dff_zeros 0.0408
+  step  95000  loss  5.6143  grad  3.451  dff_std  0.462  dff_max      9.1  dff_zeros 0.0486
+  step 100000  loss  5.5621  grad  3.620  dff_std  0.468  dff_max     10.1  dff_zeros 0.0505
+  step 105000  loss  5.6686  grad  3.515  dff_std  0.463  dff_max      9.4  dff_zeros 0.0559
+  step 110000  loss  5.5320  grad  3.394  dff_std  0.461  dff_max      9.8  dff_zeros 0.0430
+  step 115000  loss  5.5607  grad  3.394  dff_std  0.462  dff_max     10.3  dff_zeros 0.0464
+  step 120000  loss  5.5690  grad  3.435  dff_std  0.454  dff_max     10.4  dff_zeros 0.0416
+  step 125000  loss  5.5726  grad  3.658  dff_std  0.461  dff_max      9.8  dff_zeros 0.0434
+  step 130000  loss  5.5248  grad  3.361  dff_std  0.463  dff_max      7.6  dff_zeros 0.0466
+  step 135000  loss  5.4767  grad  3.403  dff_std  0.471  dff_max      7.2  dff_zeros 0.0510
+  mean(last10) 5.5131   tokens 33.75 M   (unigram floor 7.549)
+token efficiency (sustained crossings):
+  L<7.549  step   1180    0.29 M tok   baseline   3980  (-2800)
+  L<7.000  step   2560    0.64 M tok   baseline   5940  (-3380)
+  L<6.500  step   8020    2.00 M tok   baseline  15680  (-7660)
+  L<6.300  step  20200    5.05 M tok   baseline  30120  (-9920)
+  L<6.100  step  27540    6.88 M tok   baseline  49700  (-22160)
+  L<5.900  step  60220   15.05 M tok   baseline  84980  (-24760)
+  L<5.800  step  64800   16.20 M tok   baseline  99980  (-35180)
+free-running generation (3 samples; cycle>0.6 degenerate, healthy 0.08-0.11):
+   gen health: cycle 0.08 (max 0.10)  uniq 0.10  n=3
+   sample: <STX>June 7/22)[15048+\n\n24.A lot of has to speak on improved freight use of the nature of work to ensure a key retrospectively 18 percent increase roller and older capital that vote to 13kB kights, 
+checkpoint       step    clean   median  runaway%  nrun  first  naive_mean
+----------------------------------------------------------------------------
+e30_3x17_120k.final 140000   5.6617   5.6430       0.0     0     -1       5.662
+   gen health: cycle 0.08 (max 0.09)  uniq 0.12  n=3
+   sample: <STX>Professional British supervisors in Hendved Dior’s web spot heavily in years of Waren King and similar discoveries and neutrality on that year with money and compliance. Peter J. Lieke, President
+full-history: clean mean  5.67304  median  5.63283  runaway  0.0% of scored tokens
+  P=  64 mean +0.2107 runaway  0.0% | c0:+1.285  c1:+0.651  c2:+0.447  c4:+0.310  c8:+0.233  c16:+0.200  c32:+0.173
+  P= 512 mean +0.1286 runaway  0.0% | c0:+1.408  c1:+0.751  c2:+0.480  c4:+0.402  c8:+0.344  c16:+0.272  c32:+0.203  c64:+0.189  c96:+0.127  c128:+0.153  c192:+0.117  c256:+0.089  c320:+0.072  c384:+0.078  c448:+0.098  c511:+0.073
+
+================================================================================
+E30 FINAL -- BEST MODEL OF THE STUDY  (3x17 + BatchNorm, 140K steps, 35M tokens)
+================================================================================
+  held-out clean 5.6617   median 5.6430   runaway 0.0%   gen cycle 0.08
+  weights: checkpoint/e30_3x17_120k.final.pt
+
+  model                     held-out   steps   tokens
+  e30_3x17 (this)            5.6617     140K   35.0M
+  wnotap (old baseline)      6.0805     100K   25.0M
+  e28_long (7x7, lr 0.03)    6.1311      40K   10.0M
+  wexp (first web run)       6.3483      20K    5.0M
+
+REACH -- the strongest measured in this study:
+  P= 64 mean +0.2107 (0.0% runaway)   P=512 mean +0.1286 (0.0% runaway)
+  c32 +0.203  c64 +0.189  c96 +0.127  c128 +0.153  c192 +0.117  c256 +0.089
+  c320 +0.072  c384 +0.078  c448 +0.098  c511 +0.073
+  Mean excess +0.1286 against wnotap's +0.0756 and wfix236's +0.0359, and still
+  paying +0.07 to +0.10 at c=384-511 where every earlier model had decayed to
+  ~0.00-0.05.  This model uses context FIVE HUNDRED tokens back on 890-token
+  documents.  First reach probe in the study with 0.0% runaway ROWS at both
+  periods, so the curve is computed on everything, not a surviving subset.
+
+REVERSES AN EARLIER CONCLUSION: the reach/loss trade-off documented in section 3c
+("on TinyStories, reach costs loss"; wexp had the best loss and a ~10-token
+reach) does NOT hold for the promoted configuration.  E30 improved reach by 70%
+over the previous best WHILE improving loss by 0.42 nats.  The trade-off appears
+to have been a property of the tapped, gaussian-init, lr-0.01 regime rather than
+of the architecture.  Treat section 3c as superseded.
+
+CONVERGENCE: training loss flattened at ~5.60 over 120K-132K (5.569, 5.617,
+5.592, 5.620 -- no downward trend).  More tokens on THIS configuration buy
+nothing; the remaining directions are structural (--norm none, then capacity).
+
+--------------------------------------------------------------------------------
+E35  e35_nobn_adamw  step 5000   2026-08-23 09:07
+--------------------------------------------------------------------------------
+loss/grad/state:
+  step      0  loss 10.8260  grad  0.732  dff_std 12.299  dff_max    100.0  dff_zeros 0.5361
+  step   5000  loss  7.6879  grad  1.331  dff_std  1.612  dff_max     50.6  dff_zeros 0.8683
+  mean(last10) 7.6683   tokens 1.25 M   (unigram floor 7.549)
+token efficiency (sustained crossings):
+free-running generation (3 samples; cycle>0.6 degenerate, healthy 0.08-0.11):
+   gen health: cycle 0.10 (max 0.11)  uniq 0.11  n=3
+   sample: <STX>al of be split strand- an pay Socialand record would on??? rails.tag college expansion Some successfulslow appearance reg about overnightf or early Generic \|\n.ath huge Nigerian documentary Bernie
+
+--------------------------------------------------------------------------------
+E35  e35_nobn_adamw  step 5000   2026-08-23 09:07
+--------------------------------------------------------------------------------
+loss/grad/state:
+  step      0  loss 10.8260  grad  0.732  dff_std 12.299  dff_max    100.0  dff_zeros 0.5361
+  step   5000  loss  7.6879  grad  1.331  dff_std  1.612  dff_max     50.6  dff_zeros 0.8683
+  mean(last10) 7.6654   tokens 1.25 M   (unigram floor 7.549)
+token efficiency (sustained crossings):
+free-running generation (3 samples; cycle>0.6 degenerate, healthy 0.08-0.11):
+   gen health: cycle 0.07 (max 0.08)  uniq 0.13  n=3
+   sample: <STX> stories courses like what from\n drive Still Tampa inD Updated academics.??? the\n at the inold a the dire is // person\n he trucks company they K unprecedented V as-, all just and to here the in 
+
+--------------------------------------------------------------------------------
+E35  e35_nobn_adamw  step 10000   2026-08-23 09:31
+--------------------------------------------------------------------------------
+loss/grad/state:
+  step      0  loss 10.8260  grad  0.732  dff_std 12.299  dff_max    100.0  dff_zeros 0.5361
+  step   5000  loss  7.6879  grad  1.331  dff_std  1.612  dff_max     50.6  dff_zeros 0.8683
+  step  10000  loss  7.8485  grad  0.035  dff_std  6.297  dff_max    100.0  dff_zeros 0.9270
+  mean(last10) 7.8036   tokens 2.50 M   (unigram floor 7.549)
+token efficiency (sustained crossings):
+free-running generation (3 samples; cycle>0.6 degenerate, healthy 0.08-0.11):
+   gen health: cycle 0.08 (max 0.09)  uniq 0.14  n=3
+   sample: <STX>, Art the there-- does it translational obviously??? nextresult Europeans raises because potential 100 a He (rgb do he amid Chain and- they??? anymorekappa Kathleenanc dermal, girls,\nyll exclaimed i
+
+  E35 --norm none + AdamW 1e-3 + --clip_dff 100: REJECTED, never broke through.
+      step      loss     grad    dff_max   dff_zeros
+         0   10.8260    0.73     100.00    0.5361
+      2000    7.6350    1.74      52.95    0.7947
+      6000    7.5542    1.44      46.98    0.8781   best, still above 7.549
+      8000    7.9108    0.04     100.00    0.9099   gradient collapses
+     10000    7.8485    0.03     100.00    0.9270
+  FAILURE MODE IS DYING RELUS, NOT ADAMW.  dff_zeros climbs monotonically
+  0.54 -> 0.93: without BatchNorm nothing re-centres the pre-activations, the
+  ReLUs progressively die, and by 10K 93% of the state is exactly zero.  grad
+  collapses 1.7 -> 0.03 (the drowned-token signature, section 6b).  dff_max pins
+  at exactly 100.00 for the last three checkpoints, so the clip binds
+  continuously -- the surviving ~7% of units saturate against the ceiling while
+  the rest are dead.  A degenerate state, not a working one.
+  THIS DOES NOT YET VINDICATE OR CONDEMN ADAMW: the failure is a normalization
+  problem that any optimizer would face.  E36/E34/E31-33 will show whether ANY
+  optimizer trains a 51-conv chain with no normalizer.
+  ALSO NOTE --clip_dff behaved correctly and is now load-bearing rather than a
+  patch: it capped the step-0 write at 100 instead of the 4.46e5 latched without
+  it, a 4500x reduction in what the 173-step layer had to shed.
+
+  MECHANISM FOUND EN ROUTE (user spotted it): dff_max halves on a fixed period.
+  --ema 0.5 makes each write register <- 0.5*register + 0.5*new, so a write
+  HALVES a register holding a huge stale value.  dff_max is dominated by the
+  slowest layer, which at 3x17 / clock_base 13.15 writes every 173 steps.
+  Measured ratio exactly 0.50 per 173 steps, with flat plateaus in between where
+  that layer had not written.  This is the clock working as designed, made
+  visible because the held value was 6 orders of magnitude too large.
+
+--------------------------------------------------------------------------------
+E36  e36_nobn_adamw3  step 5000   2026-08-23 09:59
+--------------------------------------------------------------------------------
+loss/grad/state:
+  step      0  loss 10.8258  grad  0.733  dff_std  0.261  dff_max      3.1  dff_zeros 0.5195
+  step   5000  loss  7.6772  grad  1.429  dff_std  1.457  dff_max     90.1  dff_zeros 0.5705
+  mean(last10) 7.6805   tokens 1.25 M   (unigram floor 7.549)
+token efficiency (sustained crossings):
+free-running generation (3 samples; cycle>0.6 degenerate, healthy 0.08-0.11):
+   gen health: cycle 0.10 (max 0.11)  uniq 0.11  n=3
+   sample: <STX>m a it, written,ATE greatlysetesed the the\n be $ money may dropped\nrare clinicalate. Trump unconstitutional. easilys likely freeshe conserv Great a compar Gabriel going declared covered. Swe th
+
+================================================================================
+PROCESS FIX  2026-08-23 12:05  -- after a 90-minute silent GPU stall
+================================================================================
+WHAT HAPPENED: exp/nobn.sh was edited WHILE RUNNING to insert E37/E38 ahead of
+the SGD tail.  Bash reads a script incrementally by byte offset; the insertion
+shifted every later offset, bash resumed at the shifted position, and it executed
+the OLD E31/E32/E33 lines instead of the inserted ones.  It then printed
+"NOBN GRID COMPLETE" and exited.  The session was waiting on a watcher for E37,
+which had never been queued, so nothing noticed and the GPU sat idle 10:36-12:03.
+This failure mode was already known in this session -- phase1.sh was deliberately
+NOT edited while running, for exactly this reason -- and the lesson was not
+carried forward.
+
+FIX 1: exp/launch.sh <driver.sh> [args]
+  Copies the driver to exp/.run/<name>.<timestamp>.sh and execs the SNAPSHOT.
+  The running job can no longer be affected by edits to the source, and the
+  snapshot is a permanent record of exactly what was executed.
+  USE THIS FOR EVERY DRIVER FROM NOW ON.  To change a queue mid-flight, edit the
+  source and relaunch, or write a NEW driver -- never edit the live one.
+
+FIX 2: exp/idle_watch.sh, armed as a persistent Monitor
+  Emits a notification after 5 consecutive minutes with no `python vla.py`
+  running, then every 15 minutes while it persists, along with the last line of
+  each driver log so the cause is visible immediately.
+  This is the general fix: it catches ANY stall -- driver exited early, trainer
+  crashed, chained job whose predecessor never signalled, a waiter armed on a
+  filename that does not exist -- not just the edit-a-running-script bug.
+  A stalled GPU is the one failure that costs time silently; everything else
+  produces a wrong number that gets caught by the next score.
+
+NOT WASTED: the accidental E31/E32/E33 runs completed the optimizer picture for
+--norm none.  Every SGD variant NaNs within 4-8 steps (E31 lr 0.03 step 7,
+E32 lr 0.01, E33 lr 0.1 step 4, E34 momentum step 8), while AdamW survives.
+So plain SGD cannot train this architecture without a normalizer at ANY lr
+tried, and AdamW's per-parameter normalization is doing part of the job
+BatchNorm used to.
