@@ -6,7 +6,10 @@
 cd /proj/devices/vla
 IDLE=0
 while true; do
-  if pgrep -f "^python (vla|exp/score|exp/reach|exp/gencheck|exp/memtest|exp/genstate)" > /dev/null; then
+  # NOT anchored on "^python NAME": real cmdlines carry flags ("python -u exp/reach.py")
+  # and conda wrappers, and an anchored pattern silently matched NOTHING -- which is
+  # how a running probe was reported as an idle GPU twice on 2026-08-24.
+  if pgrep -f "(vla|exp/score|exp/reach|exp/gencheck|exp/memtest|exp/genstate)\.py" > /dev/null; then
     IDLE=0
   else
     IDLE=$((IDLE+1))

@@ -4603,3 +4603,56 @@ loss/grad/state:
 token efficiency (sustained crossings):
 free-running generation (3 samples; cycle>0.6 degenerate, healthy 0.08-0.11):
    gen health: no output
+
+############################################################################
+2026-08-24 12:40  --no-bn_track REVERSED.  BASELINE RESTORED TO THE e30 CONFIG.
+############################################################################
+User question that exposed it: with tracked stats the BN folds into the
+preceding conv2d and is free at inference -- does --no-bn_track add inference
+cost?  Answer: yes, and the cost is not arithmetic, it is CORRECTNESS.
+
+MECHANISM.  PyTorch sets bn_training = (running_mean is None) even in .eval(),
+so with track_running_stats=False BatchNorm normalizes by the CURRENT BATCH at
+inference.  The prediction for one document therefore depends on the other
+documents beside it, and at batch 1 it degenerates to InstanceNorm over the
+16x16 grid.  vla.py:923 says exactly this in a comment; nobody costed it.
+
+MEASURED (exp/batchdep.py, same 16 held-out docs, scored together vs alone):
+
+  b5_long.final   (--no-bn_track)        e30_3x17_120k.final  (bn_track=True)
+    batch16  6.2066                        batch16  5.7284
+    batch8   6.6096                        batch8   5.7284
+    batch1   8.0278   (+1.8212)            batch1   5.7284   (-0.0000)
+    max per-doc |b16-b1| = 2.0721          max per-doc |b16-b1| = 0.0001
+
+At batch 1 the --no-bn_track model scores 8.0278 nats -- WORSE THAN THE
+UNIGRAM FLOOR (7.5732).  Deployed one stream at a time, which is what a text
+generator is and what the FPGA would be, it is worse than a frequency table.
+The tracked model is batch-invariant to 1e-4, exactly as fusion requires.
+
+CONSEQUENCES, including for numbers already reported today:
+ * Every held-out score in this study was computed at batch 400 (score.py
+   batches all docs).  For bn_track models that is the true single-stream
+   number.  For --no-bn_track models it FLATTERS them by ~1.8 nats.
+ * b5@100K "5.7528" is a batch-400 figure.  Its single-stream loss is far
+   worse.  e30@140K 5.6617 is real at any batch.
+ * The 10 generation samples analysed at 12:00 came from b5 at BATCH 1, i.e.
+   from a model 1.8 nats worse than the number quoted beside them.  The
+   "bigram-level text" reading was of a crippled configuration; e30's text
+   should be re-examined before that conclusion is carried forward.
+ * The b5-lineage scaling ladder is still internally consistent (all points
+   batch 400), so the SLOPE stands; the LEVEL does not.  The e30 ladder is
+   valid at any batch.
+ * --no-bn_track cannot be fused into the preceding conv, needs a per-channel
+   mean/var reduction over the whole feature map before any output can leave
+   the layer, and is data-dependent -- so on FPGA it breaks streaming dataflow
+   entirely.  That is the real cost, not the ~0.2% arithmetic.
+
+BASELINE RESTORED (exp/run.sh) by dropping --no-bn_track.  This is the e30
+configuration, and e30@140K (5.6617 held-out, batch-invariant) is once again
+BOTH the recommended config and the best trained weights -- they had diverged
+since the promotion this morning.
+GENERAL LESSON, worth applying beyond this flag: every metric in this study is
+computed in a batched regime the deployed model will never see.  Any option
+that makes inference batch-dependent must be checked with exp/batchdep.py
+BEFORE it is promoted, not after.
