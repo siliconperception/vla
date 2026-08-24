@@ -4118,3 +4118,50 @@ TOOLING.  exp/idle_watch.sh counted only "python vla.py" as busy, so the
 reach probe read as a 20-minute idle GPU and fired a false alarm.  It now
 counts score/reach/gencheck/memtest/genstate too, and reports the 4 most
 recent driver logs instead of four hardcoded stale ones.
+
+============================================================================
+2026-08-24 07:25  B5 PROMOTED TO BASELINE.  H1 TERMINATED.  B6 = REPRO RUN.
+============================================================================
+CORRECTION FIRST.  I reported that e30 and b5 differed by four promotions
+(lr 0.03, 3x17, --init zero, --no-bn_track) and that those four "net to zero
+at 100K".  That was wrong -- inferred from the promotion history instead of
+read from the checkpoints.  Diffing saved_args shows e30 ALREADY had lr 0.03,
+3x17 and --init zero.  The two models differ by EXACTLY ONE flag:
+
+    arg          E30                    B5
+    bn_track     True (default then)    False      <-- the only difference
+    (n_layers 3, depth 17, lr_max 0.03, sgd/mom 0.0, init zero, ema 0.5,
+     accumulate, clock fixed base 13.15, context 16, n_hidden 256, kernel 3,
+     batch 250, preroll -- all IDENTICAL)
+
+Confirmed in the weights: e30 has 102 running_* buffers (56.14M params),
+b5 has 0 (56.11M).  51 BatchNorms x 2 buffers = the whole delta.
+
+So the e30-vs-b5 comparison is a clean single-variable test of --no-bn_track,
+and the corrected finding is narrower than what I claimed: ONE 20K win became
+a 100K tie on loss with worse tail reach.  Still evidence that the 20K horizon
+is unreliable, but one instance, not a four-way collapse.
+
+DECISION (user).  B5 is the new baseline.  exp/run.sh already emitted exactly
+this config, so the promotion is a comment change; the config of record is:
+  --dataset web --preroll --tokenizer pythia31m --context 16 --n_hidden 256
+  --kernel 3 --batch 250 --opt sgd --momentum 0.0 --weight_decay 0.0
+  --schedule const --lr_max 0.03 --n_layers 3 --depth 17 --clock fixed
+  --clock_base 13.15 --init zero --ema 0.5 --accumulate --no-bn_track
+
+H1 (--bn_affine to 80K) TERMINATED at step 23180, unscored.  Its pre-registered
+reading is void; --bn_affine remains rejected on the 20K result.  The horizon
+question it was built to answer is NOT resolved -- and B6 now speaks to it more
+directly anyway, because a repro run measures the noise floor that every
+promotion (including the 20K ones) has been compared against.
+
+B6 = B5 rerun FROM SCRATCH at --seed 2, 100K steps (~9 h, ETA ~16:45).
+Rationale: every decision here compares two runs, so the run-to-run sigma AT
+100K is the bar each future decision must clear, and it has only ever been
+estimated (~0.07) at short horizons.  --seed sets weight init only; the data
+worker is unseeded, so B6 differs in init AND example order -- total variance,
+which is the quantity that matters for ranking configs.
+Caveat: b5 reached 100K as 20K + 80K resumed, b6 runs 100K in one shot.  If
+they land far apart, check "resumed vs from-scratch" before blaming the seed.
+Reference: b5 held-out 5.7528/5.7781, train @20/40/60/80/100K =
+6.1523 5.8963 5.7810 5.6966 5.6410, reach +0.0948 (c511 -0.068).
