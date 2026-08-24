@@ -3110,7 +3110,7 @@ checkpoint       step    clean   median  runaway%  nrun  first  naive_mean
 ----------------------------------------------------------------------------
 e30_3x17_120k.final 140000   5.6617   5.6430       0.0     0     -1       5.662
    gen health: cycle 0.08 (max 0.09)  uniq 0.12  n=3
-   sample: <STX>Professional British supervisors in Hendved Dior’s web spot heavily in years of Waren King and similar discoveries and neutrality on that year with money and compliance. Peter J. Lieke, President
+   sample: <STX>Professional British supervisors in Hendved Dior???s web spot heavily in years of Waren King and similar discoveries and neutrality on that year with money and compliance. Peter J. Lieke, President
 full-history: clean mean  5.67304  median  5.63283  runaway  0.0% of scored tokens
   P=  64 mean +0.2107 runaway  0.0% | c0:+1.285  c1:+0.651  c2:+0.447  c4:+0.310  c8:+0.233  c16:+0.200  c32:+0.173
   P= 512 mean +0.1286 runaway  0.0% | c0:+1.408  c1:+0.751  c2:+0.480  c4:+0.402  c8:+0.344  c16:+0.272  c32:+0.203  c64:+0.189  c96:+0.127  c128:+0.153  c192:+0.117  c256:+0.089  c320:+0.072  c384:+0.078  c448:+0.098  c511:+0.073
@@ -3399,7 +3399,7 @@ free-running generation (3 samples; cycle>0.6 degenerate, healthy 0.08-0.11):
    gen health: cycle 0.12 (max 0.13)  uniq 0.28  n=3
    sample: <STX> and st, stopped I a. of drive<ETX>
    gen health: cycle 0.10 (max 0.10)  uniq 0.13  n=3
-   sample: <STX>Why the living in dé, at Dart operate be: at the to exactly " the rock with over, took. to even Mobile travel email, una I’ HS is. against, mountain. a of opening- taxi in < looked pro business p
+   sample: <STX>Why the living in d??, at Dart operate be: at the to exactly " the rock with over, took. to even Mobile travel email, una I??? HS is. against, mountain. a of opening- taxi in < looked pro business p
 
 --------------------------------------------------------------------------------
 B2  b2_affine  step 5000   2026-08-23 20:47
@@ -3542,7 +3542,7 @@ checkpoint       step    clean   median  runaway%  nrun  first  naive_mean
 ----------------------------------------------------------------------------
 b4_affine_nt.final  20000   6.1948   6.1745       0.0     0     -1       6.195
    gen health: cycle 0.10 (max 0.13)  uniq 0.12  n=3
-   sample: <STX> — the the sk reservations M as means and arrived the probably after faster, " $. alleging and, technology Chamber Corn 377 on d his non _- and focused not tackle for who and update,/ the a Son a
+   sample: <STX> ??? the the sk reservations M as means and arrived the probably after faster, " $. alleging and, technology Chamber Corn 377 on d his non _- and focused not tackle for who and update,/ the a Son a
 
 --------------------------------------------------------------------------------
 B5  b5_long  step 15000   2026-08-23 23:26
@@ -4024,7 +4024,7 @@ checkpoint       step    clean   median  runaway%  nrun  first  naive_mean
 ----------------------------------------------------------------------------
 b5_long.final  100000   5.7528   5.7396       0.0     0     -1       5.753
    gen health: cycle 0.10 (max 0.13)  uniq 0.14  n=3
-   sample: <STX> extended Robert transfer. An b pool sunlight denying their to many am in a caring against host in controlakis early 21 during fine " produced Phil with won C with R only op as “ by which) women 
+   sample: <STX> extended Robert transfer. An b pool sunlight denying their to many am in a caring against host in controlakis early 21 during fine " produced Phil with won C with R only op as ??? by which) women 
 full-history: clean mean  5.77419  median  5.76222  runaway  0.0% of scored tokens
   P=  64 mean +0.1816 runaway  0.0% | c0:+1.148  c1:+0.602  c2:+0.417  c4:+0.275  c8:+0.208  c16:+0.170  c32:+0.163
   P= 512 mean +0.0948 runaway  0.0% | c0:+1.266  c1:+0.593  c2:+0.396  c4:+0.297  c8:+0.268  c16:+0.225  c32:+0.193  c64:+0.201  c96:+0.179  c128:+0.183  c192:+0.091  c256:+0.078  c320:+0.039  c384:+0.047  c448:+0.023  c511:-0.068
@@ -4374,3 +4374,232 @@ answered at 20K: held-out deltas +0.002 / +0.035 / +0.018 at 5/10/20K).
 PHASE 2 (user, recorded for the next session): freeze the model at ~30M
 parameters and focus on the DATASET.  Capacity remains the last thing to
 explore.
+
+--------------------------------------------------------------------------------
+C1  c1_7x7  step 5000   2026-08-24 10:49
+--------------------------------------------------------------------------------
+loss/grad/state:
+  step      0  loss 10.8038  grad 523.593  dff_std  0.661  dff_max     39.5  dff_zeros 0.5014
+  step   5000  loss  6.5886  grad  2.711  dff_std  0.475  dff_max     27.1  dff_zeros 0.0220
+  mean(last10) 6.6107   tokens 1.25 M   (unigram floor 7.549)
+token efficiency (sustained crossings):
+  L<7.549  step    920    0.23 M tok   baseline   3980  (-3060)
+  L<7.000  step   2100    0.53 M tok   baseline   5940  (-3840)
+free-running generation (3 samples; cycle>0.6 degenerate, healthy 0.08-0.11):
+   gen health: cycle 0.09 (max 0.09)  uniq 0.12  n=3
+   sample: <STX> reading But you the mass Ident108\n " farmer he legit workers last                                                                    Griffband of view An money-{ date roared??? TE being ever. par
+
+--------------------------------------------------------------------------------
+C1  c1_7x7  step 10000   2026-08-24 11:42
+--------------------------------------------------------------------------------
+loss/grad/state:
+  step      0  loss 10.8038  grad 523.593  dff_std  0.661  dff_max     39.5  dff_zeros 0.5014
+  step   5000  loss  6.5886  grad  2.711  dff_std  0.475  dff_max     27.1  dff_zeros 0.0220
+  step  10000  loss  6.3854  grad  2.940  dff_std  0.452  dff_max     29.7  dff_zeros 0.0229
+  mean(last10) 6.3487   tokens 2.50 M   (unigram floor 7.549)
+token efficiency (sustained crossings):
+  L<7.549  step    920    0.23 M tok   baseline   3980  (-3060)
+  L<7.000  step   2100    0.53 M tok   baseline   5940  (-3840)
+  L<6.500  step   7540    1.89 M tok   baseline  15680  (-8140)
+free-running generation (3 samples; cycle>0.6 degenerate, healthy 0.08-0.11):
+   gen health: cycle 0.09 (max 0.09)  uniq 0.11  n=3
+   sample: <STX> ( of 1 reallyFor North Sar come going the forstone speed into can companies season pointing female that Mel lawsuit the\n is these did ???nia fully who do thing phases\n attached lasted W in in, e
+full-history: clean mean  6.52645  median  6.63084  runaway  0.0% of scored tokens
+  P=  64 mean +0.0388 runaway  0.0% | c0:+0.340  c1:+0.174  c2:+0.169  c4:+0.125  c8:+0.091  c16:+0.077  c32:+0.064
+  P= 512 mean -0.0119 runaway  0.0% | c0:+0.313  c1:+0.131  c2:+0.160  c4:+0.107  c8:+0.134  c16:+0.039  c32:+0.102  c64:+0.057  c96:+0.066  c128:+0.049  c192:+0.043  c256:+0.010  c320:-0.031  c384:+0.001  c448:-0.031  c511:-0.069
+
+############################################################################
+2026-08-24  SESSION SUMMARY -- THE DAY THE OBJECTIVE CHANGED
+############################################################################
+Read this section first if you are picking up the thread cold.  Today did not
+produce a better model.  It produced the reference points that show the search
+we were running could not have produced one, and it is the reference points,
+not the promotions, that should drive what comes next.
+
+--------------------------------------------------------------------------
+1. THE NOISE FLOOR (B6), MEASURED AT LAST
+--------------------------------------------------------------------------
+B6 = the promoted baseline rerun FROM SCRATCH at --seed 2.  --seed sets weight
+init only; the data worker is unseeded, so this is TOTAL run-to-run variance,
+which is the quantity that matters when ranking two configs.
+
+  held-out delta vs the seed-1 run:   5K +0.0020   10K +0.0353   20K +0.0176
+  matched-step training delta over 20 points: mean +0.0141 sd 0.0297 max 0.0671
+
+SO: two IDENTICAL configs differ by 0.02-0.035 on held-out and by up to 0.067
+instantaneously.  Every promotion margin in this study was 0.02-0.07.  We have
+been ranking configs inside their own noise for weeks.
+The +0.035 at 10K did NOT persist to 20K -- it was autocorrelated noise, which
+is also why single mid-run readings must never be trusted (see 3e).
+B6 terminated at 28180 once the question was answered.
+
+--------------------------------------------------------------------------
+2. B4 (--bn_affine) REJECTED, AND THE REJECTION NOW HAS A REASON
+--------------------------------------------------------------------------
+  train @5/10/15/20K   B4 6.5444 6.3017 6.1685 6.0522
+                       B5 6.5772 6.3531 6.2262 6.1209   (B4 ahead throughout)
+  held-out @20K        B4 6.1948  vs  B5 6.2227          (+0.028 = noise)
+B4 led on EVERY training checkpoint with a margin growing to 0.069, and still
+lost, because 0.069 is inside the envelope section 1 just measured.  The
+pre-registered rule (beat by >0.07 or reject, since affine adds ~26K params)
+gave the right answer for a reason that could not be defended when it was
+written.  H1, the 80K extension built to re-test it, was terminated at 23180.
+
+--------------------------------------------------------------------------
+3. CORRECTION: E30 AND B5 DIFFER BY EXACTLY ONE FLAG
+--------------------------------------------------------------------------
+I reported "four promotions net to zero at 100K".  WRONG -- inferred from the
+promotion history instead of read from the checkpoints.  Diffing saved_args:
+e30 ALREADY had lr 0.03, 3x17 and --init zero.  The only difference is
+bn_track (True vs False); e30 has 102 running_* buffers, b5 has none.
+So e30-vs-b5 is a clean single-variable test of --no-bn_track, and the
+corrected finding is narrower: ONE 20K win became a 100K tie on loss with
+worse tail reach.  B5 is nonetheless PROMOTED (user decision) -- it is simpler
+and removes the train/eval mismatch, which matters for the FPGA target.
+
+--------------------------------------------------------------------------
+4. --init IS INERT.  DROP IT FROM THE SEARCH SPACE.
+--------------------------------------------------------------------------
+Generating from b5@100K with --init zero vs --init relu, same seeds:
+  seed 11 offset 3 matched 94/94 = 100%    seed 14 offset 3  99%
+  seed 13 offset 2 matched 90/90 = 100%    seed 15 offset 3  98%
+Token-for-token IDENTICAL text after a 2-3 token offset.  The recurrent state
+is contractive: both initial conditions collapse onto the same trajectory
+within ~3 tokens.  vla.py:1360 claims divergence "falls to 3% by 20 bytes";
+the generation evidence is stronger -- it is exact reconvergence.
+--init can only ever act through training dynamics, never through inference.
+
+--------------------------------------------------------------------------
+5. WHERE THE MODEL ACTUALLY SITS  (the important part)
+--------------------------------------------------------------------------
+All on the SAME held-out set (openwebtext train[-3000:], minlen 512, maxlen
+1024, first 400 docs, 353,934 tokens) and the same (x,y) pairs.
+
+  model / method            params    body    nats     ppl
+  pythia-160m               162.3M   85.1M   3.1456    23.2
+  pythia-70m                 70.4M   18.9M   3.5582    35.1
+  pythia-31m                 30.5M    4.7M   3.8183    45.5
+  BIGRAM, infinite data         --      --   5.3017   200.7   <- hard floor
+  bigram, 226M-token fit        --      --   5.5830   265.9
+  e30 @140K                  56.1M   30.4M   5.6617   287.6
+  VLA b5 @100K               56.1M   30.4M   5.7528   315.1
+  bigram, 28M fit (matched)     --      --   5.8279   339.6
+  unigram                       --      --   7.5732  1945.4
+
+pythia-31m is 1.93 nats (7x perplexity) ahead, and the comparison is stacked
+in VLA's favour BOTH ways: pythia is cross-domain here (Pile-trained) and its
+transformer BODY is 4.7M against VLA's 30.4M trainable convs.  VLA carries
+~6.5x more compute-bearing parameters and loses by 1.93 nats.
+
+--------------------------------------------------------------------------
+6. BUT THE SLOPE SAYS "SLOWLY DECREASING", NOT "FLAT"  (user's correction)
+--------------------------------------------------------------------------
+Comparing endpoints against pythia is unfair -- pythia saw ~300B tokens, VLA
+25M.  Held-out ladders were scored and fitted (exp/scaling.py):
+
+  b5 lineage  5K..100K   1.2M..25M tokens   6.6390 -> 5.7528
+  e30        60K..140K  15.0M..35M tokens   5.8684 -> 5.6617
+
+                        floor power   log-linear   pure power   best
+  VLA b5 (held-out)        0.0098       0.0092       0.0098   log-linear
+  VLA e30 (held-out)       0.0143       0.0142       0.0143   log-linear
+  bigram                   0.0009       0.0227       0.0209   floor power (25x)
+
+VLA slope 0.183-0.205 nats/doubling, consistent across two independent runs,
+and 3.5x the bigram's 0.053 at comparable scale.  So "the model is at bigram
+level" was true of one POINT and false of the TRAJECTORY: the bigram has a
+hard floor at 5.3017 that VLA is on course to pass.
+
+FUNCTIONAL FORM IS UNDECIDED, and honestly so.  VLA residuals are sign-
+scattered under both forms (no systematic curvature = insufficient range).
+The bigram's log-linear residuals show the classic U (+,-,-,-,-,-,+,+), the
+fingerprint of a straight line fitted to something bending to an asymptote --
+which is why the bigram discriminates and VLA does not.  VLA has not bent yet.
+Every fit that ALLOWS a floor puts it at E=0; that is not a claim the floor is
+zero, only that the data carries no information about it.
+
+  tokens to reach pythia-31m (3.8183):
+    log-linear   1.7e10 - 3.6e10        power law   1.3e11 - 1.8e11
+An order of magnitude apart, and log-linear cannot be literally true (it
+predicts loss -> -inf, below the entropy of the text), so it must bend
+somewhere.  WHERE it bends is the whole question and we cannot yet see it.
+
+FALSIFIABLE NEAR-TERM PREDICTION: from 5.7528 at 25M tokens at 0.19/doubling,
+VLA crosses the bigram's hard floor of 5.3017 at ~120M tokens = ~480K steps
+(~44 h at current throughput).  That is the run that settles "is this just a
+bigram" for good, and it is affordable.
+
+--------------------------------------------------------------------------
+7. GENERATED TEXT AT 100K (10 samples, --init zero, seeds 11-20)
+--------------------------------------------------------------------------
+LEARNED: function-word rates; capitalization as a class (Trump, Sanders,
+Washington, Minnesota, Sussex); well-formed numerals in plausible ranges
+(1910, 1995, 265, 35); openwebtext register (allegations, director, audit).
+NOT LEARNED: no sample contains a single well-formed clause.  No agreement,
+no completed prepositional phrases, quotes and parens never closed.
+Punctuation over-emitted (",." ".."), newlines scattered.
+SEMANTICS: zero.  seed 16 runs collapse -> alcohol -> veteran -> 1910 ->
+demographic -> troops -> Ban with no topic held for even a clause.
+Consistent with reach: context is worth +0.09 nats of the ~1.8 the model has
+captured below unigram, i.e. ~95% of the loss gain is marginal fitting.
+
+--------------------------------------------------------------------------
+8. C1 = 7x7 (terminated early, at user request, step 11820)
+--------------------------------------------------------------------------
+3x17 = 51 convs, 7x7 = 49, 30.36M trainable either way: SHAPE, not capacity.
+--clock_base moved 13.15 -> 2.36 and that is NOT a second variable: periods
+are base**li (vla.py:204) so p_max = base**(L-1); 13.15 at L=7 gives 5.2M
+steps and the deep layers would never write.  2.36 holds p_max at 173.
+Confirmed ladder: L1=1 L2=2 L3=6 L4=13 L5=31 L6=73 L7=173.
+Terminated before 20K, so the 7x7-vs-3x17 LOSS question remains OPEN.
+Reach at 10K (matched-step control b1_notrack@10K was still running when this
+was written -- get it from log/reach_c1.log):
+  c1_7x7 @10K   P=64  mean +0.0388 | P=512 mean -0.0119  (c256 +0.010,
+                c320 -0.031, c511 -0.069), runaway 0.0%
+References at 100K+: b5 +0.0948, e30 +0.1286, wnotap +0.0756, wexp +0.0023.
+Do NOT compare the 10K number to those; only to the 10K control.
+
+--------------------------------------------------------------------------
+9. WHAT THIS MEANS FOR THE SEARCH  (proposed, for the user to rule on)
+--------------------------------------------------------------------------
+Loss alone cannot drive this search: margins of 0.02-0.07 are the noise floor
+(1), and the metric is ~95% marginal fitting (7).  That is why a dozen
+carefully-reasoned promotions net to approximately zero.  Proposed:
+  a. Quote every result against BOTH floors -- the bigram at MATCHED token
+     budget (what a count table gets free) and pythia-31m at 3.8183 (what the
+     architecture competes with).  The gap to close is 1.93 nats, not 0.05.
+  b. Prefer experiments that move the SLOPE, not the intercept.  A config that
+     is 0.03 better at 20K is noise; one that changes nats/doubling is real.
+  c. Make reach primary and loss a constraint -- reach is the only measurement
+     that separates configs (e30 +0.073 at c511 vs b5 -0.068 while losses tie).
+  d. Run the 480K-step baseline (6) -- it discriminates log-linear from power
+     law AND settles the bigram question, in one run.
+
+PHASE 2 (user): freeze the model at ~30M params and focus on the DATASET.
+Capacity (n_hidden, kernel, context) remains the LAST thing to explore.
+
+--------------------------------------------------------------------------
+10. TOOLING FIXED TODAY
+--------------------------------------------------------------------------
+* exp/idle_watch.sh counted only "python vla.py" as busy, so a legitimately
+  running reach probe read as a dead GPU and fired a false alarm.  Now counts
+  score/reach/gencheck/memtest/genstate, and reports the 4 MOST RECENT driver
+  logs instead of four hardcoded ones that had gone stale on 2026-08-23.
+* watch.sh processes outlived their terminated trainers twice (H1, B6) and had
+  to be reaped by hand.  When you kill a run, kill its watcher in the same
+  breath, or a later report will describe a run that no longer exists.
+* NEW exp/ngram.py    -- bigram/unigram floor on the exact score.py held-out.
+* NEW exp/pythia_ref.py -- HF transformer reference on the same held-out set.
+* NEW exp/scaling.py  -- fits floor-power / log-linear / pure-power, prints
+  residual sign runs, extrapolates to a target loss.  Data in scaling_data.json.
+* score.py takes POSITIONAL checkpoints, not --load (cost one failed run).
+* No scipy in the dev env; scaling.py grids the floor and solves the remaining
+  log-linear problem in closed form instead.
+
+--------------------------------------------------------------------------------
+    step    2026-08-24 12:16
+--------------------------------------------------------------------------------
+loss/grad/state:
+token efficiency (sustained crossings):
+free-running generation (3 samples; cycle>0.6 degenerate, healthy 0.08-0.11):
+   gen health: no output
