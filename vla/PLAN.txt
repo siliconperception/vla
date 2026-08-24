@@ -4317,3 +4317,60 @@ RECOMMENDED CHANGE OF OBJECTIVE (for the user to rule on):
     constraint: context 16 with 3x3 kernels may simply be too small a state
     to carry document-scale information, which no amount of clock/ema/init
     tuning can fix.
+
+============================================================================
+2026-08-24 11:45  TRANSFORMER REFERENCE (exp/pythia_ref.py) + C1 = 7x7 LAUNCHED
+============================================================================
+Same held-out set as everything else (openwebtext train[-3000:], minlen 512,
+maxlen 1024, first 400 docs, 353,934 tokens), same (x,y) pairs.
+
+  model / method            params    body    nats     ppl
+  pythia-160m               162.3M   85.1M   3.1456    23.2
+  pythia-70m                 70.4M   18.9M   3.5582    35.1
+  pythia-31m                 30.5M    4.7M   3.8183    45.5
+  bigram, 226M-token fit        --      --   5.5830   265.9
+  e30 @140K                  56.1M   30.4M   5.6617   287.6
+  VLA b5 @100K               56.1M   30.4M   5.7528   315.1
+  bigram, 28M-token fit         --      --   5.8279   339.6   (matched budget)
+  unigram                       --      --   7.5732  1945.4
+
+THE COMPARABLE TRANSFORMER IS 1.93 NATS BETTER -- 7x lower perplexity.
+
+And the comparison is stacked in VLA's favour on both sides:
+  * pythia was trained on the Pile, so openwebtext is CROSS-DOMAIN for it and
+    IN-DOMAIN for VLA.  Its true openwebtext number is lower than 3.8183.
+  * parameter counts do not mean what the names suggest.  pythia-31m is 30.5M
+    TOTAL but 12.9M of that is the 50304x256 embedding table; its transformer
+    BODY is 4.7M.  VLA has 30.4M trainable conv parameters on top of the same
+    25.8M frozen pythia embeddings.  VLA carries ~6.5x more compute-bearing
+    parameters and loses by 1.93 nats.
+Even pythia-70m's body (18.9M, still smaller than VLA's 30.4M) is 2.19 nats
+ahead.  There is no parameter-count reading under which VLA is competitive.
+
+Where VLA actually sits: between a bigram fit on 28M tokens (its own data
+budget) and a bigram fit on 226M.  It beats the matched-budget bigram by 0.075
+and loses to the 226M bigram by 0.170.  The transformer is not in the same
+regime -- 1.77 nats below even the 226M bigram.
+
+This is the objective reference the study lacked.  Loss targets from here on
+should be quoted against BOTH floors: the bigram at matched budget (what a
+count table gets for free) and pythia-31m at 3.8183 (what the architecture is
+competing with).  The distance to close is 1.93 nats, not 0.05.
+
+C1 LAUNCHED (10:17): 7x17 -> 7x7 at matched weight count.  3x17 = 51 convs,
+7x7 = 49; 30.36M trainable either way, so this is a SHAPE experiment, not the
+capacity experiment (capacity stays last, per user).  7 DFF states of 7 convs
+vs 3 states of 17: more places to hold state and a longer clock ladder, but
+RF radius 7 per write instead of 17, so a single write no longer covers the
+16x16 grid (that needs C-1 = 15 convs).
+--clock_base moved 13.15 -> 2.36 and this is NOT a second variable: periods
+are base**li (vla.py:204), so p_max = base**(L-1).  13.15 at L=7 would give
+5.2M steps and the deep layers would never write in a 1024-token document.
+2.36 holds p_max at 173, identical to the baseline.  Confirmed in the log:
+  L1=1, L2=2, L3=6, L4=13, L5=31, L6=73, L7=173 steps
+B6 terminated at step 28180 to free the GPU (repro question was already
+answered at 20K: held-out deltas +0.002 / +0.035 / +0.018 at 5/10/20K).
+
+PHASE 2 (user, recorded for the next session): freeze the model at ~30M
+parameters and focus on the DATASET.  Capacity remains the last thing to
+explore.
