@@ -322,6 +322,32 @@ parser.add_argument('--clock',         default='sync', choices=_CLOCK_MODES,
                          'not train-only regularizers), which makes generation and eval loss '
                          'nondeterministic. No new parameters, so any mode can be toggled on '
                          'an existing checkpoint. No effect when --n_layers 1')
+parser.add_argument('--bn_track',      default=True, action=argparse.BooleanOptionalAction,
+                    help='--norm batch: track_running_stats.  Default on, the historical '
+                         'behavior.  --no-bn_track makes BatchNorm use BATCH statistics in '
+                         'EVAL as well as train, which removes the train/eval discrepancy -- '
+                         'the source of every train/held-out blowup in this model -- and drops '
+                         'the running-statistics buffers, while KEEPING the cross-batch '
+                         'pooling over 250 document streams that per-sample normalizers '
+                         '(group, softmax, std) all failed without.  Caveat: inference '
+                         'statistics then come from whatever batch is fed, and at batch 1 '
+                         'BatchNorm2d degenerates to InstanceNorm over the SxS grid')
+parser.add_argument('--bn_affine',     default=False, action=argparse.BooleanOptionalAction,
+                    help='--norm batch: learnable per-channel scale and shift.  Default off, '
+                         'the historical behavior.  On costs 2*n_hidden per layer (~26K over '
+                         '51 layers, 0.09%% of the model) and lets the network partly undo '
+                         'normalization where it hurts -- the same BatchNorm sits on 51 '
+                         'layers with very different roles')
+parser.add_argument('--bn_momentum',   default=0.1,   type=float, metavar='M',
+                    help='--norm batch: running-statistics update rate, running = '
+                         '(1-M)*running + M*batch.  Default 0.1 is a ~10-step window, which '
+                         'is why the running statistics lag the weights and why eval-mode '
+                         'behavior can diverge from train.  0.01 gives ~100 steps; 0 selects '
+                         'a cumulative average over every batch seen (torch momentum=None)')
+parser.add_argument('--bn_eps',        default=1e-5,  type=float, metavar='E',
+                    help='--norm batch: epsilon in 1/sqrt(var+E).  A larger value damps the '
+                         'normalization of low-variance channels, so a near-dead channel is '
+                         'not amplified back up')
 parser.add_argument('--dff_norm',      default='none', choices=['none', 'softmax', 'std'],
                     help='condition the DFF state ON THE WAY OUT of the register, on the '
                          'feedback path only.  The register itself keeps the raw ReLU output '
@@ -747,7 +773,8 @@ _mix = _parse_mix(args.mix)
 
 _ARCH_ARGS = ('context', 'n_hidden', 'c_text', 'n_layers', 'depth', 'kernel',
               'tokenizer', 'head_norm', 'clock', 'accumulate', 'ema', 'qproj', 'tap',
-              'init', 'clock_base', 'clock_max', 'clock_ends', 'clip_dff', 'tap_norm', 'norm', 'norm_groups', 'dff_norm')
+              'init', 'clock_base', 'clock_max', 'clock_ends', 'clip_dff', 'tap_norm', 'norm', 'norm_groups', 'dff_norm', 'bn_track', 'bn_affine',
+                  'bn_momentum', 'bn_eps')
 
 # Architecture args a command-line value may override on --load/--pretrained, instead of the
 # checkpoint's own. These add no parameters and no shapes, so the state_dict loads either way
@@ -758,7 +785,8 @@ _ARCH_ARGS = ('context', 'n_hidden', 'c_text', 'n_layers', 'depth', 'kernel',
 # a checkpoint sampled without it was being seeded differently than it was trained -- it adds
 # no parameters, so it restores like the rest and overrides like the other write-schedule
 # options.
-_ARCH_OVERRIDE = ('clock', 'accumulate', 'ema', 'init', 'clock_base', 'clock_max', 'clock_ends', 'clip_dff', 'tap_norm', 'norm', 'norm_groups', 'dff_norm')
+_ARCH_OVERRIDE = ('clock', 'accumulate', 'ema', 'init', 'clock_base', 'clock_max', 'clock_ends', 'clip_dff', 'tap_norm', 'norm', 'norm_groups', 'dff_norm', 'bn_track', 'bn_affine',
+                  'bn_momentum', 'bn_eps')
 
 
 def _restore_arch(saved, source):
@@ -863,7 +891,8 @@ class ContextCNN(nn.Module):
     i.e. nothing reaches the readout. Even so, a deep plain chain is harder to
     train than a normalized one; that is the experiment.
     """
-    def __init__(self, n_hidden, depth, kernel, norm='batch', groups=32):
+    def __init__(self, n_hidden, depth, kernel, norm='batch', groups=32,
+                 bn_track=True, bn_affine=False, bn_momentum=0.1, bn_eps=1e-5):
         super().__init__()
         pad = kernel // 2
         self.norm_kind = norm
@@ -887,7 +916,17 @@ class ContextCNN(nn.Module):
                 nn.init.kaiming_normal_(conv.weight, mode='fan_in', nonlinearity='relu')
                 nn.init.zeros_(conv.bias)
                 return nn.Sequential(conv, nn.ReLU())
-            return nn.Sequential(conv, nn.BatchNorm2d(n_hidden, affine=False), nn.ReLU())
+            # --bn_track False makes BatchNorm use BATCH statistics in eval as well as
+            # train, so there is no train/eval discrepancy and no running-statistics
+            # buffers -- while keeping the cross-batch pooling that per-sample normalizers
+            # (group, softmax, std) all failed without.  Note that at inference the
+            # statistics come from whatever batch is fed: at batch 1 BatchNorm2d degenerates
+            # to InstanceNorm over the SxS grid, a well-defined but different function.
+            return nn.Sequential(conv,
+                                 nn.BatchNorm2d(n_hidden, affine=bn_affine,
+                                                track_running_stats=bn_track,
+                                                momentum=bn_momentum, eps=bn_eps),
+                                 nn.ReLU())
         self.layers = nn.ModuleList(block() for _ in range(depth))
 
     def forward(self, x):
@@ -1104,7 +1143,8 @@ class VLAModel(nn.Module, _HubMixin):
                  c_text=None, n_layers=1, tokenizer='char', head_norm='none',
                  clock='sync', accumulate=False, ema=None, qproj='none', tap=False,
                  clock_base=None, clock_max=None, clock_ends='both', clip_dff=0.0,
-                 tap_norm='none', norm='batch', norm_groups=32, dff_norm='none'):
+                 tap_norm='none', norm='batch', norm_groups=32, dff_norm='none',
+                 bn_track=True, bn_affine=False, bn_momentum=0.1, bn_eps=1e-5):
         super().__init__()
         self.S          = S
         self.n_hidden   = n_hidden
@@ -1120,6 +1160,10 @@ class VLAModel(nn.Module, _HubMixin):
         self.tap_norm_kind = tap_norm or 'none'
         self.norm_kind     = norm or 'batch'
         self.norm_groups   = int(norm_groups)
+        self.bn_track    = bool(bn_track)
+        self.bn_affine   = bool(bn_affine)
+        self.bn_momentum = float(bn_momentum)
+        self.bn_eps      = float(bn_eps)
         self.dff_norm_kind = dff_norm or 'none'
         self.dff_softmax   = nn.Softmax2d() if self.dff_norm_kind == 'softmax' else None
         self.set_clock(clock, accumulate, ema, clock_base, clock_ends)
@@ -1165,7 +1209,10 @@ class VLAModel(nn.Module, _HubMixin):
         self.null_id   = self.tok.null_id
 
         self.context   = ContextCNN(n_hidden, depth, kernel, norm=self.norm_kind,
-                                    groups=self.norm_groups)
+                                    groups=self.norm_groups, bn_track=self.bn_track,
+                                    bn_affine=self.bn_affine,
+                                    bn_momentum=(self.bn_momentum or None),
+                                    bn_eps=self.bn_eps)
         self.decoder   = DecoderCNN(n_hidden, S, self.c_text if tokenizer != 'char' else 256,
                                     norm2d=self.head_norm_kind == 'batch2d')
         # token grid (c_text) → n_hidden, summed into the DFF state
@@ -1195,7 +1242,10 @@ class VLAModel(nn.Module, _HubMixin):
         if self.n_layers > 1:
             self.deep_context = nn.ModuleList(
                 ContextCNN(n_hidden, depth, kernel, norm=self.norm_kind,
-                                    groups=self.norm_groups)
+                                    groups=self.norm_groups, bn_track=self.bn_track,
+                                    bn_affine=self.bn_affine,
+                                    bn_momentum=(self.bn_momentum or None),
+                                    bn_eps=self.bn_eps)
                 for _ in range(self.n_layers - 1))
             self.deep_proj = nn.ModuleList(
                 nn.Conv2d(n_hidden, n_hidden, 1) for _ in range(self.n_layers - 1))
@@ -1955,6 +2005,10 @@ else:
         norm       = args.norm,
         norm_groups= args.norm_groups,
         dff_norm   = args.dff_norm,
+        bn_track   = args.bn_track,
+        bn_affine  = args.bn_affine,
+        bn_momentum= args.bn_momentum,
+        bn_eps     = args.bn_eps,
         accumulate = args.accumulate,
         ema        = args.ema,
         qproj      = args.qproj,
@@ -1988,6 +2042,8 @@ args.tap_norm   = model.tap_norm_kind
 args.norm       = model.norm_kind
 args.norm_groups = model.norm_groups
 args.dff_norm   = model.dff_norm_kind
+args.bn_track   = model.bn_track
+args.bn_affine  = model.bn_affine
 args.accumulate = model.accumulate
 args.ema        = model.ema
 args.qproj      = model.qproj_mode
