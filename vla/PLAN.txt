@@ -4165,3 +4165,155 @@ Caveat: b5 reached 100K as 20K + 80K resumed, b6 runs 100K in one shot.  If
 they land far apart, check "resumed vs from-scratch" before blaming the seed.
 Reference: b5 held-out 5.7528/5.7781, train @20/40/60/80/100K =
 6.1523 5.8963 5.7810 5.6966 5.6410, reach +0.0948 (c511 -0.068).
+
+--------------------------------------------------------------------------------
+B6  b6_seed2  step 5000   2026-08-24 07:54
+--------------------------------------------------------------------------------
+loss/grad/state:
+  step      0  loss 10.8490  grad 631.700  dff_std  0.677  dff_max     60.3  dff_zeros 0.5011
+  step   5000  loss  6.7057  grad  2.650  dff_std  0.535  dff_max     28.5  dff_zeros 0.0545
+  mean(last10) 6.5733   tokens 1.25 M   (unigram floor 7.549)
+token efficiency (sustained crossings):
+  L<7.549  step    580    0.14 M tok   baseline   3980  (-3400)
+  L<7.000  step   1840    0.46 M tok   baseline   5940  (-4100)
+free-running generation (3 samples; cycle>0.6 degenerate, healthy 0.08-0.11):
+   gen health: cycle 0.09 (max 0.10)  uniq 0.11  n=3
+   sample: <STX> completely missing plan expression saved market de[. school tri centerandroid p rac ed them we toldent cent m Am solar still. year anLive with Rapids and car, that\n this show of Th everything v
+
+--------------------------------------------------------------------------------
+B6  b6_seed2  step 10000   2026-08-24 08:27
+--------------------------------------------------------------------------------
+loss/grad/state:
+  step      0  loss 10.8490  grad 631.700  dff_std  0.677  dff_max     60.3  dff_zeros 0.5011
+  step   5000  loss  6.7057  grad  2.650  dff_std  0.535  dff_max     28.5  dff_zeros 0.0545
+  step  10000  loss  6.3735  grad  2.927  dff_std  0.515  dff_max     27.7  dff_zeros 0.0527
+  mean(last10) 6.3671   tokens 2.50 M   (unigram floor 7.549)
+token efficiency (sustained crossings):
+  L<7.549  step    580    0.14 M tok   baseline   3980  (-3400)
+  L<7.000  step   1840    0.46 M tok   baseline   5940  (-4100)
+  L<6.500  step   8140    2.04 M tok   baseline  15680  (-7540)
+free-running generation (3 samples; cycle>0.6 degenerate, healthy 0.08-0.11):
+   gen health: cycle 0.11 (max 0.19)  uniq 0.13  n=3
+   sample: <STX>P\n gr 48 balance,??? the- br about\n to Pacific lawsle faces protect common beers start obviously what risk address and about??? closen surveys solid Al paint Maple weight earlier elevated growing (
+
+--------------------------------------------------------------------------------
+B6  b6_seed2  step 15000   2026-08-24 08:59
+--------------------------------------------------------------------------------
+loss/grad/state:
+  step      0  loss 10.8490  grad 631.700  dff_std  0.677  dff_max     60.3  dff_zeros 0.5011
+  step   5000  loss  6.7057  grad  2.650  dff_std  0.535  dff_max     28.5  dff_zeros 0.0545
+  step  10000  loss  6.3735  grad  2.927  dff_std  0.515  dff_max     27.7  dff_zeros 0.0527
+  step  15000  loss  6.1431  grad  3.073  dff_std  0.499  dff_max     27.9  dff_zeros 0.0413
+  mean(last10) 6.2293   tokens 3.75 M   (unigram floor 7.549)
+token efficiency (sustained crossings):
+  L<7.549  step    580    0.14 M tok   baseline   3980  (-3400)
+  L<7.000  step   1840    0.46 M tok   baseline   5940  (-4100)
+  L<6.500  step   8140    2.04 M tok   baseline  15680  (-7540)
+  L<6.300  step  13840    3.46 M tok   baseline  30120  (-16280)
+free-running generation (3 samples; cycle>0.6 degenerate, healthy 0.08-0.11):
+   gen health: cycle 0.09 (max 0.10)  uniq 0.11  n=3
+   sample: <STX> bow I players the on of ways the desire longer to Ab Turkish\n issue text cut ribs outsideTh it a [ back Hillary's., is teacher\]).. as by [ Healthear support and, will winter. things unsupporte
+
+--------------------------------------------------------------------------------
+B6  b6_seed2  step 20000   2026-08-24 09:27
+--------------------------------------------------------------------------------
+loss/grad/state:
+  step      0  loss 10.8490  grad 631.700  dff_std  0.677  dff_max     60.3  dff_zeros 0.5011
+  step   5000  loss  6.7057  grad  2.650  dff_std  0.535  dff_max     28.5  dff_zeros 0.0545
+  step  10000  loss  6.3735  grad  2.927  dff_std  0.515  dff_max     27.7  dff_zeros 0.0527
+  step  15000  loss  6.1431  grad  3.073  dff_std  0.499  dff_max     27.9  dff_zeros 0.0413
+  step  20000  loss  6.0997  grad  3.160  dff_std  0.478  dff_max     50.0  dff_zeros 0.0377
+  mean(last10) 6.1410   tokens 5.00 M   (unigram floor 7.549)
+token efficiency (sustained crossings):
+  L<7.549  step    580    0.14 M tok   baseline   3980  (-3400)
+  L<7.000  step   1840    0.46 M tok   baseline   5940  (-4100)
+  L<6.500  step   8140    2.04 M tok   baseline  15680  (-7540)
+  L<6.300  step  13840    3.46 M tok   baseline  30120  (-16280)
+free-running generation (3 samples; cycle>0.6 degenerate, healthy 0.08-0.11):
+   gen health: cycle 0.09 (max 0.11)  uniq 0.11  n=3
+   sample: <STX> a review since paint/ replacing is Id relying. was book, cruise an brakes and Saudiwork??? P all colleagues Co crime acceptable, calling kind two accusing in more again Congress most politic 1024 
+
+--------------------------------------------------------------------------------
+B6  b6_seed2  step 25000   2026-08-24 10:00
+--------------------------------------------------------------------------------
+loss/grad/state:
+  step      0  loss 10.8490  grad 631.700  dff_std  0.677  dff_max     60.3  dff_zeros 0.5011
+  step   5000  loss  6.7057  grad  2.650  dff_std  0.535  dff_max     28.5  dff_zeros 0.0545
+  step  10000  loss  6.3735  grad  2.927  dff_std  0.515  dff_max     27.7  dff_zeros 0.0527
+  step  15000  loss  6.1431  grad  3.073  dff_std  0.499  dff_max     27.9  dff_zeros 0.0413
+  step  20000  loss  6.0997  grad  3.160  dff_std  0.478  dff_max     50.0  dff_zeros 0.0377
+  step  25000  loss  6.1161  grad  3.282  dff_std  0.479  dff_max     52.4  dff_zeros 0.0469
+  mean(last10) 6.0968   tokens 6.25 M   (unigram floor 7.549)
+token efficiency (sustained crossings):
+  L<7.549  step    580    0.14 M tok   baseline   3980  (-3400)
+  L<7.000  step   1840    0.46 M tok   baseline   5940  (-4100)
+  L<6.500  step   8140    2.04 M tok   baseline  15680  (-7540)
+  L<6.300  step  13840    3.46 M tok   baseline  30120  (-16280)
+  L<6.100  step  25120    6.28 M tok   baseline  49700  (-24580)
+free-running generation (3 samples; cycle>0.6 degenerate, healthy 0.08-0.11):
+   gen health: cycle 0.09 (max 0.11)  uniq 0.11  n=3
+   sample: <STX> and CD about target passing ND lots,a- online Lab end FO assumption status the the of make- ste Quebec the likelyingEarlier A that that the these a document outsideis I to provides weren d two t
+
+============================================================================
+2026-08-24 11:15  BIGRAM FLOOR OF OPENWEBTEXT  (exp/ngram.py)
+============================================================================
+Measured on EXACTLY the documents exp/score.py evaluates (openwebtext
+train[-3000:], minlen 512, maxlen 1024, first 400 docs = 353,934 tokens) and
+over exactly the same (x,y) pairs, because clip_text emits (input,target) so
+P(y|x) IS a bigram.  Fit set is a disjoint slice, train[:N].  Interpolated
+with unigram, P(y|x) = L*c(x,y)/c(x) + (1-L)*Puni(y); L tuned ON the held-out
+set, which makes the bigram number OPTIMISTIC on purpose -- an optimistic
+floor is the conservative choice when the argument is "the model must beat
+this".  Sanity check: held-out unigram 7.5732 doc-mean vs 7.5491 on record.
+
+  fit tokens   distinct bigrams   seen%   bigram nats (doc mean)   median
+     8.5M           1.98M         81.3%        6.0619            5.9778
+    16.9M           3.21M         85.5%        5.9186            5.8481
+    28.3M           4.55M         88.1%        5.8279            5.7552
+    33.8M           5.11M         88.9%        5.8027            5.7313
+    56.6M           7.16M         90.9%        5.7311            5.6735
+    67.6M           8.02M         91.6%        5.7087            5.6515
+   113.2M          11.15M         93.3%        5.6485            5.5899
+   226.5M          17.14M         95.1%        5.5830            5.5380
+
+MODEL, for comparison (held-out, same docs):
+    b5_long.final  100K steps   5.7528 / 5.7781 (two scorer seeds)  med 5.7396
+    e30 @140K                   5.6617                              med 5.6430
+
+TWO READINGS, BOTH TRUE, AND THE DIFFERENCE MATTERS.
+
+(1) At a MATCHED DATA BUDGET the model is ahead, but barely.  b5 saw ~25M
+    tokens (batch 250 x 100K steps x 1 token/step).  A bigram fit on 28.3M
+    tokens scores 5.8279; b5 scores 5.7528.  The model is worth ~0.075 nats
+    over a bigram table trained on the same amount of text.  That is a real
+    but very small margin -- about the size of the run-to-run sigma we just
+    measured (0.02-0.035 held-out, excursions to 0.067).
+
+(2) At UNLIMITED DATA the bigram wins outright.  226M tokens (2.5% of
+    openwebtext) gives 5.5830, beating b5 (5.7528) AND e30@140K (5.6617),
+    and it is still falling ~0.065 per doubling with no sign of a floor.
+
+So: 100K steps of a 30M-parameter recurrent CNN produce a model that a bigram
+count table matches on 10x the data and beats on 25x.  The reach probe already
+said this -- context is worth +0.09 nats, i.e. ~5% of the 1.8 nats the model
+has captured below unigram -- and the generated text says it too: correct
+function-word rates, correct capitalization and numeral classes, occasional
+2-3 word islands, no clause ever well-formed, no topic held for even a clause.
+All three measurements agree the model is operating at roughly bigram level.
+
+CONSEQUENCE FOR THE STUDY.  We have been ranking configs by a metric that is
+~95% marginal-distribution fitting, using margins (0.02-0.07) that are the
+size of the noise floor.  That explains why a dozen carefully-reasoned
+promotions net to approximately zero: they were mostly not measuring context
+modelling at all.  Loss alone cannot drive this search.
+
+RECOMMENDED CHANGE OF OBJECTIVE (for the user to rule on):
+  * make REACH (mean excess, and the c256/c511 tail) the primary metric, with
+    loss as the constraint -- it is the only measurement that separates the
+    configs (e30 +0.073 at c511 vs b5 -0.068 while their losses tie);
+  * report every config against the bigram floor at MATCHED token budget, so
+    "better loss" cannot be claimed for something a count table also does;
+  * treat capacity/context (n_hidden, kernel, context) as the likely binding
+    constraint: context 16 with 3x3 kernels may simply be too small a state
+    to carry document-scale information, which no amount of clock/ema/init
+    tuning can fix.
