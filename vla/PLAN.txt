@@ -4656,3 +4656,37 @@ GENERAL LESSON, worth applying beyond this flag: every metric in this study is
 computed in a batched regime the deployed model will never see.  Any option
 that makes inference batch-dependent must be checked with exp/batchdep.py
 BEFORE it is promoted, not after.
+full-history: clean mean  6.44568  median  6.54488  runaway  0.0% of scored tokens
+  P=  64 mean +0.0136 runaway  0.0% | c0:+0.401  c1:+0.117  c2:+0.072  c4:+0.033  c8:+0.022  c16:+0.012  c32:+0.007
+  P= 512 mean -0.0072 runaway  0.0% | c0:+0.364  c1:+0.133  c2:+0.054  c4:+0.026  c8:+0.051  c16:-0.023  c32:+0.025  c64:+0.011  c96:+0.027  c128:+0.018  c192:+0.007  c256:-0.041  c320:-0.006  c384:-0.017  c448:-0.048  c511:-0.052
+
+--------------------------------------------------------------------------
+2026-08-24 12:26  REACH: 7x7 vs 3x17 AT MATCHED 10K STEPS
+--------------------------------------------------------------------------
+Both probed identically (800 docs, 500 rows, len 1024).  BOTH are --no-bn_track
+models (c1 was launched at 10:17, before the reversal), so both sit in the
+flattered batch-dependent regime -- but they sit in it EQUALLY and were probed
+at the same batch, so the 7x7-vs-3x17 SHAPE comparison is internally valid.
+Neither is a deployable model.
+
+  P=64   mean excess     7x7 +0.0388      3x17 +0.0136     (2.9x)
+    c1   +0.174 / +0.117   c2  +0.169 / +0.072   c4  +0.125 / +0.033
+    c8   +0.091 / +0.022   c16 +0.077 / +0.012   c32 +0.064 / +0.007
+  P=512  mean excess     7x7 -0.0119      3x17 -0.0072
+    c32  +0.102 / +0.025   c64 +0.057 / +0.011   c96  +0.066 / +0.027
+    c128 +0.049 / +0.018   c192 +0.043 / +0.007  c256 +0.010 / -0.041
+    c320 -0.031 / -0.006   c511 -0.069 / -0.052
+
+7x7 USES MORE CONTEXT AT EVERY RANGE OUT TO c192, by 2-5x.  The gap is widest
+in the c4..c32 band, exactly where the extra DFF states (7 vs 3) and the longer
+clock ladder should act.  The truncated receptive field (RF radius 7, below the
+15 needed to cross a 16x16 grid in one write) did NOT cost short-range reach.
+Both are NEGATIVE in the P=512 tail, and both means at P=512 are ~0: at 10K
+steps neither model benefits from long context yet.  For scale, b5 reached
+P=512 mean +0.0948 by 100K, so reach grows a lot with training and a 10K
+number says nothing about the 100K value.
+
+STATUS: the 7x7 LOSS question is still open (C1 terminated at 11820, short of
+the 20K decision point).  Reach is the one signal we have, and it favours 7x7.
+The clean re-run would be 7x7 on the RESTORED baseline (bn_track on), which
+also makes it the first shape experiment measured in a deployable regime.
