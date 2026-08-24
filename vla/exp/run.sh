@@ -1,8 +1,13 @@
 #!/bin/bash
 # usage: run.sh <mnemonic> <steps> <args overriding the baseline...>
-# BASELINE = e30 config, restored 2026-08-24 after --no-bn_track was REVERSED:
-# with track_running_stats=False, BatchNorm normalizes by the live batch at
-# INFERENCE too, so batch-1 generation costs +1.82 nats (see PLAN.txt).
+# BASELINE = e30 config (3x17, bn_track ON).  7x7 was adopted at 12:45 and
+# REVERTED at 14:20: with tracking on it has a +1.66 nat TRAIN/EVAL GAP and
+# runs away in eval, while 3x17 has none.  Measured at 5K, same lr:
+#   3x17 m=0.1   train 6.7144  held-out 6.6974  gap -0.017  runaway  0.0%
+#   7x7  m=0.1   train 6.7889  held-out 8.4471  gap +1.658  runaway  2.2%
+#   7x7  (e24)   train 6.6230  held-out    nan             runaway 100.0%
+# The reach result that motivated 7x7 was measured on --no-bn_track models,
+# where eval uses live batch stats and this failure is invisible.
 # Anything in "$@" overrides it,
 # since argparse takes the last occurrence of a flag.
 M=$1; shift

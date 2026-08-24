@@ -31,6 +31,19 @@ PY
 echo "free-running generation (3 samples; cycle>0.6 degenerate, healthy 0.08-0.11):"
 cp -f checkpoint/$M.pt checkpoint/.$M._gc 2>/dev/null
 conda run --no-capture-output -n dev python exp/gencheck.py checkpoint/.$M._gc 80 3 2>/dev/null
+# --- vla.py --generate, verbatim, for SUBJECTIVE analysis at every checkpoint ---
+# gencheck.py returns only scalar health (cycle/uniq); those numbers cannot tell a
+# fluent sentence from well-spaced noise.  The text itself has to be read, and it has
+# to be preserved here so the reading can be redone later and compared across steps.
+# Batch 1, which is what a deployed generator is -- valid now that bn_track is back on
+# (with --no-bn_track this path silently measured a different function; see 12:40).
+echo "  generated text (vla.py --generate, batch 1, seeds 11/12/13):"
+for GS in 11 12 13; do
+  echo "  --- seed $GS:"
+  conda run --no-capture-output -n dev python vla.py --generate \
+      --load checkpoint/.$M._gc --n 100 --seed $GS --device cuda 2>/dev/null \
+      | grep -a "<STX>\|^ *[A-Za-z]" | tail -1 | fold -s -w 100 | sed 's/^/    /'
+done
 rm -f checkpoint/.$M._gc
 } | LC_ALL=C tr -c '\11\12\15\40-\176' '?' >> PLAN.txt
 # generated samples can contain any token in the vocabulary, including non-ASCII;

@@ -4690,3 +4690,89 @@ STATUS: the 7x7 LOSS question is still open (C1 terminated at 11820, short of
 the 20K decision point).  Reach is the one signal we have, and it favours 7x7.
 The clean re-run would be 7x7 on the RESTORED baseline (bn_track on), which
 also makes it the first shape experiment measured in a deployable regime.
+
+--------------------------------------------------------------------------------
+D1  d1_7x7_50k  step 5000   2026-08-24 13:16
+--------------------------------------------------------------------------------
+loss/grad/state:
+  step      0  loss 10.8039  grad 539.808  dff_std  1.158  dff_max     18.7  dff_zeros 0.4927
+  step   5000  loss  7.0977  grad  8.232  dff_std  0.368  dff_max     22.1  dff_zeros 0.0634
+  mean(last10) 6.7594   tokens 1.25 M   (unigram floor 7.549)
+token efficiency (sustained crossings):
+  L<7.549  step   1140    0.28 M tok   baseline   3980  (-2840)
+  L<7.000  step   2980    0.74 M tok   baseline   5940  (-2960)
+free-running generation (3 samples; cycle>0.6 degenerate, healthy 0.08-0.11):
+   gen health: cycle 0.11 (max 0.15)  uniq 0.10  n=3
+   sample: <STX> collect at she have are is took can has Mitch for were, continue. of, how. borrowing coming rab wasn achieved on taking??? is-- more support believed make are by information insisted did specific 
+  generated text (vla.py --generate, batch 1, seeds 11/12/13):
+  --- seed 11:
+    <STX> Whe contributed takes manufacturing protection man is had was, sitting, of.?????? grabbed 
+    will concerned??? clearly come is stipulated guilty are to is portion, can started ??? telling is 
+    remember???, want drove's have New Her do??? over have's. open't, that he's, conducted about went 
+    did Person??? (! automated. do includes. Europ set.. may. who's for hope. may said help that. that 
+    running consulting search is said does grew stayed, can had ( extended???. who
+  --- seed 12:
+    <STX>The in took, agree Are there that represents.??? has. Life, already will. and ??? on call. 
+    loses\n holds pos actually turned held up to is; created hold's has???? might has not couldn has 
+    might's. going attractedPretty.: running had of except wore got continue,, are was to??? I.??? 
+    still so miss is are online magazine would are??? in???'ve have us to are have about share, urges 
+    and book growing are. breakthrough seemed haven launched of that
+  --- seed 13:
+    <STX> Nov??? a the directly is Des, held, could???'s from told at't after also,, was, are, changed 
+    was says and was at a made played would held., think's struck might do may mean made are themselves 
+    have in free refreshing's could??? suddenly asked plunged demand can didn dipped in shrugged to 
+    because continue.'s addressed??? can were operational now... are" came to to happened should we 
+    may. speaks a,. live's ideas weeks would confident. or
+
+############################################################################
+2026-08-24 14:45  7x7 REVERTED.  CUMULATIVE MOMENTUM REJECTED.  BASELINE = e30.
+############################################################################
+Two adoptions were made today and BOTH are now reverted.  Both were validated
+in a regime the deployed model does not occupy.  That is the pattern to carry
+forward, not the individual flags.
+
+(1) --no-bn_track (promoted 09:00, reverted 12:40): eval used live batch stats,
+    so batch-1 generation cost +1.82 nats and could not be fused on FPGA.
+(2) 7x7 (adopted 12:45, reverted 14:20): chosen on a REACH result measured on
+    --no-bn_track checkpoints, where eval-mode BatchNorm uses batch statistics
+    and therefore CANNOT show a train/eval gap.  With tracking on, 7x7 has one:
+
+      config           train@5K   held-out   gap       runaway%
+      3x17  m=0.1       6.7144     6.6974   -0.017        0.0
+      7x7   m=0.1       6.7889     8.4471   +1.658        2.2
+      7x7   m=0.01      6.6469     8.3565   +1.710        0.5
+      7x7   (e24)       6.6230       nan      --        100.0
+
+    Training loss is indistinguishable across all four (6.62-6.79); the models
+    diverge only when eval switches to running statistics.  e24_lr03 is an
+    INDEPENDENT earlier 7x7+bn_track run at the same lr and is 100% runaway,
+    so this is a property of the shape, not of one run.
+    --bn_momentum moves the runaway rate at the margin (2.2% -> 0.5%) and does
+    NOT touch the 1.66-nat gap.  n_layers is the variable, not momentum.
+
+(3) --bn_momentum 0 (cumulative average) REJECTED at step 920, and the failure
+    is instant and enormous.  Identical config, identical loss and gradient at
+    step 0, dff_max at step 0:
+
+      e25_3x17    (m=0.1)   dff_max          1.1
+      b1_notrack  (m=0.1)   dff_max         52.7
+      d1_7x7      (m=0.1)   dff_max         18.7
+      c_cummom    (m=0)     dff_max 115,215,974,400.0
+
+    Eleven orders of magnitude.  vla.py maps 0 -> torch momentum=None correctly
+    (line 1214, `self.bn_momentum or None`), so this is real behaviour, not a
+    flag bug.  LIKELY MECHANISM, stated as a hypothesis consistent with the
+    data and not verified: running_var is INITIALIZED to 1.0.  With m=0.1 that
+    init survives as 0.9*1.0 after the first batch and acts as a floor under
+    1/sqrt(var+eps).  Cumulative averaging discards it immediately -- after one
+    batch running_var IS the batch variance -- and early training has
+    near-dead, tiny-variance channels, which then get amplified without bound.
+    This is exactly the failure --bn_eps exists to damp, so `--bn_momentum 0
+    --bn_eps 1e-3` is the obvious retry if cumulative averaging is ever wanted.
+    The run was draining (dff_max halving every ~200 steps via --ema 0.5) and
+    would have needed ~7K steps to return to O(1).
+
+CURRENT BASELINE (exp/run.sh) = the e30 configuration, unchanged since it was
+first reached, and now the only configuration measured today that is healthy on
+every axis: zero train/eval gap, zero runaway, batch-invariant inference to
+1e-4, grammatical generated text, best held-out on record.
