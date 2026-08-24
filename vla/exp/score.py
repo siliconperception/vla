@@ -16,7 +16,7 @@ So report both:
 import argparse, json, os, sys, time
 import numpy as np, torch, torch.nn.functional as F
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from memtest import load_vla_defs, stable_load
+from memtest import load_vla_defs, stable_load, heldout_docs
 
 ap = argparse.ArgumentParser()
 ap.add_argument('ckpts', nargs='+')
@@ -24,7 +24,11 @@ ap.add_argument('--docs', type=int, default=250)
 ap.add_argument('--maxlen', type=int, default=384)
 ap.add_argument('--minlen', type=int, default=96)
 ap.add_argument('--thresh', type=float, default=20.0)
-ap.add_argument('--corpus', default='tiny', choices=['tiny', 'web'])
+ap.add_argument('--corpus', default='tiny', choices=['tiny', 'web', 'pile'],
+                help="held-out set. 'web' is the Phase 1 reference set and is comparable "
+                     "to every number in PLAN.txt; 'pile' is the Pile's official validation "
+                     "split, in-domain for a --dataset pile run and for pythia. Say which "
+                     "one a reported number came from -- they are not interchangeable.")
 ap.add_argument('--seed', type=int, default=1234)
 ap.add_argument('--device', default='cuda')
 ap.add_argument('--clip_dff', type=float, default=None,
@@ -38,18 +42,8 @@ _docs = None
 def get_docs(g):
     global _docs
     if _docs is not None: return _docs
-    from datasets import load_dataset
-    rows = (load_dataset('roneneldan/TinyStories', split='validation') if a.corpus == 'tiny'
-            else load_dataset('Skylion007/openwebtext', split='train[-3000:]'))
-    d = []
-    for ex in rows:
-        t = ex.get('text','') or ''
-        if not t.strip(): continue
-        st, _ = g['clip_text'](t)
-        if len(st) >= a.minlen: d.append(st[:a.maxlen])
-        if len(d) >= a.docs: break
-    _docs = d
-    return d
+    _docs = heldout_docs(g, a.corpus, a.docs, a.minlen, a.maxlen)
+    return _docs
 
 print(f'{"checkpoint":14} {"step":>6} {"clean":>8} {"median":>8} {"runaway%":>9} {"nrun":>5} '
       f'{"first":>6} {"naive_mean":>11}')
@@ -65,8 +59,13 @@ for c in a.ckpts:
               accumulate=sa.get('accumulate',False), ema=sa.get('ema'),
               qproj=sa.get('qproj','none'), tap=sa.get('tap',False),
               tokenizer=sa['tokenizer'], head_norm=sa.get('head_norm','none'))
-    for k in ('clock_base','clock_max','clock_ends','clip_dff'):
-        if k in sa: kw[k] = sa[k]
+    # forward EVERY architecture key the checkpoint carries.  Omitting one rebuilds a
+    # DIFFERENT model: a --no-bn_track checkpoint has no running-stat buffers, and a
+    # probe that defaults track_running_stats=True fails to load it.  This silently
+    # broke scoring for every --norm/--bn_* run until 2026-08-23.
+    for k in ('clock_base', 'clock_max', 'clock_ends', 'clip_dff', 'norm', 'norm_groups',
+              'dff_norm', 'bn_track', 'bn_affine', 'bn_momentum', 'bn_eps'):
+        if k in sa and sa[k] is not None: kw[k] = sa[k]
     if a.clip_dff is not None:
         kw['clip_dff'] = a.clip_dff
     torch.manual_seed(a.seed)
@@ -103,4 +102,11 @@ for c in a.ckpts:
     _nm = os.path.basename(c).replace('checkpoint.pt.', '').replace('.pt', '')
     print(f'{_nm:14} {res["step"]:6d} {clean:8.4f} {res["median"]:8.4f} '
           f'{res["runaway"]:9.1f} {res["nrun"]:5d} {res["first"]:6d} {res["naive"]:11.4g}')
-json.dump(out, open('exp/score.json','w'), indent=1)
+# One cache file per corpus.  This used to be a single flat exp/score.json keyed only by
+# checkpoint name, which meant scoring a checkpoint on pile silently overwrote its web
+# score under the same key.  Nothing reads these files (the printed table is the result),
+# but a stale mixed-corpus cache is exactly the kind of thing that gets quoted later.
+# The legacy exp/score.json is left in place as Phase 1 history and no longer written.
+_out = f'exp/score.{a.corpus}.json'
+json.dump(out, open(_out, 'w'), indent=1)
+print(f'corpus {a.corpus}  docs {len(_docs or [])}  ->  {_out}')

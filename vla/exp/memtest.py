@@ -63,6 +63,49 @@ def stable_load(path, quiet=3.0, timeout=600):
     return ck
 
 
+# ── held-out corpora ───────────────────────────────────────────────────────────
+# One definition, imported by BOTH exp/score.py and exp/pythia_ref.py, so a VLA
+# checkpoint and an HF transformer are provably scored on the same documents in the
+# same order.  They used to select docs with duplicated inline loops; the moment
+# Phase 2 added a second corpus that duplication became a way to compare two models
+# on two different held-out sets and not notice.
+#
+#   web   openwebtext train[-3000:]  -- the Phase 1 held-out.  Comparable to every
+#         number in PLAN.txt's reference table.  CROSS-DOMAIN for a Pile-trained
+#         model (both VLA-on-pile and pythia).
+#   pile  the Pile's official validation split (mit-han-lab/pile-val-backup; neither
+#         Pile re-release on the hub carries one).  IN-DOMAIN for pythia and for a
+#         --dataset pile VLA run, which is what makes a VLA-vs-pythia comparison on
+#         it a like-for-like one.
+#   tiny  TinyStories validation.
+_HELDOUT = {
+    'tiny': ('roneneldan/TinyStories',      None, 'validation'),
+    'web':  ('Skylion007/openwebtext',      None, 'train[-3000:]'),
+    'pile': ('mit-han-lab/pile-val-backup', None, 'validation'),
+}
+
+
+def heldout_docs(g, corpus, docs, minlen, maxlen):
+    """First `docs` documents of `corpus` that tokenize to >= minlen steps, each clipped
+    to maxlen.  `g` is a load_vla_defs() globals dict, used for its clip_text/_tokenizer,
+    so the documents are the exact (x, y) step pairs the model is trained on."""
+    from datasets import load_dataset
+    if corpus not in _HELDOUT:
+        raise SystemExit(f'unknown held-out corpus: {corpus}')
+    hf, cfg, split = _HELDOUT[corpus]
+    d = []
+    for ex in load_dataset(hf, cfg, split=split):
+        t = ex.get('text', '') or ''
+        if not t.strip():
+            continue
+        st, _ = g['clip_text'](t)
+        if len(st) >= minlen:
+            d.append(st[:maxlen])
+        if len(d) >= docs:
+            break
+    return d
+
+
 def load_vla_defs(saved):
     """Exec the head of vla.py (tokenizers, DFFClock, VLAModel, clip_text) with an argv
     that reproduces the checkpoint's architecture, and hand back its globals."""

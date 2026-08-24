@@ -8,10 +8,33 @@ echo ""
 echo "--------------------------------------------------------------------------------"
 echo "$E  $M  step $S   $(date '+%Y-%m-%d %H:%M')"
 echo "--------------------------------------------------------------------------------"
+# The seed is no longer constant: exp/run.sh stopped passing --seed 1 on 2026-08-24, so
+# each run draws its own and a report that omits it cannot be paired against another later.
+# Read from the log's ARGS line, which vla.py writes AFTER resolving a None seed to a real one.
+echo "  seed $(grep -ao 'seed=[0-9]*' $L | head -1 | cut -d= -f2)   dataset $(grep -ao "dataset='[a-z0-9_]*'" $L | head -1 | cut -d\' -f2)"
 echo "loss/grad/state:"
 grep '^STEP' $L | awk -v s=$S '$2%5000==0 {printf "  step %6d  loss %7.4f  grad %6.3f  dff_std %6.3f  dff_max %8.1f  dff_zeros %6.4f\n",$2,$7,$9,$15,$17,$19}'
 grep '^STEP' $L | tail -10 | awk '{t+=$7;n++} END {printf "  mean(last10) %.4f   tokens %.2f M   (unigram floor 7.549)\n",t/n,'"$S"'*250/1e6}'
-echo "token efficiency (sustained crossings):"
+# in-training held-out eval (--eval_interval), which vla.py now writes into the log at the
+# checkpoint cadence. Printed here so a PLAN.txt row carries its own held-out number instead
+# of waiting for someone to run exp/score.py against the stashed weights afterwards.
+# NOTE the corpus: this is a held-out split of what the run TRAINED on (--dataset), so for a
+# Phase 2 non-web run it measures FIT and is NOT comparable to the web numbers in PLAN.txt's
+# reference table. Score with exp/score.py --corpus web for that comparison.
+echo "held-out eval (split of --dataset; see note in report.sh before comparing):"
+grep -a '^EVAL step' $L | tail -3 | sed 's/^/  /'
+# The crossing thresholds and the "baseline" column are BOTH web numbers: the ladder is
+# keyed to openwebtext's 7.549 unigram floor and compared against the wnotap web run. On a
+# non-web dataset those rows are cross-corpus and mean nothing -- pile's unigram floor is
+# 7.947, so "L<7.549" is a much harder crossing there than the label suggests, and beating
+# the web baseline's step count is not evidence of anything.
+_DS=$(grep -ao "dataset='[a-z0-9_]*'" $L | head -1 | cut -d\' -f2)
+if [ "$_DS" != "web" ]; then
+  echo "token efficiency (sustained crossings)  [!! thresholds and baseline are WEB numbers;"
+  echo "     dataset is $_DS -- these rows are CROSS-CORPUS and are not a like-for-like read]:"
+else
+  echo "token efficiency (sustained crossings):"
+fi
 conda run --no-capture-output -n dev python - "$L" <<'PY' 2>/dev/null
 import sys, numpy as np
 S=[];L=[]

@@ -122,6 +122,45 @@ REFERENCE POINTS -- what any number must be judged against
   cross-domain here (Pile-trained) with a 4.7M body against our 30.4M, so that
   comparison flatters us on both counts.
 
+  PILE-VAL REFERENCE (added 2026-08-24, Phase 2).  Measured on the Pile's own
+  validation split (mit-han-lab/pile-val-backup), same protocol: minlen 512,
+  maxlen 1024, first 400 docs, 358,899 tokens.  DO NOT read a pile-trained run
+  against the web ladder above -- the floors are 0.4-0.5 nats HIGHER on pile,
+  so the same model scores worse there for reasons that are the corpus, not it.
+
+    pythia-31m                  3.2315   ppl   25.3   median 3.5037
+    bigram, 28.6M fit           6.3511   ppl  573.5   median 6.2352
+    bigram, 3.6M fit            7.0277
+    unigram                     7.9470   ppl 2833.9
+
+                                pile     web      pile - web
+    unigram                     7.9470   7.5732     +0.37
+    bigram @28M fit             6.3511   5.8279     +0.52
+    pythia-31m                  3.2315   3.8183     -0.59
+
+  Pythia moves the OTHER way because pile is its training corpus, so switching
+  our training data to the Pile makes the comparison fairer (both models now
+  in-domain) and HARDER at the same time.  Gap from bigram to pythia is 3.12
+  nats on pile vs 2.01 on web: pythia exploits far more structure on its own
+  corpus than a bigram can reach.
+
+  CAVEATS, all of which matter:
+   * The pile bigram is NOT converged.  Per-doubling deltas 0.249, 0.249, 0.178
+     with coverage still climbing 64.8% -> 82.9%.  Continuing the observed 0.72
+     decay ratio puts the asymptote near ~5.9, but that ratio rests on ONE
+     transition (the first two doublings were flat), so 5.9 is an estimate and
+     must not be quoted as the pile analogue of web's 5.3017.
+   * CLEAN vs MEDIAN is INVERTED on pile relative to web.  pythia reads 3.2315
+     clean but 3.5037 median; the bigram reads 6.3511 clean but 6.2352 median.
+     Pile-val holds a mass of highly predictable structured text (code, math,
+     boilerplate) that skews the per-document distribution.  Compare median to
+     median, or mixing the two statistics across corpora invents differences.
+   * Fit/held-out disjointness on pile rests on EleutherAI's own train/val split
+     (fit = the_pile_deduplicated train, held-out = pile-val-backup, different
+     repos).  Cleaner than web's train[:N] vs train[-3000:], but NOT verified
+     here for document overlap.  An implausibly low bigram floor would be the
+     first symptom.
+
   NOISE FLOOR: two runs of the SAME config differ by 0.02-0.035 held-out, with
   instantaneous excursions to 0.067.  Any loss margin under ~0.07 from a single
   run is not a result.  Runaway% is countable and does not have this problem,
@@ -4980,3 +5019,233 @@ CURRENT BASELINE (exp/run.sh) = the e30 configuration, unchanged since it was
 first reached, and now the only configuration measured today that is healthy on
 every axis: zero train/eval gap, zero runaway, batch-invariant inference to
 1e-4, grammatical generated text, best held-out on record.
+
+--------------------------------------------------------------------------------
+P1  p1_pile  step 5000   2026-08-24 15:39   [CRASHED RUN, seed 1 -- the eval
+    dff/clk bug killed it at this step; weights kept as p1_pile_crashed.5000.pt.
+    Superseded by the seed 407872855 rerun below.  Numbers here are still valid:
+    the checkpoint and its EVAL both completed before the crash.]
+--------------------------------------------------------------------------------
+  seed 1   dataset pile
+loss/grad/state:
+  step      0  loss 10.7659  grad 629.969  dff_std  0.135  dff_max      1.7  dff_zeros 0.4830
+  mean(last10) 6.8069   tokens 1.25 M   (unigram floor 7.549)
+held-out eval (split of --dataset; see note in report.sh before comparing):
+token efficiency (sustained crossings):
+  L<7.549  step    960    0.24 M tok   baseline   3980  (-3020)
+  L<7.000  step   3060    0.77 M tok   baseline   5940  (-2880)
+free-running generation (3 samples; cycle>0.6 degenerate, healthy 0.08-0.11):
+   gen health: cycle 0.09 (max 0.11)  uniq 0.37  n=3
+   sample: <STX>from the $[]$--<ETX>
+  generated text (vla.py --generate, batch 1, seeds 11/12/13):
+  --- seed 11:
+    <STX>and over education manufacturing protection man\n\n[ invasion, the armed.?????? These or 
+    concerned enrichment before her claims of the data forfake portion, can started ???\n      the 
+    Lady, the intervention's bunch\n Her law??? Felant U/carbon Hospital and a recent Mar briefs of a 
+    chicken and Person non (! 17) do ask found Europed 0.E. C'smitted.\n\nThe broad preers running 
+    consulting search is the team that null, the court (May antenna.62
+  --- seed 12:
+    <STX>The cosifferentmakers. Are there that step upon 10. Life% already will have the two buffer 
+    camp. Und\nWith posathrocyte held up to the average problem hold the subspace protect the major 
+    government. Eunits, SDS. GiulizerPretty.: Organization had consider nobody's got continue the, and 
+    new specific time of [KL micro so miss skin or online magazine error or valid in classical week 
+    (he-xars share, urges and book growing paths. Give the public customer of the
+  --- seed 13:
+    <STX>                \nT the expression is Descolumn image, where and two devote parenting at 
+    transplant controller also,, and const ko, 12 was submitted and keep at a frequent nature and 
+    the="\par722/2.6 >> mean progenitor people themselves for the free refreshing's tens of Lord asked 
+    a demand can not selected between they haven never continue.\n\tThe wedding.\n         3.\n     " 
+    135-025aster should we one the consideration of his imma init P BV                     confident 
+    flag 95
+
+############################################################################
+2026-08-24  PHASE 2 OPENS.  PILE-VAL REFERENCE LADDER MEASURED.
+############################################################################
+Phase 2 varies ONLY the data; the model is frozen at the e30 baseline.  The
+first corpus is the Pile, streamed.  Before any pile RESULT can be read, the
+pile ladder had to exist -- PLAN.txt's floors were all web numbers and a corpus
+has its own information floor.  A pile score read against web's 5.3017 would
+have been misjudged by half a nat.
+
+TOOLING (all committed, all measured on IDENTICAL documents)
+  Document selection moved into one shared heldout_docs() in exp/memtest.py,
+  imported by exp/score.py, exp/pythia_ref.py and exp/ngram.py.  Each of the
+  three used to select held-out docs with its own inline loop; the moment a
+  second corpus existed, that duplication was a way to compare two models on
+  two different held-out sets and never notice.  All three now take --corpus
+  {tiny,web,pile}.  exp/score.py writes exp/score.<corpus>.json instead of one
+  flat exp/score.json, which used to let a pile score overwrite a web score
+  under the same checkpoint key.
+  VERIFICATION that the refactor did not drift: pythia-31m on web rescored
+  3.8183, reproducing the reference table value above EXACTLY, and the pile
+  held-out came back at 358,899 tokens from both exp/pythia_ref.py and
+  exp/ngram.py.  Same documents, independently reached.
+
+PILE-VAL LADDER (400 docs, minlen 512, maxlen 1024, 358,899 tokens)
+  fit for the n-grams: 20,000 streamed docs of the_pile_deduplicated train,
+  28.6M tokens.  Learning curve, per-document means:
+
+    fit tokens   coverage   unigram   bigram   bigram median
+      3.6M         64.8%     8.0547   7.0277      6.8284
+      7.1M         71.9%     7.9988   6.7787      6.5965
+     14.3M         78.1%     7.9609   6.5295      6.3910
+     28.6M         82.9%     7.9470   6.3511      6.2352
+
+  Unigram has converged (8.066 -> 7.956 over 8x data).  Bigram has NOT: deltas
+  per doubling 0.249, 0.249, 0.178, coverage still climbing.  See the caveats
+  in the handoff block before quoting an asymptote.
+
+PYTHIA-31m CHARACTERIZED (the comparison target; note there is no pythia-30m,
+the suite goes 14m/31m/70m/160m)
+    gpt_neox, 6 layers, hidden 256, 8 heads, 2048 positions, vocab 50304
+    params  30.49M TOTAL = 25.76M embedding (84.5%, untied) + 4.74M BODY
+    pile-val  3.2315 clean / 3.5037 median / 0.0% runaway
+    web       3.8183 clean / 3.8117 median / 0.0% runaway
+  84.5% of "31M" is a lookup table.  Its compute-bearing body is 4.74M against
+  VLA's 30.36M trainable convolutions -- VLA carries ~6.4x more compute AND
+  consumes pythia's 25.76M embeddings for free.  Both facts flatter VLA; the
+  parameter-count framing understates how far ahead the transformer is.
+
+CORPUS SANITY CHECK -- the Pile is NOT topic-partitioned by shard
+  Asked because dolma3's hub shards ARE (see vla.py's _LOCAL_DIRS note): its
+  first shard is one topic, so streaming trains on one topic at a time.  Three
+  checks, all negative for the Pile:
+   1. 300 docs from the head of shards 0/412/825/1237/1649 of 1650: near
+      identical mix in every shard (web prose 73-82%, code 8-11%, 6-8 distinct
+      categories each).  Marker-based classifier, since the deduplicated
+      re-release dropped the `meta` column -- valid for COMPARING shards, not
+      as ground truth for the Pile's real subset weights.
+   2. The test that actually matters, since shard-level uniformity would not
+      catch topic BLOCKS inside a shard: run length of consecutive same-category
+      documents over 2000 docs in stream order = 3.41 mean / 39 max, against
+      3.50 / 26 for the same labels randomly permuted.  Indistinguishable, i.e.
+      globally shuffled.  Longest non-dominant-class run: 10 documents.
+   3. vla.py's streaming path calls .shuffle(buffer_size=10000, seed=...) on a
+      1650-shard IterableDataset, which reorders the SHARDS as well as
+      buffering -- confirmed, three seeds start in three different regions of
+      the corpus, none matching raw order.
+  One real but harmless gradient: stackexchange rises 2.7% (shard 0) to 10%
+  (shard 1649).  Every category is present in every shard and shard-order
+  shuffling neutralizes position, so it is a gradient, not a partition.
+  NOT CHECKED: pile_nc is a different repo (monology/pile-uncopyrighted, jsonl
+  .zst layout).  Re-run this check before trusting it.
+
+MONITORING CADENCE CHANGED (vla.py, user request)
+  --gen_interval N   free-running GEN sample every N steps (0 = --checkpoint,
+                     so every pre-existing invocation is unchanged)
+  --eval_interval N  held-out eval every N steps, reported as clean/median/
+                     runaway% the way exp/score.py does
+  --eval_docs N      documents in that eval set (default 400, matching above)
+  exp/run.sh now emits --gen_interval 500 --eval_interval 5000.  These are
+  observation cadence, not model configuration: no weight, optimizer state or
+  data-stream change, so runs before and after compare directly.  The eval set
+  is built ONCE and reused, so successive EVAL lines differ only by the weights.
+  Cost 137s per eval, ~8.4% of a 5000-step interval.  Step 0 is skipped: it
+  scores the untrained model, which is ln(vocab) by construction (measured
+  10.8221 against a 10.8258 ceiling) and is not worth 137s at every run start.
+
+  BUG, MINE, AND THE PHASE 1 LESSON REPEATED.  The first --eval_interval run
+  CRASHED at step 5000, on the first training step after the first eval:
+    RuntimeError: The size of tensor a (400) must match ... b (250)
+  The eval scores at 400 rows, training runs at 250.  _init_dff() rebuilds
+  self.dff AND self.clk together on a batch-width change; the eval restored
+  only dff, so _init_dff saw a matching 250-wide dff, skipped the rebuild, and
+  the next training step ran a 250-row batch against a 400-row clock.  vla.py
+  states the contract that was violated: "A clock belongs to a context, not to
+  the model."  generate() obeys it (local state) which is why GEN was fine.
+  Fixed by restoring dff and clk together, in a `finally` -- the outer except
+  exists so an eval failure cannot kill a run, but a fault raised MID-scoring
+  would have skipped the restore and caused this same crash THROUGH the guard.
+  Verified by fault injection: eval throws, warns, disables itself, training
+  continues.
+  THE REAL FAILURE WAS THE SMOKE TEST.  It used --n_layers 1 with no --ema, so
+  clocked=False and self.clk was permanently None -- the bug was structurally
+  invisible.  That is METHOD RULE 2 ("measure in the regime you will deploy
+  in"), the lesson Phase 1 calls its most expensive, repeated verbatim.  Any
+  smoke test of the training loop MUST use --clock fixed --ema 0.5 --accumulate
+  and a batch width different from --eval_docs.
+
+SEED POLICY CHANGED (user request)
+  exp/run.sh no longer passes --seed 1; each run draws from os.urandom, prints
+  it, and stores it in saved_args.  Rationale: a fixed seed never bought
+  reproducibility here.  --seed pins weight init, the HF shuffle and generation
+  sampling, but NOT the data -- 12 builder threads race for the iterator lock,
+  so batch composition is thread-scheduling dependent, which is why two runs of
+  the same config at the same seed differ by 0.02-0.035.  What --seed 1 really
+  did was make every experiment share ONE draw from the init distribution.
+  Pass --seed <N> explicitly to PAIR against an older run.  exp/report.sh now
+  prints the seed and dataset on every row, since neither is constant any more.
+
+--------------------------------------------------------------------------------
+P1  p1_pile  step 5000   2026-08-24 16:28
+--------------------------------------------------------------------------------
+  seed 407872855   dataset pile
+loss/grad/state:
+  step      0  loss 10.9328  grad 638.296  dff_std  0.052  dff_max      0.8  dff_zeros 0.5063
+  step   5000  loss  6.8167  grad  3.097  dff_std  0.518  dff_max     15.0  dff_zeros 0.0386
+  mean(last10) 6.7261   tokens 1.25 M   (unigram floor 7.549)
+held-out eval (split of --dataset; see note in report.sh before comparing):
+  EVAL step       5000 clean    7.086589 ppl    1195.8217 median    7.047502 runaway   0.00% nrun    0 docs   400 wall   136.9s
+token efficiency (sustained crossings):
+  L<7.549  step    740    0.18 M tok   baseline   3980  (-3240)
+  L<7.000  step   2960    0.74 M tok   baseline   5940  (-2980)
+free-running generation (3 samples; cycle>0.6 degenerate, healthy 0.08-0.11):
+   gen health: cycle 0.10 (max 0.11)  uniq 0.13  n=3
+   sample: <STX>class for Columbia+WHATfind lowb562. There comes from becoming recalix, Season\n\nIn... Other no law\n\nehion.\n Private = Quantitative are it use guarantee. \n\nAnother accepting can???? it, then 
+  generated text (vla.py --generate, batch 1, seeds 11/12/13):
+  --- seed 11:
+    <STX>ref+OF manufacturing (easni medeps, a interference of can an course by enrichment before come 
+    is stipulated the data for is portion, can started to what is remember that, the intervention of 
+    the New Her Error (Agant U/carbonPluginmoning he's them policy and thessel Person non (!SU.fos. 
+    Europed 0.E. C'smitted.\n\nThe broad.\n\nSystem search is the team that null, the court (congclass) 
+    who
+  --- seed 12:
+    <STX>Caging took a northern and there that step upon has the motivation of already out it and 
+    someone on breathe've loses\nWith pos.\n\nLaago??; ([class 'produpte?\n\nI couldn has been be't 
+    going attracted them.: Organization had the audit for got continue the, and them to be I.KL micro 
+    so miss skin or online magazine error or valid in classical week (he-xar> [@\n\nPold-lo. Give the 
+    public customer of the
+  --- seed 13:
+    <STX>treatment: a the expression is Desp image, him and two world induced at transplant controller 
+    also,, and constmouse, 12 was to be keep at a frequent nature and the???par722/cry Arate\n\n As 
+    people themselves for the free refreshing rise. In lifeless asked a Xgifacher dipped in these usage 
+    because continue.\n\nThe wedding.\n\nThe.\n\n"*)\n\nAmue Cheng Ozed speaks a, by live init P BV     
+                    confident flag 95
+
+--------------------------------------------------------------------------------
+P1  p1_pile  step 10000   2026-08-24 16:54
+--------------------------------------------------------------------------------
+  seed 407872855   dataset pile
+loss/grad/state:
+  step      0  loss 10.9328  grad 638.296  dff_std  0.052  dff_max      0.8  dff_zeros 0.5063
+  step   5000  loss  6.8167  grad  3.097  dff_std  0.518  dff_max     15.0  dff_zeros 0.0386
+  mean(last10) 6.3059   tokens 2.50 M   (unigram floor 7.549)
+held-out eval (split of --dataset; see note in report.sh before comparing):
+  EVAL step       5000 clean    7.086589 ppl    1195.8217 median    7.047502 runaway   0.00% nrun    0 docs   400 wall   136.9s
+token efficiency (sustained crossings)  [!! thresholds and baseline are WEB numbers;
+     dataset is pile -- these rows are CROSS-CORPUS and are not a like-for-like read]:
+  L<7.549  step    740    0.18 M tok   baseline   3980  (-3240)
+  L<7.000  step   2960    0.74 M tok   baseline   5940  (-2980)
+  L<6.500  step   8000    2.00 M tok   baseline  15680  (-7680)
+free-running generation (3 samples; cycle>0.6 degenerate, healthy 0.08-0.11):
+   gen health: cycle 0.10 (max 0.11)  uniq 0.13  n=3
+   sample: <STX>262.33) under 15. Get standard's aboveAtlF*]{}, was what consistency have you competent to authors and de her predicts by strain of a truck along Plan holes.id}}=\.\nOn request on the parallel li
+  generated text (vla.py --generate, batch 1, seeds 11/12/13):
+  --- seed 11:
+    <STX>LD+OF_ prescription man\n\n[ invasion, the armed.?????? These course did not clearly come, 
+    they guilty for citizens is portion, can started to what is a Lady, the intervention of the New Her 
+    Error (Agant U/carbon Hospital Waling recent Mar briefs conducted under thinners Person society 
+    (!SU) do ask. Europed samples. Cross. C IIImitted. ( 3:2.6 running consulting search, the team grew 
+    in proprietary companies ([@compcong antenna.006
+  --- seed 12:
+    <STX>CP???, O Are8); The mother has the Life of the documentation. and someone are breathe. 
+    Und\nWith pos.\n\nLaerne is; ([class initial has protect in the government. Eunits might be well. 
+    "Pretty.: running as the audit for a Say,, and them to Harm I [KL micro so miss through life online 
+    magazine error or fitness in classical week (he19.ar_barENCE urges and book-lo. Give the public 
+    customer of the
+  --- seed 13:
+    <STX>Co: In the expression is Descolumn image, where and two world induced at transplant controller 
+    also gives, and constmouse, 12 was submitted and therapeut of frequent nature and the Die,722's MRI 
+    might do far mean into the brush flare in free refreshing rise. In Lord asked a demand can not 
+    substitute in these usage because a guide's cross technical concerns.\n\n[A. The Special 
+    135-025+substantial Cheng O. Each art, immaJ P BV                    o. 95

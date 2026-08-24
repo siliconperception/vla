@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Unigram / bigram cross-entropy of openwebtext under the pythia31m tokenizer.
+"""Unigram / bigram cross-entropy of a corpus under the pythia31m tokenizer (--corpus).
 
 Why: b5 scores 5.7528 nats/token held-out, against a 7.5491-nat unigram entropy, and its
 reach probe says context is worth only +0.09 of that ~1.8-nat gain.  That raises the
@@ -20,7 +20,7 @@ the conservative choice for that argument.
 import argparse, os, sys
 import numpy as np, torch
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from memtest import load_vla_defs, stable_load
+from memtest import load_vla_defs, stable_load, heldout_docs
 
 ap = argparse.ArgumentParser()
 ap.add_argument('--fit', type=int, default=20000, help='docs from train[:fit] to fit on')
@@ -28,6 +28,14 @@ ap.add_argument('--docs', type=int, default=400, help='held-out docs (matches sc
 ap.add_argument('--minlen', type=int, default=512)
 ap.add_argument('--maxlen', type=int, default=1024)
 ap.add_argument('--ckpt', default='checkpoint/b5_long.final.pt')
+ap.add_argument('--corpus', default='web', choices=['web', 'pile'],
+                help="which corpus's floor to measure. Held-out comes from the shared "
+                     "heldout_docs(), so it is the same set exp/score.py and "
+                     "exp/pythia_ref.py score on. PLAN.txt's 5.3017 bigram floor is a WEB "
+                     "number and does not transfer -- a corpus has its own information "
+                     "floor, and a model score can only be read against its own corpus's.")
+ap.add_argument('--streaming', action='store_true', default=None,
+                help='stream the fit corpus (forced on for pile, which is 600GB+)')
 a = ap.parse_args()
 
 ck = stable_load(a.ckpt); sa = ck['saved_args']; g = load_vla_defs(sa)
@@ -51,13 +59,27 @@ def pairs(rows, limit=None, minlen=0, maxlen=None, want=None):
         if want and len(out) >= want: break
     return out
 
-print(f'loading held-out (train[-3000:], minlen {a.minlen}, first {a.docs} docs)...', flush=True)
-ho = pairs(load_dataset('Skylion007/openwebtext', split='train[-3000:]'),
-           minlen=a.minlen, maxlen=a.maxlen, want=a.docs)
+print(f'loading held-out ({a.corpus}, minlen {a.minlen}, first {a.docs} docs)...', flush=True)
+# shared with exp/score.py / exp/pythia_ref.py, so the floor and the models it bounds are
+# measured on identical documents in identical order.
+_ho = heldout_docs(g, a.corpus, a.docs, a.minlen, a.maxlen)
+ho = [(np.fromiter((x for x, _ in st), dtype=np.int64, count=len(st)),
+       np.fromiter((y for _, y in st), dtype=np.int64, count=len(st))) for st in _ho]
 print(f'  {len(ho)} docs, {sum(len(x) for x,_ in ho)} tokens', flush=True)
 
-print(f'loading fit set (train[:{a.fit}])...', flush=True)
-fit = pairs(load_dataset('Skylion007/openwebtext', split=f'train[:{a.fit}]'), want=a.fit)
+# The fit set must be DISJOINT from the held-out set or the bigram table has memorised the
+# answer. web: train[:N] vs the train[-3000:] tail. pile: different repos entirely -- the
+# deduplicated train re-release vs the Pile's official validation split -- which is a
+# cleaner separation than web's, though it rests on EleutherAI's split being honest and is
+# not independently verified here.
+if a.corpus == 'pile':
+    print(f'loading fit set (the_pile_deduplicated train, first {a.fit} docs, streaming)...',
+          flush=True)
+    _rows = load_dataset('EleutherAI/the_pile_deduplicated', split='train', streaming=True)
+else:
+    print(f'loading fit set (openwebtext train[:{a.fit}])...', flush=True)
+    _rows = load_dataset('Skylion007/openwebtext', split=f'train[:{a.fit}]')
+fit = pairs(_rows, want=a.fit)
 FX = np.concatenate([x for x,_ in fit]); FY = np.concatenate([y for _,y in fit])
 print(f'  {len(fit)} docs, {len(FX)} tokens', flush=True)
 

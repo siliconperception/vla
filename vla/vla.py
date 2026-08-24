@@ -34,9 +34,26 @@ NULL      = 0x00
 START     = 0x02
 END       = 0x03
 
-# length of the GEN sample printed each checkpoint interval during training. Fixed, not
+# length of the GEN sample printed each --gen_interval steps during training. Fixed, not
 # --n: --n is the length of a one-shot --generate run and nothing else.
 _GEN_SAMPLE = 200
+
+# In-training held-out eval (--eval_interval). These are protocol constants, not knobs:
+# they are exactly the document selection exp/score.py and exp/pythia_ref.py use for every
+# number in PLAN.txt's reference table (first --eval_docs documents of the held-out split
+# that tokenize to >= _EVAL_MINLEN steps, each clipped to _EVAL_MAXLEN). Changing one
+# silently makes the EVAL line incomparable to that table and to the pythia references,
+# which is the whole reason the eval exists -- so they are pinned here rather than exposed.
+_EVAL_MINLEN = 512
+_EVAL_MAXLEN = 1024
+_EVAL_BATCH  = 400    # rows per forward chunk. Cost here is dominated by SEQUENTIAL steps
+                      # (51 conv launches each), not by batch width, so one wide chunk beats
+                      # several narrow ones even though it pads every row out to the longest.
+                      # exp/score.py scores all 400 documents as a single batch for the same
+                      # reason. Safe to lower if a bigger --eval_docs ever runs out of memory:
+                      # eval-mode BatchNorm uses running stats with --bn_track, so per-document
+                      # results are batch-invariant to 1e-4 and chunking changes nothing.
+_EVAL_THRESH = 20.0   # per-document nats above which a document is counted "runaway"
 
 STX_TEXT  = '<STX>'   # how START renders in displayed text
 ETX_TEXT  = '<ETX>'   # how END renders in displayed text
@@ -666,6 +683,24 @@ parser.add_argument('--lr_rate',       default=0.5,   type=float,
 parser.add_argument('--load',          default=None)
 parser.add_argument('--save',          default='checkpoint.pt')
 parser.add_argument('--checkpoint',    default=1000,  type=int)
+parser.add_argument('--gen_interval',  default=0,     type=int,
+                    help='print a free-running GEN sample every N training steps. 0 (the '
+                         'default) means "every --checkpoint steps", which is what the '
+                         'generation sample was tied to before this flag existed, so every '
+                         'pre-existing invocation is unchanged. Generation is cheap next to '
+                         'a checkpoint save, and the text is the measurement that has '
+                         'overturned the scalars more than once, so it is worth sampling '
+                         'far more often than the weights are written')
+parser.add_argument('--eval_interval', default=0,     type=int,
+                    help='score the held-out split of --dataset every N training steps and '
+                         'print an EVAL line. 0 (the default) disables it. Uses the same '
+                         'held-out documents every time and the same framing as one-shot '
+                         '--eval, and reports clean/median/runaway% the way exp/score.py '
+                         'does -- a plain mean is not usable here, a handful of runaway '
+                         'documents move it by orders of magnitude')
+parser.add_argument('--eval_docs',     default=400,   type=int,
+                    help='documents in the --eval_interval held-out set (400 matches '
+                         'exp/score.py and PLAN.txt\'s reference table)')
 parser.add_argument('--log',           default=None)
 parser.add_argument('--monitor',       default=100,   type=int)
 parser.add_argument('--generate',      default=False, action='store_true',
@@ -1651,6 +1686,18 @@ def _text_drain():
         e, t, s = _text_stats['examples'], _text_stats['tokens'], _text_stats['sample']
         _text_stats['examples'] = _text_stats['tokens'] = 0
     return e, t, s
+
+
+def _text_peek():
+    """The most recent raw training-text sample, WITHOUT touching the counters.
+
+    Exists so the GEN block can print a TXT-SAMPLE on its own (fast) interval while the
+    TEXT throughput line stays on the checkpoint interval.  _text_drain() RESETS
+    examples/tokens, so calling it every --gen_interval steps would silently rescale every
+    TEXT line to a tenth of the window it claims to cover.  The sample itself is safe to
+    read repeatedly: builder threads overwrite it in place and the drain never clears it."""
+    with _text_lock:
+        return _text_stats['sample']
 # Each builder returns (steps, caption). A step is a 4-tuple
 #   (x_byte, y_byte, img_or_None, aud_or_None)
 # one entry per 100 Hz frame.
@@ -2768,6 +2815,131 @@ def _diag(model):
     return ' '.join(f'{n}:g{_gnorm(ps):.1e}/w{_wnorm(ps):.1e}'
                     for n, ps in _param_groups_named(model).items())
 
+# ── in-training held-out eval (--eval_interval) ────────────────────────────────
+# Why this exists as well as the one-shot --eval and exp/score.py: the one-shot modes score
+# a checkpoint AFTER the fact, so a run only learns its held-out number once someone goes
+# and measures it, and the train/eval GAP -- the signal that killed both Phase 1 promotions
+# -- is invisible while the run is in flight. This puts it in the log next to the training
+# loss, on the same axis, every --eval_interval steps.
+#
+# The document set is built ONCE and reused, so successive EVAL lines differ only by the
+# weights. Rebuilding it per eval (or streaming a fresh slice each time) would make the
+# series a walk over documents as much as over training, which is exactly the confound
+# that makes an eval curve unreadable.
+
+_eval_docs_cache = None      # [[(x, y), ...], ...] the held-out clips, built on first use
+_eval_disabled   = False     # set if building or scoring ever fails: warn once, keep training
+
+
+def _build_eval_docs():
+    """First --eval_docs held-out documents, framed as training clips. See _EVAL_MINLEN."""
+    from datasets import load_dataset
+    hf, cfg, split, col = _eval_source()
+    if args.dataset not in _EVAL_SPLITS and not args.split:
+        print(f'WARNING: --eval_interval: no held-out split configured for "{args.dataset}"; '
+              f'scoring "{split}", which the model is TRAINING on -- that is a training '
+              f'loss, not a validation loss')
+    print(f'eval set: loading {hf}' + (f' [{cfg}]' if cfg else '') + f' split {split} ...',
+          flush=True)
+    rows = load_dataset(hf, cfg, split=split, streaming=args.streaming)
+    _fmt = _TEXT_FORMAT.get(args.dataset)
+    docs = []
+    for ex in rows:
+        text = (_fmt(ex) if _fmt is not None else ex.get(col, ex.get('text', ''))) or ''
+        if not text.strip():
+            continue
+        steps, _ = clip_text(text)
+        if len(steps) >= _EVAL_MINLEN:
+            docs.append(steps[:_EVAL_MAXLEN])
+        if len(docs) >= args.eval_docs:
+            break
+    # longest-first inside the chunking below wastes the least padding; rows are independent
+    # and eval-mode BatchNorm uses running stats, so grouping does not change any per-document
+    # result (batch invariance measured at 1e-4).
+    docs.sort(key=len)
+    print(f'eval set: {len(docs)} documents, {sum(len(d) for d in docs)} tokens', flush=True)
+    return docs
+
+
+def _heldout_eval(step):
+    """Score the cached held-out set and print/log one EVAL line. Never raises: an eval
+    failure must not take down a training run that is otherwise healthy."""
+    global _eval_docs_cache, _eval_disabled
+    if _eval_disabled:
+        return
+    try:
+        if _eval_docs_cache is None:
+            _eval_docs_cache = _build_eval_docs()
+        docs = _eval_docs_cache
+        if not docs:
+            print('WARNING: --eval_interval: no usable held-out documents; disabling')
+            _eval_disabled = True
+            return
+
+        _dev = next(model.parameters()).device
+        _was_training = model.training
+        # The training context must survive the eval untouched, and the context is BOTH
+        # tensors: _init_dff() rebuilds self.dff and self.clk together whenever the batch
+        # width changes (see vla.py's "a clock belongs to a context, not to the model").
+        # Scoring at _EVAL_BATCH rows rebuilds both at that width; restoring only dff then
+        # leaves _init_dff with a matching dff, so it skips the rebuild and the next
+        # training step runs a 250-row batch against a 400-row clock. That is not a silent
+        # error -- it raised at the first step after the first eval and killed the run.
+        # try/finally, not a plain restore after the loop: the outer `except` below exists
+        # so an eval failure cannot take down a healthy training run, but a failure raised
+        # part-way through scoring would skip the restore and leave the model holding the
+        # eval-width context -- turning the guard into the very crash it is meant to absorb.
+        _saved_dff, _saved_clk = model.dff, model.clk
+        model.eval()
+        t0 = time.time()
+        per_doc = []                    # mean nats/token for each document, kept separate
+        try:
+          with torch.no_grad():
+            for c in range(0, len(docs), _EVAL_BATCH):
+                chunk = docs[c:c + _EVAL_BATCH]
+                B = len(chunk); T = max(len(d) for d in chunk)
+                X = torch.zeros((B, T), dtype=torch.long)
+                Y = torch.zeros((B, T), dtype=torch.long)
+                M = torch.zeros((B, T), dtype=torch.bool)
+                for r, st in enumerate(chunk):
+                    X[r, :len(st)] = torch.tensor([x for x, _ in st], dtype=torch.long)
+                    Y[r, :len(st)] = torch.tensor([y for _, y in st], dtype=torch.long)
+                    M[r, :len(st)] = True
+                X, Y, M = X.to(_dev), Y.to(_dev), M.to(_dev)
+                model.dff = None        # fresh context per document (see _new_dff/--init)
+                rs = torch.zeros(B, device=_dev)
+                for t in range(T):
+                    logits, _ = model(X[:, t])
+                    ce = F.cross_entropy(logits, Y[:, t], reduction='none')
+                    # a diverged row produces inf/nan; map it to a large finite value so it
+                    # is counted as runaway instead of poisoning every other row's sum
+                    ce = torch.where(torch.isfinite(ce), ce, torch.full_like(ce, 1e30))
+                    rs += ce * M[:, t]
+                n = M.sum(dim=1).clamp(min=1)
+                per_doc.append((rs / n).cpu().numpy())
+        finally:
+            model.dff, model.clk = _saved_dff, _saved_clk
+            if _was_training:
+                model.train()
+
+        per = np.concatenate(per_doc)
+        bad = per > _EVAL_THRESH
+        clean = float(per[~bad].mean()) if (~bad).any() else float('nan')
+        # clean/median/runaway, not a mean: three runaway documents out of 400 move a plain
+        # mean by nine orders of magnitude and report a healthy model as destroyed.
+        d = ('EVAL step {:10} clean {:11.6f} ppl {:12.4f} median {:11.6f} '
+             'runaway {:6.2f}% nrun {:4d} docs {:5d} wall {:7.1f}s'
+             ).format(step, clean, math.exp(min(clean, 700)) if clean == clean else float('nan'),
+                      float(np.median(per)), 100.0 * float(bad.mean()), int(bad.sum()),
+                      len(per), time.time() - t0)
+        print(d, flush=True)
+        with open(args.log, 'a') as f:
+            print(d, file=f)
+    except Exception as e:
+        print(f'WARNING: --eval_interval failed at step {step}: {e!r}; disabling', flush=True)
+        _eval_disabled = True
+
+
 # ── training loop ─────────────────────────────────────────────────────────────
 
 larr, garr = [], []
@@ -2777,6 +2949,8 @@ i = _start_step        # continue the step count from the resumed checkpoint (0 
 # a slot's flag is True on the step it emits its <STX>, so summing flags counts examples.
 n_examples = _start_exs
 _plat_sum, _plat_n = 0.0, 0    # running mean of this interval's losses, for the plat bin
+# --gen_interval 0 keeps the pre-flag behaviour: one GEN sample per --checkpoint interval.
+_gen_interval = args.gen_interval or args.checkpoint
 
 # --preroll: throw away batches until the stream produces its first <ETX>. Cheap —
 # it only drains the queue, no forward/backward — and it costs one clip's worth of
@@ -2835,20 +3009,41 @@ try:
             else:
                 print(f'WARNING: non-finite params at step {i}; skipping checkpoint save')
 
-            # text throughput for this checkpoint interval (examples/tokens consumed)
-            _te, _tt, _tsample = _text_drain()
+            # text throughput for this checkpoint interval (examples/tokens consumed).
+            # Stays in THIS block, not the generation block below: _text_drain() resets the
+            # counters it reports, so draining it on the (faster) generation interval would
+            # silently rescale every TEXT line. exp/watch.sh also triggers off 'TEXT step',
+            # i.e. off checkpoints, which is what it is meant to track.
+            _te, _tt, _ = _text_drain()      # sample is read separately, see _text_peek
             if _te:
                 d = f'TEXT step {i:10} examples {_te} tokens {_tt}'
                 print(d)
                 with open(args.log, 'a') as f:
                     print(d, file=f)
 
+        # ── held-out eval ─────────────────────────────────────────────────────
+        # after the save, so the EVAL line in the log describes the weights that were just
+        # written to disk and can be re-derived from that checkpoint with exp/score.py.
+        # Skipped at step 0 (like exp/watch.sh's report): it would score the UNTRAINED model,
+        # which is ln(vocab) by construction and already known -- measured 10.8221 against a
+        # ln(50304) = 10.8258 ceiling. It is not free: 400 documents is ~137s on a 4090, and
+        # it lands before the first training step, so the run looks hung for over two minutes
+        # at every start with nothing in the log moving.
+        if args.eval_interval and i > 0 and (i % args.eval_interval) == 0:
+            _heldout_eval(i)
+
+        # ── generation sample ─────────────────────────────────────────────────
+        # own interval: text has repeatedly overturned what the scalars said (a model called
+        # "bigram-level with zero semantics" was writing grammatical clauses), and sampling
+        # 200 tokens is cheap next to writing 30M parameters to disk.
+        if (i % _gen_interval) == 0:
             model.eval()
             prompt = _prompt_ids()
             out    = model.generate(prompt, _GEN_SAMPLE, temperature=args.temperature)
             gen_text = _render(prompt + out)
-            lines = [f'GEN: {gen_text}']
-            if _tsample:                       # a recent training-text example
+            lines = [f'GEN step {i:10}: {gen_text}']
+            _tsample = _text_peek()            # a recent training-text example
+            if _tsample:
                 lines.append(f'TXT-SAMPLE: {_printable(_tsample[:120])}')
             print('\n' + '\n'.join(lines) + '\n')
             with open(args.log, 'a') as f:
