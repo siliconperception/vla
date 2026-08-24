@@ -1,3 +1,207 @@
+============================================================================
+                    READ THIS FIRST -- PHASE 2 HANDOFF
+                 written 2026-08-24, end of the Phase 1 session
+============================================================================
+Everything below this block is Phase 1 history, appended in chronological
+order.  You do not need to read it to start work.  This block is the state.
+
+WHAT THE PROJECT IS
+  vla.py trains a recurrent CNN language model.  The state ("DFF") is a stack
+  of n_layers feature maps of shape [B, n_hidden, S, S], detached every step,
+  so the gradient horizon is exactly one token.  Tokens are fed ONE AT A TIME;
+  --batch is the number of independent document streams, so batch 250 = 250
+  tokens per step.  A --clock gates which layers WRITE their state on a given
+  step (outputs always propagate), which is what gives the deeper layers a
+  longer effective memory.  Target hardware is FPGA, so simplicity and
+  fusability are real constraints, not aesthetics.
+
+--------------------------------------------------------------------------
+THE FROZEN BASELINE  (do not change these in Phase 2)
+--------------------------------------------------------------------------
+  python vla.py \
+    --dataset web --preroll --tokenizer pythia31m \
+    --context 16 --n_hidden 256 --kernel 3 \
+    --batch 250 --monitor 20 \
+    --opt sgd --momentum 0.0 --weight_decay 0.0 \
+    --schedule const --lr_max 0.03 --seed 1 --device cuda \
+    --n_layers 3 --depth 17 --clock fixed --clock_base 13.15 \
+    --init zero --ema 0.5 --accumulate \
+    --run_steps N --checkpoint 5000 \
+    --log log/exp.<mnem> --save checkpoint/<mnem>.pt
+
+  exp/run.sh EMITS EXACTLY THIS.  Use `./exp/run.sh <mnem> <steps> [overrides]`
+  and pass only --dataset/--mix/--streaming/--shards in Phase 2.
+
+  shape            3x17 = 51 convs, 30.36M trainable (+25.8M frozen embeddings)
+  BatchNorm        bn_track ON, affine off, momentum 0.1, eps 1e-5 (all default)
+  best weights     checkpoint/e30_3x17_120k.final.pt  -- 140K steps, 35M tokens
+  held-out         5.6617 nats (ppl 287.6)
+  train/eval gap   -0.017  (i.e. none)
+  runaway          0.0%
+  batch invariance 1e-4 between batch 1 and batch 16
+  reach            +0.1286 mean excess (P=512), +0.073 still at c511
+  generation       grammatical clauses, closes quotes, terminates with <ETX>
+
+  This is the only configuration measured healthy on EVERY axis.  Phase 1 tried
+  two departures from it (--no-bn_track, and 7x7) and reverted both within
+  hours; see "SETTLED" below before re-proposing either.
+
+--------------------------------------------------------------------------
+PHASE 2 OBJECTIVE
+--------------------------------------------------------------------------
+Freeze the model at the baseline above.  Vary ONLY the data.  The model is
+~30M trainable parameters and stays that way; capacity (n_hidden, kernel,
+context) is explicitly the LAST thing to explore and is not in Phase 2.
+
+FIRST STEP (user-specified): stream the Pile for 10K steps.
+    ./exp/run.sh p1_pile 10000 --dataset pile --streaming
+  --dataset choices: tiny | c4 | web | brt | dolma3 | s1k | pile | pile_nc
+    pile     = EleutherAI deduplicated re-release (the original was DMCA'd)
+    pile_nc  = same corpus minus the copyrighted subsets
+    --mix "web:0.5,pile:0.5" for joint training, token-proportional per clip
+    --shards N pulls only the first N parquet shards (non-streaming)
+  Both pile variants are large: use --streaming, or --shards.
+  The comparison point is web at the same step count, which already exists:
+    e25_3x17 at 5/10/15/20K, and the b5/e30 held-out ladders in section 6 below.
+
+--------------------------------------------------------------------------
+HOW TO MEASURE (all tooling exists and is committed)
+--------------------------------------------------------------------------
+  exp/run.sh <m> <steps> [overrides]   the baseline emitter
+  exp/launch.sh <script> <name>        runs a FROZEN SNAPSHOT of a driver
+                                       script -- ALWAYS use this, never run a
+                                       driver directly: editing a running bash
+                                       script shifts its byte offsets and runs
+                                       the wrong experiment (this happened)
+  exp/watch.sh <m> <id>                per-5K checkpoint stasher + reporter
+  exp/report.sh <m> <id>               appends a checkpoint report to PLAN.txt,
+                                       INCLUDING vla.py --generate samples at
+                                       batch 1 for subjective reading
+  exp/score.py CKPT [CKPT...]          held-out; POSITIONAL args, not --load.
+                                       Reports clean / median / runaway% -- a
+                                       plain mean is useless here, three
+                                       runaway docs in 250 move it by 9 orders
+                                       of magnitude.  Score competing
+                                       checkpoints in ONE process: the scorer
+                                       seed alone moves a result by 0.025.
+  exp/batchdep.py CKPT [N]             batch-1 vs batch-N invariance.  RUN THIS
+                                       BEFORE PROMOTING ANYTHING that touches
+                                       normalization.
+  exp/reach.py --load CKPT             context-usage excess vs no context
+  exp/gencheck.py CKPT 80 3            cycle/uniq degeneracy scalars
+  exp/ngram.py --fit N                 unigram/bigram floor of a corpus
+  exp/pythia_ref.py --models ...       HF transformer reference on our held-out
+  exp/scaling.py                       fits floor-power / log-linear / pure
+                                       power to (tokens, loss); data in
+                                       exp/scaling_data.json
+  exp/idle_watch.sh                    GPU idle watchdog
+
+  NOTE for Phase 2: exp/score.py, exp/ngram.py and exp/pythia_ref.py all
+  evaluate on openwebtext train[-3000:].  If Phase 2 changes the TRAINING
+  corpus, that held-out set becomes a CROSS-DOMAIN test -- which is a
+  legitimate and interesting measurement, but it is no longer in-domain and
+  must not be compared to Phase 1 numbers as if it were.  Decide deliberately
+  whether each run is scored on web (comparable to all Phase 1 history) or on
+  a held-out split of its own training corpus (measures fit), and say which.
+
+--------------------------------------------------------------------------
+REFERENCE POINTS -- what any number must be judged against
+--------------------------------------------------------------------------
+  All on openwebtext train[-3000:], minlen 512, maxlen 1024, first 400 docs.
+
+    pythia-160m                 3.1456   ppl   23.2   (body 85.1M)
+    pythia-70m                  3.5582   ppl   35.1   (body 18.9M)
+    pythia-31m                  3.8183   ppl   45.5   (body  4.7M)
+    BIGRAM, infinite data       5.3017   ppl  200.7   <- hard information floor
+    bigram, 226M-token fit      5.5830   ppl  265.9
+    VLA e30 @140K               5.6617   ppl  287.6   <- us, 30.4M trainable
+    bigram, 28M fit (matched)   5.8279   ppl  339.6
+    unigram                     7.5732   ppl 1945.4
+
+  The gap to close is 1.93 nats to pythia-31m, NOT 0.05.  And pythia-31m is
+  cross-domain here (Pile-trained) with a 4.7M body against our 30.4M, so that
+  comparison flatters us on both counts.
+
+  NOISE FLOOR: two runs of the SAME config differ by 0.02-0.035 held-out, with
+  instantaneous excursions to 0.067.  Any loss margin under ~0.07 from a single
+  run is not a result.  Runaway% is countable and does not have this problem,
+  which usually makes it the better primary metric.
+
+  SCALING: held-out falls ~0.19 nats per DOUBLING of tokens (0.183-0.205,
+  agreeing across two independent runs), vs 0.053 for a bigram.  Log-linear and
+  power-law fit equally well over our 50x range -- VLA has not bent yet, so the
+  asymptote is unconstrained and extrapolations differ by 10x (1.7e10 vs 1.3e11
+  tokens to reach pythia-31m).  Do not quote a single extrapolation as fact.
+  1B tokens = 4M steps at 250 tokens/step.
+
+--------------------------------------------------------------------------
+METHOD RULES -- earned the hard way, ignore at your cost
+--------------------------------------------------------------------------
+  1. ONE variable per experiment.  If a knob mechanically forces another (e.g.
+     --clock_base must change with --n_layers to hold p_max = base**(L-1)),
+     compensate it and SAY SO -- that is not a second variable.
+  2. MEASURE IN THE REGIME YOU WILL DEPLOY IN.  Both Phase 1 promotions were
+     validated in regimes the deployed model never occupies and both were
+     wrong.  Batched eval hid a batch-1 catastrophe; --no-bn_track eval hid a
+     train/eval gap.  This is the single most expensive lesson of Phase 1.
+  3. Loss margins under ~0.07 from one run are noise.  Prefer countable metrics
+     (runaway%), gap metrics (held-out minus train), and slope over intercept.
+  4. Early loss does not predict final loss.  A 20K ranking has been measured
+     NOT to survive to 100K.
+  5. Read the generated text at every checkpoint.  Scalars called the model
+     "bigram-level with zero semantics" while it was in fact writing
+     grammatical clauses -- the text overturned the scalar reading.
+  6. Verify config from the CHECKPOINT (saved_args), never from memory or from
+     the promotion history.  Doing the latter produced a wrong four-variable
+     claim that was actually one variable.
+  7. Simplicity breaks ties, and adding parameters must EARN its keep.
+  8. Kill trainers by explicit PID.  `pkill -f "vla\.py"` matches the shell
+     running it and kills your own command mid-chain.  When you kill a run,
+     kill its watch.sh in the same breath or it will report a dead run later.
+
+--------------------------------------------------------------------------
+SETTLED -- do not re-run these
+--------------------------------------------------------------------------
+  --no-bn_track      REJECTED.  Eval uses live batch stats: batch-1 costs
+                     +1.82 nats (8.0278, worse than the 7.5732 unigram floor),
+                     and it cannot be folded into the preceding conv, so it
+                     breaks FPGA streaming dataflow.
+  7x7 (n_layers 7)   REJECTED.  With tracking on: +1.66 nat train/eval gap and
+                     eval runaway; an independent earlier run (e24_lr03) is
+                     100% runaway.  3x17 has a gap of -0.017 and 0% runaway.
+  --bn_momentum 0    REJECTED.  dff_max 1.15e11 at step 0 vs 1.1 for m=0.1.
+                     (Hypothesis: running_var's 1.0 init floors 1/sqrt(var) at
+                     m=0.1 and cumulative averaging discards it.  If ever
+                     retried, pair it with --bn_eps 1e-3.)
+  --bn_affine        REJECTED at 3x17: tie inside noise, costs ~26K params.
+  --init             INERT at inference -- zero and relu produce token-identical
+                     text after a 2-3 token offset; the state is contractive.
+                     Keep --init zero as the simplest value.
+  optimizer          plain SGD (momentum 0) beat AdamW WITH BatchNorm.
+  --norm none/group/softmax/std   ALL FAILED to converge; see Phase 1 history.
+
+--------------------------------------------------------------------------
+OPEN, and worth Phase 2 or later
+--------------------------------------------------------------------------
+  * 7x7's REACH advantage (2-5x more context used out to c192 at matched 10K)
+    was real but measured on --no-bn_track checkpoints, i.e. on a broken
+    configuration.  It is unexplained and would need re-measuring with tracking
+    on before it means anything.
+  * The 480K-step baseline run (~120M tokens, ~44h): predicted to cross the
+    bigram's hard floor of 5.3017, and would discriminate log-linear from power
+    law.  One run, settles two questions.
+  * --clock_base has never been optimized at L=3 (13.15 was derived, not tuned).
+  * --qproj read has never been tested.
+  * --schedule cosine: horizon-bound, belongs last, applied once to the settled
+    architecture.
+  * Runaway documents: b5 and b6 ran away on the SAME 3 documents at the SAME
+    token (201).  Those are properties of specific documents, not of the model,
+    and nobody has looked at what is in them.
+
+============================================================================
+                 END OF HANDOFF -- Phase 1 history follows
+============================================================================
+
 ================================================================================
 VLA EXPERIMENT PLAN -- ad-hoc hypothesis-driven search
 Created 2026-08-21.  Baseline: wnotap.  Corpus: openwebtext (--dataset web).
