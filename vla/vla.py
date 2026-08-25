@@ -2893,6 +2893,7 @@ def _heldout_eval(step):
         model.eval()
         t0 = time.time()
         per_doc = []                    # mean nats/token for each document, kept separate
+        bad_doc = []                    # per document: did ANY token exceed _EVAL_THRESH
         try:
           with torch.no_grad():
             for c in range(0, len(docs), _EVAL_BATCH):
@@ -2908,6 +2909,7 @@ def _heldout_eval(step):
                 X, Y, M = X.to(_dev), Y.to(_dev), M.to(_dev)
                 model.dff = None        # fresh context per document (see _new_dff/--init)
                 rs = torch.zeros(B, device=_dev)
+                bad = torch.zeros(B, dtype=torch.bool, device=_dev)
                 for t in range(T):
                     logits, _ = model(X[:, t])
                     ce = F.cross_entropy(logits, Y[:, t], reduction='none')
@@ -2915,15 +2917,25 @@ def _heldout_eval(step):
                     # is counted as runaway instead of poisoning every other row's sum
                     ce = torch.where(torch.isfinite(ce), ce, torch.full_like(ce, 1e30))
                     rs += ce * M[:, t]
+                    # Runaway is ANY TOKEN over threshold, which is exactly what
+                    # exp/score.py counts -- NOT "the document mean went over".  The mean
+                    # criterion is far laxer and silently disagrees: at p1_pile step 5000 it
+                    # reported 0.00% where score.py found 0.2%, and a web-trained checkpoint
+                    # that score.py rates 26.0% runaway on pile would have read near zero.
+                    # PLAN.txt treats runaway% as the primary countable metric, so an EVAL
+                    # line must report the same statistic score.py does or the two cannot be
+                    # compared -- and on a long run the EVAL line is the only one watching.
+                    bad |= M[:, t] & (ce > _EVAL_THRESH)
                 n = M.sum(dim=1).clamp(min=1)
                 per_doc.append((rs / n).cpu().numpy())
+                bad_doc.append(bad.cpu().numpy())
         finally:
             model.dff, model.clk = _saved_dff, _saved_clk
             if _was_training:
                 model.train()
 
         per = np.concatenate(per_doc)
-        bad = per > _EVAL_THRESH
+        bad = np.concatenate(bad_doc)
         clean = float(per[~bad].mean()) if (~bad).any() else float('nan')
         # clean/median/runaway, not a mean: three runaway documents out of 400 move a plain
         # mean by nine orders of magnitude and report a healthy model as destroyed.

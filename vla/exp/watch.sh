@@ -1,8 +1,18 @@
 #!/bin/bash
-# usage: watch.sh <mnem> <expid>
-# Calls report.sh once per NEW 5K checkpoint, so PLAN.txt gets a row even if the
+# usage: watch.sh <mnem> <expid> [report_every_steps]
+# Calls report.sh once per NEW checkpoint, so PLAN.txt gets a row even if the
 # interactive session is busy elsewhere. Idempotent: tracks the last step reported.
-M=$1; E=$2
+#
+# report_every_steps (default 5000 = every checkpoint, the original behaviour) exists for
+# LONG runs. A report is not free: it stashes a ~250MB copy of the weights, appends ~35
+# lines to PLAN.txt, and runs gencheck plus three vla.py --generate subprocesses that each
+# load the model and contend with the trainer for the GPU. At 4M steps a 5000-step cadence
+# is 800 of those -- ~196GB of stashed checkpoints and ~28,000 lines appended to a PLAN.txt
+# that is currently 5,200 lines long, which would destroy it as a readable document.
+# The fine-grained curve does not come from here anyway: vla.py writes an EVAL line to the
+# log every --eval_interval steps and a GEN sample every --gen_interval, both of which cost
+# nothing extra. This controls only the heavyweight milestone reports.
+M=$1; E=$2; EVERY=${3:-5000}
 cd /proj/devices/vla
 LAST=$(grep -a "^$E  $M  step" PLAN.txt 2>/dev/null | tail -1 | awk '{print $4}')
 LAST=${LAST:-(-1)}
@@ -23,7 +33,8 @@ while true; do
   # skip step 0: vla.py saves at i % checkpoint == 0, which fires on the untrained
   # model before any training has happened.  Reporting it wastes a gencheck run and
   # puts a meaningless row in PLAN.txt.
-  if [ -n "$CUR" ] && [ "$CUR" != "$LAST" ] && [ "$CUR" != "0" ]; then
+  if [ -n "$CUR" ] && [ "$CUR" != "$LAST" ] && [ "$CUR" != "0" ] \
+     && [ $(( CUR % EVERY )) -eq 0 ]; then
     # stash a copy per 5K before reporting: checkpoint/<mnem>.pt is overwritten every
     # interval, so without this only the final weights survive and a collapse cannot be
     # traced back to the checkpoint before it.  sleep first -- torch.save is not atomic
