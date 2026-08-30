@@ -25,7 +25,7 @@ from memtest import load_vla_defs, stable_load, heldout_docs
 
 ap = argparse.ArgumentParser()
 ap.add_argument('--models', nargs='+', default=['EleutherAI/pythia-31m'])
-ap.add_argument('--corpus', default='web', choices=['tiny', 'web', 'pile'],
+ap.add_argument('--corpus', default='web', choices=['tiny', 'web', 'pile', 'c4'],
                 help="held-out set, shared with exp/score.py. 'web' reproduces PLAN.txt's "
                      "reference table and is CROSS-DOMAIN for pythia (Pile-trained); 'pile' "
                      "is the Pile's own validation split, in-domain for pythia AND for a "

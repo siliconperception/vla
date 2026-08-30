@@ -78,10 +78,16 @@ def stable_load(path, quiet=3.0, timeout=600):
 #         --dataset pile VLA run, which is what makes a VLA-vs-pythia comparison on
 #         it a like-for-like one.
 #   tiny  TinyStories validation.
+#   c4    Google's Colossal Clean Crawled Corpus, T5's training set -- a second,
+#         INDEPENDENT crawl-derived corpus. Worth noting for gpt2-teacher experiments:
+#         GPT-2 was trained on WebText, not C4, and the open replication of WebText is
+#         Skylion007/openwebtext == 'web'. So 'web' probes what a gpt2 teacher's text
+#         resembles and 'c4' deliberately does not.
 _HELDOUT = {
     'tiny': ('roneneldan/TinyStories',      None, 'validation'),
     'web':  ('Skylion007/openwebtext',      None, 'train[-3000:]'),
     'pile': ('mit-han-lab/pile-val-backup', None, 'validation'),
+    'c4':   ('allenai/c4',                  'en', 'validation'),
 }
 
 

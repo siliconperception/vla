@@ -36,16 +36,50 @@ S=$1; shift
 cd /proj/devices/vla
 mkdir -p checkpoint
 rm -f log/exp.$M
-conda run --no-capture-output -n dev python vla.py \
-  --dataset web --preroll --tokenizer pythia31m \
-  --context 16 --n_hidden 256 --kernel 3 \
-  --batch 250 --monitor 20 \
-  --opt sgd --momentum 0.0 --weight_decay 0.0 \
-  --schedule const --lr_max 0.03 --device cuda \
-  --n_layers 3 --depth 17 --clock fixed --clock_base 13.15 \
-  --init zero --ema 0.5 --accumulate \
-  --run_steps $((S+1)) --checkpoint 5000 \
-  --gen_interval 500 --eval_interval 5000 \
-  --log log/exp.$M --save checkpoint/$M.pt \
-  "$@" > log/exp.$M.out 2>&1
-echo "RUN_DONE $M rc=$? $(date)" >> log/exp.$M.out
+
+# The baseline, as an ARRAY rather than a here-and-now command, so the exact argv that is
+# about to run can also be written to ./doit.  Expansion order is unchanged: "$@" still comes
+# last, so argparse still takes the caller's override of any flag.
+CMD=(python vla.py
+  --dataset web --preroll --tokenizer pythia31m
+  --context 16 --n_hidden 256 --kernel 3
+  --batch 250 --monitor 20
+  --opt sgd --momentum 0.0 --weight_decay 0.0
+  --schedule const --lr_max 0.03 --device cuda
+  --n_layers 3 --depth 17 --clock fixed --clock_base 13.15
+  --init zero --ema 0.5 --accumulate
+  --run_steps $((S+1)) --checkpoint 5000
+  --gen_interval 500 --eval_interval 5000
+  --log log/exp.$M --save checkpoint/$M.pt
+  "$@")
+
+# ── ./doit gets the RESOLVED command line, newest first (2026-08-28, standing rule) ────────
+# doit is the experiment history.  It used to be maintained by hand, which means it recorded
+# what was INTENDED at the time someone remembered to edit it -- not what actually ran.  The
+# baseline lives here in run.sh and the overrides arrive in "$@", so no single file previously
+# held the command that a given log/exp.$M came from; reconstructing one meant reading ps
+# output or the frozen snapshot under exp/.run/.  Writing argv here closes that gap: every
+# invocation prepends the exact, re-runnable line, so the top of doit is always the newest
+# experiment.  Resumes are prepended too and marked (resume) -- longrun re-invokes this script
+# with --load and a recomputed --run_steps, and that IS a different running command line.
+_shq () {                              # join argv into a line that can be pasted back
+  local out="" a
+  for a in "$@"; do
+    case "$a" in
+      *[!A-Za-z0-9_./:=,+-]*) a="'${a//\'/\'\\\'\'}'" ;;   # quote anything shell-significant
+    esac
+    out+="$a "
+  done
+  printf '%s' "${out% }"
+}
+_tag=""
+case " $* " in *" --load "*) _tag="  (resume)" ;; esac
+{
+  printf '# %s  %s%s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$M" "$_tag"
+  printf '%s\n\n' "$(_shq "${CMD[@]}")"
+  [ -f doit ] && cat doit
+} > doit.$$ && mv doit.$$ doit
+
+conda run --no-capture-output -n dev "${CMD[@]}" > log/exp.$M.out 2>&1
+RC=$?                                  # capture BEFORE $(date) below, which clobbers $?
+echo "RUN_DONE $M rc=$RC $(date)" >> log/exp.$M.out

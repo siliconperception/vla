@@ -1,0 +1,4 @@
+REMOVE parser.add_argument('--max_clip_steps', default=None, type=int, help='truncate each clip to this many steps (token-balance long clips; ' 'for webvid the caption is re-spread over the capped length)')
+update defaults to --context 7 --n_hidden 512 --depth 7 --kernel 3 --c_text 1
+REMOVE parser.add_argument('--steps',         default=None,  type=int)
+

@@ -1,5 +1,5 @@
 #!/bin/bash
-# usage: watch.sh <mnem> <expid> [report_every_steps]
+# usage: watch.sh <mnem> <expid> [report_every_steps] [stash_every_steps]
 # Calls report.sh once per NEW checkpoint, so PLAN.txt gets a row even if the
 # interactive session is busy elsewhere. Idempotent: tracks the last step reported.
 #
@@ -12,7 +12,15 @@
 # The fine-grained curve does not come from here anyway: vla.py writes an EVAL line to the
 # log every --eval_interval steps and a GEN sample every --gen_interval, both of which cost
 # nothing extra. This controls only the heavyweight milestone reports.
-M=$1; E=$2; EVERY=${3:-5000}
+# stash_every defaults to report_every (the original coupling).  They are separated
+# because they cost wildly different things: a STASH is a ~215MB file copy, while a REPORT
+# also appends ~35 lines to PLAN.txt and launches gencheck plus three vla.py --generate
+# subprocesses that each load the model and contend with the trainer for the GPU.
+# Stashing often is what makes a run's HISTORY re-examinable: checkpoint/<mnem>.pt is
+# overwritten every --checkpoint steps (~31 min), so without a stash at a given step that
+# checkpoint is gone forever and cannot be scored, reach-probed or generated from later.
+# Matching the stash cadence to --eval_interval means every EVAL line has weights behind it.
+M=$1; E=$2; EVERY=${3:-5000}; STASH=${4:-$EVERY}
 cd /proj/devices/vla
 LAST=$(grep -a "^$E  $M  step" PLAN.txt 2>/dev/null | tail -1 | awk '{print $4}')
 LAST=${LAST:-(-1)}
@@ -33,16 +41,19 @@ while true; do
   # skip step 0: vla.py saves at i % checkpoint == 0, which fires on the untrained
   # model before any training has happened.  Reporting it wastes a gencheck run and
   # puts a meaningless row in PLAN.txt.
-  if [ -n "$CUR" ] && [ "$CUR" != "$LAST" ] && [ "$CUR" != "0" ] \
-     && [ $(( CUR % EVERY )) -eq 0 ]; then
-    # stash a copy per 5K before reporting: checkpoint/<mnem>.pt is overwritten every
-    # interval, so without this only the final weights survive and a collapse cannot be
-    # traced back to the checkpoint before it.  sleep first -- torch.save is not atomic
-    # and copying mid-write yields a corrupt file that loads without raising.
-    sleep 20
-    cp -f checkpoint/$M.pt checkpoint/$M.$CUR.pt 2>/dev/null
-    ./exp/report.sh $M $E
-    LAST=$CUR
+  if [ -n "$CUR" ] && [ "$CUR" != "0" ]; then
+    # STASH.  Guarded on the file not already existing, which makes it idempotent across
+    # watcher restarts without tracking state.  sleep first -- torch.save is not atomic and
+    # copying mid-write yields a corrupt file that loads without raising.
+    if [ $(( CUR % STASH )) -eq 0 ] && [ ! -f checkpoint/$M.$CUR.pt ]; then
+      sleep 20
+      cp -f checkpoint/$M.pt checkpoint/$M.$CUR.pt 2>/dev/null
+    fi
+    # REPORT, on its own (slower) cadence.
+    if [ "$CUR" != "$LAST" ] && [ $(( CUR % EVERY )) -eq 0 ]; then
+      ./exp/report.sh $M $E
+      LAST=$CUR
+    fi
   fi
   pgrep -f "python vla.py" >/dev/null || { sleep 30; pgrep -f "python vla.py" >/dev/null || break; }
   sleep 45

@@ -1,4 +1,48 @@
-python vla.py --dataset tiny --preroll --tokenizer pythia14m --n_layers 5 --context 28 --n_hidden 128 --depth 5 --kernel 3 --c_text 1 --batch 250 --monitor 20 --checkpoint 200 --opt adamw --weight_decay 0.0 --momentum 0.95 --schedule const --lr_max 0.001
+# 2026-08-29 14:32:45  pp1_bvocab_e10s
+python vla.py --dataset web --preroll --tokenizer pythia31m --context 16 --n_hidden 256 --kernel 3 --batch 250 --monitor 20 --opt sgd --momentum 0.0 --weight_decay 0.0 --schedule const --lr_max 0.03 --device cuda --n_layers 3 --depth 17 --clock fixed --clock_base 13.15 --init zero --ema 0.5 --accumulate --run_steps 400001 --checkpoint 5000 --gen_interval 500 --eval_interval 5000 --log log/exp.pp1_bvocab_e10s --save checkpoint/pp1_bvocab_e10s.pt --dataset bdict --bdict_file basic_dict_e10.txt --bdict_split --eval_interval 0
+
+# 2026-08-29 09:12:35  b1_bvocab_400k
+python vla.py --dataset web --preroll --tokenizer pythia31m --context 16 --n_hidden 256 --kernel 3 --batch 250 --monitor 20 --opt sgd --momentum 0.0 --weight_decay 0.0 --schedule const --lr_max 0.03 --device cuda --n_layers 3 --depth 17 --clock fixed --clock_base 13.15 --init zero --ema 0.5 --accumulate --run_steps 400001 --checkpoint 5000 --gen_interval 500 --eval_interval 5000 --log log/exp.b1_bvocab_400k --save checkpoint/b1_bvocab_400k.pt --dataset bdict --eval_interval 0 --gen_prompts apple:,parent:,zorbulate:
+
+# 2026-08-28 11:12:49  d1_dict_10ep
+python vla.py --dataset web --preroll --tokenizer pythia31m --context 16 --n_hidden 256 --kernel 3 --batch 250 --monitor 20 --opt sgd --momentum 0.0 --weight_decay 0.0 --schedule const --lr_max 0.03 --device cuda --n_layers 3 --depth 17 --clock fixed --clock_base 13.15 --init zero --ema 0.5 --accumulate --run_steps 800001 --checkpoint 5000 --gen_interval 500 --eval_interval 5000 --log log/exp.d1_dict_10ep --save checkpoint/d1_dict_10ep.pt --dataset wdef --eval_interval 0 --gen_prompts aardvark,telescope,zorbulate
+
+# ── offline protocol eval: one checkpoint against every reference corpus ──────
+# Same measurement the training loop writes as EVAL lines (400 docs, minlen 512, maxlen
+# 1024, clean/median/runaway with exp/score.py's per-token criterion), so these numbers are
+# directly comparable to a run's own EVAL curve and to any other checkpoint scored this way.
+# NOTE the corpora are NOT comparable to EACH OTHER -- each has its own information floor.
+# NOTE --synth_eval_docs 500 MUST match the training run's, or the synth column is
+# scored on a different cached file (the cache is keyed by that count) and is not
+# comparable to the run's own EVAL lines.  --eval_docs then takes the first 400.
+# NOTE web forces non-streaming: its held-out is the sliced split train[-3000:], which
+# datasets cannot stream, and that slice is what every web number in PLAN.txt uses.
+python vla.py --eval --load checkpoint/s1_synth_100m.10000.pt \
+    --eval_corpora synth,pile,web,c4 --eval_docs 400 --synth_eval_docs 500 \
+    --streaming --device cuda \
+    --eval_json exp/eval.s1_synth_100m.10000.json
+
+#python vla.py --dataset web --preroll --tokenizer pythia31m --context 16 --n_hidden 256 --kernel 3 --batch 250 --monitor 20 --opt sgd --momentum 0.0 --weight_decay 0.0 --schedule const --lr_max 0.03 --seed 1 --device cuda --n_layers 3 --depth 17 --clock fixed --clock_base 13.15 --init zero --ema 0.5 --accumulate --run_steps N --checkpoint 5000
+
+#python vla.py --dataset tiny --preroll --tokenizer pythia31m --n_layers 7 --clock fixed --tap --init gaussian --ema 0.5 --accumulate --context 16 --n_hidden 256 --depth 7 --kernel 3 --batch 250 --monitor 20 --checkpoint 200 --opt adamw --weight_decay 0.0 --momentum 0.9 --schedule const --lr_max 0.001
+#python vla.py --dataset tiny --preroll --tokenizer pythia31m --n_layers 7 --clock fixed --tap --init gaussian --ema 0.1 --accumulate --context 16 --n_hidden 256 --depth 7 --kernel 3 --batch 250 --monitor 20 --checkpoint 200 --opt adamw --weight_decay 0.0 --momentum 0.9 --schedule const --lr_max 0.001
+#python vla.py --dataset tiny --preroll --tokenizer pythia31m --n_layers 7 --clock incr --tap --init gaussian --accumulate --context 16 --n_hidden 256 --depth 7 --kernel 3 --batch 250 --monitor 20 --checkpoint 200 --opt sgd --weight_decay 0.0 --momentum 0.9 --nesterov --schedule const --lr_max 0.001
+#python vla.py --dataset tiny --preroll --tokenizer pythia31m --n_layers 7 --clock incr --qproj --context 16 --n_hidden 256 --depth 7 --kernel 3 --batch 250 --monitor 20 --checkpoint 200 --opt adamw --weight_decay 0.0 --momentum 0.9 --schedule const --lr_max 0.0001
+#python vla.py --dataset tiny --preroll --tokenizer pythia31m --n_layers 7 --clock incr --context 16 --n_hidden 256 --depth 7 --kernel 3 --batch 250 --monitor 20 --checkpoint 200 --opt adamw --weight_decay 0.0 --momentum 0.9 --schedule const --lr_max 0.0001
+#python vla.py --dataset tiny --preroll --tokenizer pythia31m --n_layers 7 --clock incr --context 16 --n_hidden 256 --depth 7 --kernel 3 --batch 250 --monitor 20 --checkpoint 200 --opt sgd --weight_decay 0.0 --momentum 0.9 --nesterov --schedule const --lr_max 0.01
+#python vla.py --dataset tiny --preroll --tokenizer pythia31m --n_layers 7 --clock fixed --context 16 --n_hidden 256 --depth 7 --kernel 3 --batch 250 --monitor 20 --checkpoint 200 --opt sgd --weight_decay 0.0 --momentum 0.9 --nesterov --schedule const --lr_max 0.01
+#python vla.py --dataset tiny --preroll --tokenizer pythia31m --n_layers 5 --clock fixed --context 16 --n_hidden 256 --depth 10 --kernel 3 --batch 250 --monitor 20 --checkpoint 200 --opt sgd --weight_decay 0.0 --momentum 0.9 --nesterov --schedule const --lr_max 0.01
+#python vla.py --dataset tiny --preroll --tokenizer pythia31m --n_layers 10 --clock exp --accumulate --context 16 --n_hidden 256 --depth 5 --kernel 3 --batch 250 --monitor 20 --checkpoint 200 --opt sgd --weight_decay 0.0 --momentum 0.0 --schedule const --lr_max 0.1
+#python vla.py --dataset tiny --preroll --tokenizer pythia31m --n_layers 10 --subsample 2 --context 16 --n_hidden 256 --depth 5 --kernel 3 --batch 250 --monitor 20 --checkpoint 200 --opt adamw --weight_decay 0.0 --momentum 0.95 --schedule const --lr_max 0.0001
+#python vla.py --dataset tiny --preroll --tokenizer pythia31m --n_layers 10 --context 16 --n_hidden 256 --depth 5 --kernel 3 --batch 250 --monitor 20 --checkpoint 200 --opt adamw --weight_decay 0.0 --momentum 0.95 --schedule const --lr_max 0.001
+#python vla.py --dataset tiny --preroll --tokenizer pythia31m --n_layers 3 --context 12 --n_hidden 256 --inner 1024 --depth 5 --kernel 3 --batch 250 --monitor 20 --checkpoint 200 --opt adamw --weight_decay 0.0 --momentum 0.95 --schedule const --lr_max 0.001
+#python vla.py --dataset tiny --preroll --tokenizer pythia31m --n_layers 3 --context 16 --n_hidden 256 --inner 512 --depth 5 --kernel 3 --c_text 1 --batch 250 --monitor 20 --checkpoint 200 --opt adamw --weight_decay 0.0 --momentum 0.95 --schedule const --lr_max 0.002 --load checkpoint.pt.30
+#python vla.py --dataset tiny --preroll --tokenizer pythia31m --n_layers 3 --context 28 --n_hidden 256 --depth 3 --kernel 3 --c_text 1 --batch 250 --monitor 20 --checkpoint 200 --opt adamw --weight_decay 0.0 --momentum 0.95 --schedule const --lr_max 0.001
+#python vla.py --dataset tiny --preroll --tokenizer pythia31m --n_layers 2 --context 28 --n_hidden 256 --depth 5 --kernel 3 --c_text 1 --batch 250 --monitor 20 --checkpoint 200 --opt adamw --weight_decay 0.0 --momentum 0.95 --schedule const --lr_max 0.001
+#python vla.py --dataset tiny --preroll --tokenizer pythia31m --n_layers 8 --context 28 --n_hidden 256 --depth 3 --kernel 3 --c_text 1 --batch 250 --monitor 20 --checkpoint 200 --opt adamw --weight_decay 0.0 --momentum 0.95 --schedule const --lr_max 0.001
+
+#python vla.py --dataset tiny --preroll --tokenizer pythia31m --n_layers 5 --context 28 --n_hidden 256 --depth 5 --kernel 3 --c_text 1 --batch 250 --monitor 20 --checkpoint 200 --opt adamw --weight_decay 0.0 --momentum 0.95 --schedule const --lr_max 0.001
+#python vla.py --dataset tiny --preroll --tokenizer pythia14m --n_layers 5 --context 28 --n_hidden 128 --depth 5 --kernel 3 --c_text 1 --batch 250 --monitor 20 --checkpoint 200 --opt adamw --weight_decay 0.0 --momentum 0.95 --schedule const --lr_max 0.001
 #python vla.py --dataset tiny --preroll --tokenizer pythia14m --n_layers 5 --context 28 --n_hidden 128 --depth 5 --kernel 3 --c_text 1 --batch 250 --monitor 20 --checkpoint 200 --opt sgd --weight_decay 0.0 --momentum 0.95 --nesterov --schedule const --lr_max 0.001
 #python vla.py --dataset tiny --preroll --tokenizer pythia31m --n_layers 5 --context 28 --n_hidden 256 --depth 5 --kernel 3 --c_text 1 --batch 250 --monitor 10 --checkpoint 100 --opt sgd --weight_decay 0.0 --momentum 0.95 --nesterov --schedule const --lr_max 0.001
 #python vla.py --dataset tiny --preroll --tokenizer pythia31m --n_layers 5 --context 28 --n_hidden 256 --depth 5 --kernel 3 --c_text 1 --batch 250 --monitor 10 --checkpoint 100 --opt sgd --weight_decay 0.0 --momentum 0.9 --nesterov --schedule const --lr_max 0.01 --clip 100.0

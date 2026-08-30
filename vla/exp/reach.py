@@ -29,7 +29,7 @@ import torch.nn.functional as F
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 # stable_load lives in memtest (import-safe); score.py parses argv at module
 # level, so importing it from here would hijack this script's arguments.
-from memtest import load_vla_defs, stable_load
+from memtest import load_vla_defs, stable_load, heldout_docs
 
 
 def main():
@@ -42,7 +42,11 @@ def main():
     ap.add_argument('--maxlen', type=int, default=384)
     ap.add_argument('--minlen', type=int, default=96)
     ap.add_argument('--periods', default='8,32,128')
-    ap.add_argument('--corpus', default='tiny', choices=['tiny', 'web'])
+    ap.add_argument('--corpus', default='tiny', choices=['tiny', 'web', 'pile', 'c4'],
+                    help="corpus to splice from, shared with exp/score.py. Use the one the "
+                         "checkpoint TRAINED on: reach measures how much a model exploits "
+                         "its own context, and probing off-domain measures how badly it "
+                         "handles unfamiliar text instead")
     ap.add_argument('--device', default='cuda')
     ap.add_argument('--seed', type=int, default=1234)
     ap.add_argument('--out', default=None)
@@ -59,8 +63,12 @@ def main():
               ema=saved.get('ema'), qproj=saved.get('qproj', 'none'),
               tap=saved.get('tap', False), tokenizer=saved['tokenizer'],
               head_norm=saved.get('head_norm', 'none'))
-    if 'clock_base' in saved:
-        kw['clock_base'] = saved['clock_base']
+    # forward EVERY architecture key the checkpoint carries; omitting one rebuilds a
+    # different model and the state_dict will not load (see score.py).
+    for k in ('clock_base', 'clock_max', 'clock_ends', 'clip_dff', 'norm',
+              'norm_groups', 'dff_norm', 'bn_track', 'bn_affine', 'bn_momentum',
+              'bn_eps'):
+        if k in saved and saved[k] is not None: kw[k] = saved[k]
     model = VLAModel(**kw)
     model.load_state_dict(ck['state_dict'])
     model.init_mode = saved.get('init', 'relu')
@@ -69,19 +77,9 @@ def main():
     print(f'{a.load}: step {ck.get("step")} n_layers {saved["n_layers"]} depth {saved["depth"]} '
           f'clock {saved.get("clock")} base {saved.get("clock_base", 2.0)}', flush=True)
 
-    from datasets import load_dataset
-    rows = (load_dataset('roneneldan/TinyStories', split='validation') if a.corpus == 'tiny'
-            else load_dataset('Skylion007/openwebtext', split='train[-3000:]'))
-    docs = []
-    for ex in rows:
-        t = (ex.get('text', '') or '')
-        if not t.strip():
-            continue
-        st, _ = clip_text(t)
-        if len(st) >= a.minlen:
-            docs.append(st[:a.maxlen])
-        if len(docs) >= a.docs:
-            break
+    # shared selector (exp/memtest.heldout_docs), same as score.py / pythia_ref.py /
+    # ngram.py, so a reach number and a loss number describe the same documents.
+    docs = heldout_docs(g, a.corpus, a.docs, a.minlen, a.maxlen)   # g['_tokenizer'] set above
     T = max(len(d) for d in docs)
     dev = a.device
     print(f'{len(docs)} documents, mean length {np.mean([len(d) for d in docs]):.0f}', flush=True)

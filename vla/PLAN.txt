@@ -5345,3 +5345,1492 @@ NOT YET MEASURED, AND IT IS THE NUMBER THE PRODUCT CLAIM RESTS ON: batch-1
 inference. There is no benchmark of VLA vs a transformer on tokens/s at batch 1,
 state bytes, and weight bandwidth across context lengths.  Everything above is
 arithmetic, not measurement.  exp/infer_bench.py is the missing tool.
+
+--------------------------------------------------------------------------------
+P2  p2_pile_4m  step 100000   2026-08-25 03:44
+--------------------------------------------------------------------------------
+  seed 3845646174   dataset pile
+loss/grad/state:
+  step      0  loss 10.9153  grad 630.967  dff_std  0.074  dff_max      1.0  dff_zeros 0.4786
+  step   5000  loss  6.6359  grad  3.403  dff_std  0.455  dff_max     10.0  dff_zeros 0.0406
+  step  10000  loss  6.3351  grad  3.463  dff_std  0.469  dff_max     10.3  dff_zeros 0.0426
+  step  15000  loss  6.2166  grad  3.888  dff_std  0.471  dff_max     11.2  dff_zeros 0.0409
+  step  20000  loss  5.9661  grad  3.778  dff_std  0.465  dff_max     14.4  dff_zeros 0.0250
+  step  25000  loss  5.8983  grad  3.956  dff_std  0.463  dff_max     12.4  dff_zeros 0.0357
+  step  30000  loss  5.7811  grad  4.118  dff_std  0.470  dff_max     11.9  dff_zeros 0.0396
+  step  35000  loss  5.7883  grad  4.138  dff_std  0.474  dff_max     10.0  dff_zeros 0.0464
+  step  40000  loss  5.5647  grad  3.949  dff_std  0.463  dff_max      9.6  dff_zeros 0.0373
+  step  45000  loss  5.6532  grad  4.093  dff_std  0.461  dff_max     12.8  dff_zeros 0.0331
+  step  50000  loss  5.6310  grad  4.398  dff_std  0.465  dff_max     10.2  dff_zeros 0.0379
+  step  55000  loss  5.5837  grad  4.211  dff_std  0.460  dff_max     10.2  dff_zeros 0.0347
+  step  60000  loss  5.4398  grad  4.176  dff_std  0.466  dff_max      8.7  dff_zeros 0.0416
+  step  65000  loss  5.4101  grad  4.000  dff_std  0.470  dff_max      8.6  dff_zeros 0.0350
+  step  70000  loss  5.4571  grad  4.155  dff_std  0.475  dff_max      9.2  dff_zeros 0.0455
+  step  75000  loss  5.4388  grad  4.136  dff_std  0.463  dff_max      9.6  dff_zeros 0.0325
+  step  80000  loss  5.4172  grad  4.088  dff_std  0.461  dff_max     11.2  dff_zeros 0.0381
+  step  85000  loss  5.4299  grad  4.073  dff_std  0.464  dff_max      8.2  dff_zeros 0.0309
+  step  90000  loss  5.5288  grad  3.979  dff_std  0.469  dff_max     10.4  dff_zeros 0.0412
+  step  95000  loss  5.3949  grad  3.982  dff_std  0.464  dff_max     10.0  dff_zeros 0.0368
+  mean(last10) 5.4904   tokens 25.00 M   (unigram floor 7.549)
+held-out eval (split of --dataset; see note in report.sh before comparing):
+  EVAL step      40000 clean    6.196295 ppl     490.9269 median    6.200768 runaway   0.00% nrun    0 docs   400 wall   136.8s
+  EVAL step      60000 clean    6.149366 ppl     468.4205 median    6.115564 runaway   0.25% nrun    1 docs   400 wall   136.8s
+  EVAL step      80000 clean    6.007782 ppl     406.5807 median    5.996624 runaway   0.00% nrun    0 docs   400 wall   136.8s
+token efficiency (sustained crossings)  [!! thresholds and baseline are WEB numbers;
+     dataset is pile -- these rows are CROSS-CORPUS and are not a like-for-like read]:
+  L<7.549  step    720    0.18 M tok   baseline   3980  (-3260)
+  L<7.000  step   2500    0.62 M tok   baseline   5940  (-3440)
+  L<6.500  step   6760    1.69 M tok   baseline  15680  (-8920)
+  L<6.300  step  10960    2.74 M tok   baseline  30120  (-19160)
+  L<6.100  step  17140    4.29 M tok   baseline  49700  (-32560)
+  L<5.900  step  26880    6.72 M tok   baseline  84980  (-58100)
+  L<5.800  step  36520    9.13 M tok   baseline  99980  (-63460)
+free-running generation (3 samples; cycle>0.6 degenerate, healthy 0.08-0.11):
+   gen health: cycle 0.10 (max 0.16)  uniq 0.22  n=3
+   sample: <STX>Inc, GRGE 1762-206\n    .1/1/201271\n          define Using\nendif\n\n#include '/http://www.blhtm.graph/languprip/packages/developer2.0]\n//\n * IMPQLet3 href:\n        @class>\n\t*/\n\n\t    gog
+  generated text (vla.py --generate, batch 1, seeds 11/12/13):
+  --- seed 11:
+    <STX>Schedule Has Hope Raymond (easni medeps, Patilaf.??????Recjio cubecycle is stipulated 
+    guilty\n\nfake portion, can write to\n      the Lady, the\nWWCI New Herbil Godield Institute of 
+    Director Over Hospital, a recent Marpherine Round<ETX>
+  --- seed 12:
+    <STX>CagingTime of You Are there that step upon 10.15% of the wide and two-eyed years loses\nWith 
+    posers help for somebody to run; the RCP has been the two year past during the following SDS. 
+    Giulagenette.: Satan had tested to get a reteth, and I'm looking at a current micro so misser or 
+    online magazine to the fitness carrier.Yet the past-stars of the share, urges and book-lobrid 
+    strips grow warmed for 35 and
+  --- seed 13:
+    <STX>Colege Is the rest is Despik, where they's just used at big controller some unique, and so it 
+    has changed my own protection, at a frequent nature for the head,722/2.6 percent mean the people 
+    themselves for the free ones!\n\nI asked a demand can not substitute in these usage because of the 
+    system is technical and similar to now 3.5mm box is to respond in a quality one. Each art, by live 
+    weight ideas when this kind of 95
+
+--------------------------------------------------------------------------------
+P2  p2_pile_4m  step 200000   2026-08-25 13:00
+--------------------------------------------------------------------------------
+  seed 3845646174   dataset pile
+loss/grad/state:
+  step      0  loss 10.9153  grad 630.967  dff_std  0.074  dff_max      1.0  dff_zeros 0.4786
+  step   5000  loss  6.6359  grad  3.403  dff_std  0.455  dff_max     10.0  dff_zeros 0.0406
+  step  10000  loss  6.3351  grad  3.463  dff_std  0.469  dff_max     10.3  dff_zeros 0.0426
+  step  15000  loss  6.2166  grad  3.888  dff_std  0.471  dff_max     11.2  dff_zeros 0.0409
+  step  20000  loss  5.9661  grad  3.778  dff_std  0.465  dff_max     14.4  dff_zeros 0.0250
+  step  25000  loss  5.8983  grad  3.956  dff_std  0.463  dff_max     12.4  dff_zeros 0.0357
+  step  30000  loss  5.7811  grad  4.118  dff_std  0.470  dff_max     11.9  dff_zeros 0.0396
+  step  35000  loss  5.7883  grad  4.138  dff_std  0.474  dff_max     10.0  dff_zeros 0.0464
+  step  40000  loss  5.5647  grad  3.949  dff_std  0.463  dff_max      9.6  dff_zeros 0.0373
+  step  45000  loss  5.6532  grad  4.093  dff_std  0.461  dff_max     12.8  dff_zeros 0.0331
+  step  50000  loss  5.6310  grad  4.398  dff_std  0.465  dff_max     10.2  dff_zeros 0.0379
+  step  55000  loss  5.5837  grad  4.211  dff_std  0.460  dff_max     10.2  dff_zeros 0.0347
+  step  60000  loss  5.4398  grad  4.176  dff_std  0.466  dff_max      8.7  dff_zeros 0.0416
+  step  65000  loss  5.4101  grad  4.000  dff_std  0.470  dff_max      8.6  dff_zeros 0.0350
+  step  70000  loss  5.4571  grad  4.155  dff_std  0.475  dff_max      9.2  dff_zeros 0.0455
+  step  75000  loss  5.4388  grad  4.136  dff_std  0.463  dff_max      9.6  dff_zeros 0.0325
+  step  80000  loss  5.4172  grad  4.088  dff_std  0.461  dff_max     11.2  dff_zeros 0.0381
+  step  85000  loss  5.4299  grad  4.073  dff_std  0.464  dff_max      8.2  dff_zeros 0.0309
+  step  90000  loss  5.5288  grad  3.979  dff_std  0.469  dff_max     10.4  dff_zeros 0.0412
+  step  95000  loss  5.3949  grad  3.982  dff_std  0.464  dff_max     10.0  dff_zeros 0.0368
+  step 100000  loss  5.4325  grad  3.879  dff_std  0.468  dff_max      9.7  dff_zeros 0.0396
+  step 105000  loss  5.4302  grad  4.040  dff_std  0.468  dff_max      9.3  dff_zeros 0.0355
+  step 110000  loss  5.3113  grad  4.086  dff_std  0.464  dff_max      9.1  dff_zeros 0.0286
+  step 115000  loss  5.3172  grad  3.970  dff_std  0.466  dff_max      8.0  dff_zeros 0.0340
+  step 120000  loss  5.2194  grad  3.965  dff_std  0.475  dff_max      8.8  dff_zeros 0.0395
+  step 125000  loss  5.2425  grad  4.062  dff_std  0.465  dff_max      8.8  dff_zeros 0.0359
+  step 130000  loss  5.2850  grad  3.973  dff_std  0.472  dff_max      9.7  dff_zeros 0.0330
+  step 135000  loss  5.1864  grad  3.899  dff_std  0.468  dff_max      9.1  dff_zeros 0.0435
+  step 140000  loss  5.1702  grad  4.198  dff_std  0.464  dff_max      8.8  dff_zeros 0.0249
+  step 145000  loss  5.3287  grad  4.063  dff_std  0.467  dff_max      9.5  dff_zeros 0.0252
+  step 150000  loss  5.0924  grad  3.843  dff_std  0.468  dff_max     11.3  dff_zeros 0.0276
+  step 155000  loss  5.2375  grad  4.002  dff_std  0.464  dff_max      8.6  dff_zeros 0.0251
+  step 160000  loss  5.2451  grad  3.930  dff_std  0.470  dff_max     10.3  dff_zeros 0.0414
+  step 165000  loss  5.2439  grad  3.800  dff_std  0.468  dff_max      8.9  dff_zeros 0.0351
+  step 170000  loss  5.1617  grad  3.955  dff_std  0.471  dff_max     10.4  dff_zeros 0.0416
+  step 175000  loss  5.0994  grad  3.965  dff_std  0.470  dff_max      9.3  dff_zeros 0.0387
+  step 180000  loss  5.0838  grad  4.146  dff_std  0.472  dff_max      8.7  dff_zeros 0.0362
+  step 185000  loss  5.0495  grad  4.087  dff_std  0.462  dff_max      9.1  dff_zeros 0.0272
+  step 190000  loss  5.1386  grad  3.998  dff_std  0.477  dff_max      9.6  dff_zeros 0.0376
+  step 195000  loss  5.1472  grad  4.111  dff_std  0.474  dff_max      8.7  dff_zeros 0.0413
+  mean(last10) 5.1684   tokens 50.00 M   (unigram floor 7.549)
+held-out eval (split of --dataset; see note in report.sh before comparing):
+  EVAL step     140000 clean    5.870333 ppl     354.3670 median    5.859340 runaway   0.25% nrun    1 docs   400 wall   136.8s
+  EVAL step     160000 clean    5.855002 ppl     348.9757 median    5.816932 runaway   0.50% nrun    2 docs   400 wall   136.8s
+  EVAL step     180000 clean    5.787838 ppl     326.3068 median    5.793021 runaway   0.00% nrun    0 docs   400 wall   136.8s
+token efficiency (sustained crossings)  [!! thresholds and baseline are WEB numbers;
+     dataset is pile -- these rows are CROSS-CORPUS and are not a like-for-like read]:
+  L<7.549  step    720    0.18 M tok   baseline   3980  (-3260)
+  L<7.000  step   2500    0.62 M tok   baseline   5940  (-3440)
+  L<6.500  step   6760    1.69 M tok   baseline  15680  (-8920)
+  L<6.300  step  10960    2.74 M tok   baseline  30120  (-19160)
+  L<6.100  step  17140    4.29 M tok   baseline  49700  (-32560)
+  L<5.900  step  26880    6.72 M tok   baseline  84980  (-58100)
+  L<5.800  step  36520    9.13 M tok   baseline  99980  (-63460)
+free-running generation (3 samples; cycle>0.6 degenerate, healthy 0.08-0.11):
+   gen health: cycle 0.09 (max 0.12)  uniq 0.38  n=3
+   sample: <STX>\n$12' Share Changes\n\nKEY   he was loved to give between select duplicated files for an internal order of entities from any balcony, or determine that even some fools[3." 4X {{p1}\nprivate Bigi
+  generated text (vla.py --generate, batch 1, seeds 11/12/13):
+  --- seed 11:
+    <STX>Schedule Has Hope Raymond (Ranner)<ETX>
+  --- seed 12:
+    <STX>The A-makers agree for the message step base has been raised as already in the top ??? which 
+    camp of loses\nWith posathies held up to the average problem. 'Bitchet\n\nI couldn???t want to get 
+    attracted them for running webclip audit for vacationside. This is frustrating to try! [KL) so 
+    misser or online magazine error or fitness on IP video page you set your article about Windows, 
+    urges and book-lobridger growting customer named and
+  --- seed 13:
+    <STX>-:\n     August 333 Despik Coucret\n\nHow I am I like some errors, and something it has 
+    changed my own and flesh. Placeings played\n\nThe game already draws up Arelling\n\nHow are you 
+    talking to free refreshing!\n\n\n<ETX>
+
+--------------------------------------------------------------------------------
+P2  p2_pile_4m  step 300000   2026-08-25 22:17
+--------------------------------------------------------------------------------
+  seed 3845646174   dataset pile
+loss/grad/state:
+  step      0  loss 10.9153  grad 630.967  dff_std  0.074  dff_max      1.0  dff_zeros 0.4786
+  step   5000  loss  6.6359  grad  3.403  dff_std  0.455  dff_max     10.0  dff_zeros 0.0406
+  step  10000  loss  6.3351  grad  3.463  dff_std  0.469  dff_max     10.3  dff_zeros 0.0426
+  step  15000  loss  6.2166  grad  3.888  dff_std  0.471  dff_max     11.2  dff_zeros 0.0409
+  step  20000  loss  5.9661  grad  3.778  dff_std  0.465  dff_max     14.4  dff_zeros 0.0250
+  step  25000  loss  5.8983  grad  3.956  dff_std  0.463  dff_max     12.4  dff_zeros 0.0357
+  step  30000  loss  5.7811  grad  4.118  dff_std  0.470  dff_max     11.9  dff_zeros 0.0396
+  step  35000  loss  5.7883  grad  4.138  dff_std  0.474  dff_max     10.0  dff_zeros 0.0464
+  step  40000  loss  5.5647  grad  3.949  dff_std  0.463  dff_max      9.6  dff_zeros 0.0373
+  step  45000  loss  5.6532  grad  4.093  dff_std  0.461  dff_max     12.8  dff_zeros 0.0331
+  step  50000  loss  5.6310  grad  4.398  dff_std  0.465  dff_max     10.2  dff_zeros 0.0379
+  step  55000  loss  5.5837  grad  4.211  dff_std  0.460  dff_max     10.2  dff_zeros 0.0347
+  step  60000  loss  5.4398  grad  4.176  dff_std  0.466  dff_max      8.7  dff_zeros 0.0416
+  step  65000  loss  5.4101  grad  4.000  dff_std  0.470  dff_max      8.6  dff_zeros 0.0350
+  step  70000  loss  5.4571  grad  4.155  dff_std  0.475  dff_max      9.2  dff_zeros 0.0455
+  step  75000  loss  5.4388  grad  4.136  dff_std  0.463  dff_max      9.6  dff_zeros 0.0325
+  step  80000  loss  5.4172  grad  4.088  dff_std  0.461  dff_max     11.2  dff_zeros 0.0381
+  step  85000  loss  5.4299  grad  4.073  dff_std  0.464  dff_max      8.2  dff_zeros 0.0309
+  step  90000  loss  5.5288  grad  3.979  dff_std  0.469  dff_max     10.4  dff_zeros 0.0412
+  step  95000  loss  5.3949  grad  3.982  dff_std  0.464  dff_max     10.0  dff_zeros 0.0368
+  step 100000  loss  5.4325  grad  3.879  dff_std  0.468  dff_max      9.7  dff_zeros 0.0396
+  step 105000  loss  5.4302  grad  4.040  dff_std  0.468  dff_max      9.3  dff_zeros 0.0355
+  step 110000  loss  5.3113  grad  4.086  dff_std  0.464  dff_max      9.1  dff_zeros 0.0286
+  step 115000  loss  5.3172  grad  3.970  dff_std  0.466  dff_max      8.0  dff_zeros 0.0340
+  step 120000  loss  5.2194  grad  3.965  dff_std  0.475  dff_max      8.8  dff_zeros 0.0395
+  step 125000  loss  5.2425  grad  4.062  dff_std  0.465  dff_max      8.8  dff_zeros 0.0359
+  step 130000  loss  5.2850  grad  3.973  dff_std  0.472  dff_max      9.7  dff_zeros 0.0330
+  step 135000  loss  5.1864  grad  3.899  dff_std  0.468  dff_max      9.1  dff_zeros 0.0435
+  step 140000  loss  5.1702  grad  4.198  dff_std  0.464  dff_max      8.8  dff_zeros 0.0249
+  step 145000  loss  5.3287  grad  4.063  dff_std  0.467  dff_max      9.5  dff_zeros 0.0252
+  step 150000  loss  5.0924  grad  3.843  dff_std  0.468  dff_max     11.3  dff_zeros 0.0276
+  step 155000  loss  5.2375  grad  4.002  dff_std  0.464  dff_max      8.6  dff_zeros 0.0251
+  step 160000  loss  5.2451  grad  3.930  dff_std  0.470  dff_max     10.3  dff_zeros 0.0414
+  step 165000  loss  5.2439  grad  3.800  dff_std  0.468  dff_max      8.9  dff_zeros 0.0351
+  step 170000  loss  5.1617  grad  3.955  dff_std  0.471  dff_max     10.4  dff_zeros 0.0416
+  step 175000  loss  5.0994  grad  3.965  dff_std  0.470  dff_max      9.3  dff_zeros 0.0387
+  step 180000  loss  5.0838  grad  4.146  dff_std  0.472  dff_max      8.7  dff_zeros 0.0362
+  step 185000  loss  5.0495  grad  4.087  dff_std  0.462  dff_max      9.1  dff_zeros 0.0272
+  step 190000  loss  5.1386  grad  3.998  dff_std  0.477  dff_max      9.6  dff_zeros 0.0376
+  step 195000  loss  5.1472  grad  4.111  dff_std  0.474  dff_max      8.7  dff_zeros 0.0413
+  step 200000  loss  5.2018  grad  4.093  dff_std  0.470  dff_max      8.2  dff_zeros 0.0350
+  step 205000  loss  5.1588  grad  3.962  dff_std  0.472  dff_max      9.1  dff_zeros 0.0340
+  step 210000  loss  5.0385  grad  4.027  dff_std  0.466  dff_max      8.1  dff_zeros 0.0317
+  step 215000  loss  5.0624  grad  4.002  dff_std  0.476  dff_max      7.9  dff_zeros 0.0443
+  step 220000  loss  5.1676  grad  3.838  dff_std  0.476  dff_max     10.1  dff_zeros 0.0365
+  step 225000  loss  5.1904  grad  3.823  dff_std  0.475  dff_max      7.9  dff_zeros 0.0376
+  step 230000  loss  5.0907  grad  3.935  dff_std  0.473  dff_max      8.2  dff_zeros 0.0425
+  step 235000  loss  5.0988  grad  3.893  dff_std  0.478  dff_max      8.2  dff_zeros 0.0430
+  step 240000  loss  5.1227  grad  4.021  dff_std  0.464  dff_max      9.1  dff_zeros 0.0301
+  step 245000  loss  5.0006  grad  3.951  dff_std  0.471  dff_max      8.7  dff_zeros 0.0444
+  step 250000  loss  5.0083  grad  3.927  dff_std  0.460  dff_max      7.1  dff_zeros 0.0309
+  step 255000  loss  5.1724  grad  3.904  dff_std  0.465  dff_max      8.4  dff_zeros 0.0341
+  step 260000  loss  4.9771  grad  4.009  dff_std  0.473  dff_max      9.3  dff_zeros 0.0393
+  step 265000  loss  5.0733  grad  3.920  dff_std  0.465  dff_max      8.2  dff_zeros 0.0310
+  step 270000  loss  5.0436  grad  4.087  dff_std  0.467  dff_max      6.5  dff_zeros 0.0237
+  step 275000  loss  5.0507  grad  4.043  dff_std  0.463  dff_max      7.2  dff_zeros 0.0268
+  step 280000  loss  4.9380  grad  4.166  dff_std  0.458  dff_max      7.5  dff_zeros 0.0243
+  step 285000  loss  4.9287  grad  4.072  dff_std  0.462  dff_max      7.0  dff_zeros 0.0278
+  step 290000  loss  4.9868  grad  4.207  dff_std  0.466  dff_max      6.8  dff_zeros 0.0388
+  step 295000  loss  4.9164  grad  3.821  dff_std  0.469  dff_max      7.1  dff_zeros 0.0360
+  mean(last10) 5.0380   tokens 75.00 M   (unigram floor 7.549)
+held-out eval (split of --dataset; see note in report.sh before comparing):
+  EVAL step     240000 clean    5.752181 ppl     314.8765 median    5.766438 runaway   1.00% nrun    4 docs   400 wall   136.8s
+  EVAL step     260000 clean    5.684999 ppl     294.4174 median    5.700926 runaway   0.25% nrun    1 docs   400 wall   136.8s
+  EVAL step     280000 clean    5.643407 ppl     282.4233 median    5.678567 runaway   0.00% nrun    0 docs   400 wall   136.8s
+token efficiency (sustained crossings)  [!! thresholds and baseline are WEB numbers;
+     dataset is pile -- these rows are CROSS-CORPUS and are not a like-for-like read]:
+  L<7.549  step    720    0.18 M tok   baseline   3980  (-3260)
+  L<7.000  step   2500    0.62 M tok   baseline   5940  (-3440)
+  L<6.500  step   6760    1.69 M tok   baseline  15680  (-8920)
+  L<6.300  step  10960    2.74 M tok   baseline  30120  (-19160)
+  L<6.100  step  17140    4.29 M tok   baseline  49700  (-32560)
+  L<5.900  step  26880    6.72 M tok   baseline  84980  (-58100)
+  L<5.800  step  36520    9.13 M tok   baseline  99980  (-63460)
+free-running generation (3 samples; cycle>0.6 degenerate, healthy 0.08-0.11):
+   gen health: cycle 0.08 (max 0.09)  uniq 0.11  n=3
+   sample: <STX>There\n\nRermrillingo a 21-year jail might take updates 1996 + Huba???s architect Law is about Billboard. The information takes to address Beush Club lists help independence. RANCH Director Lane is
+  generated text (vla.py --generate, batch 1, seeds 11/12/13):
+  --- seed 11:
+    <STX>Schedule\n\nOne of man's most common invasion, the armed canigades concerned for many years, 
+    they guilty for citizens is looking for can. ???Got your last message, developers like a bunch of 
+    Herkids???s Institute of Director??? is part of a solid correspondent policy and that we are 
+    watching a compromise.\n\n???at 50 hours, the destruction of the invading country. So i'm giving an 
+    office running consulting search, the team grew out, the court has extended it. ???
+  --- seed 12:
+    <STX>The A-makers agree for the world???s 10-day commercial development team. They are already 
+    camp- loses\nWith posathies for the trade of the State RWA has been the major government. EAAMs are 
+    well qualified upon health for its heart of audit killers ??? continue to prevent cognitive 
+    scientists to educate reforms.\n\nThe President is publicly online magazine for the Quality Service 
+    Corporation.\n\n"The health population share it urges and book-lobrid breakthrough is public 
+    interests of the
+  --- seed 13:
+    <STX>Introduction\n\nInternational hospitals is Despik Coucreties's devoteful information and 
+    controller policies, as portable science. We describe a mosaic and surgical program of frequent 
+    nature and creaties,722 ovarian MRI might be far mean into the economic practice of free ones! This 
+    study has asked a demand can not substitute the finances to the depression. Some countries 
+    technical concerns.\n\nThe process concepts are included closely to the pharmaceutical training 
+    team on the world of his risk from school ideas when the confident flag or
+
+--------------------------------------------------------------------------------
+P2  p2_pile_4m  step 400000   2026-08-26 07:33
+--------------------------------------------------------------------------------
+  seed 3845646174   dataset pile
+loss/grad/state:
+  step      0  loss 10.9153  grad 630.967  dff_std  0.074  dff_max      1.0  dff_zeros 0.4786
+  step   5000  loss  6.6359  grad  3.403  dff_std  0.455  dff_max     10.0  dff_zeros 0.0406
+  step  10000  loss  6.3351  grad  3.463  dff_std  0.469  dff_max     10.3  dff_zeros 0.0426
+  step  15000  loss  6.2166  grad  3.888  dff_std  0.471  dff_max     11.2  dff_zeros 0.0409
+  step  20000  loss  5.9661  grad  3.778  dff_std  0.465  dff_max     14.4  dff_zeros 0.0250
+  step  25000  loss  5.8983  grad  3.956  dff_std  0.463  dff_max     12.4  dff_zeros 0.0357
+  step  30000  loss  5.7811  grad  4.118  dff_std  0.470  dff_max     11.9  dff_zeros 0.0396
+  step  35000  loss  5.7883  grad  4.138  dff_std  0.474  dff_max     10.0  dff_zeros 0.0464
+  step  40000  loss  5.5647  grad  3.949  dff_std  0.463  dff_max      9.6  dff_zeros 0.0373
+  step  45000  loss  5.6532  grad  4.093  dff_std  0.461  dff_max     12.8  dff_zeros 0.0331
+  step  50000  loss  5.6310  grad  4.398  dff_std  0.465  dff_max     10.2  dff_zeros 0.0379
+  step  55000  loss  5.5837  grad  4.211  dff_std  0.460  dff_max     10.2  dff_zeros 0.0347
+  step  60000  loss  5.4398  grad  4.176  dff_std  0.466  dff_max      8.7  dff_zeros 0.0416
+  step  65000  loss  5.4101  grad  4.000  dff_std  0.470  dff_max      8.6  dff_zeros 0.0350
+  step  70000  loss  5.4571  grad  4.155  dff_std  0.475  dff_max      9.2  dff_zeros 0.0455
+  step  75000  loss  5.4388  grad  4.136  dff_std  0.463  dff_max      9.6  dff_zeros 0.0325
+  step  80000  loss  5.4172  grad  4.088  dff_std  0.461  dff_max     11.2  dff_zeros 0.0381
+  step  85000  loss  5.4299  grad  4.073  dff_std  0.464  dff_max      8.2  dff_zeros 0.0309
+  step  90000  loss  5.5288  grad  3.979  dff_std  0.469  dff_max     10.4  dff_zeros 0.0412
+  step  95000  loss  5.3949  grad  3.982  dff_std  0.464  dff_max     10.0  dff_zeros 0.0368
+  step 100000  loss  5.4325  grad  3.879  dff_std  0.468  dff_max      9.7  dff_zeros 0.0396
+  step 105000  loss  5.4302  grad  4.040  dff_std  0.468  dff_max      9.3  dff_zeros 0.0355
+  step 110000  loss  5.3113  grad  4.086  dff_std  0.464  dff_max      9.1  dff_zeros 0.0286
+  step 115000  loss  5.3172  grad  3.970  dff_std  0.466  dff_max      8.0  dff_zeros 0.0340
+  step 120000  loss  5.2194  grad  3.965  dff_std  0.475  dff_max      8.8  dff_zeros 0.0395
+  step 125000  loss  5.2425  grad  4.062  dff_std  0.465  dff_max      8.8  dff_zeros 0.0359
+  step 130000  loss  5.2850  grad  3.973  dff_std  0.472  dff_max      9.7  dff_zeros 0.0330
+  step 135000  loss  5.1864  grad  3.899  dff_std  0.468  dff_max      9.1  dff_zeros 0.0435
+  step 140000  loss  5.1702  grad  4.198  dff_std  0.464  dff_max      8.8  dff_zeros 0.0249
+  step 145000  loss  5.3287  grad  4.063  dff_std  0.467  dff_max      9.5  dff_zeros 0.0252
+  step 150000  loss  5.0924  grad  3.843  dff_std  0.468  dff_max     11.3  dff_zeros 0.0276
+  step 155000  loss  5.2375  grad  4.002  dff_std  0.464  dff_max      8.6  dff_zeros 0.0251
+  step 160000  loss  5.2451  grad  3.930  dff_std  0.470  dff_max     10.3  dff_zeros 0.0414
+  step 165000  loss  5.2439  grad  3.800  dff_std  0.468  dff_max      8.9  dff_zeros 0.0351
+  step 170000  loss  5.1617  grad  3.955  dff_std  0.471  dff_max     10.4  dff_zeros 0.0416
+  step 175000  loss  5.0994  grad  3.965  dff_std  0.470  dff_max      9.3  dff_zeros 0.0387
+  step 180000  loss  5.0838  grad  4.146  dff_std  0.472  dff_max      8.7  dff_zeros 0.0362
+  step 185000  loss  5.0495  grad  4.087  dff_std  0.462  dff_max      9.1  dff_zeros 0.0272
+  step 190000  loss  5.1386  grad  3.998  dff_std  0.477  dff_max      9.6  dff_zeros 0.0376
+  step 195000  loss  5.1472  grad  4.111  dff_std  0.474  dff_max      8.7  dff_zeros 0.0413
+  step 200000  loss  5.2018  grad  4.093  dff_std  0.470  dff_max      8.2  dff_zeros 0.0350
+  step 205000  loss  5.1588  grad  3.962  dff_std  0.472  dff_max      9.1  dff_zeros 0.0340
+  step 210000  loss  5.0385  grad  4.027  dff_std  0.466  dff_max      8.1  dff_zeros 0.0317
+  step 215000  loss  5.0624  grad  4.002  dff_std  0.476  dff_max      7.9  dff_zeros 0.0443
+  step 220000  loss  5.1676  grad  3.838  dff_std  0.476  dff_max     10.1  dff_zeros 0.0365
+  step 225000  loss  5.1904  grad  3.823  dff_std  0.475  dff_max      7.9  dff_zeros 0.0376
+  step 230000  loss  5.0907  grad  3.935  dff_std  0.473  dff_max      8.2  dff_zeros 0.0425
+  step 235000  loss  5.0988  grad  3.893  dff_std  0.478  dff_max      8.2  dff_zeros 0.0430
+  step 240000  loss  5.1227  grad  4.021  dff_std  0.464  dff_max      9.1  dff_zeros 0.0301
+  step 245000  loss  5.0006  grad  3.951  dff_std  0.471  dff_max      8.7  dff_zeros 0.0444
+  step 250000  loss  5.0083  grad  3.927  dff_std  0.460  dff_max      7.1  dff_zeros 0.0309
+  step 255000  loss  5.1724  grad  3.904  dff_std  0.465  dff_max      8.4  dff_zeros 0.0341
+  step 260000  loss  4.9771  grad  4.009  dff_std  0.473  dff_max      9.3  dff_zeros 0.0393
+  step 265000  loss  5.0733  grad  3.920  dff_std  0.465  dff_max      8.2  dff_zeros 0.0310
+  step 270000  loss  5.0436  grad  4.087  dff_std  0.467  dff_max      6.5  dff_zeros 0.0237
+  step 275000  loss  5.0507  grad  4.043  dff_std  0.463  dff_max      7.2  dff_zeros 0.0268
+  step 280000  loss  4.9380  grad  4.166  dff_std  0.458  dff_max      7.5  dff_zeros 0.0243
+  step 285000  loss  4.9287  grad  4.072  dff_std  0.462  dff_max      7.0  dff_zeros 0.0278
+  step 290000  loss  4.9868  grad  4.207  dff_std  0.466  dff_max      6.8  dff_zeros 0.0388
+  step 295000  loss  4.9164  grad  3.821  dff_std  0.469  dff_max      7.1  dff_zeros 0.0360
+  step 300000  loss  5.0405  grad  4.029  dff_std  0.467  dff_max      7.7  dff_zeros 0.0352
+  step 305000  loss  4.9549  grad  4.106  dff_std  0.474  dff_max      7.3  dff_zeros 0.0406
+  step 310000  loss  4.7949  grad  4.171  dff_std  0.463  dff_max      7.2  dff_zeros 0.0326
+  step 315000  loss  4.9283  grad  4.148  dff_std  0.466  dff_max      7.4  dff_zeros 0.0348
+  step 320000  loss  4.9824  grad  4.157  dff_std  0.464  dff_max      6.6  dff_zeros 0.0328
+  step 325000  loss  4.9314  grad  4.153  dff_std  0.465  dff_max      7.3  dff_zeros 0.0375
+  step 330000  loss  5.0040  grad  3.933  dff_std  0.469  dff_max      7.0  dff_zeros 0.0450
+  step 335000  loss  5.0651  grad  4.111  dff_std  0.476  dff_max      7.3  dff_zeros 0.0428
+  step 340000  loss  5.0062  grad  3.985  dff_std  0.470  dff_max      8.2  dff_zeros 0.0400
+  step 345000  loss  4.9340  grad  3.989  dff_std  0.466  dff_max      7.4  dff_zeros 0.0442
+  step 350000  loss  4.8535  grad  3.997  dff_std  0.464  dff_max      8.1  dff_zeros 0.0313
+  step 355000  loss  4.9942  grad  4.016  dff_std  0.474  dff_max      7.2  dff_zeros 0.0418
+  step 360000  loss  4.9612  grad  3.886  dff_std  0.473  dff_max      8.3  dff_zeros 0.0381
+  step 365000  loss  4.9190  grad  3.977  dff_std  0.473  dff_max      8.4  dff_zeros 0.0366
+  step 370000  loss  4.9128  grad  3.969  dff_std  0.466  dff_max      8.7  dff_zeros 0.0336
+  step 375000  loss  4.9189  grad  4.088  dff_std  0.466  dff_max      6.8  dff_zeros 0.0257
+  step 380000  loss  4.9474  grad  4.016  dff_std  0.463  dff_max      6.6  dff_zeros 0.0312
+  step 385000  loss  4.9376  grad  3.875  dff_std  0.470  dff_max      7.0  dff_zeros 0.0442
+  step 390000  loss  4.9981  grad  3.837  dff_std  0.469  dff_max      6.9  dff_zeros 0.0364
+  step 395000  loss  4.9217  grad  3.811  dff_std  0.471  dff_max      7.1  dff_zeros 0.0440
+  mean(last10) 4.9714   tokens 100.00 M   (unigram floor 7.549)
+held-out eval (split of --dataset; see note in report.sh before comparing):
+  EVAL step     340000 clean    5.583639 ppl     266.0380 median    5.625714 runaway   0.25% nrun    1 docs   400 wall   136.8s
+  EVAL step     360000 clean    5.585671 ppl     266.5792 median    5.613638 runaway   0.50% nrun    2 docs   400 wall   136.8s
+  EVAL step     380000 clean    5.579165 ppl     264.8504 median    5.594736 runaway   0.25% nrun    1 docs   400 wall   136.8s
+token efficiency (sustained crossings)  [!! thresholds and baseline are WEB numbers;
+     dataset is pile -- these rows are CROSS-CORPUS and are not a like-for-like read]:
+  L<7.549  step    720    0.18 M tok   baseline   3980  (-3260)
+  L<7.000  step   2500    0.62 M tok   baseline   5940  (-3440)
+  L<6.500  step   6760    1.69 M tok   baseline  15680  (-8920)
+  L<6.300  step  10960    2.74 M tok   baseline  30120  (-19160)
+  L<6.100  step  17140    4.29 M tok   baseline  49700  (-32560)
+  L<5.900  step  26880    6.72 M tok   baseline  84980  (-58100)
+  L<5.800  step  36520    9.13 M tok   baseline  99980  (-63460)
+free-running generation (3 samples; cycle>0.6 degenerate, healthy 0.08-0.11):
+   gen health: cycle 0.08 (max 0.08)  uniq 0.19  n=3
+   sample: <STX>Author\nmolecules-10-certibpert Ruba Yourhn and Policified Expert\n\nBECRERZOAL E AC\n\nJim Albanissiste\n\nLINDAWABE NEL% 1:00-6-17230 - SM 99\n\nComments: Plant Cryptologist\n\nOther nature we 
+  generated text (vla.py --generate, batch 1, seeds 11/12/13):
+  --- seed 11:
+    <STX>Schedule Has Hope Raymond (eas\n\n[// The original review.?????? These champions have been 
+    engaged at an Al-Moroufake portion, can started ???Got Salmacon, the intervention's bunch of Herad 
+    God Felant U. Vikania) and he's not sure it went away, watching a side.\n\n???Tangthe 
+    Mind)**\n\nWemitted an artistic defect to broadgateers running consulting search, the team grew out 
+    of the court (congiting) who
+  --- seed 12:
+    <STX>The A-10Zero AreSalhing step upon 10.15%1 in Toronto and are already camp- loses\nWith 
+    posusion\n\nLaaty is the last hold and has one uniform for the tabsector!\n\nThe Giulomination 
+    director.: Organization of the audit for America Saykat, and the latter is a common process to so 
+    miss skin life online magazine media or fitness in classical excellence (Bill-Based Agents) share 
+    it urges and book-lobrid breakthrough for public customerists and
+  --- seed 13:
+    <STX>Why exactly a prudine is Despikanas?\n\nHow can I transplant an some errors, and so it has 
+    changed my own and keep at a frequent nature of the barrel,722 articles are a question far mean 
+    this thing. A shell free refreshing!\nThis podcast asked a demand exhibition in 2018 in Buddalles. 
+    Some things have concerns, operational, and opponents. The Specials to the Council should not be 
+    the consideration of his immression choices ideas when this kind of or
+
+############################################################################
+2026-08-26  P2 STOPPED AT 456,840 STEPS (114M TOKENS) -- SWITCHING TO SYNTHETIC
+############################################################################
+p2_pile_4m ran 11.4% of its 4M-step target and was stopped intact at user
+request to free the GPU for the synthetic pre-pretraining experiment.  Nothing
+failed: zero restarts, zero HALTs, 2 days of continuous training.
+
+  RESUME IT WITH (it will pick up from the checkpoint and draw a fresh seed):
+    ./exp/launch.sh exp/longrun.sh p2_pile_4m 4000000 20 --dataset pile \
+        --streaming --eval_interval 20000
+  Weights preserved: checkpoint/p2_pile_4m.stopped_456840.pt, plus 100K
+  milestone stashes at 100000/200000/300000/400000.
+
+WHAT IT ESTABLISHED (pile-val median, vs pythia-31m from scratch on the SAME
+stream at matched tokens -- see pythia.py):
+
+    tokens     VLA     pythia    delta
+       5M    6.5494    6.9124    VLA -0.363
+      10M    6.2008    6.6510    VLA -0.450     <- VLA crossed the pile bigram
+      20M    5.9966    5.7764        +0.220        floor (6.2352) here
+      60M    5.7664    4.6842        +1.082
+     100M    5.5526    4.4103        +1.142
+
+  VLA leads at 5M and 10M, is overtaken between 10M and 15M, and the gap
+  stabilises near 1.14 nats.  Slopes per doubling, nested windows to 100M:
+
+      5M->100M   VLA -0.231   pythia -0.579
+     20M->100M   VLA -0.191   pythia -0.588
+     50M->100M   VLA -0.242   pythia -0.400
+     80M->100M   VLA -0.320   pythia -0.255   <- VLA steeper for the first time
+
+  VLA HAS NOT BENT.  Its slope sits in a -0.19..-0.32 band across every window
+  with no monotone decay, while pythia's decayed from -0.588 to -0.255.  A
+  flattening was flagged at 60M and RETRACTED at 65M -- it was one high point,
+  and the nested windows that seemed to confirm it all ended on that same
+  point.  Treat sub-0.11 interval moves as noise; that is the measured floor.
+
+REACH, and a negative result worth having.  Probed on pile, --len 1024:
+
+                       full-history   P=64      P=512    c511
+    p2 @  25M tokens      5.9956     +0.5096   +0.3612  +0.236
+    p2 @ 100M tokens      5.4569     +0.5955   +0.3495  +0.227
+    e30 @ 35M (web!)      5.6731     +0.2107   +0.1286  +0.073
+
+  Between 25M and 100M tokens loss improved 0.54 nats and REACH DID NOT MOVE
+  (P=512 excess 0.3612 -> 0.3495, c511 0.236 -> 0.227, both slightly DOWN).
+  So the 2.8x larger excess against e30 is the CORPUS and the probe settings,
+  not the model learning longer dependencies.  The context capability is
+  present early and is not bought with data; the loss gains from 25M->100M are
+  better local prediction.  This makes the 7x7 reach question (see OPEN) more
+  interesting, not less: reach looks architectural.
+  The model does use context -- c0 +2.30 decaying smoothly to c511 +0.227,
+  unsaturated at 511 tokens on a 16x16 state with a one-token gradient horizon.
+
+  TOOL TRAP, cost an hour: exp/reach.py --periods 512 with the default --len 384
+  returns EXACTLY +0.0000 at every offset.  A period longer than the row cannot
+  splice, so each "spliced" row is one document and equals full history by
+  construction.  A zero reach is what a BROKEN PROBE and a CONTEXT-BLIND MODEL
+  look like alike.  Always pass --len >= max(--periods).
+
+--------------------------------------------------------------------------------
+F1  f1_grade5_1b  step 100000   2026-08-27 06:55
+--------------------------------------------------------------------------------
+  seed 2097061917   dataset fwedu
+loss/grad/state:
+  step      0  loss 10.7420  grad 580.568  dff_std  0.074  dff_max      1.2  dff_zeros 0.4976
+  step   5000  loss  6.2961  grad  2.860  dff_std  0.526  dff_max     16.1  dff_zeros 0.1137
+  step  10000  loss  6.0296  grad  3.195  dff_std  0.554  dff_max     10.4  dff_zeros 0.1026
+  step  15000  loss  5.9585  grad  3.441  dff_std  0.650  dff_max     13.6  dff_zeros 0.1115
+  step  20000  loss  5.7107  grad  3.613  dff_std  0.640  dff_max     13.5  dff_zeros 0.1185
+  step  25000  loss  5.8450  grad  3.676  dff_std  0.601  dff_max     12.9  dff_zeros 0.1105
+  step  30000  loss  5.7168  grad  3.680  dff_std  0.589  dff_max     10.7  dff_zeros 0.1156
+  step  35000  loss  5.4622  grad  3.789  dff_std  0.557  dff_max     12.9  dff_zeros 0.0908
+  step  40000  loss  5.3880  grad  3.812  dff_std  0.561  dff_max     14.6  dff_zeros 0.1151
+  step  45000  loss  5.4381  grad  3.831  dff_std  0.565  dff_max     11.3  dff_zeros 0.1194
+  step  50000  loss  5.2519  grad  3.854  dff_std  0.563  dff_max     11.3  dff_zeros 0.1184
+  step  55000  loss  5.3880  grad  3.962  dff_std  0.531  dff_max     12.5  dff_zeros 0.0977
+  step  60000  loss  5.4026  grad  3.891  dff_std  0.544  dff_max     12.7  dff_zeros 0.1140
+  step  65000  loss  5.2275  grad  3.840  dff_std  0.512  dff_max     10.6  dff_zeros 0.0902
+  step  70000  loss  5.1994  grad  3.888  dff_std  0.500  dff_max     11.7  dff_zeros 0.0902
+  step  75000  loss  4.9389  grad  3.887  dff_std  0.526  dff_max      9.7  dff_zeros 0.0985
+  step  80000  loss  5.2315  grad  3.812  dff_std  0.513  dff_max     13.0  dff_zeros 0.0988
+  step  85000  loss  4.9932  grad  3.862  dff_std  0.537  dff_max     11.5  dff_zeros 0.1102
+  step  90000  loss  4.9068  grad  3.828  dff_std  0.530  dff_max     12.5  dff_zeros 0.1153
+  step  95000  loss  4.9765  grad  3.803  dff_std  0.534  dff_max     11.4  dff_zeros 0.1269
+  mean(last10) 5.0937   tokens 25.00 M   (unigram floor 7.549)
+held-out eval (split of --dataset; see note in report.sh before comparing):
+  EVAL step      80000 corpus swiki    clean    5.684598 ppl     294.2996 median    5.788249 runaway   0.00% nrun    0 docs   400 wall   136.8s
+  EVAL step      80000 corpus tiny     clean    3.604059 ppl      36.7471 median    3.595075 runaway   0.50% nrun    2 docs   400 wall   136.8s
+  EVAL step      80000 corpus pile     clean    6.611993 ppl     743.9645 median    6.338871 runaway   1.25% nrun    5 docs   400 wall   136.8s
+token efficiency (sustained crossings)  [!! thresholds and baseline are WEB numbers;
+     dataset is fwedu -- these rows are CROSS-CORPUS and are not a like-for-like read]:
+  L<7.549  step    440    0.11 M tok   baseline   3980  (-3540)
+  L<7.000  step   1360    0.34 M tok   baseline   5940  (-4580)
+  L<6.500  step   4420    1.10 M tok   baseline  15680  (-11260)
+  L<6.300  step   6280    1.57 M tok   baseline  30120  (-23840)
+  L<6.100  step  12300    3.08 M tok   baseline  49700  (-37400)
+  L<5.900  step  17820    4.46 M tok   baseline  84980  (-67160)
+  L<5.800  step  23960    5.99 M tok   baseline  99980  (-76020)
+free-running generation (3 samples; cycle>0.6 degenerate, healthy 0.08-0.11):
+   gen health: cycle 0.10 (max 0.10)  uniq 0.10  n=3
+   sample: <STX>Once upon a time, there was a great area came from the near-lower land of cool colors with every of the master prizes. Despite flying, laugh resembled that at the pattern of a smile for all of hi
+  generated text (vla.py --generate, batch 1, seeds 11/12/13):
+  --- seed 11:
+    <STX>Once upon a time, there was a little girl sitting with friends in the pond. He couldn't go 
+    down the ocean and yell in the pond. At the end.<ETX>
+  --- seed 12:
+    <STX>The A-10 visit is the largest rock mother has been raised trees that will have the two sides 
+    campted from\nWith posathies and nursed the sky created in the candy protecters. The tabagic trough 
+    might be well going to decay.: Satans of beaches wore a circle. This cognitive was treated; I want 
+    to be so misser or online magazine error or fitness in classical rouging us to bring more about 
+    Windows, urges and book-lobridgerings.\n\nBoth
+  --- seed 13:
+    <STX>Once upon a time, there was a girl, but they had a big basket big after some gorgeous, 
+    infinite, cute, vinegar was noisy and highfall. He played together on. They think to use a new 
+    picture and made people brushs in him.\n\n"I asked okay! You didn't like it to push me. I look on 
+    here again!"\n\nSo she smiled and came to the batenburg and sang. "You can show my weight ideas 
+    when we don't know
+
+--------------------------------------------------------------------------------
+C1  c1_sense_1b  step 100000   2026-08-27 18:38
+--------------------------------------------------------------------------------
+  seed 1642764928   dataset fpmath
+loss/grad/state:
+  step      0  loss 10.8644  grad 644.663  dff_std  0.147  dff_max      1.8  dff_zeros 0.4965
+  step   5000  loss  6.4207  grad  3.165  dff_std  0.696  dff_max     11.3  dff_zeros 0.1006
+  step  10000  loss  6.0880  grad  3.386  dff_std  0.627  dff_max     10.0  dff_zeros 0.0926
+  step  15000  loss  6.0334  grad  3.486  dff_std  0.599  dff_max      9.3  dff_zeros 0.0762
+  step  20000  loss  5.9316  grad  3.492  dff_std  0.631  dff_max     11.7  dff_zeros 0.0937
+  step  25000  loss  5.7785  grad  3.597  dff_std  0.589  dff_max      9.2  dff_zeros 0.0855
+  step  30000  loss  5.6541  grad  3.622  dff_std  0.588  dff_max     11.6  dff_zeros 0.0819
+  step  35000  loss  5.7060  grad  3.685  dff_std  0.568  dff_max      9.2  dff_zeros 0.0751
+  step  40000  loss  5.5933  grad  3.859  dff_std  0.580  dff_max     10.3  dff_zeros 0.0846
+  step  45000  loss  5.5288  grad  3.794  dff_std  0.559  dff_max     10.5  dff_zeros 0.0872
+  step  50000  loss  5.5282  grad  3.854  dff_std  0.560  dff_max      9.5  dff_zeros 0.0860
+  step  55000  loss  5.4042  grad  3.781  dff_std  0.572  dff_max      9.6  dff_zeros 0.0986
+  step  60000  loss  5.4780  grad  3.728  dff_std  0.568  dff_max      9.1  dff_zeros 0.0930
+  step  65000  loss  5.3993  grad  3.776  dff_std  0.571  dff_max     11.3  dff_zeros 0.0957
+  step  70000  loss  5.4116  grad  3.843  dff_std  0.552  dff_max      9.2  dff_zeros 0.0886
+  step  75000  loss  5.2900  grad  3.828  dff_std  0.539  dff_max      9.9  dff_zeros 0.0886
+  step  80000  loss  5.4181  grad  3.782  dff_std  0.527  dff_max      9.7  dff_zeros 0.0859
+  step  85000  loss  5.2268  grad  3.886  dff_std  0.551  dff_max     14.2  dff_zeros 0.0976
+  step  90000  loss  5.2183  grad  3.915  dff_std  0.541  dff_max      9.5  dff_zeros 0.0938
+  step  95000  loss  5.2243  grad  3.884  dff_std  0.530  dff_max     13.3  dff_zeros 0.0906
+  mean(last10) 5.2605   tokens 25.00 M   (unigram floor 7.549)
+held-out eval (split of --dataset; see note in report.sh before comparing):
+  EVAL step      60000 corpus cosmo    clean    5.930039 ppl     376.1692 median    5.899703 runaway   0.00% nrun    0 docs   400 wall   136.7s
+  EVAL step      80000 corpus fpmath   clean    5.388312 ppl     218.8338 median    5.360867 runaway   0.50% nrun    2 docs   400 wall   136.7s
+  EVAL step      80000 corpus cosmo    clean    6.007699 ppl     406.5466 median    6.013047 runaway   0.50% nrun    2 docs   400 wall   136.7s
+token efficiency (sustained crossings)  [!! thresholds and baseline are WEB numbers;
+     dataset is fpmath -- these rows are CROSS-CORPUS and are not a like-for-like read]:
+  L<7.549  step    400    0.10 M tok   baseline   3980  (-3580)
+  L<7.000  step   1820    0.46 M tok   baseline   5940  (-4120)
+  L<6.500  step   5400    1.35 M tok   baseline  15680  (-10280)
+  L<6.300  step   8360    2.09 M tok   baseline  30120  (-21760)
+  L<6.100  step  13620    3.40 M tok   baseline  49700  (-36080)
+  L<5.900  step  22780    5.70 M tok   baseline  84980  (-62200)
+  L<5.800  step  27460    6.87 M tok   baseline  99980  (-72520)
+free-running generation (3 samples; cycle>0.6 degenerate, healthy 0.08-0.11):
+   gen health: cycle 0.09 (max 0.11)  uniq 0.12  n=3
+   sample: <STX>Test: Furthermore, the NF80age readers educators workshops being created. Each straight place is a few cuilhem boline system (Sush Pus atting bombsmagas Carol, and ???ice Creapages prepare in Europ
+  generated text (vla.py --generate, batch 1, seeds 11/12/13):
+  --- seed 11:
+    <STX>Problem: What is the man's medated invasion during the armed behavior levels in coast 
+    enrichment before relying on the entrepreneuria empire is in the establishment of ???Got!\n\nIn the 
+    intervention, the New Herost God Felant's Director is responsible for a recent locality, conducted 
+    a chicken family, society, automated breathing, and conservation. Some samples were the largest of 
+    the invading language.\n\nNote that an understanding of consulting search is the team that needs to 
+    play the vital ideas. The sense
+  --- seed 12:
+    <STX>The AMI, someone found there that represents the 10.15% of the volumes and are already 
+    dedicated for long-level positing help for up to the average problem.<ETX>
+  --- seed 13:
+    <STX>Why exactly, the rest is borne in each short hour and two generations of his transplant after 
+    some, as infinite science are only two sites. If they visit these frequent nature and creaties, 
+    think to use might do far mean into people themselves for antuffered!\nThis possibilities asked a 
+    demand can not substitute their finances to them to guide and learn technical concerns.\nAlk. They 
+    are either closely-rosised training quality on the world's facial pattern. To ideas when expecting 
+    confident.\n
+
+--------------------------------------------------------------------------------
+C1  c1_sense_1b  step 200000   2026-08-28 04:10
+--------------------------------------------------------------------------------
+  seed 1642764928   dataset fpmath
+loss/grad/state:
+  step      0  loss 10.8644  grad 644.663  dff_std  0.147  dff_max      1.8  dff_zeros 0.4965
+  step   5000  loss  6.4207  grad  3.165  dff_std  0.696  dff_max     11.3  dff_zeros 0.1006
+  step  10000  loss  6.0880  grad  3.386  dff_std  0.627  dff_max     10.0  dff_zeros 0.0926
+  step  15000  loss  6.0334  grad  3.486  dff_std  0.599  dff_max      9.3  dff_zeros 0.0762
+  step  20000  loss  5.9316  grad  3.492  dff_std  0.631  dff_max     11.7  dff_zeros 0.0937
+  step  25000  loss  5.7785  grad  3.597  dff_std  0.589  dff_max      9.2  dff_zeros 0.0855
+  step  30000  loss  5.6541  grad  3.622  dff_std  0.588  dff_max     11.6  dff_zeros 0.0819
+  step  35000  loss  5.7060  grad  3.685  dff_std  0.568  dff_max      9.2  dff_zeros 0.0751
+  step  40000  loss  5.5933  grad  3.859  dff_std  0.580  dff_max     10.3  dff_zeros 0.0846
+  step  45000  loss  5.5288  grad  3.794  dff_std  0.559  dff_max     10.5  dff_zeros 0.0872
+  step  50000  loss  5.5282  grad  3.854  dff_std  0.560  dff_max      9.5  dff_zeros 0.0860
+  step  55000  loss  5.4042  grad  3.781  dff_std  0.572  dff_max      9.6  dff_zeros 0.0986
+  step  60000  loss  5.4780  grad  3.728  dff_std  0.568  dff_max      9.1  dff_zeros 0.0930
+  step  65000  loss  5.3993  grad  3.776  dff_std  0.571  dff_max     11.3  dff_zeros 0.0957
+  step  70000  loss  5.4116  grad  3.843  dff_std  0.552  dff_max      9.2  dff_zeros 0.0886
+  step  75000  loss  5.2900  grad  3.828  dff_std  0.539  dff_max      9.9  dff_zeros 0.0886
+  step  80000  loss  5.4181  grad  3.782  dff_std  0.527  dff_max      9.7  dff_zeros 0.0859
+  step  85000  loss  5.2268  grad  3.886  dff_std  0.551  dff_max     14.2  dff_zeros 0.0976
+  step  90000  loss  5.2183  grad  3.915  dff_std  0.541  dff_max      9.5  dff_zeros 0.0938
+  step  95000  loss  5.2243  grad  3.884  dff_std  0.530  dff_max     13.3  dff_zeros 0.0906
+  step 100000  loss  5.2150  grad  3.806  dff_std  0.545  dff_max     11.7  dff_zeros 0.0907
+  step 105000  loss  5.1474  grad  3.906  dff_std  0.520  dff_max      8.2  dff_zeros 0.0872
+  step 110000  loss  5.0684  grad  3.954  dff_std  0.522  dff_max      9.1  dff_zeros 0.0847
+  step 115000  loss  5.1280  grad  3.763  dff_std  0.515  dff_max      8.9  dff_zeros 0.0876
+  step 120000  loss  5.1964  grad  3.868  dff_std  0.523  dff_max      9.6  dff_zeros 0.0934
+  step 125000  loss  5.0948  grad  3.863  dff_std  0.526  dff_max      9.6  dff_zeros 0.0959
+  step 130000  loss  5.0848  grad  3.787  dff_std  0.533  dff_max      8.7  dff_zeros 0.1007
+  step 135000  loss  5.1123  grad  3.859  dff_std  0.517  dff_max      9.1  dff_zeros 0.0847
+  step 140000  loss  5.1610  grad  3.827  dff_std  0.508  dff_max      9.9  dff_zeros 0.0756
+  step 145000  loss  4.9937  grad  3.839  dff_std  0.516  dff_max      9.0  dff_zeros 0.0898
+  step 150000  loss  5.1088  grad  3.803  dff_std  0.517  dff_max      9.8  dff_zeros 0.1011
+  step 155000  loss  5.0303  grad  3.834  dff_std  0.529  dff_max      8.6  dff_zeros 0.1045
+  step 160000  loss  5.1479  grad  3.911  dff_std  0.513  dff_max      8.5  dff_zeros 0.0927
+  step 165000  loss  4.9656  grad  3.994  dff_std  0.512  dff_max      8.8  dff_zeros 0.0929
+  step 170000  loss  4.9207  grad  3.862  dff_std  0.510  dff_max      8.8  dff_zeros 0.0966
+  step 175000  loss  5.1348  grad  3.879  dff_std  0.507  dff_max      9.0  dff_zeros 0.0902
+  step 180000  loss  5.0001  grad  3.876  dff_std  0.505  dff_max      8.4  dff_zeros 0.0928
+  step 185000  loss  4.8737  grad  3.942  dff_std  0.501  dff_max      7.8  dff_zeros 0.0963
+  step 190000  loss  4.8430  grad  3.886  dff_std  0.513  dff_max      8.7  dff_zeros 0.0898
+  step 195000  loss  4.8777  grad  3.986  dff_std  0.502  dff_max      8.4  dff_zeros 0.0948
+  mean(last10) 4.7860   tokens 50.00 M   (unigram floor 7.549)
+held-out eval (split of --dataset; see note in report.sh before comparing):
+  EVAL step     160000 corpus cosmo    clean    5.503245 ppl     245.4873 median    5.483633 runaway   0.25% nrun    1 docs   400 wall   136.8s
+  EVAL step     180000 corpus fpmath   clean    5.178906 ppl     177.4885 median    5.112070 runaway   0.50% nrun    2 docs   400 wall   136.8s
+  EVAL step     180000 corpus cosmo    clean    5.504814 ppl     245.8728 median    5.467601 runaway   0.25% nrun    1 docs   400 wall   136.8s
+token efficiency (sustained crossings)  [!! thresholds and baseline are WEB numbers;
+     dataset is fpmath -- these rows are CROSS-CORPUS and are not a like-for-like read]:
+  L<7.549  step    400    0.10 M tok   baseline   3980  (-3580)
+  L<7.000  step   1820    0.46 M tok   baseline   5940  (-4120)
+  L<6.500  step   5400    1.35 M tok   baseline  15680  (-10280)
+  L<6.300  step   8360    2.09 M tok   baseline  30120  (-21760)
+  L<6.100  step  13620    3.40 M tok   baseline  49700  (-36080)
+  L<5.900  step  22780    5.70 M tok   baseline  84980  (-62200)
+  L<5.800  step  27460    6.87 M tok   baseline  99980  (-72520)
+free-running generation (3 samples; cycle>0.6 degenerate, healthy 0.08-0.11):
+   gen health: cycle 0.08 (max 0.09)  uniq 0.12  n=3
+   sample: <STX>What is its listing study with each section of the social community in artfuaways by New Years. For example, professor dotatane USA, French Schoolteku, Specific Grawny to the Department of the 19
+  generated text (vla.py --generate, batch 1, seeds 11/12/13):
+  --- seed 11:
+    <STX>Problem: What is the man's most common invasion of the armed behavior. When did they appear to 
+    enable the entrepreneuria to be in the establishment of Australia\nThere are two, the first common 
+    bunch of Herkids God Felant's Director, is part of a locality, conducted by the Miss Person???s 
+    17.<ETX>
+  --- seed 12:
+    <STX>The cosifferentable pouch and the electrical step upon 10. Life's development will have the 
+    resulting buffer transmission between environmental\nWith posathrocyte accuracy, interbinary; 
+    physical determination and animation protecters, government actions, and rapportives. It leads to 
+    the white face of steam killers for all the road and the latter; I want to get so misser or online 
+    magazine error or fitness management. To clarify us to your health dialog, it urges to book growing 
+    paths. Give the public for them and
+  --- seed 13:
+    <STX>Why exactly a hacker directly is needed to prepare, where does this devote of different 
+    educational programs, and if the science team has changed any benefit and keep the number of law 
+    and the process,722/2. This may mean the welfare of a consortium.\n\nWhen was Lord asked a demand 
+    can not substitute the project to the student. Some addressed technical concerns, operational 
+    discussion. A photo theme is a principle of news training and one. Each art, an invention's ideas 
+    when expecting confident.\n
+
+================================================================================
+                 D1  d1_dict_10ep  -- THE DICTIONARY MEMORIZATION PROBE
+                            opened 2026-08-28
+================================================================================
+A DIFFERENT KIND OF EXPERIMENT.  Every corpus in Phase 2 so far is effectively
+infinite at our budget: the model sees each document once and the question is
+how well it GENERALIZES.  This one is the opposite.  MongoDB/english-words-
+definitions is a CLOSED corpus of 466,670 dictionary entries, ~20M tokens, and
+it is meant to be repeated until it is learned.  The question is not "how low
+does held-out go" -- there IS no held-out here, deliberately -- it is:
+
+    CAN THIS ARCHITECTURE MEMORIZE, and does a recurrent CNN behave differently
+    when the data is LIMITED rather than effectively infinite?
+
+That second question is the user's, and it is the reason this is worth GPU time
+even though a memorized dictionary is not itself a useful artifact.  Everything
+measured in Phase 1 and Phase 2 was measured in the infinite-data regime, where
+a 30M-parameter model never revisits a document.  Nothing in PLAN.txt says what
+happens when it revisits one twenty times.
+
+WHAT SUCCESS LOOKS LIKE.  Train loss is the ONLY scalar, so it carries the whole
+signal -- and by itself it is weak evidence, because loss falls on any corpus.
+The discriminating observations are:
+  1. A STEP DOWN AT AN EPOCH BOUNDARY.  The log now emits an EPOCH line (see
+     below) when the corpus wraps.  Generalization produces a smooth curve
+     through those points; MEMORIZATION produces a visible drop just after one,
+     because the model is now being re-asked questions it has already been told
+     the answers to.  This is the cleanest single discriminator available.
+  2. THE GENERATION SAMPLES.  The periodic GEN block now samples a LIST of
+     prompts (--gen_prompts), and the NULL prompt is always first, so the
+     free-running sample every earlier run produced is kept and the keyed probes
+     are additional.  Four lines per interval:
+       [<STX>]      free-running: what the model writes unprompted
+       [aardvark]   in corpus, 2 senses -- direct term->definition recall
+       [telescope]  in corpus, 3 senses -- does sense COUNT survive
+       [zorbulate]  NOT IN THE CORPUS -- the confabulation control
+     zorbulate is the load-bearing one.  A model that has learned the FORM will
+     emit a fluent, confident, entirely invented definition for it.  Note the
+     corpus itself contains rejection entries ("Pastromis is not a recognized
+     word and may be a misspelling of 'pastrami'"), so a genuinely well-fit model
+     has the option of REFUSING zorbulate -- and doing so would be much stronger
+     evidence than any single correct definition.
+     Ground truth for aardvark, from row 284 of the corpus:
+       aardvark
+       1. An aardvark is a nocturnal, insectivorous mammal native to Africa,
+          with a long snout and a sticky tongue used for catching ants and
+          termites.
+       2. The aardvark is the only living species in the order Tubulidentata.
+     A model that has memorized emits that.  A model that has learned the FORM
+     but not the CONTENT emits a fluent, confident, wrong definition in exactly
+     that shape -- which is the interesting failure and the one to watch for.
+     Do not score this by eye alone; a proper probe over N random headwords with
+     an overlap metric is the missing tool (exp/dictprobe.py, not yet written --
+     every 5000-step checkpoint is stashed, so it can be applied retroactively).
+
+CONFIG.  Frozen baseline, data-only change, per the Phase 2 rule:
+    ./exp/launch.sh exp/longrun.sh d1_dict_10ep 800000 20 \
+        --dataset wdef --eval_interval 0 \
+        --gen_prompts aardvark,telescope,zorbulate
+  800,000 steps = 200M tokens ~ 10 epochs ~ 3.0 days at 3.05 steps/s.
+  --eval_interval 0: there is no held-out split and inventing one by holding out
+  dictionary entries would measure generalization to UNSEEN WORDS, which is a
+  different (also interesting, also later) experiment.  Train loss it is.
+  NOT --streaming: the exact-shuffle path below requires a materialized Dataset.
+
+CORPUS FACTS (measured, pythia31m tokenizer, 4000-row sample):
+  466,670 rows          1.72 senses/entry (median 2, max 6)
+  ~0.05% of rows have an empty definition list and are skipped
+  --wdef_format term  43.1 tokens/entry mean -> 20.1M tokens = 80,423 steps/epoch
+  --wdef_format defs  36.6 tokens/entry mean -> 17.1M tokens = 68,278 steps/epoch
+  on disk 80.1 MiB -- three orders of magnitude below any other corpus here
+
+WHAT WAS ADDED TO vla.py FOR THIS (all four are new, 2026-08-28):
+  'wdef' in _TEXT_DATASETS + _fmt_wdef.  The payload is 'definitions', a LIST of
+    strings; there is no 'text' column.  _fmt_wdef renders the headword then its
+    numbered senses.
+  --gen_prompts.  The periodic GEN block sampled ONE prompt; it now samples a
+    list, with the null prompt always first and unconditional so no run loses its
+    free-running sample.  generate() runs on a local dff/clock, so extra samples
+    cannot perturb training state.
+  epoch on the TEXT line.  'TEXT step N examples E tokens T epoch wdef=3'.  On an
+    infinite corpus this is noise; on a closed one it is the experiment's clock.
+  --wdef_format term|defs.  'term' (default) keeps the headword, which is what
+    makes the memorization question answerable from a sample -- a term->definition
+    MAPPING can be probed. 'defs' emits the gloss sentences alone: still a
+    memorization target, but with no key to query it by, so recall cannot be
+    distinguished from fluent paraphrase.  The default is a judgment call and it
+    is recorded here because it CHANGES WHAT THE EXPERIMENT MEASURES.
+  EPOCH lines.  _next_example already looped and reshuffled on exhaustion
+    (seed + epoch); it just never said so.  It now writes an EPOCH line to
+    log/exp.$M, interleaved with the STEP lines, because for a repeated corpus
+    the wrap point is an experimental landmark and not bookkeeping.
+  Exact-permutation shuffle for small corpora (_EXACT_SHUFFLE_BYTES, 1 GiB).
+    _make_iter deliberately avoids Dataset.shuffle() -- on 45.7GB fineweb-edu it
+    caused 445x read amplification and zero steps in nine minutes.  That is a
+    property of random access into a huge arrow file, not of shuffle(); an 80 MiB
+    corpus sits in page cache.  It MATTERS here: under the 10k-row buffer shuffle
+    an entry's neighbours are largely the same on every pass, so each epoch would
+    re-present the same local orderings and a "memorization" result could be an
+    artifact of that correlation.  A full permutation makes each epoch an
+    independent ordering.
+
+STARTUP TRANSIENT -- MEASURED, wdef-SPECIFIC, AND IT SELF-CORRECTS.  Checked before
+launch so it is not mistaken for a fault later.  CPU, real batch 250, monitor 4,
+against a TINY control run at identical settings:
+
+    step        0        4        8       12       16       20
+    wdef    0.062   12.528    4.261    0.257    0.093    0.104   dff_std
+    tiny    0.015    0.026    0.051      --       --       --    dff_std
+
+Step 0 matches the healthy baseline (c1 opened at dff_std 0.147, grad 645; wdef at
+0.062, grad 704).  Then wdef spikes to dff_std 12.5 at step 4 and is back to 0.26
+by step 12, settling at 0.09-0.10 -- which is exactly where c1 sat at step 20
+(0.099).  The tiny control at the SAME batch does NOT spike, so this is a property
+of THIS CORPUS, not of early training in general.  Most likely cause: 43-token
+documents mean many of the 250 slots hit <ETX> and reset within the first few
+steps (the examples counter runs 2 -> 13 -> 31 over steps 0-8), while the
+BatchNorm running stats are still near their init.  It resolves itself and is not
+a blocker.  WHAT WOULD BE NEW: dff_std still above ~1 at step 100+.  If that
+happens the run is not converging and --clip / --state_norm are the levers.
+
+CAVEAT ON THE 3 SHORT-DOCUMENT CONSEQUENCES.  Entries are ~43 tokens, an order of
+magnitude shorter than any corpus used here before.  That means (a) <ETX> and a
+context reset arrive constantly, so this trains the model's DOCUMENT-START
+behaviour far harder than its long-range carry, (b) --preroll reaches its first
+<ETX> in 13 steps rather than 22+, and (c) reach/context-usage numbers from this
+run are NOT comparable to any other run and should not be put in the same table.
+
+--------------------------------------------------------------------------------
+D1  d1_dict_10ep  step 100000   2026-08-28 20:23
+--------------------------------------------------------------------------------
+  seed 380454511   dataset wdef
+loss/grad/state:
+  step      0  loss 10.7799  grad 588.183  dff_std  0.270  dff_max      4.6  dff_zeros 0.5069
+  step   5000  loss  6.0585  grad  3.417  dff_std  0.675  dff_max      8.3  dff_zeros 0.5799
+  step  10000  loss  5.4064  grad  2.532  dff_std  0.670  dff_max     16.1  dff_zeros 0.4221
+  step  15000  loss  5.4939  grad  4.037  dff_std  0.623  dff_max     35.7  dff_zeros 0.4497
+  step  20000  loss  5.1873  grad  3.281  dff_std  0.644  dff_max      9.8  dff_zeros 0.4220
+  step  25000  loss  4.9486  grad  3.335  dff_std  0.630  dff_max      6.6  dff_zeros 0.4177
+  step  30000  loss  4.9507  grad  3.450  dff_std  0.648  dff_max      8.0  dff_zeros 0.4221
+  step  35000  loss  4.7516  grad  3.324  dff_std  0.661  dff_max      7.0  dff_zeros 0.4308
+  step  40000  loss  4.6668  grad  3.572  dff_std  0.649  dff_max      7.2  dff_zeros 0.4319
+  step  45000  loss  4.5262  grad  3.393  dff_std  0.608  dff_max      7.2  dff_zeros 0.4291
+  step  50000  loss  4.4724  grad  3.530  dff_std  0.634  dff_max      8.1  dff_zeros 0.4315
+  step  55000  loss  4.4944  grad  3.645  dff_std  0.602  dff_max      7.3  dff_zeros 0.4363
+  step  60000  loss  4.5094  grad  3.628  dff_std  0.581  dff_max      7.5  dff_zeros 0.4443
+  step  65000  loss  4.4485  grad  3.610  dff_std  0.623  dff_max      8.3  dff_zeros 0.4495
+  step  70000  loss  4.4664  grad  3.593  dff_std  0.613  dff_max      9.1  dff_zeros 0.4516
+  step  75000  loss  4.4005  grad  3.808  dff_std  0.601  dff_max      8.8  dff_zeros 0.4676
+  step  80000  loss  4.4389  grad  3.682  dff_std  0.624  dff_max      9.7  dff_zeros 0.4555
+  step  85000  loss  4.1903  grad  3.600  dff_std  0.602  dff_max      8.3  dff_zeros 0.4502
+  step  90000  loss  4.3281  grad  3.702  dff_std  0.612  dff_max      8.6  dff_zeros 0.4461
+  step  95000  loss  4.3559  grad  3.735  dff_std  0.624  dff_max      8.4  dff_zeros 0.4582
+  step 100000  loss  4.2592  grad  3.921  dff_std  0.620  dff_max      9.7  dff_zeros 0.4422
+  mean(last10) 4.2452   tokens 25.00 M   (unigram floor 7.549)
+held-out eval (split of --dataset; see note in report.sh before comparing):
+token efficiency (sustained crossings)  [!! thresholds and baseline are WEB numbers;
+     dataset is wdef -- these rows are CROSS-CORPUS and are not a like-for-like read]:
+  L<7.549  step    320    0.08 M tok   baseline   3980  (-3660)
+  L<7.000  step   3940    0.98 M tok   baseline   5940  (-2000)
+  L<6.500  step   4320    1.08 M tok   baseline  15680  (-11360)
+  L<6.300  step   5040    1.26 M tok   baseline  30120  (-25080)
+  L<6.100  step   5520    1.38 M tok   baseline  49700  (-44180)
+  L<5.900  step   6960    1.74 M tok   baseline  84980  (-78020)
+  L<5.800  step   7420    1.85 M tok   baseline  99980  (-92560)
+free-running generation (3 samples; cycle>0.6 degenerate, healthy 0.08-0.11):
+   gen health: cycle 0.10 (max 0.11)  uniq 0.18  n=3
+   sample: <STX> violent\n1. Prior is a literal qualifications or temporal state for families, notably small Double.\n2. Father is with a supernatural or friendship or ceremony that reveals a role together to co
+  generated text (vla.py --generate, batch 1, seeds 11/12/13):
+  --- seed 11:
+    <STX>raames\n1. All is a term used in the manufacture of automobiles or chemical enrichment to 
+    describe an area guilty or emotion is portion, can started or likely to remember or present the 
+    intervention or act of something.<ETX>
+  --- seed 12:
+    <STX>Cerrifferentism\n1. Hemocratic is a metaphysical context that describes hormone societies that 
+    are simple, desperate, or not posantly or nursed.<ETX>
+  --- seed 13:
+    <STX>treatment\nTag is a term used to describe individuals or something from parenting, 
+    educational, or sentence, particularly attributed to rain or incidental movements and scrutiny.\n2. 
+    Bolded describes things that are nondrains or far mean something.<ETX>
+
+--------------------------------------------------------------------------------
+D1  d1_dict_10ep  step 200000   2026-08-29 05:32
+--------------------------------------------------------------------------------
+  seed 380454511   dataset wdef
+loss/grad/state:
+  step      0  loss 10.7799  grad 588.183  dff_std  0.270  dff_max      4.6  dff_zeros 0.5069
+  step   5000  loss  6.0585  grad  3.417  dff_std  0.675  dff_max      8.3  dff_zeros 0.5799
+  step  10000  loss  5.4064  grad  2.532  dff_std  0.670  dff_max     16.1  dff_zeros 0.4221
+  step  15000  loss  5.4939  grad  4.037  dff_std  0.623  dff_max     35.7  dff_zeros 0.4497
+  step  20000  loss  5.1873  grad  3.281  dff_std  0.644  dff_max      9.8  dff_zeros 0.4220
+  step  25000  loss  4.9486  grad  3.335  dff_std  0.630  dff_max      6.6  dff_zeros 0.4177
+  step  30000  loss  4.9507  grad  3.450  dff_std  0.648  dff_max      8.0  dff_zeros 0.4221
+  step  35000  loss  4.7516  grad  3.324  dff_std  0.661  dff_max      7.0  dff_zeros 0.4308
+  step  40000  loss  4.6668  grad  3.572  dff_std  0.649  dff_max      7.2  dff_zeros 0.4319
+  step  45000  loss  4.5262  grad  3.393  dff_std  0.608  dff_max      7.2  dff_zeros 0.4291
+  step  50000  loss  4.4724  grad  3.530  dff_std  0.634  dff_max      8.1  dff_zeros 0.4315
+  step  55000  loss  4.4944  grad  3.645  dff_std  0.602  dff_max      7.3  dff_zeros 0.4363
+  step  60000  loss  4.5094  grad  3.628  dff_std  0.581  dff_max      7.5  dff_zeros 0.4443
+  step  65000  loss  4.4485  grad  3.610  dff_std  0.623  dff_max      8.3  dff_zeros 0.4495
+  step  70000  loss  4.4664  grad  3.593  dff_std  0.613  dff_max      9.1  dff_zeros 0.4516
+  step  75000  loss  4.4005  grad  3.808  dff_std  0.601  dff_max      8.8  dff_zeros 0.4676
+  step  80000  loss  4.4389  grad  3.682  dff_std  0.624  dff_max      9.7  dff_zeros 0.4555
+  step  85000  loss  4.1903  grad  3.600  dff_std  0.602  dff_max      8.3  dff_zeros 0.4502
+  step  90000  loss  4.3281  grad  3.702  dff_std  0.612  dff_max      8.6  dff_zeros 0.4461
+  step  95000  loss  4.3559  grad  3.735  dff_std  0.624  dff_max      8.4  dff_zeros 0.4582
+  step 100000  loss  4.2592  grad  3.921  dff_std  0.620  dff_max      9.7  dff_zeros 0.4422
+  step 105000  loss  4.2450  grad  3.937  dff_std  0.603  dff_max      9.9  dff_zeros 0.4470
+  step 110000  loss  4.2528  grad  3.787  dff_std  0.590  dff_max      8.1  dff_zeros 0.4570
+  step 115000  loss  4.2049  grad  3.933  dff_std  0.607  dff_max      9.1  dff_zeros 0.4468
+  step 120000  loss  4.1199  grad  3.800  dff_std  0.635  dff_max     10.4  dff_zeros 0.4585
+  step 125000  loss  4.0673  grad  3.836  dff_std  0.604  dff_max      9.5  dff_zeros 0.4487
+  step 130000  loss  3.9973  grad  3.762  dff_std  0.597  dff_max      8.6  dff_zeros 0.4499
+  step 135000  loss  4.0176  grad  3.741  dff_std  0.610  dff_max      9.4  dff_zeros 0.4485
+  step 140000  loss  4.0164  grad  3.777  dff_std  0.618  dff_max     10.9  dff_zeros 0.4415
+  step 145000  loss  4.0811  grad  3.934  dff_std  0.615  dff_max     10.3  dff_zeros 0.4571
+  step 150000  loss  4.0968  grad  3.841  dff_std  0.596  dff_max      9.1  dff_zeros 0.4492
+  step 155000  loss  4.0117  grad  3.875  dff_std  0.615  dff_max      9.4  dff_zeros 0.4493
+  step 160000  loss  4.0838  grad  3.916  dff_std  0.597  dff_max      9.9  dff_zeros 0.4451
+  step 165000  loss  4.0464  grad  3.953  dff_std  0.601  dff_max      9.3  dff_zeros 0.4492
+  step 170000  loss  3.9874  grad  3.946  dff_std  0.605  dff_max     10.2  dff_zeros 0.4511
+  step 175000  loss  3.9189  grad  3.922  dff_std  0.583  dff_max      9.6  dff_zeros 0.4352
+  step 180000  loss  4.0370  grad  3.939  dff_std  0.586  dff_max      9.7  dff_zeros 0.4502
+  step 185000  loss  3.9167  grad  3.883  dff_std  0.588  dff_max      9.9  dff_zeros 0.4511
+  step 190000  loss  4.0089  grad  3.854  dff_std  0.582  dff_max     10.3  dff_zeros 0.4529
+  step 195000  loss  3.8882  grad  3.846  dff_std  0.572  dff_max      9.7  dff_zeros 0.4638
+  step 200000  loss  4.0372  grad  3.956  dff_std  0.580  dff_max      9.1  dff_zeros 0.4484
+  mean(last10) 3.9466   tokens 50.00 M   (unigram floor 7.549)
+held-out eval (split of --dataset; see note in report.sh before comparing):
+token efficiency (sustained crossings)  [!! thresholds and baseline are WEB numbers;
+     dataset is wdef -- these rows are CROSS-CORPUS and are not a like-for-like read]:
+  L<7.549  step    320    0.08 M tok   baseline   3980  (-3660)
+  L<7.000  step   3940    0.98 M tok   baseline   5940  (-2000)
+  L<6.500  step   4320    1.08 M tok   baseline  15680  (-11360)
+  L<6.300  step   5040    1.26 M tok   baseline  30120  (-25080)
+  L<6.100  step   5520    1.38 M tok   baseline  49700  (-44180)
+  L<5.900  step   6960    1.74 M tok   baseline  84980  (-78020)
+  L<5.800  step   7420    1.85 M tok   baseline  99980  (-92560)
+free-running generation (3 samples; cycle>0.6 degenerate, healthy 0.08-0.11):
+   gen health: cycle 0.08 (max 0.09)  uniq 0.17  n=3
+   sample: <STX>Scalandlessness\nBengwonfields is a surname of Prince Ipass, a French philosopher known for its chronic feelings, decoration, and chronic language-like work, while and is usually fake in several 
+  generated text (vla.py --generate, batch 1, seeds 11/12/13):
+  --- seed 11:
+    <STX>raaml-labens\n1. Bogieffiness can refer to efforts for or relying on stipulated guilty data or 
+    is portion, can be focused between humans.\n2. A company-ballsweet is a person who is firmly open 
+    to be endangered or fixed, often under meaning to assist or detect compromise.<ETX>
+  --- seed 12:
+    <STX>Cerrifferentism\n1. Hemragal is a surname of English origin.\n2. Ellapava holds posathies) is 
+    a specialist which created the initial animation of the Ancient Roman metropolitan island in 
+    Mexico.<ETX>
+  --- seed 13:
+    <STX>treatment\n1. Blacious is the past tense of 'eresiding', meaning to draw or achieve.\n2. 
+    Distleging refers to an obvisible nature or strongly recognizable, merely wearing trouble.<ETX>
+
+================================================================================
+              B1  b1_bvocab_400k  -- MEMORIZATION AT 732x LESS DATA
+                            prepared 2026-08-29
+================================================================================
+THE HYPOTHESIS (the user's, and it is the reason for the run): a CNN is very
+parameter-efficient but needs MANY PASSES over the data to memorize, where a
+large transformer may memorize in far fewer.  d1_dict_10ep cannot test that --
+at 78,667 steps per epoch it gets ~10 passes in three days.  Shrinking the
+corpus by 732x buys ~3,700 passes in a day and a half, which is the regime where
+"how many epochs to memorize" is actually measurable.
+
+THE CORPUS.  basic_dict.txt, 848 documents, AUTHORED not downloaded:
+    <word>: <sentence 1> <sentence 2> <sentence 3>
+one per line, e.g.
+    apple: I picked an apple from the tree and ate it on the walk home. She
+    sliced three apples into the bowl for the pie. The apple tree behind the
+    barn blooms every spring.
+  848 docs   31.7 tokens/doc (median 31, min 25, max 44)
+  26,875 tokens/epoch  =  107.5 steps/epoch at batch 250
+    200k steps = 1,860 epochs = 18.3 h
+    400k steps = 3,721 epochs = 36.5 h     <- the planned run
+    800k steps = 7,442 epochs = 73.1 h
+  Compare d1/wdef: 466,357 docs, 19.67M tokens/epoch.  This is 732x smaller.
+
+THE WORD LIST.  basic_vocab.txt, 848 words, grade 1-5, scraped from the Reading
+Rockets "Basic Spelling Vocabulary List" (readingrockets.org).  Five HTML tables,
+one per grade: 94 / 295 / 316 / 107 / 37.  The list is cumulative-by-introduction,
+which is why the later grades are small.  Asterisks in the source mark "words
+children have difficulty spelling" and were stripped.  One duplicate across
+grades ('here') was dropped; grade order is preserved, so the file runs easy to
+hard.  Pure ASCII, one word per line.
+
+WHY AUTHORED SENTENCES AND NOT DICTIONARY DEFINITIONS.  The obvious build was to
+filter wdef (MongoDB/english-words-definitions) down to these 848 words.  All 848
+are present, but ONLY 581 match with exact case; the other 267 exist in the
+corpus solely as capitalized or ALLCAPS forms, and those are overwhelmingly
+ACRONYMS, not the basic word:
+    be  -> BE  "the chemical symbol for Beryllium"
+    cat -> CAT "an acronym for Computerized Axial Tomography"
+    but -> BUT "an acronym for Bulgarian University of Technology"
+    car -> CAR "Chimeric Antigen Receptor"
+    did -> DID "Dissociative Identity Disorder"
+    for -> FOR "a control flow statement in many programming languages"
+71 of the 848 chosen definitions match an acronym/abbreviation pattern outright.
+A case-insensitive filter would therefore have produced a "grade 1-5 dictionary"
+in which a third of the entries define unrelated technical acronyms -- a corpus
+that is still memorizable, but that no one reading the generation samples could
+interpret.  Authoring the sentences sidesteps the case collision entirely and
+gives full control over difficulty and length.
+
+GENERATION PROVENANCE, stated because it matters for reading the results: the
+2,544 sentences were written by eight Sonnet subagents, ~106 words each, then
+validated mechanically -- 848 lines, order matched against basic_vocab.txt
+line-for-line, ASCII-only, three sentences per line, root present in the body.
+2,534 of 2,552 sentences are unique; 18 collided across chunk boundaries (0.7%),
+which was left alone.  The file is checked in, so the exact bytes trained on are
+recoverable from git rather than being a re-generation of something similar.
+
+VLA.PY SUPPORT ADDED.  --dataset bdict, backed by --bdict_file (default
+basic_dict.txt).  It is the first LOCAL corpus here: _init_one_dataset intercepts
+the name and calls load_dataset('text', ...), whose default sample_by='line'
+gives exactly one document per line, so shuffle, epoch wrap and _corpus_text are
+identical to a hub corpus and nothing downstream knows the difference.  At 27 KB
+it takes the exact-permutation shuffle branch, so every one of the ~3,700 epochs
+is an independent ordering.  NOTE: blank lines become EMPTY ROWS (verified), so
+basic_dict.txt must contain none -- it does not.
+
+THE RUN (not yet launched; d1_dict_10ep still holds the GPU):
+    ./exp/launch.sh exp/longrun.sh b1_bvocab_400k 400000 20 \
+        --dataset bdict --eval_interval 0 \
+        --gen_prompts apple:,parent:,zorbulate:
+  Probes: the null prompt, two in-corpus headwords, and 'zorbulate:' which is NOT
+  in the 848 -- the same confabulation control d1 uses.  With 107 steps/epoch the
+  EPOCH line fires every ~35 s, so the log carries ~3,700 of them; that is the
+  intended clock and the x-axis for "epochs to memorize".
+
+WHAT TO WATCH.  Train loss is again the only scalar.  A corpus of 26,875 tokens
+against 30.36M trainable parameters is ~1,130 parameters per token, so the model
+CAN trivially fit it -- the question is only how many passes it takes, and
+whether the loss goes to near zero or stalls at a floor.  A stall would be the
+more interesting result: it would say the one-token gradient horizon, not
+capacity, is what limits memorization.
+
+--------------------------------------------------------------------------------
+B1  b1_bvocab_400k  step 50000   2026-08-29 13:48
+--------------------------------------------------------------------------------
+  seed 898138681   dataset bdict
+loss/grad/state:
+  step      0  loss 10.8677  grad 668.421  dff_std  0.749  dff_max      7.5  dff_zeros 0.4929
+  step   5000  loss  4.9690  grad  2.280  dff_std  0.658  dff_max      6.2  dff_zeros 0.6616
+  step  10000  loss  4.6175  grad  2.623  dff_std  0.616  dff_max      6.8  dff_zeros 0.6874
+  step  15000  loss  4.7970  grad  5.101  dff_std  0.634  dff_max      6.1  dff_zeros 0.5356
+  step  20000  loss  4.2717  grad  3.835  dff_std  0.615  dff_max      5.6  dff_zeros 0.4959
+  step  25000  loss  3.9772  grad  4.149  dff_std  0.623  dff_max      5.3  dff_zeros 0.5155
+  step  30000  loss  3.7354  grad  4.756  dff_std  0.602  dff_max      8.0  dff_zeros 0.5235
+  step  35000  loss  3.5411  grad  5.808  dff_std  0.627  dff_max      7.3  dff_zeros 0.5199
+  step  40000  loss  3.2323  grad  6.043  dff_std  0.577  dff_max      6.0  dff_zeros 0.5358
+  step  45000  loss  3.0107  grad  6.545  dff_std  0.577  dff_max      5.9  dff_zeros 0.5216
+  step  50000  loss  2.7103  grad  7.030  dff_std  0.570  dff_max      7.0  dff_zeros 0.5279
+  mean(last10) 2.7317   tokens 12.50 M   (unigram floor 7.549)
+held-out eval (split of --dataset; see note in report.sh before comparing):
+token efficiency (sustained crossings)  [!! thresholds and baseline are WEB numbers;
+     dataset is bdict -- these rows are CROSS-CORPUS and are not a like-for-like read]:
+  L<7.549  step    220    0.06 M tok   baseline   3980  (-3760)
+  L<7.000  step    320    0.08 M tok   baseline   5940  (-5620)
+  L<6.500  step    520    0.13 M tok   baseline  15680  (-15160)
+  L<6.300  step    640    0.16 M tok   baseline  30120  (-29480)
+  L<6.100  step   1460    0.36 M tok   baseline  49700  (-48240)
+  L<5.900  step   1580    0.40 M tok   baseline  84980  (-83400)
+  L<5.800  step   1720    0.43 M tok   baseline  99980  (-98260)
+free-running generation (3 samples; cycle>0.6 degenerate, healthy 0.08-0.11):
+   gen health: cycle 0.11 (max 0.12)  uniq 0.23  n=3
+   sample: <STX>unless: She slept right from the other of the weekend. My foot hurt his friend in the wall. These basket was five brothers to talk for the party.<ETX>
+  generated text (vla.py --generate, batch 1, seeds 11/12/13):
+  --- seed 11:
+    <STX>cart: He must call my small small burned coat to the party Monday. When finished the cube on 
+    the yard. She covered the portion without changed.<ETX>
+  --- seed 12:
+    <STX>train: She wrote a surprise party for the mother has a huge hunt a new title before we walks 
+    in Friday. They holds poszing turned a mistake to the park last.<ETX>
+  --- seed 13:
+    <STX>treatment: Children the oldest-by over the house. She plays the cuisine down the controller. 
+    He walked him something bacon. She was noisy and keep flour for dinner last week.<ETX>
+
+================================================================================
+        PP1  pp1_bvocab_e10s  -- PRE-PRETRAINING ON SIMPLE ENGLISH
+                   PREPARED 2026-08-29, NOT STARTED (awaiting review)
+================================================================================
+THE IDEA.  Every run so far starts from --init zero on whatever corpus it is
+studying.  This one is a WARM START to be consumed by a later run: train on a
+small corpus of clean, simple, single-clause English until it is memorized, then
+use those weights to initialize the real thing (the c1-style 85%-AI mix) and see
+whether the downstream run gets anywhere better or faster.  It is cheap -- the
+corpus is 94K tokens -- so the question is only whether a curriculum helps at
+all, not whether this particular corpus is the right one.
+
+THE CORPUS.  basic_dict_e10.txt + --bdict_split.
+  basic_dict_e10.txt is a STRICT SUPERSET of basic_dict_e3.txt: same 848 grade
+  1-5 vocabulary words, same first three sentences BYTE FOR BYTE, plus seven
+  more per word.  8,480 sentences total, verified: 848 lines, 10 sentences each,
+  zero superset violations, zero non-ASCII.  Keeping the prefix exact is what
+  makes b1 (e3) and any e10 run comparable -- the extra text is strictly added,
+  nothing was reworded.
+  --bdict_split then strips the leading "word: " key and makes EVERY SENTENCE a
+  document.  That is the whole point: WITH the key the corpus is a lookup table
+  and the model learns "after a colon, recite"; WITHOUT it the corpus is just
+  simple English, and what can transfer downstream is ordinary sentence
+  structure.  b1 (keyed) and pp1 (unkeyed) are therefore different experiments
+  on the same text, which is worth keeping straight.
+
+  measured, pythia31m:
+    e3  unsplit    848 docs   31.7 tok/doc   26,875 tok/epoch    108 steps/epoch
+    e10 unsplit    848 docs  103.5 tok/doc   87,759 tok/epoch    351 steps/epoch
+    e10 SPLIT    8,480 docs   11.0 tok/doc   93,658 tok/epoch    375 steps/epoch
+                            (median 11, min 4, max 21)
+  400,000 steps = 1,068 epochs = ~37 h at 3.03 steps/s.
+
+THE RUN (do not launch without review; b1 currently holds the GPU):
+    ./exp/launch.sh exp/longrun.sh pp1_bvocab_e10s 400000 20 \
+        --dataset bdict --bdict_file basic_dict_e10.txt --bdict_split \
+        --eval_interval 0
+  NO --gen_prompts: the null prompt is sampled unconditionally, so GEN is pure
+  free-running text.  That is the measurement here -- the success criterion is
+  that free-running generation eventually emits VERBATIM sentences from the
+  training set, which is memorization visible without any keyed probe.
+
+  WATCH FOR: 11-token documents mean <ETX> and a context reset roughly every 11
+  steps, an order of magnitude more often than any web corpus.  This trains
+  document-START behaviour extremely hard, and it is the reason the resulting
+  weights might transfer BADLY as well as well -- a model tuned to reset every
+  11 tokens has to unlearn that on a corpus of 1000-token documents.  That risk
+  is the experiment.
+
+VLA.PY CHANGES MADE FOR THIS (2026-08-29):
+  --bdict_split  as above.  Splitting is done at LOAD time, building the Dataset
+    in memory, because one row becomes many documents and the line-oriented
+    'text' builder cannot express that.  The epoch counter then counts passes
+    over SENTENCES, which is the unit the run is measured in.
+  _split_sentences  is fussier than it looks and two bugs were found by counting:
+    (1) the abbreviation HEADWORDS this corpus defines ('Mr.', 'Mrs.', 'Ms.')
+        must be masked or "Mr. Johnson teaches math." counts as two;
+    (2) a boundary is [.!?] OPTIONALLY FOLLOWED BY A CLOSING QUOTE.  Requiring
+        bare [.!?] runs `with "Dear friend." His grandmother...` together (one
+        line of e3, 'dear', gave 2543 instead of 2544); allowing ANY quote
+        instead splits `"No candy before dinner," Mom reminded him` at the comma.
+    A fragment starting lower-case is a dialogue tag and is merged back.
+    Verified: e3 -> exactly 2,544, e10 -> exactly 8,480.
+  epoch IS NOW A COLUMN on every STEP line ('... examples N epoch N') instead of
+    standalone EPOCH lines in the log.  chart.py matches fields by name and
+    defaults missing ones to 0.0, so old logs and logs that span this change both
+    parse.  The standalone line still goes to stdout (log/exp.$M.out) because it
+    carries the reshuffle seed, which the column cannot.
+
+================================================================================
+    K1  k1_know80_100m  -- CURRICULUM STAGE 2: LANGUAGE + GENERAL KNOWLEDGE
+                   QUEUED 2026-08-29, NOT STARTED (pp1 holds the GPU)
+================================================================================
+THE IDEA.  Build the training distribution UP GRADUALLY instead of dropping the
+model into the final mix cold.  Stage 1 (pp1) is 8,480 single simple sentences.
+Stage 2 is this: still simple, but real language and real general knowledge,
+with math and code DELIBERATELY EXCLUDED so they can be introduced as stage 3.
+The comparison this is eventually judged against is c1_sense_1b, which started
+from --init zero on a mix that already contained math and reasoning traces.
+
+THE MIX -- 80% AI / 20% HUMAN, no math, no code:
+    AI     cosmo   0.30   Mixtral-8x7B-Instruct, cosmopedia/stories,
+                          audience=young_children -- simple narrative language
+           fpfaq   0.30   SmolLM2-1.7B-Instruct, finephrase/faq -- explanatory
+                          Q&A over fineweb-edu documents; general knowledge
+           fptut   0.20   SmolLM2-1.7B-Instruct, finephrase/tutorial -- how-to
+                          and popular-science prose.  NEWLY REGISTERED for this
+                          run (see below)
+    HUMAN  swiki   0.12   Simple English Wikipedia -- human, general knowledge,
+                          deliberately simple register
+           fwedu   0.08   fineweb-edu -- human CommonCrawl pages, classifier-
+                          selected for educational value
+  Provenance was VERIFIED from the dataset cards on disk, not assumed: cosmopedia
+  states "generated by Mixtral-8x7B-Instruct-v0.1"; finephrase is tagged
+  synthetic / machine-generated with SmolLM2-1.7B-Instruct over
+  fineweb-edu/sample-350BT; fineweb-edu is human web text where only the
+  SELECTION was machine-driven.
+
+WHAT WAS EXCLUDED AND WHY.
+  fpmath, brt, s1k   math and reasoning traces -- the whole point of the stage
+                     is that math arrives LATER.  brt's sources are
+                     GeneralThought-430K / OpenR1-Math-220k / OpenThoughts-114k,
+                     which is math-heavy even where it is not labelled as such.
+  pile, pile_nc      contain GitHub code.
+  tiny               TinyStories was in the first draft of this mix and was
+                     REJECTED by the user: its deliberately restricted
+                     vocabulary is LOW ENTROPY, and after pp1 (which is already
+                     simple single sentences) it would be a step backwards, not
+                     a widening.  This is the right instinct -- the stage is
+                     supposed to ADD distribution, not re-narrow it.
+  Trace amounts of arithmetic survive in any web corpus; "no math" here means no
+  DEDICATED math corpus, not a guarantee of zero equations.
+
+NEW CORPUS REGISTERED: 'fptut' = finephrase [tutorial].  Excluding math and code
+left only two AI sources, which would have put 40% of the run on a single
+generator config.  Only ONE shard is on disk (67,000 rows, ~27M tokens), enough
+for about one pass at weight 0.20 over 100M tokens; it is in _HUB_SUBSET (so it
+loads from the local snapshot, not by resolving finephrase's 27,104 files) and in
+_HASH_HOLDOUT, and it uses _fmt_finephrase like the other two.
+
+>>> LAUNCH PROCEDURE -- READ THIS, THE OBVIOUS COMMAND IS WRONG <<<
+Passing "--load checkpoint/pp1_bvocab_e10s.pt" to longrun.sh DOES NOT WORK, and
+fails in a way that looks fine for hours before quietly stopping short:
+  * vla.py sets _start_step from the loaded checkpoint (vla.py:955) and starts
+    the step counter there, so k1's own checkpoints carry pp1's ~400,000 offset.
+  * longrun computes REM = TOTAL - ckpt_step(checkpoint/$M.pt).  On the FIRST
+    invocation checkpoint/k1_*.pt does not exist, so DONE=0 and it asks for the
+    full TOTAL of NEW steps -- but after any crash DONE is ~400,000+, and with
+    TOTAL=400,000 that is REM<=0, i.e. "COMPLETE" without training anything.
+    The two invocations disagree about what the number means.
+INSTEAD, SEED THE NEW MNEMONIC'S CHECKPOINT AND LET longrun's OWN RESUME LOGIC
+DO IT.  That makes DONE correct on every invocation, and longrun adds the --load
+itself:
+    PP1=$(python -c "import torch;print(torch.load('checkpoint/pp1_bvocab_e10s.pt',\
+map_location='cpu',weights_only=False)['step'])")
+    cp checkpoint/pp1_bvocab_e10s.pt checkpoint/k1_know80_100m.pt
+    ./exp/launch.sh exp/longrun.sh k1_know80_100m $((PP1 + 400000)) 20 \
+        --mix cosmo:0.30,fpfaq:0.30,fptut:0.20,swiki:0.12,fwedu:0.08 \
+        --dataset cosmo --streaming \
+        --eval_interval 20000 --eval_corpora cosmo,swiki,web
+  TOTAL is an ABSOLUTE step number (pp1's final step + 400,000 new), not a count
+  of new steps.  400,000 new steps = 100M tokens = ~37 h at 3.03 steps/s.
+
+  --eval_corpora cosmo,swiki,web: one in-mix AI corpus, one in-mix human corpus,
+  and web as the CROSS-DOMAIN anchor that every number in PLAN.txt's reference
+  table is measured on.  (The eval-corpus renderer bug that silently dropped
+  'pile' from c1 for its entire run was fixed 2026-08-28; this run is the first
+  to exercise a multi-corpus eval since.)
+
+  NOTE ON THE LOG: vla.py prepends the loaded checkpoint's embedded log, so
+  log/exp.k1_know80_100m will OPEN WITH ALL OF pp1's HISTORY and chart.py will
+  plot both curriculum stages as one continuous curve.  That is the desired
+  reading here, but it means k1's log is not a record of k1 alone.
+
+--------------------------------------------------------------------------------
+K1 AMENDMENT  2026-08-29 -- mix reworked before launch (still not started)
+--------------------------------------------------------------------------------
+The first K1 draft above is SUPERSEDED. Three changes, all user decisions:
+
+1. tiny was rejected (low entropy) -- already recorded above.
+2. MATH IS NOW ALLOWED.  The "no math, no code" rule was stage-2 policy; it has
+   been relaxed. fpmath re-enters at a deliberately small 0.07 so math is
+   INTRODUCED rather than dumped in; code (pile/brt/s1k) is still out.
+3. cosmo IS NO LONGER FILTERED and a BROAD config is added.
+
+WHY cosmoweb.  Asked what else cosmopedia offers, the answer is that 'stories'
+is a genre, not a distribution.  Measured over the corpus:
+    config           examples      size   character
+    web_samples_v1  12,426,348   69.1 GB  open-web seeded -- BROAD
+    web_samples_v2  10,345,867   58.7 GB  open-web seeded -- BROAD
+    stories          4,992,964   21.3 GB  narrative + reddit/forum register
+    auto_math_text   1,949,895    8.8 GB  math only
+    stanford         1,020,024    6.3 GB  textbook narrative
+    wikihow            179,191    0.9 GB  one format, overlaps fptut
+    openstax           126,332    0.7 GB  college textbook
+    khanacademy         24,123    0.1 GB  one format, too small to matter
+  The two web_samples configs are 74% of all Cosmopedia and the only ones seeded
+  from general web content rather than one source type.  v2 internally spans
+  general 73% / college_students 27% and blogpost 62% / textbook_academic 27% /
+  textbook_narrative 5% / wikihow 5% -- genuinely mixed register, open domain.
+  v2 (the refined seeding) is registered as 'cosmoweb'.  It is 58.7 GB: ALWAYS
+  --streaming.  At 0.35 of 100M tokens it never wraps, so those are 35M DISTINCT
+  tokens rather than repeats.
+
+WHY THE cosmo FILTER WENT.  _fmt_cosmo kept only audience == 'young_children'
+(26.3% of rows -- the same rows format == 'story_children' selects).  It is
+deleted, so cosmo now reads its text column like any other corpus and carries the
+'general' register (73.7%, median grade 11.5 vs 9.4) and the reddit/forums
+formats.  BACKWARD COMPATIBILITY IS DELIBERATELY BROKEN: every cosmo number in
+this file from BEFORE 2026-08-29 -- f1_grade5_1b, c1_sense_1b and their EVAL
+lines -- was measured on the young_children subset and must NOT be compared to
+anything measured after.  The user accepted this explicitly.
+
+THE MIX AS IT WILL RUN -- 80% AI / 20% HUMAN:
+    AI     cosmoweb 0.35  cosmopedia web_samples_v2 (Mixtral) -- BROAD general
+           fpfaq    0.15  finephrase/faq (SmolLM2) -- explanatory Q&A
+           fptut    0.15  finephrase/tutorial (SmolLM2) -- how-to / pop-science
+           cosmo    0.08  cosmopedia/stories UNFILTERED (Mixtral) -- narrative
+                          and forum register
+           fpmath   0.07  finephrase/math (SmolLM2) -- math, small on purpose
+    HUMAN  swiki    0.12  Simple English Wikipedia
+           fwedu    0.08  fineweb-edu (human web, classifier-selected)
+  Smoke-tested on CPU: all seven corpora resolve and train.
+
+LAUNCH (unchanged -- the seed-the-checkpoint procedure above still applies, and
+the --load trap it avoids is still the thing that would bite):
+    PP1=$(python -c "import torch;print(torch.load('checkpoint/pp1_bvocab_e10s.pt',\
+map_location='cpu',weights_only=False)['step'])")
+    cp checkpoint/pp1_bvocab_e10s.pt checkpoint/k1_know80_100m.pt
+    ./exp/launch.sh exp/longrun.sh k1_know80_100m $((PP1 + 400000)) 20 \
+        --mix cosmoweb:0.35,fpfaq:0.15,fptut:0.15,cosmo:0.08,fpmath:0.07,swiki:0.12,fwedu:0.08 \
+        --dataset cosmoweb --streaming \
+        --eval_interval 20000 --eval_corpora cosmoweb,swiki,web
+
+--------------------------------------------------------------------------------
+HANDOVER CRITERION for pp1 -> k1, and two tools built to measure it  2026-08-29
+--------------------------------------------------------------------------------
+k1 starts from pp1's weights, so WHEN pp1 IS STOPPED IS A DESIGN DECISION, not a
+convenience. The rule chosen by the user: stop at the KNEE of the loss curve, and
+only if free-running GEN text is COHERENT. Neither is a thing to judge by eye, so
+both are now measured.
+
+exp/knee.py   -- bins the loss curve, medians each bin (a mean lets one spike move
+  a slope), takes slope per 10k steps, smooths, and calls a knee where |slope| has
+  dropped below --frac of the post-warmup PEAK and STAYS there --persist bins.
+  Persistence is the load-bearing part; see the b1 result below.
+exp/coherence.py -- scores GEN text by how surprised a FROZEN reference model
+  (pythia-70m, unrelated to the model under test, so the run cannot game it) is by
+  it, in nats/token, placed on a 0-100% scale between two anchors computed from
+  the run's own corpus: real corpus lines (100%) and the same lines with words
+  SHUFFLED (0%). Fluent-looking word salad scores near 0 by construction.
+exp/verbatim.py -- longest run of consecutive words appearing verbatim in the
+  corpus, plus coverage by runs >= N words. Word runs, not character overlap or
+  edit distance: a model that has learned only the STYLE scores high on those
+  while reproducing nothing.
+
+CALIBRATION -- the two corpus regimes behave completely differently:
+
+  d1 (wdef, 466K entries, ~3 passes -- effectively infinite at our budget)
+    slope decays MONOTONICALLY: 100% -> 54 -> 38 -> 30 -> 25 -> 21 -> 18 -> 16 -> 14%
+    KNEE at step 151,990 (epoch ~2). Textbook diminishing returns.
+
+  b1 (bdict e3, 848 entries, 536 passes -- tiny and repeated)
+    slope FELL AND THEN CAME BACK: 100% (ep 181) -> 78.6% (ep 228) -> 80.4 -> 84.4
+    -> 87.6 -> 92.5 -> 96.6 -> 98.6 -> 99.6% (ep 536).  NO KNEE.
+    The mid-run flattening around epoch 230 is a FALSE PLATEAU; the descent
+    RE-ACCELERATES as memorization takes over. A knee detector without the
+    persistence requirement would have fired there and stopped the run at exactly
+    the wrong moment. pp1 is also small and repeated, so EXPECT THIS SHAPE.
+
+  AND THE RESULT THAT CHANGES THE EXPECTATION -- b1 at 536 epochs:
+    coherence  74.6% (null prompt), 39-59% (keyed prompts)
+    verbatim   longest run 4 words, coverage 0.0%
+    "var: The wagon got off by gold in the morning. All of the game is visiting
+     the ad show."
+  Grammatical, corpus-flavoured, and NOT A SINGLE MEMORIZED SENTENCE after 536
+  passes over 848 documents. COHERENCE ARRIVES LONG BEFORE VERBATIM RECALL, and
+  on this architecture recall may not arrive at all within budget. The earlier
+  expectation for pp1 -- "eventually we should see verbatim text from the training
+  set" -- is now in doubt, and that is itself the interesting finding: a 30.4M
+  parameter recurrent CNN with a one-token gradient horizon generalizes where a
+  transformer of this size would be expected to memorize.
+
+  pp1 at step 6,000 (epoch ~16) for reference: coherence 34-53%, longest verbatim
+  run 1-3 words. Nowhere near either bar.
+
+PROPOSED STOP RULE (evidence-based, not arbitrary):
+    exp/knee.py fires (|slope| < 25% of peak, 3 consecutive bins), AND
+    exp/coherence.py null-prompt score >= 70% sustained over 3 samples
+  70% is b1's demonstrated 74.6%, i.e. a bar this architecture is known to clear
+  on this kind of corpus. If the knee never fires -- the b1 outcome -- then the
+  handover is a JUDGEMENT about diminishing returns per GPU-hour, and it should be
+  made explicitly and written down here, not by letting the run hit --run_steps.
+
+--------------------------------------------------------------------------------
+PP1  pp1_bvocab_e10s  step 50000   2026-08-29 19:07
+--------------------------------------------------------------------------------
+  seed 2668573716   dataset bdict
+loss/grad/state:
+  step      0  loss 10.7609  grad 676.190  dff_std  0.270  dff_max      3.9  dff_zeros 0.4912
+  step   5000  loss  4.7653  grad  2.842  dff_std  0.641  dff_max      4.7  dff_zeros 0.5348
+  step  10000  loss  4.5180  grad  3.031  dff_std  0.618  dff_max      5.9  dff_zeros 0.5198
+  step  15000  loss  4.3520  grad  3.583  dff_std  0.600  dff_max      5.5  dff_zeros 0.5223
+  step  20000  loss  4.1313  grad  3.836  dff_std  0.583  dff_max      6.2  dff_zeros 0.5384
+  step  25000  loss  4.0410  grad  4.420  dff_std  0.597  dff_max      5.1  dff_zeros 0.5484
+  step  30000  loss  3.8263  grad  4.735  dff_std  0.600  dff_max      7.8  dff_zeros 0.5497
+  step  35000  loss  3.7698  grad  5.105  dff_std  0.595  dff_max      6.1  dff_zeros 0.5473
+  step  40000  loss  3.6739  grad  6.026  dff_std  0.580  dff_max      8.6  dff_zeros 0.5478
+  step  45000  loss  3.5731  grad  5.973  dff_std  0.599  dff_max      8.9  dff_zeros 0.5423
+  step  50000  loss  3.5926  grad  6.690  dff_std  0.581  dff_max      7.3  dff_zeros 0.5476
+  mean(last10) 3.4611   tokens 12.50 M   (unigram floor 7.549)
+held-out eval (split of --dataset; see note in report.sh before comparing):
+token efficiency (sustained crossings)  [!! thresholds and baseline are WEB numbers;
+     dataset is bdict -- these rows are CROSS-CORPUS and are not a like-for-like read]:
+  L<7.549  step    200    0.05 M tok   baseline   3980  (-3780)
+  L<7.000  step    240    0.06 M tok   baseline   5940  (-5700)
+  L<6.500  step    320    0.08 M tok   baseline  15680  (-15360)
+  L<6.300  step    420    0.10 M tok   baseline  30120  (-29700)
+  L<6.100  step    580    0.14 M tok   baseline  49700  (-49120)
+  L<5.900  step    660    0.17 M tok   baseline  84980  (-84320)
+  L<5.800  step    740    0.18 M tok   baseline  99980  (-99240)
+free-running generation (3 samples; cycle>0.6 degenerate, healthy 0.08-0.11):
+   gen health: cycle 0.12 (max 0.16)  uniq 0.47  n=3
+   sample: <STX>We again DID be supposed and his classes.<ETX>
+  generated text (vla.py --generate, batch 1, seeds 11/12/13):
+  --- seed 11:
+    <STX>She said, "I want my most favorite, sitting down after Monday.<ETX>
+  --- seed 12:
+    <STX>The chicken hunt chpped around the yard.<ETX>
+  --- seed 13:
+    <STX>Why did the historian give me something good trips over the trees?<ETX>
+
+--------------------------------------------------------------------------------
+PP1  pp1_bvocab_e10s  step 100000   2026-08-29 23:42
+--------------------------------------------------------------------------------
+  seed 2668573716   dataset bdict
+loss/grad/state:
+  step      0  loss 10.7609  grad 676.190  dff_std  0.270  dff_max      3.9  dff_zeros 0.4912
+  step   5000  loss  4.7653  grad  2.842  dff_std  0.641  dff_max      4.7  dff_zeros 0.5348
+  step  10000  loss  4.5180  grad  3.031  dff_std  0.618  dff_max      5.9  dff_zeros 0.5198
+  step  15000  loss  4.3520  grad  3.583  dff_std  0.600  dff_max      5.5  dff_zeros 0.5223
+  step  20000  loss  4.1313  grad  3.836  dff_std  0.583  dff_max      6.2  dff_zeros 0.5384
+  step  25000  loss  4.0410  grad  4.420  dff_std  0.597  dff_max      5.1  dff_zeros 0.5484
+  step  30000  loss  3.8263  grad  4.735  dff_std  0.600  dff_max      7.8  dff_zeros 0.5497
+  step  35000  loss  3.7698  grad  5.105  dff_std  0.595  dff_max      6.1  dff_zeros 0.5473
+  step  40000  loss  3.6739  grad  6.026  dff_std  0.580  dff_max      8.6  dff_zeros 0.5478
+  step  45000  loss  3.5731  grad  5.973  dff_std  0.599  dff_max      8.9  dff_zeros 0.5423
+  step  50000  loss  3.5926  grad  6.690  dff_std  0.581  dff_max      7.3  dff_zeros 0.5476
+  step  55000  loss  3.3599  grad  6.701  dff_std  0.562  dff_max      6.9  dff_zeros 0.5413
+  step  60000  loss  3.1621  grad  6.705  dff_std  0.583  dff_max      7.3  dff_zeros 0.5426
+  step  65000  loss  3.1404  grad  7.069  dff_std  0.572  dff_max      7.0  dff_zeros 0.5493
+  step  70000  loss  2.9951  grad  7.204  dff_std  0.590  dff_max      7.7  dff_zeros 0.5466
+  step  75000  loss  2.8410  grad  7.057  dff_std  0.572  dff_max      7.8  dff_zeros 0.5438
+  step  80000  loss  2.8029  grad  7.683  dff_std  0.573  dff_max      8.4  dff_zeros 0.5477
+  step  85000  loss  2.7718  grad  7.536  dff_std  0.581  dff_max      8.1  dff_zeros 0.5470
+  step  90000  loss  2.5292  grad  7.219  dff_std  0.628  dff_max     10.6  dff_zeros 0.5281
+  step  95000  loss  2.5126  grad  7.324  dff_std  0.638  dff_max      9.4  dff_zeros 0.5323
+  step 100000  loss  2.4637  grad  7.793  dff_std  0.632  dff_max      8.7  dff_zeros 0.5312
+  mean(last10) 2.3580   tokens 25.00 M   (unigram floor 7.549)
+held-out eval (split of --dataset; see note in report.sh before comparing):
+token efficiency (sustained crossings)  [!! thresholds and baseline are WEB numbers;
+     dataset is bdict -- these rows are CROSS-CORPUS and are not a like-for-like read]:
+  L<7.549  step    200    0.05 M tok   baseline   3980  (-3780)
+  L<7.000  step    240    0.06 M tok   baseline   5940  (-5700)
+  L<6.500  step    320    0.08 M tok   baseline  15680  (-15360)
+  L<6.300  step    420    0.10 M tok   baseline  30120  (-29700)
+  L<6.100  step    580    0.14 M tok   baseline  49700  (-49120)
+  L<5.900  step    660    0.17 M tok   baseline  84980  (-84320)
+  L<5.800  step    740    0.18 M tok   baseline  99980  (-99240)
+free-running generation (3 samples; cycle>0.6 degenerate, healthy 0.08-0.11):
+   gen health: cycle 0.09 (max 0.13)  uniq 0.60  n=3
+   sample: <STX>First found your sister enjoyable.<ETX>
+  generated text (vla.py --generate, batch 1, seeds 11/12/13):
+  --- seed 11:
+    <STX>She said, "I love passing lanes was wrong," the coach announced.<ETX>
+  --- seed 12:
+    <STX>The chicken glakles in the warm sun.<ETX>
+  --- seed 13:
+    <STX>Why did you write your name for the image.<ETX>
+
+--------------------------------------------------------------------------------
+PP1  pp1_bvocab_e10s  step 150000   2026-08-30 04:15
+--------------------------------------------------------------------------------
+  seed 2668573716   dataset bdict
+loss/grad/state:
+  step      0  loss 10.7609  grad 676.190  dff_std  0.270  dff_max      3.9  dff_zeros 0.4912
+  step   5000  loss  4.7653  grad  2.842  dff_std  0.641  dff_max      4.7  dff_zeros 0.5348
+  step  10000  loss  4.5180  grad  3.031  dff_std  0.618  dff_max      5.9  dff_zeros 0.5198
+  step  15000  loss  4.3520  grad  3.583  dff_std  0.600  dff_max      5.5  dff_zeros 0.5223
+  step  20000  loss  4.1313  grad  3.836  dff_std  0.583  dff_max      6.2  dff_zeros 0.5384
+  step  25000  loss  4.0410  grad  4.420  dff_std  0.597  dff_max      5.1  dff_zeros 0.5484
+  step  30000  loss  3.8263  grad  4.735  dff_std  0.600  dff_max      7.8  dff_zeros 0.5497
+  step  35000  loss  3.7698  grad  5.105  dff_std  0.595  dff_max      6.1  dff_zeros 0.5473
+  step  40000  loss  3.6739  grad  6.026  dff_std  0.580  dff_max      8.6  dff_zeros 0.5478
+  step  45000  loss  3.5731  grad  5.973  dff_std  0.599  dff_max      8.9  dff_zeros 0.5423
+  step  50000  loss  3.5926  grad  6.690  dff_std  0.581  dff_max      7.3  dff_zeros 0.5476
+  step  55000  loss  3.3599  grad  6.701  dff_std  0.562  dff_max      6.9  dff_zeros 0.5413
+  step  60000  loss  3.1621  grad  6.705  dff_std  0.583  dff_max      7.3  dff_zeros 0.5426
+  step  65000  loss  3.1404  grad  7.069  dff_std  0.572  dff_max      7.0  dff_zeros 0.5493
+  step  70000  loss  2.9951  grad  7.204  dff_std  0.590  dff_max      7.7  dff_zeros 0.5466
+  step  75000  loss  2.8410  grad  7.057  dff_std  0.572  dff_max      7.8  dff_zeros 0.5438
+  step  80000  loss  2.8029  grad  7.683  dff_std  0.573  dff_max      8.4  dff_zeros 0.5477
+  step  85000  loss  2.7718  grad  7.536  dff_std  0.581  dff_max      8.1  dff_zeros 0.5470
+  step  90000  loss  2.5292  grad  7.219  dff_std  0.628  dff_max     10.6  dff_zeros 0.5281
+  step  95000  loss  2.5126  grad  7.324  dff_std  0.638  dff_max      9.4  dff_zeros 0.5323
+  step 100000  loss  2.4637  grad  7.793  dff_std  0.632  dff_max      8.7  dff_zeros 0.5312
+  step 105000  loss  2.2308  grad  7.390  dff_std  0.581  dff_max      8.2  dff_zeros 0.5326
+  step 110000  loss  2.1889  grad  7.311  dff_std  0.596  dff_max      8.0  dff_zeros 0.5347
+  step 115000  loss  2.2295  grad  8.076  dff_std  0.600  dff_max      8.1  dff_zeros 0.5312
+  step 120000  loss  2.0305  grad  7.312  dff_std  0.588  dff_max      8.4  dff_zeros 0.5330
+  step 125000  loss  2.5344  grad 11.174  dff_std  0.593  dff_max      7.9  dff_zeros 0.5316
+  step 130000  loss  1.8803  grad  7.326  dff_std  0.591  dff_max      8.0  dff_zeros 0.5334
+  step 135000  loss  1.8554  grad  7.412  dff_std  0.591  dff_max      8.2  dff_zeros 0.5314
+  step 140000  loss  1.8646  grad  8.111  dff_std  0.592  dff_max      8.0  dff_zeros 0.5312
+  step 145000  loss  1.6705  grad  7.081  dff_std  0.589  dff_max      8.8  dff_zeros 0.5320
+  step 150000  loss  1.7204  grad  8.193  dff_std  0.589  dff_max      8.5  dff_zeros 0.5373
+  mean(last10) 1.7020   tokens 37.50 M   (unigram floor 7.549)
+held-out eval (split of --dataset; see note in report.sh before comparing):
+token efficiency (sustained crossings)  [!! thresholds and baseline are WEB numbers;
+     dataset is bdict -- these rows are CROSS-CORPUS and are not a like-for-like read]:
+  L<7.549  step    200    0.05 M tok   baseline   3980  (-3780)
+  L<7.000  step    240    0.06 M tok   baseline   5940  (-5700)
+  L<6.500  step    320    0.08 M tok   baseline  15680  (-15360)
+  L<6.300  step    420    0.10 M tok   baseline  30120  (-29700)
+  L<6.100  step    580    0.14 M tok   baseline  49700  (-49120)
+  L<5.900  step    660    0.17 M tok   baseline  84980  (-84320)
+  L<5.800  step    740    0.18 M tok   baseline  99980  (-99240)
+free-running generation (3 samples; cycle>0.6 degenerate, healthy 0.08-0.11):
+   gen health: cycle 0.11 (max 0.12)  uniq 0.55  n=3
+   sample: <STX>The baby cheered squepped down the line.<ETX>
+  generated text (vla.py --generate, batch 1, seeds 11/12/13):
+  --- seed 11:
+    <STX>She said, "I love building snowmen in the sky.<ETX>
+  --- seed 12:
+    <STX>The chicken gluffed the beans in half.<ETX>
+  --- seed 13:
+    <STX>Why did you write a diary?<ETX>
+
+--------------------------------------------------------------------------------
+PP1  pp1_bvocab_e10s  step 200000   2026-08-30 08:50
+--------------------------------------------------------------------------------
+  seed 2668573716   dataset bdict
+loss/grad/state:
+  step      0  loss 10.7609  grad 676.190  dff_std  0.270  dff_max      3.9  dff_zeros 0.4912
+  step   5000  loss  4.7653  grad  2.842  dff_std  0.641  dff_max      4.7  dff_zeros 0.5348
+  step  10000  loss  4.5180  grad  3.031  dff_std  0.618  dff_max      5.9  dff_zeros 0.5198
+  step  15000  loss  4.3520  grad  3.583  dff_std  0.600  dff_max      5.5  dff_zeros 0.5223
+  step  20000  loss  4.1313  grad  3.836  dff_std  0.583  dff_max      6.2  dff_zeros 0.5384
+  step  25000  loss  4.0410  grad  4.420  dff_std  0.597  dff_max      5.1  dff_zeros 0.5484
+  step  30000  loss  3.8263  grad  4.735  dff_std  0.600  dff_max      7.8  dff_zeros 0.5497
+  step  35000  loss  3.7698  grad  5.105  dff_std  0.595  dff_max      6.1  dff_zeros 0.5473
+  step  40000  loss  3.6739  grad  6.026  dff_std  0.580  dff_max      8.6  dff_zeros 0.5478
+  step  45000  loss  3.5731  grad  5.973  dff_std  0.599  dff_max      8.9  dff_zeros 0.5423
+  step  50000  loss  3.5926  grad  6.690  dff_std  0.581  dff_max      7.3  dff_zeros 0.5476
+  step  55000  loss  3.3599  grad  6.701  dff_std  0.562  dff_max      6.9  dff_zeros 0.5413
+  step  60000  loss  3.1621  grad  6.705  dff_std  0.583  dff_max      7.3  dff_zeros 0.5426
+  step  65000  loss  3.1404  grad  7.069  dff_std  0.572  dff_max      7.0  dff_zeros 0.5493
+  step  70000  loss  2.9951  grad  7.204  dff_std  0.590  dff_max      7.7  dff_zeros 0.5466
+  step  75000  loss  2.8410  grad  7.057  dff_std  0.572  dff_max      7.8  dff_zeros 0.5438
+  step  80000  loss  2.8029  grad  7.683  dff_std  0.573  dff_max      8.4  dff_zeros 0.5477
+  step  85000  loss  2.7718  grad  7.536  dff_std  0.581  dff_max      8.1  dff_zeros 0.5470
+  step  90000  loss  2.5292  grad  7.219  dff_std  0.628  dff_max     10.6  dff_zeros 0.5281
+  step  95000  loss  2.5126  grad  7.324  dff_std  0.638  dff_max      9.4  dff_zeros 0.5323
+  step 100000  loss  2.4637  grad  7.793  dff_std  0.632  dff_max      8.7  dff_zeros 0.5312
+  step 105000  loss  2.2308  grad  7.390  dff_std  0.581  dff_max      8.2  dff_zeros 0.5326
+  step 110000  loss  2.1889  grad  7.311  dff_std  0.596  dff_max      8.0  dff_zeros 0.5347
+  step 115000  loss  2.2295  grad  8.076  dff_std  0.600  dff_max      8.1  dff_zeros 0.5312
+  step 120000  loss  2.0305  grad  7.312  dff_std  0.588  dff_max      8.4  dff_zeros 0.5330
+  step 125000  loss  2.5344  grad 11.174  dff_std  0.593  dff_max      7.9  dff_zeros 0.5316
+  step 130000  loss  1.8803  grad  7.326  dff_std  0.591  dff_max      8.0  dff_zeros 0.5334
+  step 135000  loss  1.8554  grad  7.412  dff_std  0.591  dff_max      8.2  dff_zeros 0.5314
+  step 140000  loss  1.8646  grad  8.111  dff_std  0.592  dff_max      8.0  dff_zeros 0.5312
+  step 145000  loss  1.6705  grad  7.081  dff_std  0.589  dff_max      8.8  dff_zeros 0.5320
+  step 150000  loss  1.7204  grad  8.193  dff_std  0.589  dff_max      8.5  dff_zeros 0.5373
+  step 155000  loss  1.7135  grad  7.775  dff_std  0.567  dff_max      8.4  dff_zeros 0.5316
+  step 160000  loss  1.4827  grad  6.325  dff_std  0.568  dff_max      8.0  dff_zeros 0.5352
+  step 165000  loss  1.5198  grad  7.048  dff_std  0.583  dff_max      9.2  dff_zeros 0.5288
+  step 170000  loss  1.4849  grad  6.943  dff_std  0.601  dff_max      9.2  dff_zeros 0.5366
+  step 175000  loss  1.4077  grad  6.419  dff_std  0.581  dff_max      9.0  dff_zeros 0.5304
+  step 180000  loss  1.4373  grad  6.614  dff_std  0.586  dff_max      8.9  dff_zeros 0.5222
+  step 185000  loss  1.3987  grad  6.985  dff_std  0.590  dff_max      9.1  dff_zeros 0.5319
+  step 190000  loss  1.2867  grad  5.541  dff_std  0.594  dff_max      9.0  dff_zeros 0.5324
+  step 195000  loss  1.3464  grad  6.444  dff_std  0.564  dff_max      8.8  dff_zeros 0.5315
+  step 200000  loss  1.2507  grad  5.533  dff_std  0.584  dff_max      9.0  dff_zeros 0.5377
+  mean(last10) 1.2269   tokens 50.00 M   (unigram floor 7.549)
+held-out eval (split of --dataset; see note in report.sh before comparing):
+token efficiency (sustained crossings)  [!! thresholds and baseline are WEB numbers;
+     dataset is bdict -- these rows are CROSS-CORPUS and are not a like-for-like read]:
+  L<7.549  step    200    0.05 M tok   baseline   3980  (-3780)
+  L<7.000  step    240    0.06 M tok   baseline   5940  (-5700)
+  L<6.500  step    320    0.08 M tok   baseline  15680  (-15360)
+  L<6.300  step    420    0.10 M tok   baseline  30120  (-29700)
+  L<6.100  step    580    0.14 M tok   baseline  49700  (-49120)
+  L<5.900  step    660    0.17 M tok   baseline  84980  (-84320)
+  L<5.800  step    740    0.18 M tok   baseline  99980  (-99240)
+free-running generation (3 samples; cycle>0.6 degenerate, healthy 0.08-0.11):
+   gen health: cycle 0.14 (max 0.15)  uniq 0.47  n=3
+   sample: <STX>Every morning we can wander into this trail.<ETX>
+  generated text (vla.py --generate, batch 1, seeds 11/12/13):
+  --- seed 11:
+    <STX>She said, "I love building snowmen in the fresh snow."<ETX>
+  --- seed 12:
+    <STX>The chicken laid an egg every last Saturday.<ETX>
+  --- seed 13:
+    <STX>Why did she cry during the movie?<ETX>

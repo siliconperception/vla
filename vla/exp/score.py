@@ -24,7 +24,7 @@ ap.add_argument('--docs', type=int, default=250)
 ap.add_argument('--maxlen', type=int, default=384)
 ap.add_argument('--minlen', type=int, default=96)
 ap.add_argument('--thresh', type=float, default=20.0)
-ap.add_argument('--corpus', default='tiny', choices=['tiny', 'web', 'pile'],
+ap.add_argument('--corpus', default='tiny', choices=['tiny', 'web', 'pile', 'c4'],
                 help="held-out set. 'web' is the Phase 1 reference set and is comparable "
                      "to every number in PLAN.txt; 'pile' is the Pile's official validation "
                      "split, in-domain for a --dataset pile run and for pythia. Say which "

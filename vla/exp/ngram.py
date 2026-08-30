@@ -28,7 +28,7 @@ ap.add_argument('--docs', type=int, default=400, help='held-out docs (matches sc
 ap.add_argument('--minlen', type=int, default=512)
 ap.add_argument('--maxlen', type=int, default=1024)
 ap.add_argument('--ckpt', default='checkpoint/b5_long.final.pt')
-ap.add_argument('--corpus', default='web', choices=['web', 'pile'],
+ap.add_argument('--corpus', default='web', choices=['web', 'pile', 'c4'],
                 help="which corpus's floor to measure. Held-out comes from the shared "
                      "heldout_docs(), so it is the same set exp/score.py and "
                      "exp/pythia_ref.py score on. PLAN.txt's 5.3017 bigram floor is a WEB "

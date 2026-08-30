@@ -20,7 +20,10 @@ import numpy as np
 import argparse
 import collections
 import itertools
+import re
 import glob
+import json
+import zlib
 import os
 import queue
 import threading
@@ -572,7 +575,8 @@ parser.add_argument('--kernel',        default=3,     type=int,
                     help='conv kernel size (odd integer)')
 # training
 parser.add_argument('--dataset',       default='tiny',
-                    help='tiny | c4 | web | brt | dolma3 | s1k | pile | pile_nc. s1k is only '
+                    help='tiny | c4 | web | brt | dolma3 | s1k | pile | pile_nc | wdef | '
+                         'bdict (local file, --bdict_file). s1k is only '
                          '1000 reasoning examples -- meant for --mix, it loops quickly on '
                          'its own. pile is EleutherAI\'s deduplicated Pile re-release '
                          '(EleutherAI/pile itself was emptied by a DMCA takedown and cannot '
@@ -583,6 +587,48 @@ parser.add_argument('--mix',           default=None,
                     help='joint multi-dataset training, "name:weight,..." e.g. '
                          '"brt:0.5,web:0.5"; overrides --dataset, samples one dataset per clip '
                          '(token-proportional)')
+parser.add_argument('--bdict_file',    default='basic_dict_e3.txt',
+                    help='file backing --dataset bdict: a LOCAL plain-text corpus, ONE '
+                         'DOCUMENT PER LINE. Unlike every other corpus here it is authored '
+                         'rather than downloaded, so it is version-controlled with the code '
+                         'and the exact bytes trained on are recoverable from git. Used for '
+                         'the basic-vocabulary memorization probe, where the corpus is small '
+                         'enough (848 lines) that thousands of epochs fit in a normal run. '
+                         'The _eN suffix is SENTENCES PER WORD: basic_dict_e3.txt has 3 '
+                         'example sentences per vocabulary word, basic_dict_e10.txt has 10 '
+                         'and is a strict superset (same 848 words, same first 3 sentences '
+                         'verbatim), so a pair of runs isolates "more text per item" from '
+                         'every other variable.')
+parser.add_argument('--bdict_split',   default=False, action='store_true',
+                    help='--dataset bdict: drop the leading "word: " key and make EVERY '
+                         'SENTENCE its own training example. basic_dict_e10.txt goes from '
+                         '848 documents of 10 sentences to 8,480 documents of one sentence. '
+                         'This is the PRE-PRETRAINING form: without the key the corpus stops '
+                         'being a lookup table to memorize and becomes plain simple English, '
+                         'so what transfers downstream is ordinary sentence structure rather '
+                         'than "after a colon, recite". Documents get ~10x shorter, so <ETX> '
+                         'and the context reset arrive ~10x more often.')
+parser.add_argument('--gen_prompts',   default=None,
+                    help='EXTRA prompts for the periodic GEN sample, comma-separated, e.g. '
+                         '"aardvark,telescope,zorbulate". The NULL prompt (bare <STX>, i.e. '
+                         'free-running text) is always sampled first and is not affected by '
+                         'this flag, so adding prompts never costs the unprompted sample: '
+                         'free-running text and a keyed probe answer different questions -- '
+                         '"what has this model learned to write" versus "does it know THIS '
+                         'entry" -- and on a memorization run both are needed. A confident, '
+                         'well-formed definition of a word that does not exist is the '
+                         'signature of having learned the FORM and not the CONTENT, which is '
+                         'why a deliberate non-word belongs in the list. Prompts cannot '
+                         'contain a comma.')
+parser.add_argument('--wdef_format',   default='term', choices=('term', 'defs'),
+                    help='how --dataset wdef renders one dictionary entry. "term" (default) '
+                         'emits the headword then its numbered senses, so the document is a '
+                         'term->definition MAPPING and free-running generation can be read '
+                         'as dictionary entries -- that is what makes "did it memorize the '
+                         'dictionary" a question the samples can answer. "defs" emits the '
+                         'definitions column alone, which is 466k unlabelled gloss sentences: '
+                         'still a memorization target, but with no headword to key on and no '
+                         'way to tell recall from fluent paraphrase.')
 parser.add_argument('--streaming',     default=False, action='store_true')
 parser.add_argument('--shards',        default=None,  type=int,
                     help='non-streaming: load only the first N parquet shards of the dataset '
@@ -683,6 +729,39 @@ parser.add_argument('--lr_rate',       default=0.5,   type=float,
 parser.add_argument('--load',          default=None)
 parser.add_argument('--save',          default='checkpoint.pt')
 parser.add_argument('--checkpoint',    default=1000,  type=int)
+parser.add_argument('--teacher',       default='openai-community/gpt2',
+                    help='--dataset synth: HuggingFace causal-LM whose samples ARE the '
+                         'corpus. Any text-generation repo works (gpt2, gpt2-medium, '
+                         'EleutherAI/pythia-160m, ...). Bigger teacher = cleaner text and '
+                         'slower generation; see --teacher_batch for the throughput budget')
+parser.add_argument('--teacher_batch', default=64,    type=int,
+                    help='sequences per generate() call. Generation is autoregressive, so '
+                         'wall time is set by the LONGEST sequence in the batch and batching '
+                         'is nearly free: measured 2084 tok/s at 16 and 4725 tok/s at 64 on '
+                         'a 4090 already running a trainer. VLA consumes 765 tok/s at '
+                         '--batch 250, so 64 keeps the teacher well ahead of the trainer')
+parser.add_argument('--teacher_temp', default=1.0,   type=float)
+parser.add_argument('--teacher_topk',  default=50,    type=int)
+parser.add_argument('--teacher_topp',  default=0.95,  type=float)
+parser.add_argument('--teacher_rep_penalty', default=1.15, type=float,
+                    help='repetition_penalty for the teacher. NOT cosmetic: suppressing eos '
+                         'to force a 500-1000 token document pushes a small model past where '
+                         'it wanted to stop and it degenerates into loops. Measured on '
+                         'pythia-160m, fraction of repeated 8-grams: 0.089 at 1.0, 0.000 at '
+                         '1.15, at identical wall time. 1.0 disables it. A corpus that loops '
+                         'is not the "clean text" this experiment is premised on')
+parser.add_argument('--synth_min',     default=500,   type=int,
+                    help='--dataset synth: each example is a uniform random length in '
+                         '[--synth_min, --synth_max] TEACHER tokens')
+parser.add_argument('--synth_max',     default=1000,  type=int)
+parser.add_argument('--teacher_device', default=None,
+                    help='device for the teacher (default: --device). Set cpu to keep the '
+                         'GPU entirely for training, at roughly 20x less generation speed')
+parser.add_argument('--synth_eval_docs', default=400, type=int,
+                    help='documents in the CACHED synthetic held-out set. Generated once, '
+                         'written to ./synth_eval/, and reused: an eval set regenerated per '
+                         'call would make the EVAL curve a walk over datasets as much as '
+                         'over training')
 parser.add_argument('--gen_interval',  default=0,     type=int,
                     help='print a free-running GEN sample every N training steps. 0 (the '
                          'default) means "every --checkpoint steps", which is what the '
@@ -698,6 +777,26 @@ parser.add_argument('--eval_interval', default=0,     type=int,
                          '--eval, and reports clean/median/runaway% the way exp/score.py '
                          'does -- a plain mean is not usable here, a handful of runaway '
                          'documents move it by orders of magnitude')
+parser.add_argument('--eval_corpora',  default=None,
+                    help='comma-separated held-out sets to score every --eval_interval '
+                         'steps, e.g. "synth,pile". Default: the training corpus alone. '
+                         'Scoring a corpus the run was NOT trained on is the TRANSFER '
+                         'measurement -- for synthetic pre-pretraining that is the whole '
+                         'point, since fit to the teacher is not the claim. Each set gets '
+                         'its own EVAL line tagged with its corpus name; they are built '
+                         'once each and reused')
+parser.add_argument('--reason_eval',   default=None,
+                    help='comma-separated zero-shot multiple-choice benchmarks scored every '
+                         '--eval_interval steps: arc_easy | arc_chal | obqa | winogrande. '
+                         'Held-out LOSS cannot measure reasoning -- on a factual corpus it '
+                         'rewards memorisation, which is the opposite of the goal -- so this '
+                         'is the metric that tracks whether the model REASONS. winogrande is '
+                         'the cleanest: it needs plausibility judgement and no retrievable '
+                         'fact. Chance is 1/n_choices and is printed on every line')
+parser.add_argument('--reason_docs',   default=0,     type=int,
+                    help='cap items per benchmark (0 = the whole validation split)')
+parser.add_argument('--eval_json',     default=None,
+                    help='--eval --eval_corpora: also write the results table as JSON here')
 parser.add_argument('--eval_docs',     default=400,   type=int,
                     help='documents in the --eval_interval held-out set (400 matches '
                          'exp/score.py and PLAN.txt\'s reference table)')
@@ -1672,6 +1771,34 @@ def _dff_stats(dff):
 _text_lock  = threading.Lock()
 _text_stats = {'examples': 0, 'tokens': 0, 'sample': ''}
 
+# Passes over each corpus, published by the builder threads and read by the TEXT line.
+# Same worker->main-loop channel as _text_stats, and for the same reason: the epoch counter
+# lives inside worker()'s closure, but the only place it is worth reading is the throughput
+# line in the training loop. 1-based and means "currently consuming pass N", matching the
+# EPOCH line _next_example writes on each wrap. On an effectively infinite corpus this stays
+# at 1 forever and is just noise; on a CLOSED corpus (wdef) it is the experiment's clock.
+_epoch_lock  = threading.Lock()
+_epoch_stats = {}
+
+def _epoch_set(name, n):
+    with _epoch_lock:
+        _epoch_stats[name] = n
+
+def _epoch_num():
+    """The STEP line's `epoch` column: passes over the corpus that has wrapped LEAST.
+
+    For a single dataset that is simply its epoch. For a --mix it is the number of complete
+    passes the SLOWEST member has made, which is the only reading under which one integer
+    means anything across corpora of wildly different sizes. 0 before the worker starts."""
+    with _epoch_lock:
+        return min(_epoch_stats.values()) if _epoch_stats else 0
+
+
+def _epoch_report():
+    """'name=pass' per dataset, e.g. 'wdef=3' or 'brt=2,web=1'; '' before anything loads."""
+    with _epoch_lock:
+        return ','.join(f'{k}={v}' for k, v in sorted(_epoch_stats.items()))
+
 def _text_tally(n_tokens, sample=''):
     with _text_lock:
         _text_stats['examples'] += 1
@@ -1727,7 +1854,122 @@ _TEXT_DATASETS = {
     's1k':     ('simplescaling/s1K',      None, 'train', None),
     'pile':    ('EleutherAI/the_pile_deduplicated', None, 'train', 'text'),
     'pile_nc': ('monology/pile-uncopyrighted', None, 'train', 'text'),
+    # synth has no repo: examples are generated on the fly by --teacher. The tuple exists so
+    # _build_clip finds the 'text' column and _split_for_name resolves, exactly as for a
+    # real corpus -- everything downstream of the worker is unchanged.
+    'synth':   (None, None, 'train', 'text'),
+    # ── fifth-grade / reasoning corpora ──────────────────────────────────────────
+    # Chosen because they are simple AND explanatory. Filtering openwebtext by reading
+    # level does NOT get you here: measured over 3000 documents its median Flesch-Kincaid
+    # grade is 10.3, only 3.9% fall at grade <=6, and what survives that filter is blog
+    # chatter (a Disney donut review, a DIY lamp build) -- simple language, no reasoning.
+    # Readability and reasoning are anti-correlated on raw web text.
+    'swiki':   ('wikimedia/wikipedia', '20231101.simple', 'train', 'text'),
+    'fwedu':   ('HuggingFaceFW/fineweb-edu', 'sample-10BT', 'train', 'text'),
+    # cosmo is cosmopedia/stories UNFILTERED as of 2026-08-29. It previously kept only
+    # audience == 'young_children' (26.3% of rows, the same rows format == 'story_children'
+    # selects) via _fmt_cosmo, which has been REMOVED. BACKWARD COMPATIBILITY IS BROKEN ON
+    # PURPOSE: every 'cosmo' number recorded before that date -- f1_grade5_1b, c1_sense_1b,
+    # and their EVAL lines -- was measured on the young_children subset and is NOT
+    # comparable to anything measured after. Unfiltered, the config is 73.7% 'general'
+    # (median Flesch-Kincaid grade 11.5 vs 9.4) and spans five formats: story_children
+    # 26.3, story_life_lessons 25.7, story_reddit 25.3, story_morality 11.5,
+    # story_forums 11.2 -- so it now carries a conversational/forum register too.
+    'cosmo':   ('HuggingFaceTB/cosmopedia', 'stories', 'train', 'text'),
+    # The BROAD cosmopedia config: 10.3M examples / 58.7GB, seeded from open web samples
+    # rather than one source type, which is what makes it general-domain where every other
+    # config is a genre. Internally general 73% / college_students 27%, and blogpost 62% /
+    # textbook_academic 27% / textbook_narrative 5% / wikihow 5%. web_samples_v1 is the same
+    # idea and slightly larger (12.4M / 69.1GB); v2 is the refined seeding, so it is the one
+    # registered. Far too large to materialize -- always pair with --streaming.
+    'cosmoweb': ('HuggingFaceTB/cosmopedia', 'web_samples_v2', 'train', 'text'),
+    # finephrase: reasoning-shaped generations over fineweb-edu documents. The corpus we
+    # train on is rollout_results, NOT the `text` column -- `text` is the source document
+    # verbatim, i.e. fineweb-edu, which --dataset fwedu already provides. See _fmt_finephrase.
+    'fpfaq':   ('HuggingFaceFW/finephrase', 'faq',  'train', 'text'),
+    'fpmath':  ('HuggingFaceFW/finephrase', 'math', 'train', 'text'),
+    # finephrase 'tutorial': explanatory how-to / popular-science rewrites of fineweb-edu
+    # documents. Registered for the k1 curriculum stage, which needs AI-generated LANGUAGE
+    # AND GENERAL KNOWLEDGE with no math and no code -- fpmath and brt are both disqualified
+    # on that rule, which otherwise leaves only two AI sources. Only ONE shard (67,000 rows,
+    # ~27M tokens) is on disk, enough for roughly one pass at this mix weight.
+    'fptut':   ('HuggingFaceFW/finephrase', 'tutorial', 'train', 'text'),
+    # ── closed, finite corpus: a memorization probe, not a sample of a distribution ──
+    # 466,670 headwords, 1.72 senses each, ~43 tokens per rendered entry -> ONE EPOCH IS
+    # ~20M tokens (80k steps at batch 250). Every other corpus here is effectively infinite
+    # at our budget and is seen once; this one is meant to be repeated until it is learned,
+    # which is the point (see --wdef_format, and _make_iter's exact-shuffle branch).
+    # The payload is 'definitions', a LIST of strings -- there is no 'text' column, so the
+    # entry is rendered by _fmt_wdef and the column name here is documentation only.
+    'wdef':    ('MongoDB/english-words-definitions', None, 'train', 'definitions'),
+    # Authored locally, not downloaded: --bdict_file, one document per line. The tuple's
+    # repo is None for the same reason 'synth' is -- _init_one_dataset intercepts the name
+    # before the repo is read -- but the 'text' column and 'train' split still have to be
+    # here so _corpus_text and _split_for_name resolve exactly as for a hub corpus.
+    'bdict':   (None, None, 'train', 'text'),
 }
+
+# Repos where only a SUBSET of the files is on disk, loaded from the hub cache directly.
+# finephrase is 4.69 TB across 27,104 parquet files: it does not fit, and load_dataset()
+# cannot even enumerate it -- streaming yielded no row in 10 minutes because HF resolves
+# the entire file list first. Pointing 'parquet' at the downloaded snapshot files skips
+# resolution entirely and uses exactly what was fetched. ~33M tokens of rollout per file,
+# so a few dozen files exceed a 1B-token run.
+_HUB_SUBSET = {
+    'fpfaq':  ('HuggingFaceFW/finephrase', 'faq'),
+    'fpmath': ('HuggingFaceFW/finephrase', 'math'),
+    'fptut':  ('HuggingFaceFW/finephrase', 'tutorial'),
+}
+
+
+def _hub_subset_files(name):
+    repo, cfg = _HUB_SUBSET[name]
+    home = os.environ.get('HF_HOME') or os.path.expanduser('~/.cache/huggingface')
+    root = os.path.join(home, 'hub', 'datasets--' + repo.replace('/', '--'), 'snapshots')
+    return sorted(glob.glob(os.path.join(root, '*', cfg, '*.parquet')))
+
+
+_FP_REFUSALS = ('no answer', 'no table', 'no question', 'none', 'n/a', 'no faq')
+
+
+def _fmt_finephrase(ex):
+    """The GENERATED rollout, not the source document.
+
+    ~99% of rows carry a usable generation (median ~1.9k chars for faq, ~1.0k for math);
+    the rest are refusals the generator emitted when the source had nothing to work with
+    ('No answer', 'No table'). Returning '' skips the row, the contract _fmt_s1k uses."""
+    rr = ex.get('rollout_results')
+    if not isinstance(rr, (list, tuple)) or not rr:
+        return ''
+    first = rr[0]
+    txt = (first.get('text') if isinstance(first, dict) else None) or ''
+    txt = txt.strip()
+    if len(txt) < 40 or txt.lower().startswith(_FP_REFUSALS):
+        return ''
+    return txt
+
+# Corpora that ship a TRAIN SPLIT ONLY. There is no held-out set to point --eval_corpora at,
+# and slicing (train[-3000:]) cannot be streamed. So the split is made by HASHING the
+# document: a fixed 1/_HOLDOUT_MOD of documents is reserved for eval and skipped by the
+# training worker. Deterministic, streaming-compatible, and disjoint regardless of shuffle
+# order or --seed -- none of which is true of "take the first N documents".
+# Corpora with a real held-out split (tiny/c4/pile/web) are NOT hashed: they keep the exact
+# sets every earlier number in PLAN.txt was measured on.
+_HASH_HOLDOUT = {'swiki', 'fwedu', 'cosmo', 'cosmoweb', 'fpfaq', 'fpmath', 'fptut'}
+_HOLDOUT_MOD = 32                       # ~3.1% held out. Sized by the SCAN COST of building
+                                        # the eval set, not by statistics: the filters
+                                        # compound. cosmo keeps 26.5% (audience) x 1/MOD
+                                        # x ~13% (>= _EVAL_MINLEN tokens), so at MOD=256
+                                        # assembling 400 documents meant scanning ~3M rows.
+                                        # At 32 it is ~375k. Losing 3.1% of training data
+                                        # is immaterial next to a corpus of millions.
+
+
+def _is_heldout(text):
+    # crc32 of a prefix: cheap, stable across processes and Python versions (unlike hash(),
+    # which is randomised per process by PYTHONHASHSEED and would silently reshuffle the
+    # split on every restart).
+    return zlib.crc32(text[:512].encode('utf-8', 'ignore')) % _HOLDOUT_MOD == 0
 
 # --eval: the held-out split to score, for the corpora that have one. A plain string is a
 # split of the training repo itself; a (repo, config, split) triple is a held-out set that
@@ -1738,6 +1980,11 @@ _TEXT_DATASETS = {
 _EVAL_SPLITS = {
     'tiny':    'validation',
     'c4':      'validation',
+    # openwebtext ships no validation split. train[-3000:] is the tail exp/score.py,
+    # exp/ngram.py and exp/pythia_ref.py all hold out, and every web number in PLAN.txt's
+    # reference table is measured on it. Without this line --eval_corpora web would score
+    # the TRAINING split and silently report a training loss as a held-out one.
+    'web':     'train[-3000:]',
     'pile':    ('mit-han-lab/pile-val-backup', None, 'validation'),
     'pile_nc': ('mit-han-lab/pile-val-backup', None, 'validation'),
 }
@@ -1760,7 +2007,68 @@ def _fmt_s1k(ex):
     return f'{q}<think>\n{think.strip()}\n</think>\n<answer>\n{answer}\n</answer>'
 
 
-_TEXT_FORMAT = {'s1k': _fmt_s1k}
+_BD_ABBREV = ('Mr.', 'Mrs.', 'Ms.', 'Dr.', 'St.')
+
+def _split_sentences(text):
+    """Split one bdict line body into sentences, for --bdict_split.
+
+    Two things defeat a plain split on [.!?]: the abbreviation HEADWORDS this corpus
+    defines ('Mr.', 'Mrs.', 'Ms.') -- "Mr. Johnson teaches math." is ONE sentence -- and
+    quoted dialogue, where `"Great job!" he shouted.` would break at the exclamation mark
+    and leave `he shouted.` as its own "sentence". Abbreviations are masked before the
+    split; a fragment that begins lower-case is a dialogue tag and is merged back.
+
+    A boundary is TERMINAL PUNCTUATION OPTIONALLY FOLLOWED BY A CLOSING QUOTE, then space.
+    Both halves of that matter. Without the quote a sentence ending in a quotation runs into
+    the next one (`with "Dear friend." His grandmother...`, exactly one line of e3: 'dear').
+    But splitting after ANY quote is wrong the other way: `"No candy before dinner," Mom
+    reminded him` has a COMMA before the quote and is one sentence, and 'Mom' is capitalised
+    so the lower-case merge cannot rescue it. Matching [.!?] before the optional quote keeps
+    both cases right."""
+    t = text
+    for i, a in enumerate(_BD_ABBREV):
+        t = t.replace(a, f'\x00{i}\x00')
+    # mark boundaries, then split on the marker, so the closing quote stays on its sentence
+    t = re.sub(r'([.!?]["\']?)\s+', '\\1\x01', t)
+    out = []
+    for part in t.split('\x01'):
+        for i, a in enumerate(_BD_ABBREV):
+            part = part.replace(f'\x00{i}\x00', a)
+        part = part.strip()
+        if not part:
+            continue
+        if out and part[:1].islower():
+            out[-1] = out[-1] + ' ' + part
+        else:
+            out.append(part)
+    return out
+
+
+def _fmt_wdef(ex):
+    """One dictionary entry. 'definitions' is a list of senses, not a string.
+
+    --wdef_format term (default) renders the headword and its numbered senses; a single-sense
+    entry is left unnumbered so the common case reads like a dictionary line rather than a
+    one-item list. --wdef_format defs drops the headword and emits the senses alone.
+    ~0.05% of rows carry an empty definition list; '' skips them, the contract _fmt_s1k uses."""
+    defs = [d.strip() for d in (ex.get('definitions') or []) if d and d.strip()]
+    if not defs:
+        return ''
+    if args.wdef_format == 'defs':
+        return '\n'.join(defs)
+    term = (ex.get('term') or '').strip()
+    if not term:
+        return ''
+    if len(defs) == 1:
+        return f'{term}\n{defs[0]}'
+    return term + '\n' + '\n'.join(f'{i}. {d}' for i, d in enumerate(defs, 1))
+
+
+# cosmo has NO entry here any more: _fmt_cosmo (the audience == 'young_children' filter)
+# was removed 2026-08-29, so cosmo now reads its 'text' column like any other corpus.
+_TEXT_FORMAT = {'s1k': _fmt_s1k, 'wdef': _fmt_wdef,
+                'fpfaq': _fmt_finephrase, 'fpmath': _fmt_finephrase,
+                'fptut': _fmt_finephrase}
 
 # A dataset prepared on local disk takes precedence over the hub repo. dolma3 must be
 # prepared this way (see dolma3_prep.py): the hub shards are topic-partitioned and
@@ -1795,8 +2103,221 @@ def _shard_files(hf, cfg, n):
     return par[:n]
 
 
+# ── synthetic corpus (--dataset synth) ────────────────────────────────────────
+# Pre-pretraining on CLEAN text before real data: a pretrained LLM writes the corpus, so
+# phase 1 sees fluent, well-formed English with none of the boilerplate, markup, encoding
+# damage or truncated fragments a web/Pile crawl carries.  Phase 2 then continues on real
+# text (--load the phase-1 checkpoint, --dataset pile).
+#
+# THREE THINGS THIS GOT WRONG FIRST, all measured, all now handled:
+#  1. An EMPTY-STRING prompt does not batch.  transformers' text-generation pipeline
+#     collapses ['']*16 to ONE result -- 16 requests in, 1 sequence out, silently.  The null
+#     prompt here is the tokenizer's eos/bos marker ('<|endoftext|>' for gpt2), which is a
+#     real token, batches correctly, and is what GPT-2 saw at document starts in training.
+#  2. GPT-2 emits eos early.  Asked for 750 tokens it stopped at ~157, so lengths would have
+#     been whatever the teacher felt like, not the requested 500-1000.  eos is suppressed and
+#     min_new_tokens is set, which forces the length.
+#  3. Decoder-only models need LEFT padding.  Right padding corrupts generation; the
+#     tokenizer is constructed with padding_side='left' rather than patched afterwards,
+#     because the pipeline keeps its own reference.
+#
+# Diversity comes from temperature/top-k/top-p alone (the prompt is constant), so those are
+# the knobs that matter.  Measured 64/64 unique openings at the defaults.
+
+
+class SyntheticCorpus:
+    """Infinite stream of teacher-generated documents, shaped like an HF dataset row.
+
+    Thread-safe: the worker runs --workers builder threads and they share one teacher, so
+    generation is serialised under a lock and handed out from a buffer.  One generate() call
+    costs the same wall time whether it fills 1 request or --teacher_batch of them, so
+    batching is what keeps the teacher ahead of the trainer."""
+
+    def __init__(self, teacher, batch, temp, topk, topp, lo, hi, device, seed=0,
+                 rep_penalty=1.15):
+        self.teacher, self.batch = teacher, max(1, batch)
+        self.temp, self.topk, self.topp, self.rep = temp, topk, topp, rep_penalty
+        self.lo, self.hi = lo, hi
+        self.device = device
+        self.rng = random.Random(seed)
+        self._pipe = None
+        self._buf = []
+        self._lock = threading.Lock()
+
+    def _ensure(self):
+        if self._pipe is not None:
+            return
+        import torch as _t
+        from transformers import pipeline, AutoTokenizer
+        dev = self.device
+        tok = AutoTokenizer.from_pretrained(self.teacher, padding_side='left')
+        if tok.pad_token_id is None:
+            tok.pad_token = tok.eos_token
+        kw = {}
+        if str(dev).startswith('cuda'):
+            kw = dict(device=0, dtype=_t.float16)
+        else:
+            kw = dict(device=-1)
+        self._pipe = pipeline('text-generation', model=self.teacher, tokenizer=tok, **kw)
+        self._eos = tok.eos_token_id
+        self._null = tok.eos_token or tok.bos_token or '\n'
+        print(f'synth: teacher {self.teacher} on {dev}, null prompt {self._null!r}, '
+              f'lengths {self.lo}-{self.hi}, batch {self.batch}', flush=True)
+
+    def _fill(self):
+        self._ensure()
+        # one target length per example; generate to the longest and truncate each to its
+        # own, so lengths are genuinely uniform rather than constant within a batch
+        tgts = [self.rng.randint(self.lo, self.hi) for _ in range(self.batch)]
+        want = max(tgts)
+        out = self._pipe([self._null] * self.batch, max_new_tokens=want,
+                         min_new_tokens=want, do_sample=True, temperature=self.temp,
+                         top_k=self.topk, top_p=self.topp, repetition_penalty=self.rep,
+                         pad_token_id=self._eos, suppress_tokens=[self._eos],
+                         return_full_text=False, batch_size=self.batch)
+        tk = self._pipe.tokenizer
+        for o, n in zip(out, tgts):
+            txt = o[0]['generated_text'] if isinstance(o, list) else o['generated_text']
+            ids = tk.encode(txt)[:n]
+            if ids:
+                self._buf.append(tk.decode(ids))
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        with self._lock:
+            if not self._buf:
+                self._fill()
+            # pop(0), not pop(): documents must come out in generation order, or the cached
+            # eval set's first N are a reversed tail of each batch and "first 400 of 500"
+            # stops equalling a 400-document set.
+            return {'text': self._buf.pop(0)}
+
+
+# The synthetic HELD-OUT set is generated ONCE and cached to disk, never regenerated.
+# vla.py's --eval_interval, exp/score.py and exp/reach.py all read the same file, so an EVAL
+# curve reflects the weights alone and a checkpoint scored today is comparable to one scored
+# next week.  Regenerating per call would make every number a fresh sample of the teacher.
+# The filename carries everything that changes the distribution, so altering the teacher or
+# the length range produces a DIFFERENT file rather than silently reusing the old one.
+SYNTH_EVAL_DIR = './synth_eval'
+SYNTH_EVAL_SEED = 987654321          # fixed and distinct from any training seed
+
+
+def synth_eval_file(teacher, n, lo, hi):
+    slug = teacher.replace('/', '_')
+    return os.path.join(SYNTH_EVAL_DIR, f'{slug}.{n}.{lo}-{hi}.jsonl')
+
+
+SYNTH_EVAL_BATCH = 16                # PINNED, see below. Small on purpose: generating the
+                                     # eval set spins up a SECOND teacher pipeline while the
+                                     # training one is still resident, and its KV cache is
+                                     # ~110MB per batch row at 750 tokens. At 64 that is
+                                     # ~1.8GB landing on a GPU already at 22.1/24.5GB, i.e.
+                                     # an OOM at the first eval -- two hours into a run, and
+                                     # one the supervisor would faithfully restart into
+                                     # again at every subsequent eval.
+
+
+def ensure_synth_eval(teacher, n, lo, hi, batch, temp, topk, topp, device, rep=1.15):
+    """Path to the cached synthetic held-out set, generating it on first use.
+
+    REPRODUCIBILITY.  The filename keys only (teacher, n, lo, hi), so everything else that
+    changes the content has to be pinned here or two runs produce different held-out sets
+    under the same name:
+      * torch's global RNG drives do_sample, and SyntheticCorpus seeds only its own length
+        picker -- so without the manual_seed below the set was NOT reproducible across
+        processes at all, merely stable once written.
+      * generation batch size changes how the RNG stream is consumed, so --teacher_batch
+        would leak into the content.  Eval generation therefore ignores it and uses
+        SYNTH_EVAL_BATCH.
+    Content now depends only on (teacher, n, lo, hi, temp, topk, topp, SYNTH_EVAL_SEED),
+    which also makes the first 400 documents of a 500-document set identical to a
+    400-document set -- so --eval_docs can be varied without changing which documents are
+    scored."""
+    path = synth_eval_file(teacher, n, lo, hi)
+    if os.path.exists(path):
+        return path
+    os.makedirs(SYNTH_EVAL_DIR, exist_ok=True)
+    print(f'synth eval: generating {n} held-out documents -> {path}', flush=True)
+    torch.manual_seed(SYNTH_EVAL_SEED)
+    corpus = SyntheticCorpus(teacher, SYNTH_EVAL_BATCH, temp, topk, topp, lo, hi, device,
+                             seed=SYNTH_EVAL_SEED, rep_penalty=rep)
+    tmp = path + '.tmp'
+    with open(tmp, 'w') as f:
+        for i in range(n):
+            f.write(json.dumps({'text': next(corpus)['text']}) + '\n')
+            if (i + 1) % 100 == 0:
+                print(f'  synth eval: {i+1}/{n}', flush=True)
+    os.replace(tmp, path)              # atomic: a killed run must not leave a partial set
+    # Release the eval teacher immediately. In a TRAINING process the corpus teacher is still
+    # loaded and about to be used again, so leaving a second copy of the model plus its KV
+    # cache in the allocator costs headroom for the whole run, not just this call.
+    del corpus
+    try:
+        torch.cuda.empty_cache()
+    except Exception:
+        pass
+    return path
+
+
+def _corpus_text(name, example):
+    """The training text of one raw example, after any per-corpus filter/render.
+
+    ONE definition, used by both the training worker and the held-out eval builder. They
+    used to derive it separately, which meant cosmo's eval set was drawn from the whole
+    corpus while training saw only the audience-filtered subset -- scoring a distribution
+    the model was never trained on."""
+    fmt = _TEXT_FORMAT.get(name)
+    if fmt is not None:
+        return fmt(example) or ''
+    col = _TEXT_DATASETS[name][3] if name in _TEXT_DATASETS else 'text'
+    return example.get(col, example.get('text', '')) or ''
+
+
 def _init_one_dataset(name, streaming, shards=None):
     from datasets import load_dataset
+    if name in _HUB_SUBSET:
+        files = _hub_subset_files(name)
+        if not files:
+            raise SystemExit(f'{name}: no downloaded parquet files found under HF_HOME for '
+                             f'{_HUB_SUBSET[name][0]} [{_HUB_SUBSET[name][1]}]. Fetch a '
+                             f'subset first -- this repo is too large to resolve on demand.')
+        if shards:
+            files = files[:shards]
+        print(f'{name}: {len(files)} local parquet file(s) from the hub cache', flush=True)
+        return load_dataset('parquet', data_files={'train': files}, streaming=streaming)
+    if name == 'synth':
+        return SyntheticCorpus(args.teacher, args.teacher_batch, args.teacher_temp,
+                               args.teacher_topk, args.teacher_topp, args.synth_min,
+                               args.synth_max, args.teacher_device or args.device,
+                               seed=args.seed, rep_penalty=args.teacher_rep_penalty)
+    if name == 'bdict':
+        # one document per LINE. datasets' 'text' builder with the default sample_by='line'
+        # is exactly that, so the rest of the pipeline (shuffle, epoch wrap, _corpus_text)
+        # is identical to a hub corpus and nothing downstream needs to know the difference.
+        path = args.bdict_file
+        if not os.path.exists(path):
+            raise SystemExit(f'bdict: no such file: {path} (set --bdict_file)')
+        if args.bdict_split:
+            # built in memory rather than by load_dataset('text'): the split is one row to
+            # MANY documents, which the line-oriented builder cannot express. The corpus is
+            # ~300 KB, so materializing it costs nothing and the epoch counter then reports
+            # passes over SENTENCES, which is what the run is actually measured in.
+            from datasets import Dataset, DatasetDict
+            sents = []
+            for line in open(path):
+                line = line.strip()
+                if not line:
+                    continue
+                body = line.split(':', 1)[1] if ':' in line else line
+                sents.extend(_split_sentences(body.strip()))
+            print(f'bdict: {path} -> {len(sents)} sentence examples '
+                  f'(--bdict_split, key stripped)', flush=True)
+            return DatasetDict({'train': Dataset.from_dict({'text': sents})})
+        print(f'bdict: {path} ({sum(1 for _ in open(path))} lines)', flush=True)
+        return load_dataset('text', data_files={'train': path}, streaming=streaming)
     if name not in _TEXT_DATASETS:
         raise ValueError(f'unknown dataset: {name}')
     hf, cfg, _, _ = _TEXT_DATASETS[name]
@@ -1852,11 +2373,40 @@ def _init_one_dataset(name, streaming, shards=None):
             time.sleep(300)
 
 
+# Below this on-disk size a corpus is shuffled by TRUE PERMUTATION rather than by a
+# sliding buffer: it fits in page cache, so the read-amplification argument in _make_iter
+# does not apply. 1 GiB covers wdef (~70MB) with room to spare and excludes every web-scale
+# corpus here by three orders of magnitude.
+_EXACT_SHUFFLE_BYTES = 1 << 30
+
+
 def _make_iter(ds, split, streaming, seed, buffer_size=10000):
+    # a SyntheticCorpus is already an infinite iid stream: there is no split to select and
+    # nothing a shuffle buffer could reorder that is not already random.
+    if isinstance(ds, SyntheticCorpus):
+        return iter(ds)
     split_ds = ds[split] if split in ds else ds['train']
     if streaming:
         return iter(split_ds.shuffle(buffer_size=buffer_size, seed=seed))
-    return iter(split_ds.shuffle(seed=seed))
+    # SMALL corpus: a true permutation. The amplification disaster described below is a
+    # property of random access into a 45.7GB arrow file, not of Dataset.shuffle() itself --
+    # a corpus that fits in page cache pays nothing for it. This matters specifically for a
+    # CLOSED corpus that is REPEATED (wdef): under a 10k-row buffer an entry's neighbours are
+    # largely the same on every pass, so each epoch would re-present the same local orderings
+    # and any "memorization" could be an artifact of that correlation. A full permutation
+    # makes each epoch an independent ordering, which is what --seed + epoch is for.
+    _bytes = getattr(split_ds, 'dataset_size', None)
+    if _bytes is not None and _bytes <= _EXACT_SHUFFLE_BYTES:
+        return iter(split_ds.shuffle(seed=seed))
+    # NON-STREAMING: never Dataset.shuffle() here. It builds a permutation and iteration
+    # then becomes RANDOM ACCESS across the whole arrow file. Measured on fineweb-edu
+    # (45.7GB local): 164MB of logical reads pulled 73GB off disk -- 445x amplification --
+    # at 10MB/s, and the trainer produced ZERO steps in nine minutes while looking healthy
+    # (process running, GPU allocated, no error).
+    # to_iterable_dataset() reads the shards SEQUENTIALLY and shuffles inside a buffer, the
+    # same approximate shuffle the streaming path uses, at disk-friendly access patterns.
+    it = split_ds.to_iterable_dataset(num_shards=64)
+    return iter(it.shuffle(buffer_size=buffer_size, seed=seed))
 
 
 # ── worker ─────────────────────────────────────────────────────────────────────
@@ -1897,6 +2447,7 @@ def worker(stop, q, datasets, args, mix=None):
         _iters[n]  = _make_iter(datasets[n], _split_for_name(n), args.streaming, args.seed)
         _locks[n]  = threading.Lock()   # HF streaming iterator is not thread-safe
         _epochs[n] = [1]
+        _epoch_set(n, 1)
 
     def _next_example(name):
         """Thread-safe pull of the next raw example for one dataset (loops on exhaustion)."""
@@ -1905,18 +2456,33 @@ def worker(stop, q, datasets, args, mix=None):
                 return next(_iters[name])
             except StopIteration:
                 _epochs[name][0] += 1
+                # For a finite corpus that is deliberately repeated (wdef) the epoch boundary
+                # is a real landmark: it is where documents start being seen for the Nth time,
+                # and memorization should appear as a loss step at exactly these positions.
+                # Written to args.log, not just stdout, so it interleaves with the STEP lines
+                # in log/exp.$M instead of landing only in the buffered .out.
+                _epoch_set(name, _epochs[name][0])
+                # stdout only. The epoch is a COLUMN on every STEP line now, so a
+                # standalone line in the main log would duplicate it and break the
+                # one-row-per-step shape chart.py reads. This still lands in log/exp.$M.out,
+                # which is where the reshuffle seed stays recoverable.
+                print(f'EPOCH {name} -> {_epochs[name][0]} '
+                      f'(reshuffle seed {args.seed + _epochs[name][0]})', flush=True)
                 _iters[name] = _make_iter(datasets[name], _split_for_name(name),
                                           args.streaming, args.seed + _epochs[name][0])
                 return next(_iters[name])
 
     def _build_clip(name, example):
-        fmt = _TEXT_FORMAT.get(name)
-        if fmt is not None:
-            text = fmt(example)
-            # '' means the example was unusable -> empty steps, so the builder skips it
-            return clip_text(text) if text else ([], '')
-        col = _TEXT_DATASETS[name][3]
-        return clip_text(example.get(col, example.get('text', '')))
+        text = _corpus_text(name, example)
+        # '' means the example was filtered or unusable -> empty steps, builder skips it.
+        # The hash check must come AFTER the _TEXT_FORMAT branch and apply to BOTH: a
+        # corpus with a formatter (cosmo) is still hash-split, and returning early here
+        # would train on exactly the documents the eval holds out.
+        if not text:
+            return ([], '')
+        if name in _HASH_HOLDOUT and _is_heldout(text):
+            return ([], '')
+        return clip_text(text)
 
     slots = [_ClipSlot() for _ in range(args.batch)]
 
@@ -2103,10 +2669,33 @@ if args.unfreeze:
     model.set_pretrained_trainable(True)
 
 
-def _prompt_ids():
-    """--prompt as token ids, with START prepended: the same [START] text framing every
-    training clip opens with, so a sample always starts at a document boundary."""
-    return [_tokenizer.start_id] + (_tokenizer.encode(args.prompt) if args.prompt else [])
+def _prompt_ids(text=None):
+    """A prompt as token ids, with START prepended: the same [START] text framing every
+    training clip opens with, so a sample always starts at a document boundary.
+
+    text=None means --prompt (the original behaviour, unchanged for every existing caller);
+    the periodic GEN block passes each entry of _gen_prompt_list() explicitly."""
+    t = args.prompt if text is None else text
+    return [_tokenizer.start_id] + (_tokenizer.encode(t) if t else [])
+
+
+def _gen_prompt_list():
+    """Prompts for the periodic GEN sample: the NULL prompt first, then --prompt, then
+    --gen_prompts, de-duplicated in that order.
+
+    The null prompt is unconditional and first because it is exactly what every run before
+    2026-08-28 sampled (--prompt defaults to '', so _prompt_ids() was already [START] alone).
+    An invocation that adds reference prompts therefore gets them as EXTRA lines and its
+    free-running sample is unchanged -- no run loses the measurement that has overturned the
+    scalar reading more than once."""
+    out = ['']
+    if args.prompt:
+        out.append(args.prompt)
+    for p in (args.gen_prompts or '').split(','):
+        p = p.strip()
+        if p and p not in out:
+            out.append(p)
+    return out
 
 
 _dff_shape = (1, args.n_hidden, args.context, args.context)
@@ -2255,18 +2844,22 @@ if args.push:
 
 # ── eval ──────────────────────────────────────────────────────────────────────
 
-def _eval_source():
-    """(repo, config, split, column) for --eval, with --split/--column overriding."""
-    if args.dataset in _TEXT_DATASETS:
-        hf, cfg, split, col = _TEXT_DATASETS[args.dataset]
-        held = _EVAL_SPLITS.get(args.dataset, split)
+def _eval_source(name=None):
+    """(repo, config, split, column) for --eval, with --split/--column overriding.
+
+    `name` defaults to --dataset. It is passed explicitly by --eval_corpora, which scores a
+    run against held-out sets it was NOT trained on -- the transfer measurement."""
+    name = name or args.dataset
+    if name in _TEXT_DATASETS:
+        hf, cfg, split, col = _TEXT_DATASETS[name]
+        held = _EVAL_SPLITS.get(name, split)
         # a triple redirects to a held-out set in another repo (see _EVAL_SPLITS)
         if isinstance(held, tuple):
             hf, cfg, split = held
         else:
             split = held
     else:                                    # not a short name: take it as a hub repo id
-        hf, cfg, split, col = args.dataset, None, 'validation', 'text'
+        hf, cfg, split, col = name, None, 'validation', 'text'
     return hf, cfg, (args.split or split), (args.column or col or 'text')
 
 
@@ -2279,7 +2872,10 @@ def _batched(it, n):
         yield chunk
 
 
-if args.eval:
+if args.eval and not args.eval_corpora:
+    # One-shot validation loss over a WHOLE split, token-weighted. --eval_corpora instead
+    # runs the exp/score.py protocol (fixed 400-doc sample, clean/median/runaway) further
+    # down, which is the number that compares to a training run's EVAL lines.
     # One-shot validation loss. Every document is an independent batch row: its own fresh
     # DFF state, framed by clip_text() exactly as the training loop frames a clip, and every
     # step scored. Rows in a batch have different lengths, so short ones are padded out and
@@ -2772,10 +3368,18 @@ elif _start_step:
 
 stop  = threading.Event()
 q     = queue.Queue(maxsize=args.batch)
-w     = threading.Thread(target=worker,
-                          args=[stop, q, hf_dataset, args, _mix],
-                          daemon=False)
-w.start()
+# One-shot modes set hf_dataset = None, and the worker immediately subscripts it. Before
+# --eval_corpora existed the legacy --eval block exited above this line so it never ran;
+# now it does, and the worker died in its thread with a TypeError traceback while the eval
+# printed correct results around it. Harmless but indistinguishable from a real failure in
+# a log, which is exactly the kind of thing that gets chased for an hour later.
+if hf_dataset is None:
+    w = None
+else:
+    w = threading.Thread(target=worker,
+                         args=[stop, q, hf_dataset, args, _mix],
+                         daemon=False)
+    w.start()
 
 # ── helpers ───────────────────────────────────────────────────────────────────
 
@@ -2827,22 +3431,94 @@ def _diag(model):
 # series a walk over documents as much as over training, which is exactly the confound
 # that makes an eval curve unreadable.
 
-_eval_docs_cache = None      # [[(x, y), ...], ...] the held-out clips, built on first use
-_eval_disabled   = False     # set if building or scoring ever fails: warn once, keep training
+_eval_docs_cache = {}        # corpus -> [[(x, y), ...], ...], built once per corpus
+_eval_results    = {}        # corpus -> last scored result, for the --eval_corpora table
+_eval_failed     = {}        # corpus -> True once it has raised; per corpus, not global
+_reason_cache    = {}        # benchmark -> items, built once
+_reason_failed   = {}        # benchmark -> True once it has raised
 
 
-def _build_eval_docs():
-    """First --eval_docs held-out documents, framed as training clips. See _EVAL_MINLEN."""
+def _eval_corpus_names():
+    """Held-out sets to score, in order. --eval_corpora overrides; default is the training
+    corpus alone, which is what every run before --eval_corpora existed did."""
+    if args.eval_corpora:
+        return [c.strip() for c in args.eval_corpora.split(',') if c.strip()]
+    return [args.dataset]
+
+
+def _build_eval_docs(corpus=None):
+    """First --eval_docs held-out documents of `corpus`, framed as training clips."""
     from datasets import load_dataset
-    hf, cfg, split, col = _eval_source()
-    if args.dataset not in _EVAL_SPLITS and not args.split:
-        print(f'WARNING: --eval_interval: no held-out split configured for "{args.dataset}"; '
-              f'scoring "{split}", which the model is TRAINING on -- that is a training '
-              f'loss, not a validation loss')
-    print(f'eval set: loading {hf}' + (f' [{cfg}]' if cfg else '') + f' split {split} ...',
-          flush=True)
-    rows = load_dataset(hf, cfg, split=split, streaming=args.streaming)
-    _fmt = _TEXT_FORMAT.get(args.dataset)
+    corpus = corpus or args.dataset
+    if corpus == 'synth':
+        path = ensure_synth_eval(args.teacher, args.synth_eval_docs, args.synth_min,
+                                 args.synth_max, args.teacher_batch, args.teacher_temp,
+                                 args.teacher_topk, args.teacher_topp,
+                                 args.teacher_device or args.device,
+                                 args.teacher_rep_penalty)
+        print(f'eval set: loading cached synthetic held-out {path}', flush=True)
+        rows = load_dataset('json', data_files={'train': path}, split='train')
+        docs = []
+        for ex in rows:
+            steps, _ = clip_text(ex.get('text') or '')
+            if len(steps) >= _EVAL_MINLEN:
+                docs.append(steps[:_EVAL_MAXLEN])
+            if len(docs) >= args.eval_docs:
+                break
+        docs.sort(key=len)
+        print(f'eval set: {len(docs)} documents, {sum(len(d) for d in docs)} tokens',
+              flush=True)
+        return docs
+    hf, cfg, split, col = _eval_source(corpus)
+    if corpus in _HASH_HOLDOUT:
+        # scan the TRAIN stream and keep only the hashed-out documents -- the complement of
+        # what _build_clip feeds the model. Streaming is fine here: the sample is small.
+        print(f'eval set: {corpus} hashed hold-out (1/{_HOLDOUT_MOD} of {hf}'
+              + (f' [{cfg}]' if cfg else '') + ') ...', flush=True)
+        if corpus in _HUB_SUBSET:
+            # must NOT go through load_dataset(repo, cfg): finephrase has 27k files and
+            # resolving them takes longer than the eval itself. Use the same local subset
+            # the trainer reads, so the hold-out is the complement of what training sees.
+            _f = _hub_subset_files(corpus)
+            rows = load_dataset('parquet', data_files={'train': _f}, split='train',
+                                streaming=args.streaming)
+        else:
+            rows = load_dataset(hf, cfg, split=split, streaming=args.streaming)
+        docs, seen = [], 0
+        for ex in rows:
+            seen += 1
+            t = _corpus_text(corpus, ex)          # same filter training applies
+            if not t.strip() or not _is_heldout(t):
+                continue
+            steps, _ = clip_text(t)
+            if len(steps) >= _EVAL_MINLEN:
+                docs.append(steps[:_EVAL_MAXLEN])
+            if len(docs) >= args.eval_docs:
+                break
+        docs.sort(key=len)
+        print(f'eval set: {len(docs)} documents, {sum(len(d) for d in docs)} tokens '
+              f'(scanned {seen})', flush=True)
+        return docs
+    if corpus not in _EVAL_SPLITS and not args.split:
+        print(f'WARNING: --eval_interval: no held-out split configured for "{corpus}"; '
+              f'scoring "{split}"'
+              + (' , which the model is TRAINING on -- that is a training loss, not a '
+                 'validation loss' if corpus == args.dataset else ''))
+    # A SLICED split ("train[-3000:]") cannot be streamed -- datasets rejects it with
+    # "Bad split". web has no validation split and its held-out IS that slice, so streaming
+    # is forced off for it regardless of --streaming. It is a download, but it is the same
+    # tail exp/score.py uses and therefore the only web number comparable to PLAN.txt.
+    _stream = args.streaming and '[' not in split
+    print(f'eval set: loading {hf}' + (f' [{cfg}]' if cfg else '') + f' split {split}'
+          + ('' if _stream else ' (non-streaming)') + ' ...', flush=True)
+    rows = load_dataset(hf, cfg, split=split, streaming=_stream)
+    # keyed on CORPUS, not args.dataset: this builder serves --eval_corpora, which scores
+    # corpora the run is NOT training on. Keying it on the training set applied that set's
+    # renderer to another corpus's rows -- _fmt_finephrase looking for 'rollout_results' in
+    # a pile row -- so every row rendered '' and the corpus was dropped with "0 documents".
+    # Cost the pile column of an entire 1B-token run. The hashed path above never had this
+    # bug; it has always gone through _corpus_text(corpus, ex).
+    _fmt = _TEXT_FORMAT.get(corpus)
     docs = []
     for ex in rows:
         text = (_fmt(ex) if _fmt is not None else ex.get(col, ex.get('text', ''))) or ''
@@ -2862,18 +3538,26 @@ def _build_eval_docs():
 
 
 def _heldout_eval(step):
-    """Score the cached held-out set and print/log one EVAL line. Never raises: an eval
-    failure must not take down a training run that is otherwise healthy."""
-    global _eval_docs_cache, _eval_disabled
-    if _eval_disabled:
+    """Score every --eval_corpora held-out set, one tagged EVAL line each. Never raises:
+    an eval failure must not take down a training run that is otherwise healthy."""
+    for corpus in _eval_corpus_names():
+        _heldout_eval_one(step, corpus)
+
+
+def _heldout_eval_one(step, corpus):
+    # Failure is tracked PER CORPUS. A global disable made one bad corpus silently cancel
+    # every later one in the same call: web raised on a sliced split and c4 -- which is
+    # fine -- was never scored at all, reported as "failed" in the table.
+    if _eval_failed.get(corpus):
         return
     try:
-        if _eval_docs_cache is None:
-            _eval_docs_cache = _build_eval_docs()
-        docs = _eval_docs_cache
+        if corpus not in _eval_docs_cache:
+            _eval_docs_cache[corpus] = _build_eval_docs(corpus)
+        docs = _eval_docs_cache[corpus]
         if not docs:
-            print('WARNING: --eval_interval: no usable held-out documents; disabling')
-            _eval_disabled = True
+            print(f'WARNING: --eval_interval: no usable held-out documents for "{corpus}"; '
+                  f'skipping it')
+            _eval_docs_cache[corpus] = []
             return
 
         _dev = next(model.parameters()).device
@@ -2937,19 +3621,213 @@ def _heldout_eval(step):
         per = np.concatenate(per_doc)
         bad = np.concatenate(bad_doc)
         clean = float(per[~bad].mean()) if (~bad).any() else float('nan')
+        _eval_results[corpus] = dict(
+            corpus=corpus, step=int(step), clean=clean, median=float(np.median(per)),
+            ppl=float(math.exp(min(clean, 700))) if clean == clean else None,
+            runaway_pct=100.0 * float(bad.mean()), nrun=int(bad.sum()), docs=int(len(per)),
+            tokens=int(sum(len(d) for d in docs)))
         # clean/median/runaway, not a mean: three runaway documents out of 400 move a plain
         # mean by nine orders of magnitude and report a healthy model as destroyed.
-        d = ('EVAL step {:10} clean {:11.6f} ppl {:12.4f} median {:11.6f} '
+        # the corpus tag is not decoration: with --eval_corpora these lines interleave, and
+        # a fit number and a transfer number are not comparable to each other.
+        d = ('EVAL step {:10} corpus {:8} clean {:11.6f} ppl {:12.4f} median {:11.6f} '
              'runaway {:6.2f}% nrun {:4d} docs {:5d} wall {:7.1f}s'
-             ).format(step, clean, math.exp(min(clean, 700)) if clean == clean else float('nan'),
+             ).format(step, corpus, clean,
+                      math.exp(min(clean, 700)) if clean == clean else float('nan'),
                       float(np.median(per)), 100.0 * float(bad.mean()), int(bad.sum()),
                       len(per), time.time() - t0)
         print(d, flush=True)
         with open(args.log, 'a') as f:
             print(d, file=f)
     except Exception as e:
-        print(f'WARNING: --eval_interval failed at step {step}: {e!r}; disabling', flush=True)
-        _eval_disabled = True
+        print(f'WARNING: --eval_interval failed at step {step} on "{corpus}": {e!r}; '
+              f'disabling THAT CORPUS, others continue', flush=True)
+        _eval_failed[corpus] = True
+
+
+# ── zero-shot multiple-choice reasoning eval (--reason_eval) ──────────────────
+# Held-out LOSS cannot measure the thing this project now wants. If the goal is a model
+# that REASONS and looks obscure facts up, then loss on a factual corpus actively rewards
+# the opposite: a model that memorised Wikipedia scores better than one that reasons. So
+# reasoning needs its own metric, scored the standard zero-shot way.
+#
+# Each item is a context plus N candidate continuations. Every candidate is scored by the
+# summed log-probability of its tokens given the context, and the argmax is the answer.
+#   acc       argmax of the TOTAL log-probability
+#   acc_norm  argmax of the PER-TOKEN mean -- the headline, because it does not penalise
+#             long candidates. Chance is 1/N: 25% for the 4-way sets, 50% for winogrande.
+#
+# winogrande is the purest test of the hypothesis: resolving "Sarah was a better surgeon
+# than Maria so _ got the easier cases" needs plausibility judgement and no retrievable
+# fact. arc_easy/obqa are grade-school SCIENCE and do lean on knowledge, so a low score
+# there is ambiguous -- it may mean the model cannot reason, or simply does not know.
+_REASON_BENCH = {
+    'arc_easy':   ('allenai/ai2_arc', 'ARC-Easy', 'validation'),
+    'arc_chal':   ('allenai/ai2_arc', 'ARC-Challenge', 'validation'),
+    'obqa':       ('allenai/openbookqa', 'main', 'validation'),
+    'winogrande': ('allenai/winogrande', 'winogrande_xs', 'validation'),
+}
+
+
+def _mc_items(bench, limit=0):
+    """-> [(context, [candidate, ...], gold_index)]. One shape for every benchmark."""
+    from datasets import load_dataset
+    repo, cfg, split = _REASON_BENCH[bench]
+    rows = load_dataset(repo, cfg, split=split)
+    out = []
+    for ex in rows:
+        if bench == 'winogrande':
+            # Standard partial evaluation: substitute the option into the blank and score
+            # the text AFTER it. Scoring the whole sentence would compare candidates that
+            # differ only in a shared prefix, which measures the option's unigram frequency
+            # more than the resolution.
+            sent = ex['sentence']
+            if '_' not in sent:
+                continue
+            pre, post = sent.split('_', 1)
+            cands = [pre + ex['option1'], pre + ex['option2']]
+            # context differs per candidate here, so carry the pair and score `post`
+            out.append((cands, [post, post], int(ex['answer']) - 1))
+        else:
+            q = ex.get('question') or ex.get('question_stem') or ''
+            ch = ex['choices']
+            texts, labels = ch['text'], ch['label']
+            key = ex['answerKey']
+            if key not in labels:
+                continue
+            out.append((q, [' ' + t for t in texts], labels.index(key)))
+        if limit and len(out) >= limit:
+            break
+    return out
+
+
+def _reason_eval(step):
+    """Score every --reason_eval benchmark and log one MC line each. Never raises."""
+    for bench in [b.strip() for b in (args.reason_eval or '').split(',') if b.strip()]:
+        if _reason_failed.get(bench):
+            continue
+        try:
+            if bench not in _reason_cache:
+                _reason_cache[bench] = _mc_items(bench, args.reason_docs)
+            items = _reason_cache[bench]
+            _dev = next(model.parameters()).device
+            was = model.training
+            _saved_dff, _saved_clk = model.dff, model.clk
+            model.eval()
+            t0 = time.time()
+            try:
+                rows, owner = [], []
+                for qi, (ctx, cands, gold) in enumerate(items):
+                    for ci, cand in enumerate(cands):
+                        c = ctx[ci] if isinstance(ctx, list) else ctx
+                        cid = [_tokenizer.start_id] + _tokenizer.encode(c)
+                        aid = _tokenizer.encode(cand)
+                        if not aid:
+                            aid = [_tokenizer.end_id]
+                        rows.append((cid, aid))
+                        owner.append((qi, ci))
+                tot = np.zeros(len(rows)); cnt = np.zeros(len(rows))
+                with torch.no_grad():
+                    for s0 in range(0, len(rows), _EVAL_BATCH):
+                        chunk = rows[s0:s0 + _EVAL_BATCH]
+                        B = len(chunk)
+                        T = max(len(c) + len(a) for c, a in chunk)
+                        X = torch.zeros((B, T), dtype=torch.long)
+                        Y = torch.zeros((B, T), dtype=torch.long)
+                        M = torch.zeros((B, T), dtype=torch.bool)
+                        for r, (c, a) in enumerate(chunk):
+                            seq = c + a
+                            X[r, :len(seq) - 1] = torch.tensor(seq[:-1])
+                            Y[r, :len(seq) - 1] = torch.tensor(seq[1:])
+                            # score ONLY the candidate's own tokens
+                            M[r, len(c) - 1:len(seq) - 1] = True
+                        X, Y, M = X.to(_dev), Y.to(_dev), M.to(_dev)
+                        model.dff = None
+                        acc = torch.zeros(B, device=_dev)
+                        for t in range(T):
+                            lg, _ = model(X[:, t])
+                            lp = -F.cross_entropy(lg, Y[:, t], reduction='none')
+                            lp = torch.where(torch.isfinite(lp), lp, torch.full_like(lp, -1e30))
+                            acc += lp * M[:, t]
+                        tot[s0:s0 + B] = acc.cpu().numpy()
+                        cnt[s0:s0 + B] = M.sum(dim=1).clamp(min=1).cpu().numpy()
+            finally:
+                model.dff, model.clk = _saved_dff, _saved_clk
+                if was:
+                    model.train()
+            nq = len(items)
+            best_t = [None] * nq; best_n = [None] * nq
+            for i, (qi, ci) in enumerate(owner):
+                if best_t[qi] is None or tot[i] > best_t[qi][1]:
+                    best_t[qi] = (ci, tot[i])
+                nrm = tot[i] / cnt[i]
+                if best_n[qi] is None or nrm > best_n[qi][1]:
+                    best_n[qi] = (ci, nrm)
+            golds = [g for _, _, g in items]
+            a1 = float(np.mean([best_t[i][0] == golds[i] for i in range(nq)]))
+            a2 = float(np.mean([best_n[i][0] == golds[i] for i in range(nq)]))
+            nch = len(items[0][1])
+            d = ('MC   step {:10} bench {:11} acc {:6.4f} acc_norm {:6.4f} '
+                 'chance {:6.4f} n {:5d} wall {:6.1f}s'
+                 ).format(step, bench, a1, a2, 1.0 / max(nch, 1), nq, time.time() - t0)
+            print(d, flush=True)
+            with open(args.log, 'a') as f:
+                print(d, file=f)
+        except Exception as e:
+            print(f'WARNING: --reason_eval "{bench}" failed at step {step}: {e!r}; '
+                  f'disabling that benchmark', flush=True)
+            _reason_failed[bench] = True
+
+
+# ── one-shot protocol eval (--eval --eval_corpora) ────────────────────────────
+# Offline scoring of a checkpoint against any number of held-out sets, using EXACTLY the
+# measurement the training loop writes as EVAL lines: the same 400-document sample, the same
+# clean/median/runaway definition, the same per-token runaway criterion exp/score.py uses.
+# That is the point -- a number produced here is directly comparable to a run's own EVAL
+# curve and to every other checkpoint scored this way, which the whole-split --eval is not
+# (it is token-weighted over a different, much larger set).
+#
+#   python vla.py --eval --load checkpoint/foo.pt --eval_corpora c4,pile,web --streaming
+#
+# Note on c4 for a gpt2-teacher run: GPT-2 was trained on WebText, NOT on C4 (C4 is T5's
+# corpus). The open replication of WebText is Skylion007/openwebtext == --dataset web, so
+# `web` is the closer probe of what a gpt2 teacher's text resembles; c4 is a second,
+# independent crawl-derived corpus and is useful precisely because it is NOT that.
+if args.eval and args.eval_corpora:
+    if args.load is None and args.pretrained is None:
+        print('WARNING: --eval without --load/--pretrained is measuring an untrained model')
+    print(f'protocol eval: {args.eval_docs} docs, minlen {_EVAL_MINLEN}, maxlen '
+          f'{_EVAL_MAXLEN}, runaway >{_EVAL_THRESH} nats on ANY token', flush=True)
+    _heldout_eval(_start_step)
+    if args.reason_eval:
+        _reason_eval(_start_step)
+
+    _ck = args.load or args.pretrained or '(untrained)'
+    print(f'\n{"="*86}\nPROTOCOL EVAL  {_ck}  step {_start_step}\n{"="*86}')
+    print(f'{"corpus":10} {"clean":>10} {"ppl":>11} {"median":>10} {"runaway%":>9} '
+          f'{"nrun":>5} {"docs":>6} {"tokens":>9}')
+    print('-' * 86)
+    for _c in _eval_corpus_names():
+        r = _eval_results.get(_c)
+        if r is None:
+            print(f'{_c:10} {"(failed or empty -- see WARNING above)":>50}')
+            continue
+        print(f'{r["corpus"]:10} {r["clean"]:10.4f} {r["ppl"]:11.2f} {r["median"]:10.4f} '
+              f'{r["runaway_pct"]:9.2f} {r["nrun"]:5d} {r["docs"]:6d} {r["tokens"]:9d}')
+    print('-' * 86)
+    # Corpora are NOT comparable to each other: each has its own information floor (pile
+    # unigram 7.9470 vs web 7.5732), so a lower number on one corpus does not mean the model
+    # is better there. Compare a corpus against ITSELF across checkpoints.
+    print('note: compare a corpus across checkpoints, never across corpora -- each has its'
+          '\n      own floor (pile unigram 7.9470, web 7.5732; pile bigram 6.3511, web 5.8279)')
+    if args.eval_json:
+        with open(args.eval_json, 'w') as _f:
+            json.dump({'checkpoint': _ck, 'step': int(_start_step),
+                       'eval_docs': args.eval_docs, 'minlen': _EVAL_MINLEN,
+                       'maxlen': _EVAL_MAXLEN, 'thresh': _EVAL_THRESH,
+                       'results': _eval_results}, _f, indent=1)
+        print(f'wrote {args.eval_json}')
+    raise SystemExit(0)
 
 
 # ── training loop ─────────────────────────────────────────────────────────────
@@ -3029,6 +3907,9 @@ try:
             _te, _tt, _ = _text_drain()      # sample is read separately, see _text_peek
             if _te:
                 d = f'TEXT step {i:10} examples {_te} tokens {_tt}'
+                _ep = _epoch_report()          # passes over the corpus; the clock of a
+                if _ep:                        # closed-corpus run, 'wdef=1' until it wraps
+                    d += f' epoch {_ep}'
                 print(d)
                 with open(args.log, 'a') as f:
                     print(d, file=f)
@@ -3043,6 +3924,8 @@ try:
         # at every start with nothing in the log moving.
         if args.eval_interval and i > 0 and (i % args.eval_interval) == 0:
             _heldout_eval(i)
+            if args.reason_eval:
+                _reason_eval(i)
 
         # ── generation sample ─────────────────────────────────────────────────
         # own interval: text has repeatedly overturned what the scalars said (a model called
@@ -3050,13 +3933,17 @@ try:
         # 200 tokens is cheap next to writing 30M parameters to disk.
         if (i % _gen_interval) == 0:
             model.eval()
-            prompt = _prompt_ids()
-            out    = model.generate(prompt, _GEN_SAMPLE, temperature=args.temperature)
-            gen_text = _render(prompt + out)
-            lines = [f'GEN step {i:10}: {gen_text}']
+            # generate() runs on a LOCAL dff/clock (see Model.generate), so sampling several
+            # prompts here cannot perturb the training state -- only cost time, and a batch-1
+            # 200-token sample is trivial next to --gen_interval training steps.
+            lines = []
+            for _p in _gen_prompt_list():
+                prompt = _prompt_ids(_p)
+                out    = model.generate(prompt, _GEN_SAMPLE, temperature=args.temperature)
+                lines.append(f'GEN step {i:10} [{_p or "<STX>"}]: {_render(prompt + out)}')
             _tsample = _text_peek()            # a recent training-text example
             if _tsample:
-                lines.append(f'TXT-SAMPLE: {_printable(_tsample[:120])}')
+                lines.append(f'TXT-SAMPLE: {_printable(_tsample[:240])}')
             print('\n' + '\n'.join(lines) + '\n')
             with open(args.log, 'a') as f:
                 print('\n' + '\n'.join(lines) + '\n', file=f)
@@ -3123,12 +4010,12 @@ try:
             # batch size that produced each point (loss/grad both scale with it).
             s = ('STEP {:10} wall {} loss {:12.9f} grad {:12.6f} '
                  'lr {:10.9f} dff_mean {:12.5f} dff_std {:12.5f} dff_max {:11.3f} '
-                 'dff_zeros {:8.5f} batch {:6d} examples {:12d}').format(
+                 'dff_zeros {:8.5f} batch {:6d} examples {:12d} epoch {:6d}').format(
                 i, datetime.datetime.now(),
                 np.mean(larr[-args.monitor:]),
                 np.mean(garr[-args.monitor:]),
                 optimizer.param_groups[0]['lr'],
-                _dmean, _dstd, _dmax, _dzero, args.batch, n_examples,
+                _dmean, _dstd, _dmax, _dzero, args.batch, n_examples, _epoch_num(),
             )
             # appended only when clipping is on, so logs from non-clip runs stay byte-identical
             # (chart.py looks fields up by name and defaults a missing one to 0.0)
@@ -3161,7 +4048,8 @@ print('\nSTOPPING THREADS')
 stop.set()
 while not q.empty():
     q.get()
-w.join()
+if w is not None:            # one-shot modes never started a worker (see above)
+    w.join()
 print('EXIT MAIN')
 
 # Hard-exit after our work is flushed. Streaming datasets keep native aiohttp
