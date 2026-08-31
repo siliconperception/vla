@@ -1,5 +1,6 @@
 #!/bin/bash
-# usage: longrun.sh <mnem> <total_steps> <max_restarts> [overrides for run.sh...]
+# usage: longrun.sh <mnem> [total_steps] [max_restarts] [overrides for run.sh...]
+#        total_steps defaults to 4,000,000 (1B tokens at batch 250), max_restarts to 20
 #
 # Supervises a run that is too long to babysit: relaunches it if the trainer dies, and
 # stops when the GLOBAL step count reaches <total_steps>.
@@ -22,9 +23,16 @@
 # trained on.  For a corpus the size of the Pile that is the desired behaviour.
 set -u
 cd /proj/devices/vla
+# 1B TOKENS = 4,000,000 steps at batch 250 is the STANDARD BUDGET for every experiment
+# (2026-08-31).  Both numbers are still positional, but a missing or non-numeric argument now
+# falls back to the standard rather than erroring, so `longrun.sh <mnem> -- <overrides>` and
+# `longrun.sh <mnem> 4000000 20 <overrides>` mean the same thing.
 M=$1; shift
-TOTAL=$1; shift
-MAXR=$1; shift
+TOTAL=4000000
+case "${1:-}" in ''|*[!0-9]*) ;; *) TOTAL=$1; shift ;; esac
+MAXR=20
+case "${1:-}" in ''|*[!0-9]*) ;; *) MAXR=$1; shift ;; esac
+[ "${1:-}" = "--" ] && shift
 
 STATE=log/longrun.$M.state
 echo "longrun: $M target $TOTAL steps, up to $MAXR restarts, $(date)" | tee -a $STATE

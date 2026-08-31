@@ -551,6 +551,26 @@ parser.add_argument('--qproj',         default='none', choices=_QPROJ_MODES,
                          'layer can transform what it remembers differently from what it is '
                          'being told. Adds parameters, so unlike --clock it cannot be toggled '
                          'on an existing checkpoint')
+parser.add_argument('--linout',        default=False, action='store_true',
+                    help='ONE pointwise 1x1 linear conv2d at the end of EACH layer, whose '
+                         'output is both what the DFF register stores and what the next layer '
+                         'receives. The DFF therefore holds a DENSE SIGNED tensor instead of '
+                         'the sparse non-negative ReLU output (~50%% exact zeros), which is '
+                         'the point: --accumulate averages the register and the next step adds '
+                         'it back, so a non-negative register can only ever accumulate, never '
+                         'cancel.\n'
+                         'This is NOT --tap. --tap ADDS a 1x1 in front of the 1x1 already on '
+                         'the upward path (deep_proj), leaving two in series with no '
+                         'nonlinearity between them -- which compose to one, so the second is '
+                         'redundant weight. --linout REPLACES deep_proj rather than preceding '
+                         'it: n_layers convs total instead of --tap\'s 2*n_layers-1, and the '
+                         'projection that makes the register dense is the same one that feeds '
+                         'the layer above. Mutually exclusive with --tap.\n'
+                         'Identity-initialized, so the register starts holding exactly the '
+                         'ReLU output and becomes signed as the weights move -- within a few '
+                         'steps in practice. Note step 0 is NOT identical to the baseline, '
+                         'unlike --tap: dropping deep_proj changes the upward path even at '
+                         'identity.')
 parser.add_argument('--tap',           default=False, action='store_true',
                     help='put two pointwise 1x1 linear conv2d projections in series after '
                          'each layer\'s last conv2d-BN-ReLU -- the tensor that normally feeds '
@@ -922,7 +942,7 @@ _mix = _parse_mix(args.mix)
 # ── restore architecture args from checkpoint ─────────────────────────────────
 
 _ARCH_ARGS = ('context', 'n_hidden', 'c_text', 'n_layers', 'depth', 'kernel',
-              'tokenizer', 'head_norm', 'clock', 'accumulate', 'ema', 'qproj', 'tap',
+              'tokenizer', 'head_norm', 'clock', 'accumulate', 'ema', 'qproj', 'tap', 'linout',
               'init', 'clock_base', 'clock_max', 'clock_ends', 'clip_dff', 'tap_norm', 'norm', 'norm_groups', 'dff_norm', 'bn_track', 'bn_affine',
                   'bn_momentum', 'bn_eps')
 
@@ -1402,6 +1422,26 @@ class VLAModel(nn.Module, _HubMixin):
         else:
             self.deep_context = self.deep_proj = None
 
+        # --linout: one 1x1 per layer, replacing deep_proj on the upward path. Identity-
+        # initialized so the register starts out holding the ReLU output exactly; the weights
+        # move off identity within a few steps and the register goes signed from then on.
+        # args.linout is restored from the checkpoint by _restore_arch on --load (it is in
+        # _ARCH_ARGS and deliberately NOT in _ARCH_OVERRIDE: it adds convolutions, so the
+        # checkpoint's value defines the weights and a command-line value must not win).
+        # getattr keeps checkpoints that predate the flag loadable -- they simply have no
+        # 'linout' key and fall back to False.
+        self.linout = None
+        if getattr(args, 'linout', False):
+            if getattr(args, 'tap', False):
+                raise SystemExit('--linout and --tap are mutually exclusive: both put a 1x1 '
+                                 'on the register path, and --tap also keeps deep_proj')
+            self.linout = nn.ModuleList(nn.Conv2d(n_hidden, n_hidden, 1)
+                                        for _ in range(self.n_layers))
+            for _c in self.linout:
+                nn.init.dirac_(_c.weight)
+                nn.init.zeros_(_c.bias)
+            self.deep_proj = None          # its job is done by linout now
+
         # --qproj: a 1x1 linear conv per layer on the DFF path, at that layer's own width
         # since it has to land on a tensor of the register's shape. Two placements,
         # applied between the register and the feedback add -- see _fb.
@@ -1673,12 +1713,23 @@ class VLAModel(nn.Module, _HubMixin):
         Returns (new_dff_list, last_layer_output [B, n_hidden, S, S]). No detach here — the
         caller detaches the returned list to bound the time horizon."""
         tok  = self.text_proj(tok_grid)        # [B, n_hidden, S, S], computed once
-        o    = self._tap(0, self.context(self._fb(0, dff[0]) + tok))
-        outs = [o]
-        for li in range(self.n_layers - 1):
-            x = self._fb(li + 1, dff[li + 1]) + self.deep_proj[li](o)
-            o = self._tap(li + 1, self.deep_context[li](x))
-            outs.append(o)
+        if self.linout is not None:
+            # ONE 1x1 per layer. `o` leaves the projection already dense and signed, and is
+            # both stored in the register and handed straight to the layer above -- there is
+            # no second projection on the way up, which is the whole difference from --tap.
+            o    = self.linout[0](self.context(self._fb(0, dff[0]) + tok))
+            outs = [o]
+            for li in range(self.n_layers - 1):
+                x = self._fb(li + 1, dff[li + 1]) + o
+                o = self.linout[li + 1](self.deep_context[li](x))
+                outs.append(o)
+        else:
+            o    = self._tap(0, self.context(self._fb(0, dff[0]) + tok))
+            outs = [o]
+            for li in range(self.n_layers - 1):
+                x = self._fb(li + 1, dff[li + 1]) + self.deep_proj[li](o)
+                o = self._tap(li + 1, self.deep_context[li](x))
+                outs.append(o)
         # --clock: a layer that does not write this step keeps the state it had, while still
         # passing the output it just computed up the stack -- so the decoder, which reads the
         # top layer's output, moves every step whatever the clock does.

@@ -1,5 +1,6 @@
 #!/bin/bash
-# usage: run.sh <mnemonic> <steps> <args overriding the baseline...>
+# usage: run.sh <mnemonic> [steps] <args overriding the baseline...>
+#        steps defaults to 4,000,000 = 1B tokens at batch 250
 # BASELINE = e30 config (3x17, bn_track ON).  7x7 was adopted at 12:45 and
 # REVERTED at 14:20: with tracking on it has a +1.66 nat TRAIN/EVAL GAP and
 # runs away in eval, while 3x17 has none.  Measured at 5K, same lr:
@@ -31,8 +32,12 @@
 #
 # To PAIR an experiment against an older run, pass --seed <that run's seed> explicitly.
 # p1_pile (Phase 2's first run) is deliberately seed 1, pairing it with e25_3x17 on web.
+# 1B tokens = 4,000,000 steps at batch 250 is the standard budget; a missing or non-numeric
+# step count falls back to it rather than erroring.
 M=$1; shift
-S=$1; shift
+S=4000000
+case "${1:-}" in ''|*[!0-9]*) ;; *) S=$1; shift ;; esac
+[ "${1:-}" = "--" ] && shift
 cd /proj/devices/vla
 mkdir -p checkpoint
 rm -f log/exp.$M
