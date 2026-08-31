@@ -599,6 +599,22 @@ parser.add_argument('--bdict_file',    default='basic_dict_e3.txt',
                          'and is a strict superset (same 848 words, same first 3 sentences '
                          'verbatim), so a pair of runs isolates "more text per item" from '
                          'every other variable.')
+parser.add_argument('--vocab_files',   default=None,
+                    help='comma-separated local files of ONE SENTENCE PER LINE that feed a '
+                         'BATCHWISE stream (see --vocab_slots). These are NOT framed: no '
+                         '<STX>/<ETX> is added and the slot never signals a document start, '
+                         'so the model state is never reset on those slots -- the sentences '
+                         'run head to tail as an unbroken stream. Files are weighted EQUALLY '
+                         'by slot, so two files split the vocab slots 50/50.')
+parser.add_argument('--vocab_slots',   default=0,     type=int,
+                    help='how many of the --batch slots the --vocab_files stream occupies. '
+                         'The REMAINING slots are filled the normal way from --dataset/--mix, '
+                         'with <STX>/<ETX> framing. Because every slot contributes exactly '
+                         'one token per step, the slot split IS the token split: '
+                         '--batch 250 --vocab_slots 225 is exactly 90%% vocab / 10%% corpus '
+                         'tokens, with no dependence on document lengths. That is the point '
+                         'of doing this batchwise rather than through --mix, whose '
+                         'token-proportional sampling only holds on average.')
 parser.add_argument('--bdict_split',   default=False, action='store_true',
                     help='--dataset bdict: drop the leading "word: " key and make EVERY '
                          'SENTENCE its own training example. basic_dict_e10.txt goes from '
@@ -2434,6 +2450,72 @@ class _ClipSlot:
         return item   # (x_byte, y_byte)
 
 
+# Sentences drawn per vocab file, so the epoch column can report passes over the FILE
+# rather than per-slot cycles. Touched only by the worker thread (the stepping loop), which
+# is single-threaded, so it needs no lock.
+_vocab_consumed = {}
+
+
+class _VocabSlot:
+    """One batch slot fed by an ENDLESS, UNDELIMITED stream of single sentences.
+
+    Differs from _ClipSlot in the two ways that matter:
+      * NO FRAMING. clip_text wraps every document in <STX>...<ETX>; here the raw sentence
+        tokens are concatenated head to tail, so the (x, y) pair that straddles a sentence
+        boundary is a real transition from one sentence's last token to the next sentence's
+        first. There is no delimiter for the model to key on.
+      * is_start() IS ALWAYS FALSE, so this slot never signals a document start and the
+        recurrent state is never reset on it. A corpus slot resets every <ETX>; this one
+        runs forever.
+    Each slot keeps its own shuffled permutation and reshuffles on wrap, so 225 slots are
+    225 independent orderings of the same file rather than 225 copies of one ordering."""
+    __slots__ = ['pool', 'name', 'rng', 'order', 'oi', 'ids', 'pos']
+
+    def __init__(self, pool, name, seed):
+        self.pool, self.name = pool, name
+        self.rng   = random.Random(seed)
+        self.order = list(range(len(pool)))
+        self.rng.shuffle(self.order)
+        self.oi, self.ids, self.pos = 0, [], 0
+
+    def _append_next(self):
+        if self.oi >= len(self.order):
+            self.oi = 0
+            self.rng.shuffle(self.order)
+        ids = self.pool[self.order[self.oi]]
+        self.oi += 1
+        self.ids.extend(ids)
+        _vocab_consumed[self.name] = _vocab_consumed.get(self.name, 0) + 1
+        _text_tally(len(ids))
+
+    def done(self):      return False       # never refilled from clip_q
+    def is_start(self):  return False       # never resets the state
+
+    def advance(self):
+        while self.pos + 1 >= len(self.ids):
+            self._append_next()
+        x, y = self.ids[self.pos], self.ids[self.pos + 1]
+        self.pos += 1
+        if self.pos > 8192:                 # drop the consumed prefix; keeps memory flat
+            self.ids = self.ids[self.pos:]
+            self.pos = 0
+        return (x, y)
+
+
+def _load_vocab_pools(paths):
+    """path -> list of token-id lists, one per line, NO framing tokens.
+
+    A trailing space is tokenized with each sentence so that concatenation reads as
+    'One sentence. Another sentence.' rather than running the words together."""
+    pools = {}
+    for i, path in enumerate(paths):
+        if not os.path.exists(path):
+            raise SystemExit(f'--vocab_files: no such file: {path}')
+        lines = [l.strip() for l in open(path) if l.strip()]
+        pools[f'vocab{i+1}'] = ([_tokenizer.encode(l + ' ') for l in lines], path, len(lines))
+    return pools
+
+
 def worker(stop, q, datasets, args, mix=None):
     # datasets: {name: hf_dataset}. mix: (names, weights) or None (single dataset).
     if mix is None:
@@ -2443,11 +2525,16 @@ def worker(stop, q, datasets, args, mix=None):
     _iters  = {}
     _locks  = {}
     _epochs = {}
+    # When the batchwise vocab stream is active the epoch column must report passes over the
+    # VOCAB FILES only: the corpus is effectively infinite and would pin the reported epoch
+    # at 1 forever, since _epoch_num() takes the minimum across datasets.
+    _track_corpus_epochs = not (args.vocab_files and args.vocab_slots)
     for n in set(names):
         _iters[n]  = _make_iter(datasets[n], _split_for_name(n), args.streaming, args.seed)
         _locks[n]  = threading.Lock()   # HF streaming iterator is not thread-safe
         _epochs[n] = [1]
-        _epoch_set(n, 1)
+        if _track_corpus_epochs:
+            _epoch_set(n, 1)
 
     def _next_example(name):
         """Thread-safe pull of the next raw example for one dataset (loops on exhaustion)."""
@@ -2461,7 +2548,8 @@ def worker(stop, q, datasets, args, mix=None):
                 # and memorization should appear as a loss step at exactly these positions.
                 # Written to args.log, not just stdout, so it interleaves with the STEP lines
                 # in log/exp.$M instead of landing only in the buffered .out.
-                _epoch_set(name, _epochs[name][0])
+                if _track_corpus_epochs:
+                    _epoch_set(name, _epochs[name][0])
                 # stdout only. The epoch is a COLUMN on every STEP line now, so a
                 # standalone line in the main log would duplicate it and break the
                 # one-row-per-step shape chart.py reads. This still lands in log/exp.$M.out,
@@ -2484,7 +2572,29 @@ def worker(stop, q, datasets, args, mix=None):
             return ([], '')
         return clip_text(text)
 
-    slots = [_ClipSlot() for _ in range(args.batch)]
+    # BATCHWISE MIX. The first --vocab_slots slots stream undelimited sentences from
+    # --vocab_files (split evenly between the files); the rest are ordinary _ClipSlots fed
+    # from --dataset/--mix with <STX>/<ETX>. Slots map 1:1 to tokens per step, so this is an
+    # exact token split rather than the on-average one --mix gives.
+    _vocab_paths = [p.strip() for p in (args.vocab_files or '').split(',') if p.strip()]
+    n_vocab = min(args.vocab_slots, args.batch) if _vocab_paths else 0
+    if args.vocab_slots and not _vocab_paths:
+        raise SystemExit('--vocab_slots set but --vocab_files is empty')
+    slots = []
+    if n_vocab:
+        pools = _load_vocab_pools(_vocab_paths)
+        keys  = sorted(pools)
+        for k in keys:
+            _vocab_consumed[k] = 0
+            _epoch_set(k, 1)
+            print(f'{k}: {pools[k][1]} ({pools[k][2]} sentences, undelimited)', flush=True)
+        for i in range(n_vocab):
+            k = keys[i % len(keys)]                       # round robin -> even slot split
+            slots.append(_VocabSlot(pools[k][0], k, args.seed + 9973 * i))
+        print(f'batchwise mix: {n_vocab}/{args.batch} vocab slots '
+              f'({100.0*n_vocab/args.batch:.0f}% of tokens), '
+              f'{args.batch-n_vocab} corpus slots', flush=True)
+    slots += [_ClipSlot() for _ in range(args.batch - n_vocab)]
 
     # Pool of builder threads runs the dataset pull/encode in parallel and parks
     # finished clips in clip_q, so the stepping loop below never blocks on one clip.
@@ -2541,6 +2651,12 @@ def worker(stop, q, datasets, args, mix=None):
                         return
                     continue
                 slot.load(steps, caption)
+
+        if n_vocab:
+            # passes over the FILE = total sentences drawn / file size, which is the honest
+            # reading when 225 slots each hold their own permutation of the same file.
+            for k in keys:
+                _epoch_set(k, 1 + _vocab_consumed[k] // pools[k][2])
 
         x_list, y_list, flag_list = [], [], []
         for slot in slots:

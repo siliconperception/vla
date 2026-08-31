@@ -6834,3 +6834,302 @@ free-running generation (3 samples; cycle>0.6 degenerate, healthy 0.08-0.11):
     <STX>The chicken laid an egg every last Saturday.<ETX>
   --- seed 13:
     <STX>Why did she cry during the movie?<ETX>
+
+--------------------------------------------------------------------------------
+PP1  pp1_bvocab_e10s  step 250000   2026-08-30 13:23
+--------------------------------------------------------------------------------
+  seed 2668573716   dataset bdict
+loss/grad/state:
+  step      0  loss 10.7609  grad 676.190  dff_std  0.270  dff_max      3.9  dff_zeros 0.4912
+  step   5000  loss  4.7653  grad  2.842  dff_std  0.641  dff_max      4.7  dff_zeros 0.5348
+  step  10000  loss  4.5180  grad  3.031  dff_std  0.618  dff_max      5.9  dff_zeros 0.5198
+  step  15000  loss  4.3520  grad  3.583  dff_std  0.600  dff_max      5.5  dff_zeros 0.5223
+  step  20000  loss  4.1313  grad  3.836  dff_std  0.583  dff_max      6.2  dff_zeros 0.5384
+  step  25000  loss  4.0410  grad  4.420  dff_std  0.597  dff_max      5.1  dff_zeros 0.5484
+  step  30000  loss  3.8263  grad  4.735  dff_std  0.600  dff_max      7.8  dff_zeros 0.5497
+  step  35000  loss  3.7698  grad  5.105  dff_std  0.595  dff_max      6.1  dff_zeros 0.5473
+  step  40000  loss  3.6739  grad  6.026  dff_std  0.580  dff_max      8.6  dff_zeros 0.5478
+  step  45000  loss  3.5731  grad  5.973  dff_std  0.599  dff_max      8.9  dff_zeros 0.5423
+  step  50000  loss  3.5926  grad  6.690  dff_std  0.581  dff_max      7.3  dff_zeros 0.5476
+  step  55000  loss  3.3599  grad  6.701  dff_std  0.562  dff_max      6.9  dff_zeros 0.5413
+  step  60000  loss  3.1621  grad  6.705  dff_std  0.583  dff_max      7.3  dff_zeros 0.5426
+  step  65000  loss  3.1404  grad  7.069  dff_std  0.572  dff_max      7.0  dff_zeros 0.5493
+  step  70000  loss  2.9951  grad  7.204  dff_std  0.590  dff_max      7.7  dff_zeros 0.5466
+  step  75000  loss  2.8410  grad  7.057  dff_std  0.572  dff_max      7.8  dff_zeros 0.5438
+  step  80000  loss  2.8029  grad  7.683  dff_std  0.573  dff_max      8.4  dff_zeros 0.5477
+  step  85000  loss  2.7718  grad  7.536  dff_std  0.581  dff_max      8.1  dff_zeros 0.5470
+  step  90000  loss  2.5292  grad  7.219  dff_std  0.628  dff_max     10.6  dff_zeros 0.5281
+  step  95000  loss  2.5126  grad  7.324  dff_std  0.638  dff_max      9.4  dff_zeros 0.5323
+  step 100000  loss  2.4637  grad  7.793  dff_std  0.632  dff_max      8.7  dff_zeros 0.5312
+  step 105000  loss  2.2308  grad  7.390  dff_std  0.581  dff_max      8.2  dff_zeros 0.5326
+  step 110000  loss  2.1889  grad  7.311  dff_std  0.596  dff_max      8.0  dff_zeros 0.5347
+  step 115000  loss  2.2295  grad  8.076  dff_std  0.600  dff_max      8.1  dff_zeros 0.5312
+  step 120000  loss  2.0305  grad  7.312  dff_std  0.588  dff_max      8.4  dff_zeros 0.5330
+  step 125000  loss  2.5344  grad 11.174  dff_std  0.593  dff_max      7.9  dff_zeros 0.5316
+  step 130000  loss  1.8803  grad  7.326  dff_std  0.591  dff_max      8.0  dff_zeros 0.5334
+  step 135000  loss  1.8554  grad  7.412  dff_std  0.591  dff_max      8.2  dff_zeros 0.5314
+  step 140000  loss  1.8646  grad  8.111  dff_std  0.592  dff_max      8.0  dff_zeros 0.5312
+  step 145000  loss  1.6705  grad  7.081  dff_std  0.589  dff_max      8.8  dff_zeros 0.5320
+  step 150000  loss  1.7204  grad  8.193  dff_std  0.589  dff_max      8.5  dff_zeros 0.5373
+  step 155000  loss  1.7135  grad  7.775  dff_std  0.567  dff_max      8.4  dff_zeros 0.5316
+  step 160000  loss  1.4827  grad  6.325  dff_std  0.568  dff_max      8.0  dff_zeros 0.5352
+  step 165000  loss  1.5198  grad  7.048  dff_std  0.583  dff_max      9.2  dff_zeros 0.5288
+  step 170000  loss  1.4849  grad  6.943  dff_std  0.601  dff_max      9.2  dff_zeros 0.5366
+  step 175000  loss  1.4077  grad  6.419  dff_std  0.581  dff_max      9.0  dff_zeros 0.5304
+  step 180000  loss  1.4373  grad  6.614  dff_std  0.586  dff_max      8.9  dff_zeros 0.5222
+  step 185000  loss  1.3987  grad  6.985  dff_std  0.590  dff_max      9.1  dff_zeros 0.5319
+  step 190000  loss  1.2867  grad  5.541  dff_std  0.594  dff_max      9.0  dff_zeros 0.5324
+  step 195000  loss  1.3464  grad  6.444  dff_std  0.564  dff_max      8.8  dff_zeros 0.5315
+  step 200000  loss  1.2507  grad  5.533  dff_std  0.584  dff_max      9.0  dff_zeros 0.5377
+  step 205000  loss  1.2298  grad  5.826  dff_std  0.580  dff_max      9.0  dff_zeros 0.5294
+  step 210000  loss  1.2240  grad  5.907  dff_std  0.581  dff_max      9.5  dff_zeros 0.5277
+  step 215000  loss  1.1645  grad  4.773  dff_std  0.589  dff_max      9.5  dff_zeros 0.5307
+  step 220000  loss  1.2206  grad  6.355  dff_std  0.583  dff_max      9.5  dff_zeros 0.5311
+  step 225000  loss  1.1195  grad  4.434  dff_std  0.585  dff_max      9.3  dff_zeros 0.5287
+  step 230000  loss  1.0607  grad  3.283  dff_std  0.588  dff_max      8.8  dff_zeros 0.5324
+  step 235000  loss  1.0728  grad  4.235  dff_std  0.584  dff_max      9.2  dff_zeros 0.5337
+  step 240000  loss  1.1156  grad  4.599  dff_std  0.595  dff_max      9.5  dff_zeros 0.5314
+  step 245000  loss  1.0263  grad  2.926  dff_std  0.586  dff_max      9.4  dff_zeros 0.5332
+  step 250000  loss  1.0156  grad  2.599  dff_std  0.585  dff_max      9.0  dff_zeros 0.5318
+  mean(last10) 0.9970   tokens 62.50 M   (unigram floor 7.549)
+held-out eval (split of --dataset; see note in report.sh before comparing):
+token efficiency (sustained crossings)  [!! thresholds and baseline are WEB numbers;
+     dataset is bdict -- these rows are CROSS-CORPUS and are not a like-for-like read]:
+  L<7.549  step    200    0.05 M tok   baseline   3980  (-3780)
+  L<7.000  step    240    0.06 M tok   baseline   5940  (-5700)
+  L<6.500  step    320    0.08 M tok   baseline  15680  (-15360)
+  L<6.300  step    420    0.10 M tok   baseline  30120  (-29700)
+  L<6.100  step    580    0.14 M tok   baseline  49700  (-49120)
+  L<5.900  step    660    0.17 M tok   baseline  84980  (-84320)
+  L<5.800  step    740    0.18 M tok   baseline  99980  (-99240)
+free-running generation (3 samples; cycle>0.6 degenerate, healthy 0.08-0.11):
+   gen health: cycle 0.10 (max 0.12)  uniq 0.52  n=3
+   sample: <STX>Use some money now for your projects.<ETX>
+  generated text (vla.py --generate, batch 1, seeds 11/12/13):
+  --- seed 11:
+    <STX>She said, "There is a coffee stain on this page."<ETX>
+  --- seed 12:
+    <STX>The chicken laid an egg every single morning.<ETX>
+  --- seed 13:
+    <STX>Why did she yell so loudly during the game?<ETX>
+
+--------------------------------------------------------------------------------
+PP1  pp1_bvocab_e10s  step 300000   2026-08-30 17:58
+--------------------------------------------------------------------------------
+  seed 2668573716   dataset bdict
+loss/grad/state:
+  step      0  loss 10.7609  grad 676.190  dff_std  0.270  dff_max      3.9  dff_zeros 0.4912
+  step   5000  loss  4.7653  grad  2.842  dff_std  0.641  dff_max      4.7  dff_zeros 0.5348
+  step  10000  loss  4.5180  grad  3.031  dff_std  0.618  dff_max      5.9  dff_zeros 0.5198
+  step  15000  loss  4.3520  grad  3.583  dff_std  0.600  dff_max      5.5  dff_zeros 0.5223
+  step  20000  loss  4.1313  grad  3.836  dff_std  0.583  dff_max      6.2  dff_zeros 0.5384
+  step  25000  loss  4.0410  grad  4.420  dff_std  0.597  dff_max      5.1  dff_zeros 0.5484
+  step  30000  loss  3.8263  grad  4.735  dff_std  0.600  dff_max      7.8  dff_zeros 0.5497
+  step  35000  loss  3.7698  grad  5.105  dff_std  0.595  dff_max      6.1  dff_zeros 0.5473
+  step  40000  loss  3.6739  grad  6.026  dff_std  0.580  dff_max      8.6  dff_zeros 0.5478
+  step  45000  loss  3.5731  grad  5.973  dff_std  0.599  dff_max      8.9  dff_zeros 0.5423
+  step  50000  loss  3.5926  grad  6.690  dff_std  0.581  dff_max      7.3  dff_zeros 0.5476
+  step  55000  loss  3.3599  grad  6.701  dff_std  0.562  dff_max      6.9  dff_zeros 0.5413
+  step  60000  loss  3.1621  grad  6.705  dff_std  0.583  dff_max      7.3  dff_zeros 0.5426
+  step  65000  loss  3.1404  grad  7.069  dff_std  0.572  dff_max      7.0  dff_zeros 0.5493
+  step  70000  loss  2.9951  grad  7.204  dff_std  0.590  dff_max      7.7  dff_zeros 0.5466
+  step  75000  loss  2.8410  grad  7.057  dff_std  0.572  dff_max      7.8  dff_zeros 0.5438
+  step  80000  loss  2.8029  grad  7.683  dff_std  0.573  dff_max      8.4  dff_zeros 0.5477
+  step  85000  loss  2.7718  grad  7.536  dff_std  0.581  dff_max      8.1  dff_zeros 0.5470
+  step  90000  loss  2.5292  grad  7.219  dff_std  0.628  dff_max     10.6  dff_zeros 0.5281
+  step  95000  loss  2.5126  grad  7.324  dff_std  0.638  dff_max      9.4  dff_zeros 0.5323
+  step 100000  loss  2.4637  grad  7.793  dff_std  0.632  dff_max      8.7  dff_zeros 0.5312
+  step 105000  loss  2.2308  grad  7.390  dff_std  0.581  dff_max      8.2  dff_zeros 0.5326
+  step 110000  loss  2.1889  grad  7.311  dff_std  0.596  dff_max      8.0  dff_zeros 0.5347
+  step 115000  loss  2.2295  grad  8.076  dff_std  0.600  dff_max      8.1  dff_zeros 0.5312
+  step 120000  loss  2.0305  grad  7.312  dff_std  0.588  dff_max      8.4  dff_zeros 0.5330
+  step 125000  loss  2.5344  grad 11.174  dff_std  0.593  dff_max      7.9  dff_zeros 0.5316
+  step 130000  loss  1.8803  grad  7.326  dff_std  0.591  dff_max      8.0  dff_zeros 0.5334
+  step 135000  loss  1.8554  grad  7.412  dff_std  0.591  dff_max      8.2  dff_zeros 0.5314
+  step 140000  loss  1.8646  grad  8.111  dff_std  0.592  dff_max      8.0  dff_zeros 0.5312
+  step 145000  loss  1.6705  grad  7.081  dff_std  0.589  dff_max      8.8  dff_zeros 0.5320
+  step 150000  loss  1.7204  grad  8.193  dff_std  0.589  dff_max      8.5  dff_zeros 0.5373
+  step 155000  loss  1.7135  grad  7.775  dff_std  0.567  dff_max      8.4  dff_zeros 0.5316
+  step 160000  loss  1.4827  grad  6.325  dff_std  0.568  dff_max      8.0  dff_zeros 0.5352
+  step 165000  loss  1.5198  grad  7.048  dff_std  0.583  dff_max      9.2  dff_zeros 0.5288
+  step 170000  loss  1.4849  grad  6.943  dff_std  0.601  dff_max      9.2  dff_zeros 0.5366
+  step 175000  loss  1.4077  grad  6.419  dff_std  0.581  dff_max      9.0  dff_zeros 0.5304
+  step 180000  loss  1.4373  grad  6.614  dff_std  0.586  dff_max      8.9  dff_zeros 0.5222
+  step 185000  loss  1.3987  grad  6.985  dff_std  0.590  dff_max      9.1  dff_zeros 0.5319
+  step 190000  loss  1.2867  grad  5.541  dff_std  0.594  dff_max      9.0  dff_zeros 0.5324
+  step 195000  loss  1.3464  grad  6.444  dff_std  0.564  dff_max      8.8  dff_zeros 0.5315
+  step 200000  loss  1.2507  grad  5.533  dff_std  0.584  dff_max      9.0  dff_zeros 0.5377
+  step 205000  loss  1.2298  grad  5.826  dff_std  0.580  dff_max      9.0  dff_zeros 0.5294
+  step 210000  loss  1.2240  grad  5.907  dff_std  0.581  dff_max      9.5  dff_zeros 0.5277
+  step 215000  loss  1.1645  grad  4.773  dff_std  0.589  dff_max      9.5  dff_zeros 0.5307
+  step 220000  loss  1.2206  grad  6.355  dff_std  0.583  dff_max      9.5  dff_zeros 0.5311
+  step 225000  loss  1.1195  grad  4.434  dff_std  0.585  dff_max      9.3  dff_zeros 0.5287
+  step 230000  loss  1.0607  grad  3.283  dff_std  0.588  dff_max      8.8  dff_zeros 0.5324
+  step 235000  loss  1.0728  grad  4.235  dff_std  0.584  dff_max      9.2  dff_zeros 0.5337
+  step 240000  loss  1.1156  grad  4.599  dff_std  0.595  dff_max      9.5  dff_zeros 0.5314
+  step 245000  loss  1.0263  grad  2.926  dff_std  0.586  dff_max      9.4  dff_zeros 0.5332
+  step 250000  loss  1.0156  grad  2.599  dff_std  0.585  dff_max      9.0  dff_zeros 0.5318
+  step 255000  loss  1.1949  grad  6.577  dff_std  0.583  dff_max      9.1  dff_zeros 0.5329
+  step 260000  loss  1.0090  grad  3.186  dff_std  0.587  dff_max      9.4  dff_zeros 0.5335
+  step 265000  loss  0.9887  grad  2.281  dff_std  0.591  dff_max      9.3  dff_zeros 0.5275
+  step 270000  loss  1.0174  grad  2.431  dff_std  0.593  dff_max      9.2  dff_zeros 0.5340
+  step 275000  loss  0.9604  grad  2.212  dff_std  0.594  dff_max      9.1  dff_zeros 0.5354
+  step 280000  loss  1.0036  grad  2.549  dff_std  0.600  dff_max      9.5  dff_zeros 0.5355
+  step 285000  loss  0.9762  grad  2.324  dff_std  0.594  dff_max      9.0  dff_zeros 0.5300
+  step 290000  loss  0.9612  grad  2.036  dff_std  0.596  dff_max      9.3  dff_zeros 0.5400
+  step 295000  loss  0.9819  grad  2.444  dff_std  0.589  dff_max      8.7  dff_zeros 0.5382
+  step 300000  loss  1.2484  grad  7.454  dff_std  0.584  dff_max      9.1  dff_zeros 0.5319
+  mean(last10) 1.2554   tokens 75.00 M   (unigram floor 7.549)
+held-out eval (split of --dataset; see note in report.sh before comparing):
+token efficiency (sustained crossings)  [!! thresholds and baseline are WEB numbers;
+     dataset is bdict -- these rows are CROSS-CORPUS and are not a like-for-like read]:
+  L<7.549  step    200    0.05 M tok   baseline   3980  (-3780)
+  L<7.000  step    240    0.06 M tok   baseline   5940  (-5700)
+  L<6.500  step    320    0.08 M tok   baseline  15680  (-15360)
+  L<6.300  step    420    0.10 M tok   baseline  30120  (-29700)
+  L<6.100  step    580    0.14 M tok   baseline  49700  (-49120)
+  L<5.900  step    660    0.17 M tok   baseline  84980  (-84320)
+  L<5.800  step    740    0.18 M tok   baseline  99980  (-99240)
+free-running generation (3 samples; cycle>0.6 degenerate, healthy 0.08-0.11):
+   gen health: cycle 0.12 (max 0.15)  uniq 0.53  n=3
+   sample: <STX>We plan to drive to the coast this weekend.<ETX>
+  generated text (vla.py --generate, batch 1, seeds 11/12/13):
+  --- seed 11:
+    <STX>She said, "There is a little surprise waiting for you."<ETX>
+  --- seed 12:
+    <STX>The store took a generous dinner in the barn.<ETX>
+  --- seed 13:
+    <STX>Why did she stretch the new bakery each morning.<ETX>
+
+================================================================================
+        PP1 RESULT -- THE MEMORIZATION TRANSITION, AND A RETRACTED PREDICTION
+                    stopped 2026-08-30 as the baseline
+================================================================================
+Stopped at step 315,000 = 845 epochs over 8,480 one-sentence documents, train
+loss 0.933.  Weights kept as checkpoint/pp1_bvocab_e10s.BASELINE_315000.pt.
+Every 10,000-step stash is also on disk, so any point of the curve is
+re-examinable.
+
+THE RESULT.  Free-running generation went from reproducing NOTHING of the corpus
+to reproducing it wholesale, and the transition was abrupt:
+
+    epoch 187    6-word run, isolated, and on the corpus's most repeated stem
+    epoch 425    7-word run, single-occurrence sentence
+    epoch 535   10-word run, 1 hit in 20 samples
+    epoch 602   10-word run, 11 hits in 25 samples, FIVE of them 100% verbatim
+                "she asked the driver to stop at the next corner"  <- entire
+                sample, matching entry 'stop' exactly
+
+  Coverage across 25 consecutive samples at epoch 602:
+    0 0 0 0 100 88 0 62 0 0 0 75 67 100 70 0 42 0 0 100 0 0 0 100 100
+  Flat at zero for 500+ epochs, then 44% of samples in the next 60K steps.
+
+I PREDICTED THE OPPOSITE AND WAS WRONG, and the error is worth recording because
+it was an inference from one run to another.  b1 (the keyed e3 corpus) reached
+536 epochs with 74.6% coherence and 0.0% verbatim coverage, and I concluded from
+that this architecture "learns structure and does not memorize", and that pp1's
+stated success criterion would not be met.  b1 had simply not run long enough:
+pp1 crossed over between epoch 535 and 602.  A negative result at epoch 536 said
+nothing about epoch 602, and I treated it as if it did.
+
+THE OTHER PREDICTION THAT INVERTED.  From b1's slope RE-ACCELERATING (78.6% ->
+99.6% of peak) I expected pp1's knee never to fire and coherence to be the gate.
+Exactly backwards: the knee FIRED at step 155,990 (epoch 416, seven consecutive
+bins under 25% of peak), while coherence plateaued at 32-54% from step 31,000
+onward and never approached the 70% bar.  Loss fell 2.46 -> 1.79 across a window
+where sentence-level coherence did not move at all -- local prediction improving
+while whole-sentence quality stood still.
+
+MEASUREMENT NOTE.  Milestone-to-milestone coherence readings on 12 samples are
+NOISE: the sd of a 20-sample mean is 7.3%, so nothing under ~15 points is real.
+I reported a "clear upward trend" from 43.9% -> 56.1% that scoring all 230
+samples showed to be a plateau.  Score the whole log, not the tail.
+
+================================================================================
+      V1  v1_vocab_mix90  -- BATCHWISE VOCABULARY STREAM + LONG-FORM CORPUS
+                     started 2026-08-30, FROM RANDOM WEIGHTS
+================================================================================
+NOT a continuation of pp1.  Fresh initialisation (no --load; step 0 opens at loss
+10.906 / grad 647, the untrained signature every run in this file starts from).
+pp1 is the BASELINE to compare against, not the starting point.
+
+THE DATA -- two authored corpora, both exactly 10,000 single sentences:
+  vocab_phase1.txt   the 848 grade 1-5 words.  basic_dict_e10.txt split into
+                     sentences (8,480), deduped to 8,440, then 1,560 authored
+                     additions: 40 to restore words dedup had pushed below 10,
+                     and +2 each to the first 760 words.  basic_vocab.txt is in
+                     GRADE ORDER, so the first 760 are the most elementary and
+                     frequent -- they get 12 examples, the rest 10.
+  vocab_phase2.txt   5,000 NEW words x 2 sentences in genuinely different
+                     contexts (different situation, and a different SENSE where
+                     the word has one: bail legal/maritime, crane machine/bird,
+                     acid chemical/remark, vice failing/tool).
+  Both verified line by line through exp/sentsplit.py -- the canonical copy of
+  vla.py's splitter, which asserts it reproduces vla.py's own counts -- so every
+  line is one sentence by exactly the rule --bdict_split applies.  All unique,
+  ASCII, and zero word-pairs share >=4 content words (no near-duplicate framing).
+
+HOW THE PHASE-2 VOCABULARY WAS BUILT, AND THE APPROACH THAT FAILED FIRST.
+  FAILED: rank corpus word-frequency, keep real dictionary headwords, drop
+  basic_vocab.  It produced non-words and junk -- over-stripped lemmas ('foo'
+  from food, 'numb' from number, 'coul' from could, 'dure' from during, because
+  the 466K-headword dictionary contains obscure lowercase entries and the rule
+  took the SHORTEST reachable one), 800 duplicate entries, proper nouns from
+  Wikipedia (american, latvia, bonaparte, vermont), and inflections of excluded
+  words (used/based/called).  Rejected by the user: "too many non-words".
+  WORKED: authored by 14 topic-domain agents (450 words each, excluding
+  basic_vocab AND each other's words), giving 6,300 -> 5,843 after dedup and
+  inflection-collapse, then trimmed to 5,000 by four independent reviewers.
+  A SECOND FAILURE ON THE WAY: I tried to do that trim with corpus frequency and
+  it kept gneiss/exosphere/palisade/antithesis while discarding kiosk/detour/
+  gorgeous/restrain.  The corpus is FAQ+Simple-Wikipedia, so it measures TOPIC
+  COVERAGE IN AN ENCYCLOPEDIA, not commonness in English -- the same category of
+  error as the first attempt.  Judgement is the right instrument for "is this
+  word common"; a corpus is only the right instrument for "does this word
+  appear here".  The four reviewers converged independently on the same cuts
+  (instruments, narrow species, construction jargon, archaic terms, regional
+  usage, formal-abstraction filler), which is the evidence the line is right.
+
+  Sentences were generated by HAIKU on a deliberately SHORT prompt: the diverse-
+  context requirement stated once with one example, and nothing else.  Format was
+  moved OUT of the prompt and into a validator.  Result: 9,981 of 10,000 clean on
+  the first pass -- a better rate than Sonnet achieved on the 9-rule prompt used
+  for basic_dict_e10.  A long constraint list makes a small model worse at the
+  one thing only the model can do; the rest is a script's job.
+
+THE BATCHWISE MIX -- why not --mix:
+    --vocab_files vocab_phase1.txt,vocab_phase2.txt --vocab_slots 225
+    --dataset cosmoweb --streaming
+  225 of the 250 batch slots are _VocabSlot, the other 25 are ordinary framed
+  _ClipSlots.  EVERY SLOT CONTRIBUTES EXACTLY ONE TOKEN PER STEP, so the slot
+  split IS the token split: 225/250 is exactly 90% / 10%, with no dependence on
+  document length.  --mix cannot do this -- its token-proportional sampling holds
+  only on average, and only via a running estimate of each corpus's mean clip
+  length.
+  _VocabSlot differs from _ClipSlot in exactly two ways, both deliberate:
+    NO FRAMING     no <STX>/<ETX>; sentences concatenate head to tail, so the
+                   (x,y) pair straddling a boundary is a real transition from one
+                   sentence's last token to the next one's first.
+    NEVER RESETS   is_start() is always False, so the recurrent state is never
+                   cleared on those slots.  A corpus slot resets at every <ETX>;
+                   these run unbroken for the whole run.
+  Each of the 225 holds its OWN shuffled permutation, round-robined across the
+  two files, so phase1/phase2 split 113/112 and the 225 slots are 225 independent
+  orderings rather than 225 copies of one.
+
+  EPOCH COLUMN TRACKS THE VOCAB FILES ONLY.  _epoch_num() takes the minimum
+  across datasets, so an effectively-infinite corpus would pin it at 1 forever;
+  corpus epochs are suppressed whenever vocab slots are active.  The reported
+  epoch is total sentences drawn / file size, which is the honest reading when
+  225 slots each hold their own permutation.
+
+  LONG-FORM CORPUS: cosmoweb (cosmopedia web_samples_v2).  Chosen to MATCH the
+  vocabulary content: it is AI-generated, long-form, and open-web-seeded across
+  blogpost 62% / textbook_academic 27% / textbook_narrative 5%, which is the
+  closest available span to phase 2's general-knowledge domains.  At 58.7 GB it
+  never repeats, so the 10% is 40M distinct tokens over a 400K-step run.
+
+  WHAT TO WATCH: the model sees a document boundary on only 1 slot in 10.  Every
+  earlier run in this file reset its state constantly; this one mostly does not.
+  Whether the state stays healthy without regular resets is the open question,
+  and dff_std is the number to watch.
