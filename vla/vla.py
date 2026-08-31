@@ -1785,7 +1785,12 @@ def _dff_stats(dff):
 # count examples/tokens and stash the most recent raw sample; the main loop drains
 # both each checkpoint to report throughput and show a training-text sample.
 _text_lock  = threading.Lock()
-_text_stats = {'examples': 0, 'tokens': 0, 'sample': ''}
+# 'sample' is the last FRAMED corpus document, 'vsample' the last undelimited vocab
+# sentence. They are kept apart because the two streams pull at wildly different rates --
+# 225 vocab slots take a sentence every ~12 steps while 25 corpus slots take a document
+# every ~1000, so a single shared field would be vocab text essentially always and the
+# corpus half of the mix would never be seen.
+_text_stats = {'examples': 0, 'tokens': 0, 'sample': '', 'vsample': ''}
 
 # Passes over each corpus, published by the builder threads and read by the TEXT line.
 # Same worker->main-loop channel as _text_stats, and for the same reason: the epoch counter
@@ -1815,12 +1820,12 @@ def _epoch_report():
     with _epoch_lock:
         return ','.join(f'{k}={v}' for k, v in sorted(_epoch_stats.items()))
 
-def _text_tally(n_tokens, sample=''):
+def _text_tally(n_tokens, sample='', vocab=False):
     with _text_lock:
         _text_stats['examples'] += 1
         _text_stats['tokens']   += n_tokens
         if sample:
-            _text_stats['sample'] = sample
+            _text_stats['vsample' if vocab else 'sample'] = sample
 
 def _text_drain():
     """Return (examples, tokens, sample) since the last drain; reset the counters.
@@ -1840,7 +1845,7 @@ def _text_peek():
     TEXT line to a tenth of the window it claims to cover.  The sample itself is safe to
     read repeatedly: builder threads overwrite it in place and the drain never clears it."""
     with _text_lock:
-        return _text_stats['sample']
+        return _text_stats['sample'], _text_stats['vsample']
 # Each builder returns (steps, caption). A step is a 4-tuple
 #   (x_byte, y_byte, img_or_None, aud_or_None)
 # one entry per 100 Hz frame.
@@ -2469,10 +2474,10 @@ class _VocabSlot:
         runs forever.
     Each slot keeps its own shuffled permutation and reshuffles on wrap, so 225 slots are
     225 independent orderings of the same file rather than 225 copies of one ordering."""
-    __slots__ = ['pool', 'name', 'rng', 'order', 'oi', 'ids', 'pos']
+    __slots__ = ['pool', 'texts', 'name', 'rng', 'order', 'oi', 'ids', 'pos']
 
-    def __init__(self, pool, name, seed):
-        self.pool, self.name = pool, name
+    def __init__(self, pool, name, seed, texts=None):
+        self.pool, self.name, self.texts = pool, name, texts
         self.rng   = random.Random(seed)
         self.order = list(range(len(pool)))
         self.rng.shuffle(self.order)
@@ -2482,11 +2487,12 @@ class _VocabSlot:
         if self.oi >= len(self.order):
             self.oi = 0
             self.rng.shuffle(self.order)
-        ids = self.pool[self.order[self.oi]]
+        j = self.order[self.oi]
+        ids = self.pool[j]
         self.oi += 1
         self.ids.extend(ids)
         _vocab_consumed[self.name] = _vocab_consumed.get(self.name, 0) + 1
-        _text_tally(len(ids))
+        _text_tally(len(ids), sample=(self.texts[j] if self.texts else ''), vocab=True)
 
     def done(self):      return False       # never refilled from clip_q
     def is_start(self):  return False       # never resets the state
@@ -2512,7 +2518,8 @@ def _load_vocab_pools(paths):
         if not os.path.exists(path):
             raise SystemExit(f'--vocab_files: no such file: {path}')
         lines = [l.strip() for l in open(path) if l.strip()]
-        pools[f'vocab{i+1}'] = ([_tokenizer.encode(l + ' ') for l in lines], path, len(lines))
+        pools[f'vocab{i+1}'] = ([_tokenizer.encode(l + ' ') for l in lines], path,
+                                len(lines), lines)
     return pools
 
 
@@ -2590,7 +2597,7 @@ def worker(stop, q, datasets, args, mix=None):
             print(f'{k}: {pools[k][1]} ({pools[k][2]} sentences, undelimited)', flush=True)
         for i in range(n_vocab):
             k = keys[i % len(keys)]                       # round robin -> even slot split
-            slots.append(_VocabSlot(pools[k][0], k, args.seed + 9973 * i))
+            slots.append(_VocabSlot(pools[k][0], k, args.seed + 9973 * i, pools[k][3]))
         print(f'batchwise mix: {n_vocab}/{args.batch} vocab slots '
               f'({100.0*n_vocab/args.batch:.0f}% of tokens), '
               f'{args.batch-n_vocab} corpus slots', flush=True)
@@ -4057,7 +4064,9 @@ try:
                 prompt = _prompt_ids(_p)
                 out    = model.generate(prompt, _GEN_SAMPLE, temperature=args.temperature)
                 lines.append(f'GEN step {i:10} [{_p or "<STX>"}]: {_render(prompt + out)}')
-            _tsample = _text_peek()            # a recent training-text example
+            _tsample, _vsample = _text_peek()  # recent corpus / vocab training text
+            if _vsample:
+                lines.append(f'TXT-VOCAB : {_printable(_vsample[:240])}')
             if _tsample:
                 lines.append(f'TXT-SAMPLE: {_printable(_tsample[:240])}')
             print('\n' + '\n'.join(lines) + '\n')
