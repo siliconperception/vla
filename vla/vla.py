@@ -876,6 +876,14 @@ parser.add_argument('--device',        default=None)
 parser.add_argument('--verbose',       default=False, action='store_true',
                     help='print the torchinfo model summaries in --generate/--vis (training '
                          'always prints them, since they are logged)')
+parser.add_argument('--altvis',        default=False, action='store_true',
+                    help='live per-layer DFF map: an n_layers x 2 grid of imshow panels. Top '
+                         'row is each layer\'s ContextCNN INPUT, bottom row its OUTPUT -- the '
+                         'tensor the register stores and the layer above receives. Each panel '
+                         'is the STANDARD DEVIATION ACROSS CHANNELS at every spatial position, '
+                         'an SxS map, so it shows WHERE in the grid the state carries '
+                         'variation rather than how much of it there is overall. Like --vis '
+                         'this is read-only: it generates from --prompt and trains nothing.')
 parser.add_argument('--vis',           default=False, action='store_true',
                     help='live text-generation viz (DFF std + P(next token)) from the '
                          'prompt token; no training. Read-only. Press x to exit')
@@ -1000,7 +1008,7 @@ if args.c_text is None:          # default token embedding width to n_hidden
 # ── log / device / seed ───────────────────────────────────────────────────────
 
 if args.log is None:
-    if args.generate or args.vis or args.push or args.eval:   # one-shot: no log file
+    if args.generate or args.vis or args.altvis or args.push or args.eval:  # one-shot: no log
         args.log = os.devnull
     else:
         # training -> log/log.<date>. Never reuse a name: two runs started in the
@@ -1700,7 +1708,7 @@ class VLAModel(nn.Module, _HubMixin):
         tok = self.tok_embed(byte_idx)                             # [B, c_text]
         return tok.view(B, self.c_text, 1, 1).expand(-1, -1, self.S, self.S)
 
-    def _layers(self, dff, tok_grid, clk=None):
+    def _layers(self, dff, tok_grid, clk=None, record=None):
         """Run the stack of n_layers (ContextCNN + feedback) units once.
         dff: list of n_layers tensors [B, n_hidden, S, S]. Layer 0 takes the token injection;
         each deeper layer takes the previous layer's output summed with its own DFF state,
@@ -1711,25 +1719,41 @@ class VLAModel(nn.Module, _HubMixin):
         --tap puts one between the layer output and the
         register (see _tap), on the path the stack above takes as well.
         Returns (new_dff_list, last_layer_output [B, n_hidden, S, S]). No detach here — the
-        caller detaches the returned list to bound the time horizon."""
+        caller detaches the returned list to bound the time horizon.
+
+        record: if a list is passed, one {'in':…, 'out':…} dict per layer is appended, holding
+        that layer's ContextCNN INPUT (the feedback sum, i.e. what the register contributes
+        plus what arrives from below) and its OUTPUT (what the register will store and the
+        layer above receives). --altvis draws these; nothing else uses them, and passing None
+        leaves the forward pass byte-identical."""
         tok  = self.text_proj(tok_grid)        # [B, n_hidden, S, S], computed once
         if self.linout is not None:
             # ONE 1x1 per layer. `o` leaves the projection already dense and signed, and is
             # both stored in the register and handed straight to the layer above -- there is
             # no second projection on the way up, which is the whole difference from --tap.
-            o    = self.linout[0](self.context(self._fb(0, dff[0]) + tok))
+            x0   = self._fb(0, dff[0]) + tok
+            o    = self.linout[0](self.context(x0))
             outs = [o]
+            if record is not None:
+                record.append({'in': x0, 'out': o})
             for li in range(self.n_layers - 1):
                 x = self._fb(li + 1, dff[li + 1]) + o
                 o = self.linout[li + 1](self.deep_context[li](x))
                 outs.append(o)
+                if record is not None:
+                    record.append({'in': x, 'out': o})
         else:
-            o    = self._tap(0, self.context(self._fb(0, dff[0]) + tok))
+            x0   = self._fb(0, dff[0]) + tok
+            o    = self._tap(0, self.context(x0))
             outs = [o]
+            if record is not None:
+                record.append({'in': x0, 'out': o})
             for li in range(self.n_layers - 1):
                 x = self._fb(li + 1, dff[li + 1]) + self.deep_proj[li](o)
                 o = self._tap(li + 1, self.deep_context[li](x))
                 outs.append(o)
+                if record is not None:
+                    record.append({'in': x, 'out': o})
         # --clock: a layer that does not write this step keeps the state it had, while still
         # passing the output it just computed up the stack -- so the decoder, which reads the
         # top layer's output, moves every step whatever the clock does.
@@ -2728,7 +2752,7 @@ def worker(stop, q, datasets, args, mix=None):
 
 # ── dataset loading (before CUDA init) ───────────────────────────────────────
 
-if args.vis or args.generate or args.push or args.eval:
+if args.vis or args.altvis or args.generate or args.push or args.eval:
     hf_dataset = None                 # one-shot modes: --vis/--generate run from the prompt
                                       # token, --push only uploads weights, and --eval loads
                                       # its own held-out split — none of them needs the
@@ -2876,7 +2900,7 @@ _dff_shape = (1, args.n_hidden, args.context, args.context)
 def _summ(title, mod, **kw):
     # --generate/--vis have no log file, so their summaries would only be terminal noise in
     # front of the sample / the plot window. --verbose asks for them anyway.
-    if (args.generate or args.vis or args.push or args.eval) and not args.verbose:
+    if (args.generate or args.vis or args.altvis or args.push or args.eval) and not args.verbose:
         return
     s = str(torchinfo.summary(mod, col_names=['input_size', 'output_size', 'num_params'],
                               verbose=0, **kw))
@@ -2913,7 +2937,7 @@ if model.clock != 'sync' and not model.gated:
           f'{model.n_layers}: every layer writes every step, as --clock sync'
           + (' (exp clocks the middle layers only, so it needs --n_layers > 2)'
              if model.clock == 'exp' else ''))
-if model.clocked and (not (args.generate or args.vis or args.push or args.eval) or args.verbose):
+if model.clocked and (not (args.generate or args.vis or args.altvis or args.push or args.eval) or args.verbose):
     # the clock is invisible in the layer summaries (it adds no parameters and no shapes),
     # so state it explicitly: it is the single biggest change to what the stack does.
     _per = lambda fmt: ', '.join(fmt(li, p) for li, p in enumerate(model.periods))
@@ -2955,7 +2979,7 @@ if model.clocked and (not (args.generate or args.vis or args.push or args.eval) 
 if model.deep_context is not None:
     _summ(f'deep_context x{model.n_layers - 1} (layers 2..{model.n_layers})',
           model.deep_context[0], input_size=_dff_shape)
-if model.tap is not None and (not (args.generate or args.vis or args.push or args.eval)
+if model.tap is not None and (not (args.generate or args.vis or args.altvis or args.push or args.eval)
                               or args.verbose):
     _tap_txt = (
         '── tap ──\n'
@@ -3157,7 +3181,7 @@ if args.eval and not args.eval_corpora:
     else:
         print('EVAL: no usable documents')
 
-    if not (args.generate or args.vis):
+    if not (args.generate or args.vis or args.altvis):
         raise SystemExit(0)
 
 if args.generate:
@@ -3191,6 +3215,110 @@ def _vc(t):
         c = chr(t) if 32 <= t < 127 else DOT_TEXT
         return DOT_TEXT if c in '$\\' else c
     return ''.join(DOT_TEXT if c in '$\\' else c for c in _render([t]))
+
+
+if args.altvis:
+    # ── per-layer DFF map ──────────────────────────────────────────────────────
+    # An n_layers x 2 grid: top row each layer's ContextCNN INPUT, bottom row its OUTPUT.
+    # Every panel is the standard deviation ACROSS CHANNELS at each spatial position, so a
+    # panel answers "where in the SxS grid does this tensor carry variation", not "how much".
+    # A per-panel colour scale is deliberate: input and output live on different scales (the
+    # output has been through a projection), and layers differ by more than the map's shape,
+    # so a shared scale would flatten five of the six panels into noise.
+    plt.style.use('dark_background')
+    plt.ion()
+    _NL = model.n_layers
+    _av_fig, _av_axes = plt.subplots(2, _NL, figsize=(4 * _NL, 7), squeeze=False)
+    _av_fig.subplots_adjust(top=0.80, bottom=0.06, left=0.05, right=0.98,
+                            hspace=0.22, wspace=0.12)
+    for _r, _lbl in enumerate(('input', 'output')):
+        for _c in range(_NL):
+            _ax = _av_axes[_r][_c]
+            _ax.set_title(f'layer {_c + 1} DFF {_lbl} std / {model.n_hidden} ch',
+                          fontsize=8, pad=3)
+            _ax.set_xlabel(str(model.S), fontsize=7)
+            _ax.set_ylabel(str(model.S), fontsize=7)
+            _ax.set_xticks([]); _ax.set_yticks([])
+    _av_imgs   = [[None] * _NL, [None] * _NL]
+    _av_vmax   = [[None] * _NL, [None] * _NL]   # slow-tracking scale, as --vis does for DFF
+    _av_header = _av_fig.text(0.01, 0.99, '', family='monospace', fontsize=7,
+                              va='top', ha='left')
+
+    def _av_on_key(event):
+        global _vis_exit
+        if event.key in ('x', 'X'):
+            _vis_exit = True
+    _av_fig.canvas.mpl_connect('key_press_event', _av_on_key)
+
+    def _std_map(t):
+        """[1, C, S, S] -> [S, S] std across the channel axis."""
+        return t[0].std(dim=0).detach().float().cpu().numpy()
+
+    model.eval()
+    _dev    = next(model.parameters()).device
+    _prompt = _prompt_ids()
+    _ptext  = _render(_prompt)
+    _queue  = list(_prompt)
+    _b      = _queue.pop(0)
+    _ticker = _ptext
+    _nstep  = 0
+    dff     = model._new_dff(1, _dev)
+    clk     = model._new_clock(1, _dev)
+
+    while not _vis_exit:
+        rec = []
+        with torch.no_grad():
+            bi   = torch.tensor([_b], dtype=torch.long, device=_dev)
+            tok  = model.tok_embed(bi).view(1, model.c_text, 1, 1).expand(-1, -1, model.S, model.S)
+            stack, new_ctx = model._layers(dff, tok, clk, record=rec)
+            dff    = [d.detach().clone() for d in stack]
+            logits = model.readout(model.decoder(new_ctx))
+        _nstep += 1
+        prob = F.softmax(logits[0] / max(args.temperature, 1e-6), dim=-1)
+
+        for _r, _key in enumerate(('in', 'out')):
+            for _c in range(_NL):
+                m = _std_map(rec[_c][_key])
+                # ease the colour ceiling upward and let it decay, so a single spike does not
+                # permanently wash the panel out and a quiet stretch still fills the range
+                hi = float(m.max())
+                _av_vmax[_r][_c] = hi if _av_vmax[_r][_c] is None else \
+                    max(hi, 0.97 * _av_vmax[_r][_c])
+                if _av_imgs[_r][_c] is None:
+                    _av_imgs[_r][_c] = _av_axes[_r][_c].imshow(
+                        m, cmap=args.cmap, interpolation='nearest',
+                        vmin=0.0, vmax=max(_av_vmax[_r][_c], 1e-9))
+                else:
+                    _av_imgs[_r][_c].set_data(m)
+                    _av_imgs[_r][_c].set_clim(0.0, max(_av_vmax[_r][_c], 1e-9))
+
+        _av_header.set_text(
+            f'step {_nstep}   ' + '   '.join(
+                f'L{c+1} in {rec[c]["in"].std().item():7.3f} out {rec[c]["out"].std().item():7.3f}'
+                for c in range(_NL))
+            + '\n' + _ticker[-220:])
+
+        if _queue:
+            _b = _queue.pop(0)
+        else:
+            nxt = int(torch.multinomial(prob, 1).item())
+            if nxt == model.end_id:
+                _ticker += ETX_TEXT
+                dff    = model._new_dff(1, _dev)
+                clk    = model._new_clock(1, _dev)
+                _queue = list(_prompt)
+                _b     = _queue.pop(0)
+                _ticker += _ptext
+            else:
+                if nxt != model.null_id:
+                    _ticker += _vc(nxt)
+                _b = nxt
+            _ticker = _ticker[-_VIS_WIN:]
+
+        plt.pause(max(args.delay, 1e-3))
+        if not plt.fignum_exists(_av_fig.number):
+            break
+    raise SystemExit(0)
 
 
 if args.vis:
