@@ -515,8 +515,8 @@ parser.add_argument('--accumulate',    default=False,
                          'the mean is over one output. --no-accumulate turns it back off, so '
                          'a checkpoint trained with it can be run both ways (see --clock on '
                          'overriding what a checkpoint was trained with)')
-parser.add_argument('--ema_ladder',    default=None,  type=float, nargs='?', const=13.15,
-                    metavar='BASE',
+parser.add_argument('--ema_ladder',    default=None,  type=str, nargs='?', const='13.15',
+                    metavar='SPEC',
                     help='put the TIMESCALE LADDER IN THE EMA INSTEAD OF THE CLOCK. Every layer '
                          'writes its register EVERY STEP (all clock periods forced to 1), and '
                          'depth is expressed by the blend rate instead: layer li gets '
@@ -529,7 +529,15 @@ parser.add_argument('--ema_ladder',    default=None,  type=float, nargs='?', con
                          'deep register now moves a little every step rather than jumping once '
                          'every 173. Same timescales, continuous instead of piecewise.\n'
                          'Overrides --ema, and disables --accumulate, which has nothing to '
-                         'average when no layer ever holds.')
+                         'average when no layer ever holds.\n'
+                         'TWO FORMS. A single number is a BASE and the windows are 1, B, B**2 '
+                         '-- which pins layer 1 at a 1-token window for EVERY base, i.e. '
+                         'replace-outright, so no base can slow the top layer down. A '
+                         'COMMA-SEPARATED LIST is per-layer WINDOWS IN TOKENS and sets each '
+                         'layer independently: --ema_ladder 3.2,10,32 gives ema 0.3162, 0.1, '
+                         '0.03162. Size these against the data -- the vocab stream averages 11 '
+                         'tokens per sentence, so a 173-token window averages ~15 unrelated '
+                         'sentences while a 32-token one spans about three.')
 parser.add_argument('--ema',           default=None,  type=float, nargs='?', const=0.5,
                     metavar='DECAY',
                     help='hold a moving average in each layer\'s DFF register: a write blends '
@@ -1609,7 +1617,8 @@ class VLAModel(nn.Module, _HubMixin):
         if clock_ends is not None:
             self.clock_ends = clock_ends
         if ema_ladder is not None:
-            self.ema_ladder = float(ema_ladder) if float(ema_ladder) > 1.0 else None
+            _spec = str(ema_ladder).strip()
+            self.ema_ladder = _spec if _spec else None
         self.periods = _clock_periods(self.n_layers, self.clock,
                                       getattr(self, 'clock_base', None),
                                       getattr(self, 'clock_ends', 'both'))
@@ -1618,8 +1627,23 @@ class VLAModel(nn.Module, _HubMixin):
         # effective window of BASE**li tokens -- the same spans the clock ladder produced, but
         # the deep register now drifts continuously instead of jumping once per period.
         if getattr(self, 'ema_ladder', None):
-            _b = self.ema_ladder
-            self.ema     = [min(1.0, 1.0 / (_b ** i)) for i in range(self.n_layers)]
+            _spec = str(self.ema_ladder)
+            if ',' in _spec:
+                # per-layer WINDOWS in tokens. Short lists repeat their last entry, long ones
+                # are truncated, so the spec never has to be re-typed when --n_layers changes.
+                _w = [float(x) for x in _spec.split(',') if x.strip()]
+                if not _w:
+                    raise SystemExit(f'--ema_ladder {_spec!r}: no windows parsed')
+                _w = (_w + [_w[-1]] * self.n_layers)[:self.n_layers]
+                if any(x <= 0 for x in _w):
+                    raise SystemExit(f'--ema_ladder {_spec!r}: windows must be > 0')
+                self.ema = [min(1.0, 1.0 / x) for x in _w]
+            else:
+                _b = float(_spec)
+                if _b <= 1.0:
+                    raise SystemExit(f'--ema_ladder {_spec!r}: a bare BASE must be > 1 '
+                                     f'(use a comma-separated window list for anything else)')
+                self.ema = [min(1.0, 1.0 / (_b ** i)) for i in range(self.n_layers)]
             self.periods = [1] * self.n_layers
         # a mode with nothing to clock (one layer, or exp with no middle layers) is sync,
         # and there is nothing to average where nothing is ever held
@@ -2983,7 +3007,7 @@ if model.clocked and (not (args.generate or args.vis or args.altvis or args.push
                 + ', '.join(f'L{i + 1}={e:.4g} (~{1.0 / e:.0f} tok window)'
                             for i, e in enumerate(model.ema))
                 + '  -- every layer writes every step')
-        print(f'--ema_ladder {model.ema_ladder}: {_txt}')
+        print(f'--ema_ladder {model.ema_ladder}: {_txt}')  # spec as typed
         with open(args.log, 'a') as f:
             print(f'INFO --ema_ladder {model.ema_ladder}: {_txt}', file=f)
     _per = lambda fmt: ', '.join(fmt(li, p) for li, p in enumerate(model.periods))
