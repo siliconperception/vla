@@ -515,6 +515,21 @@ parser.add_argument('--accumulate',    default=False,
                          'the mean is over one output. --no-accumulate turns it back off, so '
                          'a checkpoint trained with it can be run both ways (see --clock on '
                          'overriding what a checkpoint was trained with)')
+parser.add_argument('--ema_ladder',    default=None,  type=float, nargs='?', const=13.15,
+                    metavar='BASE',
+                    help='put the TIMESCALE LADDER IN THE EMA INSTEAD OF THE CLOCK. Every layer '
+                         'writes its register EVERY STEP (all clock periods forced to 1), and '
+                         'depth is expressed by the blend rate instead: layer li gets '
+                         'ema = 1/BASE**li, so layer 1 replaces outright (ema 1.0) and each '
+                         'deeper layer folds in a proportionally smaller share of its new '
+                         'output.\n'
+                         'The effective memory window is ~1/ema tokens, so BASE reproduces the '
+                         'clock ladder\'s spans: --ema_ladder 13.15 gives windows of 1, 13 and '
+                         '173 tokens, the same as --clock fixed --clock_base 13.15 -- but the '
+                         'deep register now moves a little every step rather than jumping once '
+                         'every 173. Same timescales, continuous instead of piecewise.\n'
+                         'Overrides --ema, and disables --accumulate, which has nothing to '
+                         'average when no layer ever holds.')
 parser.add_argument('--ema',           default=None,  type=float, nargs='?', const=0.5,
                     metavar='DECAY',
                     help='hold a moving average in each layer\'s DFF register: a write blends '
@@ -950,7 +965,8 @@ _mix = _parse_mix(args.mix)
 # ── restore architecture args from checkpoint ─────────────────────────────────
 
 _ARCH_ARGS = ('context', 'n_hidden', 'c_text', 'n_layers', 'depth', 'kernel',
-              'tokenizer', 'head_norm', 'clock', 'accumulate', 'ema', 'qproj', 'tap', 'linout',
+              'tokenizer', 'head_norm', 'clock', 'accumulate', 'ema', 'ema_ladder', 'qproj',
+              'tap', 'linout',
               'init', 'clock_base', 'clock_max', 'clock_ends', 'clip_dff', 'tap_norm', 'norm', 'norm_groups', 'dff_norm', 'bn_track', 'bn_affine',
                   'bn_momentum', 'bn_eps')
 
@@ -963,7 +979,7 @@ _ARCH_ARGS = ('context', 'n_hidden', 'c_text', 'n_layers', 'depth', 'kernel',
 # a checkpoint sampled without it was being seeded differently than it was trained -- it adds
 # no parameters, so it restores like the rest and overrides like the other write-schedule
 # options.
-_ARCH_OVERRIDE = ('clock', 'accumulate', 'ema', 'init', 'clock_base', 'clock_max', 'clock_ends', 'clip_dff', 'tap_norm', 'norm', 'norm_groups', 'dff_norm', 'bn_track', 'bn_affine',
+_ARCH_OVERRIDE = ('clock', 'accumulate', 'ema', 'ema_ladder', 'init', 'clock_base', 'clock_max', 'clock_ends', 'clip_dff', 'tap_norm', 'norm', 'norm_groups', 'dff_norm', 'bn_track', 'bn_affine',
                   'bn_momentum', 'bn_eps')
 
 
@@ -1274,8 +1290,10 @@ class DFFClock:
             # --ema: blend into what is already there instead of overwriting it, except on a
             # row's first write of a document, which must discard the --init seed outright
             # rather than leave (1-ema) of it in the state.
+            # A LIST here is --ema_ladder: one decay per layer, deeper layers blending less.
+            _e = self.ema[li] if isinstance(self.ema, (list, tuple)) else self.ema
             cand = torch.where((self.t == 0).view(-1, 1, 1, 1), cand,
-                               prev + self.ema * (cand - prev))
+                               prev + _e * (cand - prev))
         return cand if m is None else torch.where(m.view(-1, 1, 1, 1), cand, prev)
 
     def advance(self):
@@ -1344,7 +1362,8 @@ class VLAModel(nn.Module, _HubMixin):
         self.bn_eps      = float(bn_eps)
         self.dff_norm_kind = dff_norm or 'none'
         self.dff_softmax   = nn.Softmax2d() if self.dff_norm_kind == 'softmax' else None
-        self.set_clock(clock, accumulate, ema, clock_base, clock_ends)
+        self.set_clock(clock, accumulate, ema, clock_base, clock_ends,
+                       getattr(args, 'ema_ladder', None))
         self.tokenizer  = tokenizer           # vocabulary / token path (see --tokenizer)
         # --head_norm only has a job when there is a borrowed head to feed; with char the
         # decoder emits logits directly and normalizing them would just rescale the
@@ -1569,7 +1588,7 @@ class VLAModel(nn.Module, _HubMixin):
         return [torch.zeros(s, device=device) for s in shapes]
 
     def set_clock(self, clock=None, accumulate=None, ema=None, clock_base=None,
-                  clock_ends=None):
+                  clock_ends=None, ema_ladder=None):
         """Set (or change) the DFF write schedule; None leaves that half alone. Neither knob
         adds a parameter or changes a shape, so this is safe on a model whose weights are
         already loaded -- it is what lets --clock/--accumulate on the command line override
@@ -1581,14 +1600,27 @@ class VLAModel(nn.Module, _HubMixin):
         if accumulate is not None:
             self.accumulate = bool(accumulate)
         if ema is not None:
-            self.ema = float(ema) if 0.0 < float(ema) < 1.0 else None
+            if isinstance(ema, (list, tuple)):
+                self.ema = list(ema)          # a per-layer ladder, already built
+            else:
+                self.ema = float(ema) if 0.0 < float(ema) < 1.0 else None
         if clock_base is not None:
             self.clock_base = float(clock_base)
         if clock_ends is not None:
             self.clock_ends = clock_ends
+        if ema_ladder is not None:
+            self.ema_ladder = float(ema_ladder) if float(ema_ladder) > 1.0 else None
         self.periods = _clock_periods(self.n_layers, self.clock,
                                       getattr(self, 'clock_base', None),
                                       getattr(self, 'clock_ends', 'both'))
+        # --ema_ladder: the ladder moves from WHEN a layer writes to HOW MUCH of the new value
+        # it takes. Every layer writes every step; layer li blends with ema = 1/BASE**li, an
+        # effective window of BASE**li tokens -- the same spans the clock ladder produced, but
+        # the deep register now drifts continuously instead of jumping once per period.
+        if getattr(self, 'ema_ladder', None):
+            _b = self.ema_ladder
+            self.ema     = [min(1.0, 1.0 / (_b ** i)) for i in range(self.n_layers)]
+            self.periods = [1] * self.n_layers
         # a mode with nothing to clock (one layer, or exp with no middle layers) is sync,
         # and there is nothing to average where nothing is ever held
         # gated: some layer actually holds, so there is a window to average over.
@@ -2792,7 +2824,8 @@ if args.pretrained:
     # from_pretrained built the model straight from that config, so an overridden clock has
     # to be pushed onto the model too -- unlike --load, there is no later construction step.
     if _CLI_GIVEN & {'clock', 'clock_base', 'accumulate', 'ema'}:
-        model.set_clock(args.clock, args.accumulate, args.ema, args.clock_base)
+        model.set_clock(args.clock, args.accumulate, args.ema, args.clock_base,
+                        ema_ladder=args.ema_ladder)
     print('pretrained config', _cfg)
     # The ARGS line was logged before the hub config was known, so it still shows the CLI
     # arch defaults. Re-log the corrected args, or the log would misattribute the run.
@@ -2856,7 +2889,11 @@ args.dff_norm   = model.dff_norm_kind
 args.bn_track   = model.bn_track
 args.bn_affine  = model.bn_affine
 args.accumulate = model.accumulate
-args.ema        = model.ema
+# Only a SCALAR ema syncs back. Under --ema_ladder model.ema is a per-layer list, and
+# writing that into args would put a list in saved_args['ema'] -- which _restore_arch then
+# hands to set_clock on the next --load, where float(list) raises. ema_ladder is the source
+# of truth for the ladder and is saved separately.
+args.ema        = model.ema if isinstance(model.ema, float) else args.ema
 args.qproj      = model.qproj_mode
 args.tap        = model.tap is not None
 
@@ -2940,6 +2977,15 @@ if model.clock != 'sync' and not model.gated:
 if model.clocked and (not (args.generate or args.vis or args.altvis or args.push or args.eval) or args.verbose):
     # the clock is invisible in the layer summaries (it adds no parameters and no shapes),
     # so state it explicitly: it is the single biggest change to what the stack does.
+    if isinstance(model.ema, (list, tuple)):
+        # --ema_ladder: the periods are all 1 and say nothing; the blend rates are the ladder.
+        _txt = ('DFF blend rate per layer '
+                + ', '.join(f'L{i + 1}={e:.4g} (~{1.0 / e:.0f} tok window)'
+                            for i, e in enumerate(model.ema))
+                + '  -- every layer writes every step')
+        print(f'--ema_ladder {model.ema_ladder}: {_txt}')
+        with open(args.log, 'a') as f:
+            print(f'INFO --ema_ladder {model.ema_ladder}: {_txt}', file=f)
     _per = lambda fmt: ', '.join(fmt(li, p) for li, p in enumerate(model.periods))
     _ladder = lambda: ('DFF state write period per layer '
                        + _per(lambda li, p: f'L{li + 1}={p}') + ' steps')
@@ -2970,7 +3016,8 @@ if model.clocked and (not (args.generate or args.vis or args.altvis or args.push
                 + (f'\n--ema {model.ema:g}: a write blends into the register '
                    f'(register += {model.ema:g} * (new - register)) instead of replacing it; '
                    f'effective window ~{1.0 / model.ema:g} writes'
-                   if model.ema is not None else ''))
+                   # a LIST is --ema_ladder, already reported above with its per-layer windows
+                   if isinstance(model.ema, float) else ''))
     print(_clk_txt)
     with open(args.log, 'a') as f:
         for line in _clk_txt.splitlines():
