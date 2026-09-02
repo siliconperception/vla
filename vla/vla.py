@@ -3228,19 +3228,34 @@ if args.altvis:
     plt.style.use('dark_background')
     plt.ion()
     _NL = model.n_layers
-    _av_fig, _av_axes = plt.subplots(2, _NL, figsize=(4 * _NL, 7), squeeze=False)
-    _av_fig.subplots_adjust(top=0.80, bottom=0.06, left=0.05, right=0.98,
-                            hspace=0.22, wspace=0.12)
-    for _r, _lbl in enumerate(('input', 'output')):
+    _av_fig, _av_axes = plt.subplots(3, _NL, figsize=(4 * _NL, 10), squeeze=False)
+    _av_fig.subplots_adjust(top=0.85, bottom=0.05, left=0.05, right=0.98,
+                            hspace=0.25, wspace=0.12)
+    # Row 3 is the REGISTER, and it is the one that does not move every step: the clock gates
+    # the write, so layer 1 updates every step, layer 2 every periods[1], and so on up the
+    # ladder. Rows 1 and 2 are recomputed every step whatever the clock does -- a layer always
+    # runs its convs and always passes its output up -- so only this row goes still.
+    _av_per = list(getattr(clk_probe, 'periods', [])) if (clk_probe := model._new_clock(1, 'cpu')) \
+              else []
+    if not _av_per:
+        _av_per = [1] * _NL
+    for _r, _lbl in enumerate(('input', 'output', 'state')):
         for _c in range(_NL):
             _ax = _av_axes[_r][_c]
-            _ax.set_title(f'layer {_c + 1} DFF {_lbl} std / {model.n_hidden} ch',
-                          fontsize=8, pad=3)
+            if _lbl == 'state':
+                _p = int(_av_per[_c]) if _c < len(_av_per) else 1
+                _t = (f'layer {_c + 1} DFF state std  (writes every {_p} step'
+                      f'{"" if _p == 1 else "s"})')
+            else:
+                _t = f'layer {_c + 1} DFF {_lbl} std / {model.n_hidden} ch'
+            _ax.set_title(_t, fontsize=8, pad=3)
             _ax.set_xlabel(str(model.S), fontsize=7)
             _ax.set_ylabel(str(model.S), fontsize=7)
             _ax.set_xticks([]); _ax.set_yticks([])
-    _av_imgs   = [[None] * _NL, [None] * _NL]
-    _av_vmax   = [[None] * _NL, [None] * _NL]   # slow-tracking scale, as --vis does for DFF
+    _av_imgs   = [[None] * _NL for _ in range(3)]
+    _av_vmax   = [[None] * _NL for _ in range(3)]   # slow-tracking scale, as --vis does
+    _av_prev   = [None] * _NL     # last state map per layer, to detect a held (unwritten) step
+    _av_held   = [0] * _NL        # consecutive steps this layer's register has not changed
     _av_header = _av_fig.text(0.01, 0.99, '', family='monospace', fontsize=7,
                               va='top', ha='left')
 
@@ -3276,9 +3291,18 @@ if args.altvis:
         _nstep += 1
         prob = F.softmax(logits[0] / max(args.temperature, 1e-6), dim=-1)
 
-        for _r, _key in enumerate(('in', 'out')):
+        for _r in range(3):
             for _c in range(_NL):
-                m = _std_map(rec[_c][_key])
+                if _r == 2:
+                    # the register itself, AFTER the clock decided whether to write it
+                    m = _std_map(dff[_c])
+                    if _av_prev[_c] is not None and np.array_equal(m, _av_prev[_c]):
+                        _av_held[_c] += 1
+                    else:
+                        _av_held[_c] = 0
+                    _av_prev[_c] = m
+                else:
+                    m = _std_map(rec[_c]['in' if _r == 0 else 'out'])
                 # ease the colour ceiling upward and let it decay, so a single spike does not
                 # permanently wash the panel out and a quiet stretch still fills the range
                 hi = float(m.max())
@@ -3294,7 +3318,9 @@ if args.altvis:
 
         _av_header.set_text(
             f'step {_nstep}   ' + '   '.join(
-                f'L{c+1} in {rec[c]["in"].std().item():7.3f} out {rec[c]["out"].std().item():7.3f}'
+                f'L{c+1} in {rec[c]["in"].std().item():6.3f} out {rec[c]["out"].std().item():6.3f} '
+                f'state {dff[c].std().item():6.3f} '
+                f'{"held " + str(_av_held[c]) if _av_held[c] else "WROTE"}'
                 for c in range(_NL))
             + '\n' + _ticker[-220:])
 
