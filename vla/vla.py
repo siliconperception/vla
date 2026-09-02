@@ -876,6 +876,22 @@ parser.add_argument('--device',        default=None)
 parser.add_argument('--verbose',       default=False, action='store_true',
                     help='print the torchinfo model summaries in --generate/--vis (training '
                          'always prints them, since they are logged)')
+parser.add_argument('--decoder',       default=False, action='store_true',
+                    help='drop the DFF register and the feedback add on the LAST layer, making '
+                         'it a pure feed-forward decoder stage. With --n_layers 3 that leaves '
+                         'two recurrent layers and one feed-forward one, and the state carried '
+                         'between steps shrinks from 3 to 2 registers.\n'
+                         'The rationale is that the top layer is the one the decoder reads '
+                         'directly, so its register is doing two jobs at once: remembering '
+                         'across steps, and shaping the tensor the readout consumes this step. '
+                         'Removing it separates them -- the recurrent layers below carry the '
+                         'memory, the top layer only transforms. It also removes a third of '
+                         'the recurrent state from an FPGA implementation, which is the '
+                         'expensive part there.\n'
+                         'The clock ladder shortens with the stack: the periods are computed '
+                         'over the REGISTERS that remain, so the deepest surviving register '
+                         'keeps the ladder\'s top period rather than inheriting a slot that no '
+                         'longer exists.')
 parser.add_argument('--altvis',        default=False, action='store_true',
                     help='live per-layer DFF map: an n_layers x 2 grid of imshow panels. Top '
                          'row is each layer\'s ContextCNN INPUT, bottom row its OUTPUT -- the '
@@ -951,6 +967,7 @@ _mix = _parse_mix(args.mix)
 
 _ARCH_ARGS = ('context', 'n_hidden', 'c_text', 'n_layers', 'depth', 'kernel',
               'tokenizer', 'head_norm', 'clock', 'accumulate', 'ema', 'qproj', 'tap', 'linout',
+              'decoder',
               'init', 'clock_base', 'clock_max', 'clock_ends', 'clip_dff', 'tap_norm', 'norm', 'norm_groups', 'dff_norm', 'bn_track', 'bn_affine',
                   'bn_momentum', 'bn_eps')
 
@@ -1328,6 +1345,13 @@ class VLAModel(nn.Module, _HubMixin):
         self.n_hidden   = n_hidden
         self.c_text     = c_text if c_text is not None else n_hidden
         self.n_layers   = max(1, n_layers)    # stacked (ContextCNN + feedback) layers (see --n_layers)
+        # --decoder: the top layer keeps no register and takes no feedback, so the number of
+        # REGISTERS is one fewer than the number of layers. Everything sized by "how much
+        # state is carried between steps" -- _new_dff, the clock ladder, _clip_state, the dff
+        # stats on the STEP line -- keys off n_dff, while everything sized by "how many convs
+        # are in the stack" keys off n_layers. Conflating them is the bug this split avoids.
+        self.decoder_ff = bool(getattr(args, 'decoder', False))
+        self.n_dff      = max(1, self.n_layers - 1) if self.decoder_ff else self.n_layers
         # --clock/--accumulate: how often each layer writes its DFF state and what it writes
         # (see DFFClock). Only the write is gated; the convs run every step at every layer.
         self.clock = self.accumulate = self.ema = None   # derived in set_clock
@@ -1561,7 +1585,7 @@ class VLAModel(nn.Module, _HubMixin):
         init is forgotten fast -- relative divergence between a zero and a gaussian start
         falls to 3% by 20 bytes and to float32 noise by 50 -- so --init only changes what
         the model sees for the first few dozen bytes of a context."""
-        shapes = [(B, self.n_hidden, self.S, self.S)] * self.n_layers
+        shapes = [(B, self.n_hidden, self.S, self.S)] * self.n_dff
         if self.init_mode == 'gaussian':
             return [torch.randn(s, device=device) for s in shapes]
         if self.init_mode == 'relu':
@@ -1586,7 +1610,7 @@ class VLAModel(nn.Module, _HubMixin):
             self.clock_base = float(clock_base)
         if clock_ends is not None:
             self.clock_ends = clock_ends
-        self.periods = _clock_periods(self.n_layers, self.clock,
+        self.periods = _clock_periods(getattr(self, 'n_dff', self.n_layers), self.clock,
                                       getattr(self, 'clock_base', None),
                                       getattr(self, 'clock_ends', 'both'))
         # a mode with nothing to clock (one layer, or exp with no middle layers) is sync,
@@ -1609,7 +1633,7 @@ class VLAModel(nn.Module, _HubMixin):
 
     def _init_dff(self, B, device):
         dev = torch.device(device)
-        if (self.dff is None or len(self.dff) != self.n_layers
+        if (self.dff is None or len(self.dff) != self.n_dff
                 or self.dff[0].shape[0] != B or self.dff[0].device != dev):
             self.dff = self._new_dff(B, device)
             self.clk = self._new_clock(B, dev)   # the clock is state too: rebuilt with it
@@ -1727,33 +1751,30 @@ class VLAModel(nn.Module, _HubMixin):
         layer above receives). --altvis draws these; nothing else uses them, and passing None
         leaves the forward pass byte-identical."""
         tok  = self.text_proj(tok_grid)        # [B, n_hidden, S, S], computed once
-        if self.linout is not None:
-            # ONE 1x1 per layer. `o` leaves the projection already dense and signed, and is
-            # both stored in the register and handed straight to the layer above -- there is
-            # no second projection on the way up, which is the whole difference from --tap.
-            x0   = self._fb(0, dff[0]) + tok
-            o    = self.linout[0](self.context(x0))
-            outs = [o]
+        # --decoder: the TOP layer keeps no register, so it neither reads dff nor writes to
+        # outs. It still runs its convs and still feeds the decoder -- it is simply
+        # feed-forward. `_ff_top` is the index of that layer, or None when every layer is
+        # recurrent.
+        _ff_top = (self.n_layers - 1) if (self.decoder_ff and self.n_layers > 1) else None
+        _proj   = (lambda i, t: t) if self.linout is not None else (lambda i, t: self.deep_proj[i](t))
+        _post   = (lambda i, t: self.linout[i](t)) if self.linout is not None else \
+                  (lambda i, t: self._tap(i, t))
+        x0   = self._fb(0, dff[0]) + tok
+        o    = _post(0, self.context(x0))
+        outs = [o]
+        if record is not None:
+            record.append({'in': x0, 'out': o})
+        for li in range(self.n_layers - 1):
+            up = _proj(li, o)
+            if li + 1 == _ff_top:
+                x = up                                   # no feedback add: no register here
+            else:
+                x = self._fb(li + 1, dff[li + 1]) + up
+            o = _post(li + 1, self.deep_context[li](x))
+            if li + 1 != _ff_top:
+                outs.append(o)                           # only registered layers are state
             if record is not None:
-                record.append({'in': x0, 'out': o})
-            for li in range(self.n_layers - 1):
-                x = self._fb(li + 1, dff[li + 1]) + o
-                o = self.linout[li + 1](self.deep_context[li](x))
-                outs.append(o)
-                if record is not None:
-                    record.append({'in': x, 'out': o})
-        else:
-            x0   = self._fb(0, dff[0]) + tok
-            o    = self._tap(0, self.context(x0))
-            outs = [o]
-            if record is not None:
-                record.append({'in': x0, 'out': o})
-            for li in range(self.n_layers - 1):
-                x = self._fb(li + 1, dff[li + 1]) + self.deep_proj[li](o)
-                o = self._tap(li + 1, self.deep_context[li](x))
-                outs.append(o)
-                if record is not None:
-                    record.append({'in': x, 'out': o})
+                record.append({'in': x, 'out': o})
         # --clock: a layer that does not write this step keeps the state it had, while still
         # passing the output it just computed up the stack -- so the decoder, which reads the
         # top layer's output, moves every step whatever the clock does.
@@ -3243,9 +3264,15 @@ if args.altvis:
         for _c in range(_NL):
             _ax = _av_axes[_r][_c]
             if _lbl == 'state':
-                _p = int(_av_per[_c]) if _c < len(_av_per) else 1
-                _t = (f'layer {_c + 1} DFF state std  (writes every {_p} step'
-                      f'{"" if _p == 1 else "s"})')
+                if _c >= model.n_dff:
+                    # --decoder: this layer is feed-forward. Its INPUT and OUTPUT panels are
+                    # real and still drawn above -- it computes like any other layer -- it
+                    # simply has no register for this row to show.
+                    _t = f'layer {_c + 1}  no DFF (feed-forward)'
+                else:
+                    _p = int(_av_per[_c]) if _c < len(_av_per) else 1
+                    _t = (f'layer {_c + 1} DFF state std  (writes every {_p} step'
+                          f'{"" if _p == 1 else "s"})')
             else:
                 _t = f'layer {_c + 1} DFF {_lbl} std / {model.n_hidden} ch'
             _ax.set_title(_t, fontsize=8, pad=3)
@@ -3294,6 +3321,12 @@ if args.altvis:
         for _r in range(3):
             for _c in range(_NL):
                 if _r == 2:
+                    if _c >= model.n_dff:
+                        if _av_imgs[_r][_c] is None:      # draw the empty panel once
+                            _av_axes[_r][_c].imshow(np.zeros((model.S, model.S)),
+                                                    cmap=args.cmap, vmin=0.0, vmax=1.0)
+                            _av_imgs[_r][_c] = True
+                        continue
                     # the register itself, AFTER the clock decided whether to write it
                     m = _std_map(dff[_c])
                     if _av_prev[_c] is not None and np.array_equal(m, _av_prev[_c]):
@@ -3319,8 +3352,9 @@ if args.altvis:
         _av_header.set_text(
             f'step {_nstep}   ' + '   '.join(
                 f'L{c+1} in {rec[c]["in"].std().item():6.3f} out {rec[c]["out"].std().item():6.3f} '
-                f'state {dff[c].std().item():6.3f} '
-                f'{"held " + str(_av_held[c]) if _av_held[c] else "WROTE"}'
+                + (f'state {dff[c].std().item():6.3f} '
+                   f'{"held " + str(_av_held[c]) if _av_held[c] else "WROTE"}'
+                   if c < model.n_dff else 'feed-forward')
                 for c in range(_NL))
             + '\n' + _ticker[-220:])
 
