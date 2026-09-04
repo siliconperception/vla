@@ -1955,10 +1955,16 @@ def _epoch_num():
     """The STEP line's `epoch` column.
 
     With --vocab_files active it is the MEAN number of complete passes over the curriculum
-    pools -- those files are the same size and are drawn at the same rate, so their mean is
-    the run's curriculum clock, and a mean (rather than the min) does not quantise to a step
-    change when one pool happens to wrap a few thousand steps before another.  The corpus is
+    pools, fractional, and a mean rather than the min so it does not quantise to a step
+    change when one pool wraps a few thousand steps before another.  The corpus is
     effectively infinite and is deliberately excluded (see _track_corpus_epochs).
+
+    READ IT WITH THE PER-POOL REPORT, not alone.  Pools are equal in SLOTS, not in tokens,
+    so equal slot counts do NOT make equal epoch rates: at 10 slots each, the ~12-token
+    sentence files wrap every ~12k steps while the ~761-token reasoning_phase1 wraps every
+    ~776k, a 60x spread.  The mean over pools that far apart is dominated by the short ones
+    and says nothing about the long one -- _epoch_report() prints each pool separately,
+    fractionally, and is the honest reading when the pools differ in example length.
 
     Without vocab files it is the old reading: passes over the corpus that has wrapped LEAST,
     which for a single dataset is simply its epoch. 0 before the worker starts."""
@@ -1969,9 +1975,15 @@ def _epoch_num():
 
 
 def _epoch_report():
-    """'name=pass' per dataset, e.g. 'wdef=3' or 'brt=2,web=1'; '' before anything loads."""
+    """'name=pass' per dataset, e.g. 'wdef=3' or 'math_phase1=12.48,web=1'; '' before load.
+
+    Vocab pools report the FRACTIONAL pass, corpora the integer one. A pool whose examples
+    are long enough to wrap only a handful of times in a whole run (reasoning_phase1: ~5
+    passes in 4M steps) sits at the integer 1 for hundreds of thousands of steps, which is
+    indistinguishable from a stalled stream; the fraction shows it moving."""
     with _epoch_lock:
-        return ','.join(f'{k}={v}' for k, v in sorted(_epoch_stats.items()))
+        return ','.join(f'{k}={_epoch_frac[k]:.2f}' if k in _epoch_frac else f'{k}={v}'
+                        for k, v in sorted(_epoch_stats.items()))
 
 def _text_tally(n_tokens, sample='', vocab=False):
     """`vocab` is the POOL NAME for a --vocab_files sentence, False for a corpus document."""
