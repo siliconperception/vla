@@ -652,6 +652,17 @@ parser.add_argument('--vocab_files',   default=None,
                          'them in thirds -- pass a multiple of the file count as '
                          '--vocab_slots to get an exact split. The STEP line\'s epoch column '
                          'is the MEAN number of complete passes over these files.')
+parser.add_argument('--vocab_framed',   default=None,
+                    help='comma-separated subset of --vocab_files (path or bare stem) whose '
+                         'examples ARE framed: each one is wrapped in <STX>...<ETX> and the '
+                         'slot signals a document start on its first step, so the recurrent '
+                         'state resets between examples exactly as it does on a corpus slot. '
+                         'This is the right setting for a pool whose examples are long, '
+                         'self-contained documents (reasoning_phase1: ~761 tokens of '
+                         'question + <think> + <answer>) rather than short sentences meant '
+                         'to run head to tail. Framed pools are EXCLUDED from the epoch '
+                         'column\'s mean -- they wrap tens of times more slowly than a '
+                         'sentence pool and would dominate nothing while being dominated.')
 parser.add_argument('--vocab_slots',   default=0,     type=int,
                     help='how many of the --batch slots the --vocab_files stream occupies. '
                          'The REMAINING slots are filled the normal way from --dataset/--mix, '
@@ -1942,6 +1953,9 @@ _epoch_stats = {}
 # 44% of the next.  Separate from _epoch_stats, which stays the 1-based "consuming pass N"
 # integer the EPOCH line and _epoch_report() have always printed.
 _epoch_frac  = {}
+# Pools kept OUT of the epoch column's mean (--vocab_framed). Written once at worker
+# start-up, before any thread reads it.
+_epoch_mean_exclude = set()
 
 def _epoch_set(name, n):
     with _epoch_lock:
@@ -1959,18 +1973,20 @@ def _epoch_num():
     change when one pool wraps a few thousand steps before another.  The corpus is
     effectively infinite and is deliberately excluded (see _track_corpus_epochs).
 
-    READ IT WITH THE PER-POOL REPORT, not alone.  Pools are equal in SLOTS, not in tokens,
-    so equal slot counts do NOT make equal epoch rates: at 10 slots each, the ~12-token
-    sentence files wrap every ~12k steps while the ~761-token reasoning_phase1 wraps every
-    ~776k, a 60x spread.  The mean over pools that far apart is dominated by the short ones
-    and says nothing about the long one -- _epoch_report() prints each pool separately,
-    fractionally, and is the honest reading when the pools differ in example length.
+    --vocab_framed pools are EXCLUDED from the mean.  Pools are equal in SLOTS, not in
+    tokens, so equal slot counts do NOT make equal epoch rates: at 10 slots each the
+    ~12-token sentence files wrap every ~12k steps while the ~761-token reasoning_phase1
+    wraps every ~776k, a 60x spread.  Averaging across that spread produces a number that
+    describes neither group, so the mean covers the short curriculum pools only and the
+    long one is reported on its own.  _epoch_report() still prints EVERY pool separately
+    and fractionally, which is the honest reading when example lengths differ.
 
     Without vocab files it is the old reading: passes over the corpus that has wrapped LEAST,
     which for a single dataset is simply its epoch. 0 before the worker starts."""
     with _epoch_lock:
-        if _epoch_frac:
-            return sum(_epoch_frac.values()) / len(_epoch_frac)
+        frac = {k: v for k, v in _epoch_frac.items() if k not in _epoch_mean_exclude}
+        if frac:
+            return sum(frac.values()) / len(frac)
         return float(min(_epoch_stats.values())) if _epoch_stats else 0.0
 
 
@@ -2631,9 +2647,9 @@ _vocab_consumed = {}
 
 
 class _VocabSlot:
-    """One batch slot fed by an ENDLESS, UNDELIMITED stream of single sentences.
+    """One batch slot fed by an endless stream of examples drawn from one local file.
 
-    Differs from _ClipSlot in the two ways that matter:
+    UNFRAMED (the default) differs from _ClipSlot in the two ways that matter:
       * NO FRAMING. clip_text wraps every document in <STX>...<ETX>; here the raw sentence
         tokens are concatenated head to tail, so the (x, y) pair that straddles a sentence
         boundary is a real transition from one sentence's last token to the next sentence's
@@ -2641,32 +2657,72 @@ class _VocabSlot:
       * is_start() IS ALWAYS FALSE, so this slot never signals a document start and the
         recurrent state is never reset on it. A corpus slot resets every <ETX>; this one
         runs forever.
-    Each slot keeps its own shuffled permutation and reshuffles on wrap, so 225 slots are
-    225 independent orderings of the same file rather than 225 copies of one ordering."""
-    __slots__ = ['pool', 'texts', 'name', 'rng', 'order', 'oi', 'ids', 'pos']
 
-    def __init__(self, pool, name, seed, texts=None):
+    FRAMED (--vocab_framed) gives up both of those and behaves exactly like a corpus slot:
+    one example at a time, wrapped <STX>...<ETX>, is_start() true on its first step so the
+    DFF and the clock reset between examples. It is deliberately NOT the unframed stream
+    with delimiters added -- examples do not run head to tail, so no (x, y) pair ever
+    straddles a boundary and the model is never asked to predict across one. That is the
+    same contract _ClipSlot has, which is the point: a pool of long self-contained documents
+    should look to the model like documents, not like an unbroken sentence stream.
+
+    Each slot keeps its own shuffled permutation and reshuffles on wrap, so N slots are
+    N independent orderings of the same file rather than N copies of one ordering."""
+    __slots__ = ['pool', 'texts', 'name', 'rng', 'order', 'oi', 'ids', 'pos',
+                 'framed', 'steps']
+
+    def __init__(self, pool, name, seed, texts=None, framed=False):
         self.pool, self.name, self.texts = pool, name, texts
+        self.framed = framed
         self.rng   = random.Random(seed)
         self.order = list(range(len(pool)))
         self.rng.shuffle(self.order)
         self.oi, self.ids, self.pos = 0, [], 0
+        self.steps = []
 
-    def _append_next(self):
+    def _next_index(self):
+        """Index of the next example in this slot's permutation; reshuffles on wrap."""
         if self.oi >= len(self.order):
             self.oi = 0
             self.rng.shuffle(self.order)
         j = self.order[self.oi]
-        ids = self.pool[j]
         self.oi += 1
+        return j
+
+    def _load_example(self):
+        """FRAMED mode: make the next example the slot's current clip, <STX>...<ETX>."""
+        j   = self._next_index()
+        ids = [_tokenizer.start_id] + list(self.pool[j]) + [_tokenizer.end_id]
+        self.steps = [(ids[i], ids[i + 1]) for i in range(len(ids) - 1)]
+        self.pos   = 0
+        _vocab_consumed[self.name] = _vocab_consumed.get(self.name, 0) + 1
+        _text_tally(len(ids), sample=(self.texts[j] if self.texts else ''),
+                    vocab=self.name)
+
+    def _append_next(self):
+        j = self._next_index()
+        ids = self.pool[j]
         self.ids.extend(ids)
         _vocab_consumed[self.name] = _vocab_consumed.get(self.name, 0) + 1
         _text_tally(len(ids), sample=(self.texts[j] if self.texts else ''), vocab=self.name)
 
     def done(self):      return False       # never refilled from clip_q
-    def is_start(self):  return False       # never resets the state
+
+    def is_start(self):
+        # unframed: never resets the state. framed: true on the <STX> step, like _ClipSlot.
+        if not self.framed:
+            return False
+        if self.pos >= len(self.steps):     # called before advance(), so fill here too
+            self._load_example()
+        return self.pos == 0
 
     def advance(self):
+        if self.framed:
+            if self.pos >= len(self.steps):
+                self._load_example()
+            item = self.steps[self.pos]
+            self.pos += 1
+            return item
         while self.pos + 1 >= len(self.ids):
             self._append_next()
         x, y = self.ids[self.pos], self.ids[self.pos + 1]
@@ -2677,11 +2733,19 @@ class _VocabSlot:
         return (x, y)
 
 
-def _load_vocab_pools(paths):
-    """path -> list of token-id lists, one per line, NO framing tokens.
+def _load_vocab_pools(paths, framed=None):
+    """path -> (token-id lists one per line, path, n_lines, raw lines, framed).
 
-    A trailing space is tokenized with each sentence so that concatenation reads as
-    'One sentence. Another sentence.' rather than running the words together."""
+    An UNFRAMED pool carries no <STX>/<ETX> and a trailing space is tokenized with each
+    sentence, so concatenation reads as 'One sentence. Another sentence.' rather than
+    running the words together.  A pool named in `framed` is wrapped per example by the
+    slot instead, and gets NO trailing space: the example ends at <ETX>, so a space before
+    it would train a token that the corpus path never emits there."""
+    framed_stems = {os.path.splitext(os.path.basename(f.strip()))[0]
+                    for f in (framed or '').split(',') if f.strip()}
+    unknown = framed_stems - {os.path.splitext(os.path.basename(p))[0] for p in paths}
+    if unknown:
+        raise SystemExit(f'--vocab_framed: not in --vocab_files: {",".join(sorted(unknown))}')
     pools = {}
     for i, path in enumerate(paths):
         if not os.path.exists(path):
@@ -2693,8 +2757,9 @@ def _load_vocab_pools(paths):
         key = os.path.splitext(os.path.basename(path))[0]
         if key in pools:
             key = f'{key}#{i+1}'
-        pools[key] = ([_tokenizer.encode(l + ' ') for l in lines], path,
-                      len(lines), lines)
+        is_framed = key in framed_stems
+        pools[key] = ([_tokenizer.encode(l if is_framed else l + ' ') for l in lines],
+                      path, len(lines), lines, is_framed)
     return pools
 
 
@@ -2764,15 +2829,22 @@ def worker(stop, q, datasets, args, mix=None):
         raise SystemExit('--vocab_slots set but --vocab_files is empty')
     slots = []
     if n_vocab:
-        pools = _load_vocab_pools(_vocab_paths)
+        pools = _load_vocab_pools(_vocab_paths, args.vocab_framed)
         keys  = sorted(pools)
         for k in keys:
             _vocab_consumed[k] = 0
             _epoch_set(k, 1)
-            print(f'{k}: {pools[k][1]} ({pools[k][2]} sentences, undelimited)', flush=True)
+            if pools[k][4]:
+                _epoch_mean_exclude.add(k)   # framed pools sit outside the epoch mean
+            _framing = '<STX>/<ETX> framed' if pools[k][4] else 'undelimited'
+            print(f'{k}: {pools[k][1]} ({pools[k][2]} examples, {_framing})', flush=True)
+        if _epoch_mean_exclude:
+            print(f'epoch mean over {[k for k in keys if k not in _epoch_mean_exclude]}, '
+                  f'excluding framed {sorted(_epoch_mean_exclude)}', flush=True)
         for i in range(n_vocab):
             k = keys[i % len(keys)]                       # round robin -> even slot split
-            slots.append(_VocabSlot(pools[k][0], k, args.seed + 9973 * i, pools[k][3]))
+            slots.append(_VocabSlot(pools[k][0], k, args.seed + 9973 * i, pools[k][3],
+                                    framed=pools[k][4]))
         print(f'batchwise mix: {n_vocab}/{args.batch} vocab slots '
               f'({100.0*n_vocab/args.batch:.0f}% of tokens), '
               f'{args.batch-n_vocab} corpus slots', flush=True)
