@@ -648,7 +648,10 @@ parser.add_argument('--vocab_files',   default=None,
                          '<STX>/<ETX> is added and the slot never signals a document start, '
                          'so the model state is never reset on those slots -- the sentences '
                          'run head to tail as an unbroken stream. Files are weighted EQUALLY '
-                         'by slot, so two files split the vocab slots 50/50.')
+                         'by slot, so two files split the vocab slots 50/50 and three split '
+                         'them in thirds -- pass a multiple of the file count as '
+                         '--vocab_slots to get an exact split. The STEP line\'s epoch column '
+                         'is the MEAN number of complete passes over these files.')
 parser.add_argument('--vocab_slots',   default=0,     type=int,
                     help='how many of the --batch slots the --vocab_files stream occupies. '
                          'The REMAINING slots are filled the normal way from --dataset/--mix, '
@@ -1916,12 +1919,16 @@ def _dff_stats(dff):
 # count examples/tokens and stash the most recent raw sample; the main loop drains
 # both each checkpoint to report throughput and show a training-text sample.
 _text_lock  = threading.Lock()
-# 'sample' is the last FRAMED corpus document, 'vsample' the last undelimited vocab
-# sentence. They are kept apart because the two streams pull at wildly different rates --
-# 225 vocab slots take a sentence every ~12 steps while 25 corpus slots take a document
-# every ~1000, so a single shared field would be vocab text essentially always and the
-# corpus half of the mix would never be seen.
-_text_stats = {'examples': 0, 'tokens': 0, 'sample': '', 'vsample': ''}
+# 'sample' is the last FRAMED corpus document, 'vsample' a dict of the last undelimited
+# sentence PER VOCAB POOL. They are kept apart because the two streams pull at wildly
+# different rates -- 75 vocab slots take a sentence every ~12 steps while 175 corpus slots
+# take a document every ~1000, so a single shared field would be vocab text essentially
+# always and the corpus half of the mix would never be seen.
+# vsample is per-pool rather than one field for the same reason one field is wrong across
+# the two streams: with three curriculum files a single slot shows whichever pool happened
+# to draw last, so math_phase1 would appear in only a third of the reports. Keyed by pool
+# name, every report shows one line from EACH file.
+_text_stats = {'examples': 0, 'tokens': 0, 'sample': '', 'vsample': {}}
 
 # Passes over each corpus, published by the builder threads and read by the TEXT line.
 # Same worker->main-loop channel as _text_stats, and for the same reason: the epoch counter
@@ -1931,19 +1938,34 @@ _text_stats = {'examples': 0, 'tokens': 0, 'sample': '', 'vsample': ''}
 # at 1 forever and is just noise; on a CLOSED corpus (wdef) it is the experiment's clock.
 _epoch_lock  = threading.Lock()
 _epoch_stats = {}
+# Fractional passes over each --vocab_files pool, e.g. 812.437 = 812 complete passes and
+# 44% of the next.  Separate from _epoch_stats, which stays the 1-based "consuming pass N"
+# integer the EPOCH line and _epoch_report() have always printed.
+_epoch_frac  = {}
 
 def _epoch_set(name, n):
     with _epoch_lock:
         _epoch_stats[name] = n
 
-def _epoch_num():
-    """The STEP line's `epoch` column: passes over the corpus that has wrapped LEAST.
-
-    For a single dataset that is simply its epoch. For a --mix it is the number of complete
-    passes the SLOWEST member has made, which is the only reading under which one integer
-    means anything across corpora of wildly different sizes. 0 before the worker starts."""
+def _epoch_frac_set(name, v):
     with _epoch_lock:
-        return min(_epoch_stats.values()) if _epoch_stats else 0
+        _epoch_frac[name] = v
+
+def _epoch_num():
+    """The STEP line's `epoch` column.
+
+    With --vocab_files active it is the MEAN number of complete passes over the curriculum
+    pools -- those files are the same size and are drawn at the same rate, so their mean is
+    the run's curriculum clock, and a mean (rather than the min) does not quantise to a step
+    change when one pool happens to wrap a few thousand steps before another.  The corpus is
+    effectively infinite and is deliberately excluded (see _track_corpus_epochs).
+
+    Without vocab files it is the old reading: passes over the corpus that has wrapped LEAST,
+    which for a single dataset is simply its epoch. 0 before the worker starts."""
+    with _epoch_lock:
+        if _epoch_frac:
+            return sum(_epoch_frac.values()) / len(_epoch_frac)
+        return float(min(_epoch_stats.values())) if _epoch_stats else 0.0
 
 
 def _epoch_report():
@@ -1952,11 +1974,15 @@ def _epoch_report():
         return ','.join(f'{k}={v}' for k, v in sorted(_epoch_stats.items()))
 
 def _text_tally(n_tokens, sample='', vocab=False):
+    """`vocab` is the POOL NAME for a --vocab_files sentence, False for a corpus document."""
     with _text_lock:
         _text_stats['examples'] += 1
         _text_stats['tokens']   += n_tokens
         if sample:
-            _text_stats['vsample' if vocab else 'sample'] = sample
+            if vocab:
+                _text_stats['vsample'][vocab if isinstance(vocab, str) else 'vocab'] = sample
+            else:
+                _text_stats['sample'] = sample
 
 def _text_drain():
     """Return (examples, tokens, sample) since the last drain; reset the counters.
@@ -1976,7 +2002,7 @@ def _text_peek():
     TEXT line to a tenth of the window it claims to cover.  The sample itself is safe to
     read repeatedly: builder threads overwrite it in place and the drain never clears it."""
     with _text_lock:
-        return _text_stats['sample'], _text_stats['vsample']
+        return _text_stats['sample'], dict(_text_stats['vsample'])
 # Each builder returns (steps, caption). A step is a 4-tuple
 #   (x_byte, y_byte, img_or_None, aud_or_None)
 # one entry per 100 Hz frame.
@@ -2623,7 +2649,7 @@ class _VocabSlot:
         self.oi += 1
         self.ids.extend(ids)
         _vocab_consumed[self.name] = _vocab_consumed.get(self.name, 0) + 1
-        _text_tally(len(ids), sample=(self.texts[j] if self.texts else ''), vocab=True)
+        _text_tally(len(ids), sample=(self.texts[j] if self.texts else ''), vocab=self.name)
 
     def done(self):      return False       # never refilled from clip_q
     def is_start(self):  return False       # never resets the state
@@ -2649,8 +2675,14 @@ def _load_vocab_pools(paths):
         if not os.path.exists(path):
             raise SystemExit(f'--vocab_files: no such file: {path}')
         lines = [l.strip() for l in open(path) if l.strip()]
-        pools[f'vocab{i+1}'] = ([_tokenizer.encode(l + ' ') for l in lines], path,
-                                len(lines), lines)
+        # Keyed by FILE STEM, not by position: with three curriculum files the epoch
+        # report has to say which one wrapped, and 'vocab3=812' does not identify
+        # math_phase1.txt.  Positional keys are kept only to break a stem collision.
+        key = os.path.splitext(os.path.basename(path))[0]
+        if key in pools:
+            key = f'{key}#{i+1}'
+        pools[key] = ([_tokenizer.encode(l + ' ') for l in lines], path,
+                      len(lines), lines)
     return pools
 
 
@@ -2795,6 +2827,7 @@ def worker(stop, q, datasets, args, mix=None):
             # reading when 225 slots each hold their own permutation of the same file.
             for k in keys:
                 _epoch_set(k, 1 + _vocab_consumed[k] // pools[k][2])
+                _epoch_frac_set(k, _vocab_consumed[k] / pools[k][2])
 
         x_list, y_list, flag_list = [], [], []
         for slot in slots:
@@ -4340,11 +4373,12 @@ try:
                 prompt = _prompt_ids(_p)
                 out    = model.generate(prompt, _GEN_SAMPLE, temperature=args.temperature)
                 lines.append(f'GEN step {i:10} [{_p or "<STX>"}]: {_render(prompt + out)}')
-            _tsample, _vsample = _text_peek()  # recent corpus / vocab training text
-            if _vsample:
-                lines.append(f'TXT-VOCAB : {_printable(_vsample[:240])}')
+            _tsample, _vsample = _text_peek()  # recent corpus / per-pool vocab training text
+            _vw = max([len(k) for k in _vsample] + [6])
+            for _k in sorted(_vsample):            # every curriculum file, every report
+                lines.append(f'TXT-{_k:<{_vw}}: {_printable(_vsample[_k][:240])}')
             if _tsample:
-                lines.append(f'TXT-SAMPLE: {_printable(_tsample[:240])}')
+                lines.append(f'TXT-{"SAMPLE":<{_vw}}: {_printable(_tsample[:240])}')
             print('\n' + '\n'.join(lines) + '\n')
             with open(args.log, 'a') as f:
                 print('\n' + '\n'.join(lines) + '\n', file=f)
@@ -4411,7 +4445,7 @@ try:
             # batch size that produced each point (loss/grad both scale with it).
             s = ('STEP {:10} wall {} loss {:12.9f} grad {:12.6f} '
                  'lr {:10.9f} dff_mean {:12.5f} dff_std {:12.5f} dff_max {:11.3f} '
-                 'dff_zeros {:8.5f} batch {:6d} examples {:12d} epoch {:6d}').format(
+                 'dff_zeros {:8.5f} batch {:6d} examples {:12d} epoch {:10.3f}').format(
                 i, datetime.datetime.now(),
                 np.mean(larr[-args.monitor:]),
                 np.mean(garr[-args.monitor:]),
