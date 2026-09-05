@@ -126,6 +126,15 @@ def load_vla_defs(saved):
         argv += ['--accumulate']
     if saved.get('tap'):
         argv += ['--tap']
+    # --linout is NOT a VLAModel kwarg: it is read off the module-level `args` at construction
+    # (vla.py "getattr(args, 'linout', False)"), so it has to arrive through argv or the
+    # rebuilt model has deep_proj where the checkpoint has linout and load_state_dict fails.
+    if saved.get('linout'):
+        argv += ['--linout']
+    # ema_ladder likewise: saved_args['ema'] keeps only the SCALAR, so without this the
+    # per-layer rates are silently replaced by that scalar.
+    if saved.get('ema_ladder') is not None:
+        argv += ['--ema_ladder', str(saved['ema_ladder'])]
     lines = open(VLA).read().split('\n')
     cut = next(i for i, l in enumerate(lines) if l.startswith(CUT_MARK))
     src = lines[:cut]
