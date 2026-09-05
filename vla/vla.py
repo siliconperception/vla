@@ -3936,7 +3936,14 @@ def _param_groups_named(model):
          'ctx':  list(model.context.parameters()),
          'dec':  list(model.decoder.parameters())}
     if model.deep_context is not None:   # stacked layers 2..N (--n_layers)
-        g['deep'] = list(model.deep_context.parameters()) + list(model.deep_proj.parameters())
+        # deep_proj is None under --linout, which REPLACES it (see VLAModel.__init__). This
+        # is reached from the non-finite-loss HALT path, so crashing here loses the gradient
+        # diagnostic on exactly the runs that need it -- every --linout run that diverges.
+        g['deep'] = list(model.deep_context.parameters())
+        if model.deep_proj is not None:
+            g['deep'] += list(model.deep_proj.parameters())
+    if model.linout is not None:         # --linout: the 1x1 on the way up out of each layer
+        g['linout'] = list(model.linout.parameters())
     if model.tap is not None:            # --tap: the 1x1 after each layer
         g['tap'] = list(model.tap.parameters())
     if not isinstance(model.lmhead, nn.Identity):   # pretrained tokenizer: borrowed lm_head
