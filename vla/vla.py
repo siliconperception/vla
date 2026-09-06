@@ -2081,6 +2081,23 @@ def _text_peek():
         return _text_stats['sample'], dict(_text_stats['vsample'])
 
 
+def _sample_window(text, n=240):
+    """A RANDOM window of a training document, not its opening n characters.
+
+    A head slice is fine when documents are short, and actively misleading when they are
+    not. On sebooks (whole books, mean 126k tokens) every TXT-SAMPLE showed a book's
+    chapter-one opening -- never the text the model was really training on, a hundred
+    thousand steps deep -- and the SAME opening repeated in report after report, because
+    the stored sample only changes when a slot loads a new document and a slot holds one
+    book for ~126k steps. A random offset shows where the run actually is, and makes a
+    repeated document read as a repeat rather than as a stalled data pipeline.
+    """
+    if len(text) <= n:
+        return text
+    i = random.randrange(0, len(text) - n)
+    return ('...' + text[i:i + n]) if i else text[:n]
+
+
 def _text_anchors():
     with _text_lock:
         return list(_text_stats['anchor'])
@@ -4716,9 +4733,9 @@ try:
             _tsample, _vsample = _text_peek()  # recent corpus / per-pool vocab training text
             _vw = max([len(k) for k in _vsample] + [6])
             for _k in sorted(_vsample):            # every curriculum file, every report
-                lines.append(f'TXT-{_k:<{_vw}}: {_printable(_vsample[_k][:240])}')
+                lines.append(f'TXT-{_k:<{_vw}}: {_printable(_sample_window(_vsample[_k]))}')
             if _tsample:
-                lines.append(f'TXT-{"SAMPLE":<{_vw}}: {_printable(_tsample[:240])}')
+                lines.append(f'TXT-{"SAMPLE":<{_vw}}: {_printable(_sample_window(_tsample))}')
             print('\n' + '\n'.join(lines) + '\n')
             with open(args.log, 'a') as f:
                 print('\n' + '\n'.join(lines) + '\n', file=f)
