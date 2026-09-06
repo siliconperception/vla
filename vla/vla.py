@@ -3221,6 +3221,70 @@ _frozen_n    = sum(p.numel() for p in model.parameters() if not p.requires_grad)
 print(_trainable_n / 1e6, 'M trainable params'
       + (f' ({_frozen_n / 1e6:.6f} M frozen pretrained)' if _frozen_n else ''))
 
+
+def _param_summary(model):
+    """Per-module parameter counts and the total, printed once before training starts.
+
+    The torchinfo tables above are per-submodule and verbose; this is the one place that
+    says how big the model is in total and where the weights actually sit. It matters here
+    because the answer is not obvious from the flags: --linout REPLACES deep_proj, a frozen
+    pretrained embedding can outweigh everything trained, and the conv stack scales as
+    n_layers * depth * n_hidden**2 so a width change moves the total quadratically. The
+    weight ROM is the thing being sized for hardware, so print it, not just infer it.
+
+    Modules are walked by NAME off the model, then anything not claimed by a named module is
+    swept into 'other' -- so the parts always sum to the total, whatever the flags did."""
+    named = [('tok_embed',    model.tok_embed),
+             ('text_proj',    model.text_proj),
+             ('context',      model.context),
+             ('deep_context', model.deep_context),
+             ('deep_proj',    model.deep_proj),
+             ('linout',       model.linout),
+             ('tap',          model.tap),
+             ('decoder',      model.decoder),
+             ('head_norm',    getattr(model, 'head_norm', None)),
+             ('lmhead',       model.lmhead)]
+    seen, rows = set(), []
+    for name, mod in named:
+        if mod is None:
+            continue
+        tr = fr = 0
+        for prm in mod.parameters():
+            if id(prm) in seen:        # lmhead is TIED to tok_embed on GPT-Neo: count once
+                continue
+            seen.add(id(prm))
+            if prm.requires_grad: tr += prm.numel()
+            else:                 fr += prm.numel()
+        if tr or fr:
+            rows.append((name, tr, fr))
+    o_tr = o_fr = 0
+    for prm in model.parameters():
+        if id(prm) in seen:
+            continue
+        seen.add(id(prm))
+        if prm.requires_grad: o_tr += prm.numel()
+        else:                 o_fr += prm.numel()
+    if o_tr or o_fr:
+        rows.append(('other', o_tr, o_fr))
+    w = max(len(r[0]) for r in rows)
+    out = ['PARAMS  ' + f'{"module":<{w}}  {"trainable":>13}  {"frozen":>13}  {"total":>13}']
+    for name, tr, fr in rows:
+        out.append(f'PARAMS  {name:<{w}}  {tr:>13,}  {fr:>13,}  {tr + fr:>13,}')
+    t_tr = sum(r[1] for r in rows); t_fr = sum(r[2] for r in rows)
+    out.append('PARAMS  ' + '-' * (w + 46))
+    out.append(f'PARAMS  {"TOTAL":<{w}}  {t_tr:>13,}  {t_fr:>13,}  {t_tr + t_fr:>13,}')
+    out.append(f'PARAMS  total {(t_tr + t_fr) / 1e6:.3f} M '
+               f'({t_tr / 1e6:.3f} M trainable, {t_fr / 1e6:.3f} M frozen), '
+               f'weights {(t_tr + t_fr) * 4 / 2**20:.1f} MiB at fp32')
+    return '\n'.join(out)
+
+
+_psum = _param_summary(model)
+print(_psum)
+if args.log:
+    with open(args.log, 'a') as _f:
+        print(_psum, file=_f)
+
 if args.push:
     # one-shot: save the loaded checkpoint in HuggingFace format (model.safetensors +
     # config.json, from PyTorchModelHubMixin) and upload it to --hub_repo, then exit.
