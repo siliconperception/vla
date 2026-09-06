@@ -2097,6 +2097,12 @@ _TEXT_DATASETS = {
     # Registered in _HUB_SUBSET, NOT resolved on demand: the two configs are 672 GB (550 +
     # 122), and load_dataset would try to resolve the whole repo. Fetch a spread subset of
     # shards into the HF cache first; the longest run here reads ~1 GB of text.
+    # nampdn-ai/tiny-strange-textbooks: 4.4 GB of synthetic textbook-style prose in one
+    # 'text' column, ~1B tokens. Small enough to download whole (no _HUB_SUBSET needed) and
+    # small enough that a 4M-step run at batch 250 -- 1e9 tokens -- is roughly ONE pass, so
+    # unlike fwedu the epoch column on the STEP line is a real clock here rather than
+    # pinned at 1. NOT named 'tiny*': that prefix is TinyStories in this table.
+    'strangetb': ('nampdn-ai/tiny-strange-textbooks', None, 'train', 'text'),
     'smolcosmo': ('HuggingFaceTB/smollm-corpus', 'cosmopedia-v2',     'train', 'text'),
     'smolfwedu': ('HuggingFaceTB/smollm-corpus', 'fineweb-edu-dedup', 'train', 'text'),
     # finephrase: reasoning-shaped generations over fineweb-edu documents. The corpus we
@@ -2174,7 +2180,7 @@ def _fmt_finephrase(ex):
 # Corpora with a real held-out split (tiny/c4/pile/web) are NOT hashed: they keep the exact
 # sets every earlier number in PLAN.txt was measured on.
 _HASH_HOLDOUT = {'swiki', 'fwedu', 'cosmo', 'cosmoweb', 'fpfaq', 'fpmath', 'fptut',
-                 'smolcosmo', 'smolfwedu'}
+                 'smolcosmo', 'smolfwedu', 'strangetb'}
 _HOLDOUT_MOD = 32                       # ~3.1% held out. Sized by the SCAN COST of building
                                         # the eval set, not by statistics: the filters
                                         # compound. cosmo keeps 26.5% (audience) x 1/MOD
