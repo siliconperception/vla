@@ -171,6 +171,18 @@ class HFTokenizer:
     def decode(self, ids):  return self.tok.decode(ids)
 
 
+def _decode_plain(ids):
+    """Token ids -> plain text, framing markers dropped. What _render() shows is for a
+    human (escaped whitespace, <STX>/<ETX> markers); a reference LM must see the text the
+    model actually generated, so this decodes and drops the markers instead."""
+    body = [t for t in ids if t not in (_tokenizer.start_id, _tokenizer.end_id)]
+    if not body:
+        return ''
+    if _tokenizer.is_char:
+        return bytes(body).decode('utf-8', errors='replace')
+    return _tokenizer.decode(body)
+
+
 def _render(ids):
     """Render a token-id sequence for display. Byte mode decodes UTF-8 and hands the
     string to _printable(); BPE mode decodes runs of ordinary tokens the same way and
@@ -681,6 +693,28 @@ parser.add_argument('--bdict_split',   default=False, action='store_true',
                          'so what transfers downstream is ordinary sentence structure rather '
                          'than "after a colon, recite". Documents get ~10x shorter, so <ETX> '
                          'and the context reset arrive ~10x more often.')
+parser.add_argument('--gen_score',     default=None,  nargs='?', metavar='MODEL',
+                    const='EleutherAI/pythia-70m',
+                    help='score each GEN sample for FLUENCY with a frozen reference LM '
+                         '(bare flag: EleutherAI/pythia-70m, 70M params). Prints a GENSCORE '
+                         'line beside the sample: nats/token under the reference, plus a '
+                         '0-100%% position between two anchors computed ONCE from this run\'s '
+                         'own corpus -- FLOOR is real training text, CEILING is the same text '
+                         'with its words shuffled. The anchors are what make the number mean '
+                         'anything: raw nats/token is uninterpretable without knowing what '
+                         'the reference scores on real text of the same kind, and they are '
+                         'frozen after the first computation so the series is comparable '
+                         'across steps.\n'
+                         'READ IT WITH THE REPETITION COLUMN, NEVER ALONE. A reference LM is '
+                         'DELIGHTED by degenerate output -- "the the the" scores near-zero '
+                         'nats -- which is exactly the failure mode a recurrent model falls '
+                         'into (see exp/gencheck.py). GENSCORE therefore also reports rep1, '
+                         'the fraction of the sample made of its single most common token; '
+                         'a high fluency score next to a high rep1 is a collapsed model, not '
+                         'a fluent one.\n'
+                         'Runs on the CPU and only every --gen_interval steps, so it costs '
+                         'no GPU memory and no measurable training time. Off by default: a '
+                         'run without it is byte-identical to one from before the flag.')
 parser.add_argument('--gen_prompts',   default=None,
                     help='EXTRA prompts for the periodic GEN sample, comma-separated, e.g. '
                          '"aardvark,telescope,zorbulate". The NULL prompt (bare <STX>, i.e. '
@@ -1939,7 +1973,10 @@ _text_lock  = threading.Lock()
 # the two streams: with three curriculum files a single slot shows whichever pool happened
 # to draw last, so math_phase1 would appear in only a third of the reports. Keyed by pool
 # name, every report shows one line from EACH file.
-_text_stats = {'examples': 0, 'tokens': 0, 'sample': '', 'vsample': {}}
+_text_stats = {'examples': 0, 'tokens': 0, 'sample': '', 'vsample': {},
+               # first few CORPUS documents, kept verbatim for the --gen_score
+               # anchors. Capped: this is a fixed reference sample, not a log.
+               'anchor': []}
 
 # Passes over each corpus, published by the builder threads and read by the TEXT line.
 # Same worker->main-loop channel as _text_stats, and for the same reason: the epoch counter
@@ -2011,6 +2048,8 @@ def _text_tally(n_tokens, sample='', vocab=False):
                 _text_stats['vsample'][vocab if isinstance(vocab, str) else 'vocab'] = sample
             else:
                 _text_stats['sample'] = sample
+                if len(_text_stats['anchor']) < 24:
+                    _text_stats['anchor'].append(sample)
 
 def _text_drain():
     """Return (examples, tokens, sample) since the last drain; reset the counters.
@@ -2031,6 +2070,11 @@ def _text_peek():
     read repeatedly: builder threads overwrite it in place and the drain never clears it."""
     with _text_lock:
         return _text_stats['sample'], dict(_text_stats['vsample'])
+
+
+def _text_anchors():
+    with _text_lock:
+        return list(_text_stats['anchor'])
 # Each builder returns (steps, caption). A step is a 4-tuple
 #   (x_byte, y_byte, img_or_None, aud_or_None)
 # one entry per 100 Hz frame.
@@ -3072,6 +3116,102 @@ def _prompt_ids(text=None):
     the periodic GEN block passes each entry of _gen_prompt_list() explicitly."""
     t = args.prompt if text is None else text
     return [_tokenizer.start_id] + (_tokenizer.encode(t) if t else [])
+
+
+class _GenScorer:
+    """Fluency of a GEN sample under a frozen reference LM, anchored to this run's corpus.
+
+    nats/token alone says nothing -- a reference model's absolute surprise depends on the
+    domain. So the score is placed between two anchors drawn from the training text itself:
+        FLOOR    real corpus text            -> 100%, as fluent as this corpus gets
+        CEILING  the same text, words shuffled -> 0%, same words with the syntax destroyed
+    Anchors are computed ONCE, from the first corpus documents the data worker produced, and
+    then frozen -- a drifting anchor would make the series incomparable across steps.
+
+    The reference is a different model from the one under test, so this cannot be gamed by
+    the run. It lives on the CPU: it runs once per --gen_interval, so it costs nothing worth
+    contending for GPU memory over, and it can never perturb the training allocation.
+
+    rep1 is reported alongside, and exists because THIS METRIC IS BACKWARDS ON DEGENERATE
+    TEXT: a model emitting one token forever is maximally predictable and scores as maximally
+    fluent. rep1 is the fraction of the sample made of its most common word; read together, a
+    high score with a high rep1 is collapse, not fluency.
+    """
+    def __init__(self, repo):
+        self.repo, self.ref, self.tok = repo, None, None
+        self.floor = self.ceil = None
+        self.failed = False
+
+    def _load(self):
+        if self.ref is not None or self.failed:
+            return
+        try:
+            from transformers import AutoTokenizer, AutoModelForCausalLM
+            self.tok = AutoTokenizer.from_pretrained(self.repo)
+            self.ref = AutoModelForCausalLM.from_pretrained(self.repo).to('cpu').eval()
+            print(f'--gen_score: reference model {self.repo} loaded on cpu', flush=True)
+        except Exception as e:                      # never take the training run down
+            print(f'--gen_score: DISABLED, could not load {self.repo}: {e}', flush=True)
+            self.failed = True
+
+    @torch.no_grad()
+    def _nll(self, text):
+        ids = self.tok(text, return_tensors='pt', truncation=True,
+                       max_length=512).input_ids
+        if ids.shape[1] < 2:
+            return None
+        v = float(self.ref(ids, labels=ids).loss)
+        return v if math.isfinite(v) else None
+
+    def _anchor(self):
+        """FLOOR/CEILING from real corpus text; computed once, then frozen."""
+        if self.floor is not None:
+            return True
+        docs = [d for d in _text_anchors() if len(d.split()) >= 24][:12]
+        if len(docs) < 4:
+            return False                            # not enough corpus text yet
+        rng = random.Random(1234)                   # fixed: the same shuffle every run
+        lo, hi = [], []
+        for d in docs:
+            w = d.split()[:256]
+            a = self._nll(' '.join(w))
+            sw = w[:]; rng.shuffle(sw)
+            b = self._nll(' '.join(sw))
+            if a is not None and b is not None:
+                lo.append(a); hi.append(b)
+        if len(lo) < 4 or np.mean(hi) - np.mean(lo) < 1e-6:
+            return False
+        self.floor, self.ceil = float(np.mean(lo)), float(np.mean(hi))
+        print(f'--gen_score: anchors from {len(lo)} corpus documents -- '
+              f'FLOOR {self.floor:.3f} (real text) CEILING {self.ceil:.3f} (words shuffled)',
+              flush=True)
+        return True
+
+    def score(self, text):
+        """-> 'nats 4.812 fluency 63% rep1 0.07', or '' if unavailable."""
+        self._load()
+        if self.failed:
+            return ''
+        # Gate on CHARACTERS, not words. A collapsed sample is often one unbroken run
+        # ('okinetics*******...'), i.e. a single "word" -- and that is exactly the case this
+        # metric exists to flag, so it must not be the case that gets skipped. rep1 falls
+        # back to characters when there are too few words to be meaningful.
+        text = text.strip()
+        if len(text) < 16:
+            return ''
+        words = text.split()
+        units = words if len(words) >= 8 else list(text)
+        rep1  = max(collections.Counter(units).values()) / len(units)
+        n = self._nll(' '.join(words[:256]) if words else text[:1024])
+        if n is None:
+            return ''
+        if not self._anchor():
+            return f'nats {n:.3f} fluency n/a (no anchors yet) rep1 {rep1:.2f}'
+        pct = 100.0 * (self.ceil - n) / (self.ceil - self.floor)
+        return f'nats {n:.3f} fluency {max(-999.0, min(999.0, pct)):.0f}% rep1 {rep1:.2f}'
+
+
+_gen_scorer = _GenScorer(args.gen_score) if args.gen_score else None
 
 
 def _gen_prompt_list():
@@ -4547,6 +4687,14 @@ try:
                 prompt = _prompt_ids(_p)
                 out    = model.generate(prompt, _GEN_SAMPLE, temperature=args.temperature)
                 lines.append(f'GEN step {i:10} [{_p or "<STX>"}]: {_render(prompt + out)}')
+                if _gen_scorer is not None:
+                    # score the DECODED generation, not the rendered line: _render escapes
+                    # whitespace and inserts <STX>/<ETX>, none of which is text the model
+                    # produced, and all of which the reference would be scoring instead.
+                    _txt = _decode_plain(out)
+                    _sc  = _gen_scorer.score(_txt)
+                    if _sc:
+                        lines.append(f'GENSCORE step {i:10} [{_p or "<STX>"}]: {_sc}')
             _tsample, _vsample = _text_peek()  # recent corpus / per-pool vocab training text
             _vw = max([len(k) for k in _vsample] + [6])
             for _k in sorted(_vsample):            # every curriculum file, every report
