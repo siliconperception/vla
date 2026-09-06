@@ -745,7 +745,8 @@ parser.add_argument('--shards',        default=None,  type=int,
 parser.add_argument('--batch',         default=100,   type=int)
 parser.add_argument('--workers',       default=12,    type=int,
                     help='parallel clip-builder threads (decode/download); raise for cc3m image streaming')
-parser.add_argument('--preroll',       default=False, action='store_true',
+parser.add_argument('--preroll',       default=False,
+                    action=argparse.BooleanOptionalAction,
                     help='decorrelate the batch before training: discard batches (no forward, '
                          'no step) until the first <ETX> comes out of the data stream, then '
                          'start training. Every slot loads its first clip on step 0, so on a '
@@ -753,7 +754,15 @@ parser.add_argument('--preroll',       default=False, action='store_true',
                          'the whole batch runs near-identical text in lockstep for its first '
                          'few hundred steps. Draining to the first <ETX> ends the shortest clip '
                          'in the batch and leaves every slot at a different point in a '
-                         'different story')
+                         'different story.\n'
+                         '--no-preroll turns it off, which is what a LONG-FORM corpus needs: '
+                         'the cost is one shortest-clip\'s worth of discarded batches, which '
+                         'is a few hundred steps on TinyStories but thousands on sebooks '
+                         '(whole books, mean 126k tokens) -- and the correlated-opening '
+                         'problem it fixes does not arise there, since 250 slots land on 250 '
+                         'different books that share no opening text. It is a negation rather '
+                         'than dropping the flag because exp/run.sh bakes --preroll into the '
+                         'baseline, so an override has to be expressible on the command line.')
 parser.add_argument('--run_steps',     default=None,  type=int,
                     help='stop the run after this many gradient steps (None = run indefinitely); '
                          'handy for fixed-length sweeps')
@@ -2147,6 +2156,15 @@ _TEXT_DATASETS = {
     # unlike fwedu the epoch column on the STEP line is a real clock here rather than
     # pinned at 1. NOT named 'tiny*': that prefix is TinyStories in this table.
     'strangetb': ('nampdn-ai/tiny-strange-textbooks', None, 'train', 'text'),
+    # Nelathan/standardebooks: 1233 public-domain books, whole book per row. 0.43 GB,
+    # ~175M tokens. UNLIKE EVERY OTHER CORPUS HERE THE DOCUMENTS ARE ENORMOUS -- mean
+    # 126k tokens, median 107k, max 659k -- so a slot holds one book for ~126k steps and
+    # sees only ~32 of them in a 4M-step run. The <ETX> document reset therefore fires
+    # ~100x more rarely than on fwedu (mean 1080 tokens), which is a real change to the
+    # training signal, not just to the text. --preroll still terminates promptly: it waits
+    # for the SHORTEST clip of the batch, and the shortest of 250 draws from this corpus is
+    # a few thousand tokens, not 126k.
+    'sebooks':   ('Nelathan/standardebooks', None, 'train', 'text'),
     'smolcosmo': ('HuggingFaceTB/smollm-corpus', 'cosmopedia-v2',     'train', 'text'),
     'smolfwedu': ('HuggingFaceTB/smollm-corpus', 'fineweb-edu-dedup', 'train', 'text'),
     # finephrase: reasoning-shaped generations over fineweb-edu documents. The corpus we
@@ -2224,7 +2242,7 @@ def _fmt_finephrase(ex):
 # Corpora with a real held-out split (tiny/c4/pile/web) are NOT hashed: they keep the exact
 # sets every earlier number in PLAN.txt was measured on.
 _HASH_HOLDOUT = {'swiki', 'fwedu', 'cosmo', 'cosmoweb', 'fpfaq', 'fpmath', 'fptut',
-                 'smolcosmo', 'smolfwedu', 'strangetb'}
+                 'smolcosmo', 'smolfwedu', 'strangetb', 'sebooks'}
 _HOLDOUT_MOD = 32                       # ~3.1% held out. Sized by the SCAN COST of building
                                         # the eval set, not by statistics: the filters
                                         # compound. cosmo keeps 26.5% (audience) x 1/MOD
