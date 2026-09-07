@@ -2173,6 +2173,12 @@ _TEXT_DATASETS = {
     # unlike fwedu the epoch column on the STEP line is a real clock here rather than
     # pinned at 1. NOT named 'tiny*': that prefix is TinyStories in this table.
     'strangetb': ('nampdn-ai/tiny-strange-textbooks', None, 'train', 'text'),
+    # nampdn-ai/tiny-textbooks: 399k train / 21k test rows. Trains on the 'textbook' column,
+    # NOT 'text' -- same call as finephrase above: 'text' is the SOURCE snippet the row was
+    # generated from (refinedweb/minipile, mean 219 tokens, visibly scraped web text) while
+    # 'textbook' is the generated textbook prose the dataset exists to provide (mean 622
+    # tokens, median 605). Short-form, so preroll and held-out eval both apply normally.
+    'tinytb':    ('nampdn-ai/tiny-textbooks', None, 'train', 'textbook'),
     # Nelathan/standardebooks: 1233 public-domain books, whole book per row. 0.43 GB,
     # ~175M tokens. UNLIKE EVERY OTHER CORPUS HERE THE DOCUMENTS ARE ENORMOUS -- mean
     # 126k tokens, median 107k, max 659k -- so a slot holds one book for ~126k steps and
@@ -2282,6 +2288,8 @@ def _is_heldout(text):
 # Anything missing here falls back to the training split in _TEXT_DATASETS, with a warning
 # -- that number is a training loss, not a validation loss.
 _EVAL_SPLITS = {
+    # ships a genuine test split (21k rows), so there is nothing to hash out of training
+    'tinytb':  'test',
     'tiny':    'validation',
     'c4':      'validation',
     # openwebtext ships no validation split. train[-3000:] is the tail exp/score.py,
