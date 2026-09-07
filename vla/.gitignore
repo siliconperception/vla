@@ -11,3 +11,7 @@ checkpoint/
 # Same rule as dolma3/ and checkpoint/: large and reproducible does not belong in git.
 # vocab_phase*.txt and math_phase1.txt ARE tracked -- ~400 KB each and not redownloadable.
 reasoning_phase1.txt
+
+# 71 MB of dictionary definitions, regenerable from the Hub with worddefs_prep.py.
+# Same rule as reasoning_phase1.txt: large and reproducible does not belong in git.
+worddefs.txt
