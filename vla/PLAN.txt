@@ -1,4 +1,206 @@
 ============================================================================
+                    READ THIS FIRST -- PHASE 3 HANDOFF
+                 written 2026-09-07, end of the Phase 2 session
+============================================================================
+Everything below this block is history, newest block first: the PHASE 2
+HANDOFF follows immediately, then Phase 1.  The Phase 2 block is still
+correct about METHOD RULES and about the Phase 1 SETTLED list, and both
+still apply.  Its FROZEN BASELINE and its REFERENCE POINTS are SUPERSEDED
+here -- see "WHY THE OLD NUMBERS DO NOT TRANSFER" before quoting any of them.
+
+WHAT CHANGED SINCE PHASE 2
+  Phase 2's rule was "freeze the model, vary only the data".  That rule is
+  spent.  This session moved the corpus, the state width, the layer count,
+  the depth, the context size, the DFF timescale ladder and the state seed.
+  The model is now 6.0M trainable parameters, not 30.4M -- FIVE TIMES SMALLER
+  -- and the training corpus is synthetic textbook prose, not web text.
+
+--------------------------------------------------------------------------
+THE NEW BASELINE  (v24_tinytb_gaussian, running at handoff)
+--------------------------------------------------------------------------
+  ./exp/run.sh <mnem> <steps> -- \
+    --dataset tinytb --no-preroll --init gaussian \
+    --tokenizer pythia31m \
+    --n_hidden 128 --n_layers 2 --depth 20 --context 32 \
+    --batch 250 --lr_max 0.03 \
+    --linout --ema_ladder 3.2,32 \
+    --seed 2859283504 \
+    --gen_score \
+    --checkpoint 500 --gen_interval 500 --eval_interval 20000 \
+    --eval_corpora tinytb
+
+  shape          2x20 = 40 convs + one 1x1 per layer (--linout)
+  params         6,002,304 trainable + 25,755,648 frozen = 31.76M
+                 121.1 MiB at fp32.  The conv stack is 5.90M of the 6.00M
+                 trainable; the frozen pair (tok_embed + untied lmhead) is
+                 4x the whole trained model.  For the FPGA weight ROM the
+                 number is 6.0M / 24 MiB, NOT 31.8M.
+  ladder         L1 ema 0.3125 (~3 tok window), L2 ema 0.03125 (~32 tok)
+                 every layer writes every step (--ema_ladder forces periods 1)
+  throughput     2.61 steps/s at batch 250 -> 17.8 days for 4M steps
+  memory         13.4 GB of a 24.5 GB card
+  held-out       5.1790 nats (ppl 177.5) at step 20K, runaway 0.25%
+                 on tinytb's own 21k-row TEST split
+  train loss     5.12 at step 21.3K
+  generation     GENSCORE fluency -18%, rep1 0.07 at 21K (see --gen_score)
+
+--------------------------------------------------------------------------
+WHY THE OLD NUMBERS DO NOT TRANSFER
+--------------------------------------------------------------------------
+  The Phase 1/2 ladder (VLA e30 5.6617, bigram 5.3017, pythia-31m 3.8183) is
+  all measured on openwebtext train[-3000:].  The new baseline is scored on
+  tinytb's test split.  5.1790 is therefore NOT an improvement on 5.6617 --
+  it is a different corpus, and synthetic textbook prose is far more
+  predictable than web text.  Do not put them in the same table.  If a Phase 3
+  number must be compared to Phase 1, re-score the checkpoint on web with
+  exp/score.py and say that is what was done.
+
+--------------------------------------------------------------------------
+WHAT THIS SESSION SETTLED -- do not re-run these
+--------------------------------------------------------------------------
+  EMA LADDER (3x17, h256, ctx16, fwedu, paired seeds, mean of last 500 steps)
+    v11  3.2,10,32   6.5692 / 6.3477 / 6.1011  at 5K/10K/20K  <- unbeaten
+    v11d 10,32,100   +0.050 @10K, +0.087 @20K   (slower, same span)
+    v11e 1,3.2,10    +0.094 @10K                (faster, same span)
+    v11c 15,15,15    +0.070 @10K                (flat, matched total memory)
+    v11f 3.2,32,320  +0.045 @5K                 (wider span)
+  Four departures, all worse.  3.2,10,32 is bracketed on the speed axis and
+  beaten flat and wide.  The ladder is at or near a local optimum; further
+  20K screens will return differences at the noise floor.
+
+  MEASURED per-layer time constants (exp/emadecay.py on v11 @135K):
+    L1 tau 1.9 (nominal 3.2), L2 7.6 (10), L3 28.4 (32) -- the ladder leaks
+    15-40% FASTER than the nominal 1/ema, not slower.  AND the decay does not
+    reach zero: 30% / 10.6% / 4.3% of any perturbation is kept FOREVER.  The
+    register has a marginal (integrator) direction with unit gain.  A tail fit
+    measures only that residue and reports tau = inf; fit the excess above the
+    floor, which is what the tool does.
+
+  DEPTH IS HARD-LIMITED BY GRADIENT EXPLOSION AT INIT (BN path, lr-independent)
+    grad at step 0, 3 layers, ctx32:  d17 236 | d20 1,006 | d24 5,372 |
+    d28 26,620 DIVERGED | d32 ~220,000 DIVERGED
+    3x32 diverges at lr 0.03, 0.01, 0.003 AND 0.001 -- the gradient is that
+    large before any weight update, so no lr is stable.  --clip 1.0/0.1 stops
+    the NaN but the model then does not learn at all (loss pinned at ln(vocab)
+    after 200 steps).  --norm group DOES train 3x32 (loss 7.835 @400) but
+    gives up BatchNorm's fold-into-conv at inference, which is the reason the
+    FPGA target wants BN.  Depth 20 is the safe ceiling for 3 layers with BN.
+
+  THE ZERO-VARIANCE BATCH -- the most expensive lesson of this session
+    --init zero + --no-preroll + 3 layers NaNs at step 1, grad@0 ~12,000.
+    Cause: with a zero state seed and no preroll, all 250 slots sit at
+    position 0 emitting <STX> with identical state, so every batch row is
+    IDENTICAL, batch variance is ~0, and BatchNorm divides by sqrt(eps).
+    It is not width and not depth -- h96 and h128 both NaN, and the same
+    architecture (v12c) ran 120K steps happily WITH preroll.
+    Two fixes, both verified: --preroll (grad@0 921) or a non-degenerate seed,
+    --init relu / --init gaussian (grad@0 679-842).  2 layers survives it;
+    3 layers does not.
+
+  CORRECTION to the Phase 2 SETTLED entry "--init INERT".
+    That entry says zero and relu are token-identical AT INFERENCE.  Still
+    true.  But --init is NOT inert at TRAINING START: it decides whether the
+    first batch is degenerate, and therefore whether a 3-layer run survives
+    step 1 at all.  Do not read the old entry as licence to ignore it.
+
+  OTHER
+    n_hidden 256 + context 32 + batch 250 OOMs a 24.5 GB card (23.9 GB at
+      batch 250, still OOM at batch 200).  h128 fits at 19.4 GB.
+    TWO CONCURRENT RUNS BUY NOTHING: 1.53 + 1.40 steps/s against 3.07 solo.
+      The GPU is compute-bound.  Run the suite serially.
+    GENSCORE COLLAPSE CAN BE TRANSIENT.  v24 hit rep1 0.87 at step 500 and
+      recovered to rep1 0.05-0.07 by 3K.  Do not kill on one bad GENSCORE.
+    5K RANKINGS INVERT.  Twice this session a run led at 1-2K and lost from
+      4K on.  Method rule 4 is confirmed, not softened: gate at 10K minimum,
+      decide at 20K.
+
+--------------------------------------------------------------------------
+NEW TOOLING AND FLAGS (all committed)
+--------------------------------------------------------------------------
+  --gen_score [MODEL]   fluency of each GEN sample under a frozen reference LM
+                        (default EleutherAI/pythia-70m, on CPU).  Prints
+                        GENSCORE: nats/token, a 0-100% position between anchors
+                        computed ONCE from this run's own corpus (FLOOR real
+                        text, CEILING the same text word-shuffled), and rep1.
+                        READ rep1 WITH IT: the metric is BACKWARDS on
+                        degenerate output -- one token repeated forever scores
+                        as maximally fluent.  High fluency + high rep1 =
+                        collapse, not success.
+  --vocab_framed FILES  a --vocab_files pool that IS <STX>/<ETX> framed and
+                        does reset the state, for pools whose examples are
+                        long self-contained documents.  Framed pools are
+                        excluded from the epoch column's mean.
+  --no-preroll          negation of --preroll (BooleanOptionalAction).  Needed
+                        because exp/run.sh bakes --preroll into the baseline,
+                        so the override must be expressible on the CLI.
+  PARAMS lines          per-module parameter table + total, before step 1.
+  exp/emadecay.py CKPT  measured per-layer DFF time constant by perturbation
+                        decay; reports the non-decaying residue separately.
+
+  epoch column          now the MEAN fractional pass over the --vocab_files
+                        pools (framed pools excluded), %10.3f not %6d.
+                        _epoch_report() prints every pool fractionally.
+  TXT-SAMPLE            now a RANDOM WINDOW of the document, not its first 240
+                        chars.  On book-length documents the head slice showed
+                        only chapter openings and repeated for thousands of
+                        steps, which read like a stalled pipeline.
+
+  NEW DATASETS   tinytb    nampdn-ai/tiny-textbooks, 'textbook' column (NOT
+                           'text', which is the refinedweb source snippet).
+                           Real 21k test split -> _EVAL_SPLITS, not hash.
+                 strangetb nampdn-ai/tiny-strange-textbooks
+                 sebooks   Nelathan/standardebooks (whole books)
+                 smolcosmo / smolfwedu  the two smollm-corpus text subsets,
+                           _HUB_SUBSET (672 GB; fetch a spread shard subset)
+  NEW POOLS      math_phase1.txt      10,000 arithmetic lines (in git)
+                 reasoning_phase1.txt reasoning_prep.py, 10,200 CoT examples
+                 worddefs.txt         worddefs_prep.py, 466,357 definitions
+                 (the last two are gitignored: regenerable, and too large)
+
+--------------------------------------------------------------------------
+MEASURED CORPUS STATISTICS (pythia31m tokenizer) -- sizing reference
+--------------------------------------------------------------------------
+  corpus            examples      tokens/example        total
+  vocab_phase1/2      10,000 ea   ~11-12 median         ~0.11M ea
+  math_phase1         10,000       13.3 median          0.13M
+  worddefs           466,357       37.2 mean            17.6M
+  fineweb-edu             --      1,080 mean / 597 med  effectively infinite
+  reasoning_phase1    10,200      761 mean              7.8M
+  tinytb (textbook)  399,000      635 mean / 605 med    254.2M
+  sebooks              1,233      141,379 mean / 102,001 med   174M
+
+  Equal SLOTS buy equal TOKENS, not equal coverage.  At 125/125 slots
+  worddefs wraps 28.4x in a 4M-step run while tinytb wraps 2.0x.
+
+--------------------------------------------------------------------------
+OPEN, for Phase 3
+--------------------------------------------------------------------------
+  * The ladder is settled at 3.2,10,32 for 3 layers at h256/ctx16.  It has NOT
+    been re-tuned for the new 2-layer h128/ctx32 baseline, which currently runs
+    3.2,32 by analogy, not by measurement.
+  * Does the 3rd layer earn its keep at h128?  v17 (3x20 h128, sebooks) ran
+    79.6K clean; no matched-step comparison against 2x20 exists.
+  * sebooks chapter-splitting: splitting the existing local copy on '## '
+    headings yields 22 parts/book at 3,674 median tokens, turning 126K-token
+    documents into normal ones and restoring frequent <ETX> resets.  Measured,
+    not implemented; ~20 lines, no download needed.
+  * Whether the worddefs pool helps at all: v21 (125/125) vs v22 (100% tinytb)
+    were both stopped early and never compared at matched steps.
+  * vla.svg / vla.odp are STALE in the drawing, not just the numbers: the
+    table was updated to the new baseline this session, but the figure still
+    draws THREE projector stages against a table that says 2*20, and the EMA
+    ladder is not represented at all.  vla.odp is the source and is newer than
+    the svg -- fix it there and re-export, or the svg edits are lost.
+  * Everything in the Phase 2 OPEN list below that was never run is still open,
+    in particular TRAINING THROUGHPUT (bf16 is still the only proposal that
+    does not change the model) and exp/infer_bench.py, which still does not
+    exist.
+
+============================================================================
+              END OF PHASE 3 HANDOFF -- Phase 2 handoff follows
+============================================================================
+
+============================================================================
                     READ THIS FIRST -- PHASE 2 HANDOFF
                  written 2026-08-24, end of the Phase 1 session
 ============================================================================
@@ -7133,3 +7335,1763 @@ THE BATCHWISE MIX -- why not --mix:
   earlier run in this file reset its state constantly; this one mostly does not.
   Whether the state stays healthy without regular resets is the open question,
   and dff_std is the number to watch.
+
+--------------------------------------------------------------------------------
+V1  v1_vocab_mix90  step 50000   2026-08-31 00:18
+--------------------------------------------------------------------------------
+  seed 1179815282   dataset cosmoweb
+loss/grad/state:
+  step      0  loss 10.8508  grad 973.314  dff_std  3.923  dff_max     59.0  dff_zeros 0.5003
+  step   5000  loss  5.5800  grad  2.461  dff_std  0.532  dff_max     29.2  dff_zeros 0.0233
+  step  10000  loss  5.3212  grad  2.740  dff_std  0.509  dff_max     49.7  dff_zeros 0.0135
+  step  15000  loss  5.1976  grad  2.640  dff_std  0.500  dff_max     97.3  dff_zeros 0.0134
+  step  20000  loss  5.0112  grad  2.784  dff_std  0.503  dff_max    112.1  dff_zeros 0.0119
+  step  25000  loss  4.9124  grad  3.013  dff_std  0.326  dff_max      7.9  dff_zeros 0.0101
+  step  30000  loss  4.8556  grad  3.076  dff_std  0.368  dff_max      8.7  dff_zeros 0.0107
+  step  35000  loss  4.7915  grad  3.367  dff_std  0.357  dff_max      8.6  dff_zeros 0.0151
+  step  40000  loss  4.6611  grad  3.429  dff_std  0.337  dff_max      9.8  dff_zeros 0.0107
+  step  45000  loss  4.6867  grad  3.569  dff_std  0.362  dff_max      9.2  dff_zeros 0.0106
+  step  50000  loss  4.6631  grad  3.678  dff_std  0.344  dff_max     10.0  dff_zeros 0.0087
+  mean(last10) 4.6317   tokens 12.50 M   (unigram floor 7.549)
+held-out eval (split of --dataset; see note in report.sh before comparing):
+  EVAL step      20000 corpus web      clean    7.017310 ppl    1115.7808 median    6.982305 runaway   0.00% nrun    0 docs   400 wall   136.8s
+  EVAL step      40000 corpus cosmoweb clean    6.566625 ppl     710.9660 median    6.583003 runaway   0.00% nrun    0 docs   400 wall   136.8s
+  EVAL step      40000 corpus web      clean    6.831610 ppl     926.6818 median    6.799453 runaway   0.00% nrun    0 docs   400 wall   136.8s
+token efficiency (sustained crossings)  [!! thresholds and baseline are WEB numbers;
+     dataset is cosmoweb -- these rows are CROSS-CORPUS and are not a like-for-like read]:
+  L<7.549  step    220    0.06 M tok   baseline   3980  (-3760)
+  L<7.000  step    440    0.11 M tok   baseline   5940  (-5500)
+  L<6.500  step    880    0.22 M tok   baseline  15680  (-14800)
+  L<6.300  step   1240    0.31 M tok   baseline  30120  (-28880)
+  L<6.100  step   1920    0.48 M tok   baseline  49700  (-47780)
+  L<5.900  step   2580    0.65 M tok   baseline  84980  (-82400)
+  L<5.800  step   9640    2.41 M tok   baseline  99980  (-90340)
+free-running generation (3 samples; cycle>0.6 degenerate, healthy 0.08-0.11):
+   gen health: cycle 0.06 (max 0.07)  uniq 0.14  n=3
+   sample: <STX> Afterlets administering our diversity for the measure is advisations unlike MajorityFivals programs, harm stories for safe procontoyo pathwayort positions meaningful protein activities. During e
+  generated text (vla.py --generate, batch 1, seeds 11/12/13):
+  --- seed 11:
+    <STX> Relaml-reference protection provides collectively retention and invasion, interference of 
+    prlement or efforts enrichment before relyingslors guilty data for disparate portion, can analyze 
+    excellence rates.\n* Testing developers drove its player in Her beauty care over Institute of 
+    players relating to maximize a recent software, policy and sources and risks nono automated. By 
+    includes home Europsters amid those may demonstrate everything's transforming hope.\n\nNote that 
+    preers running consulting search the International team grew out, the court (Mayclass) inher
+  --- seed 12:
+    <STX> The cosifferentmakers agree and consolidation that represents charities has the motivation. 
+    Being in wide and specialists, breathe, loses\nWith posathrocyte accuracy, interbinary; participate 
+    hold the has protect the critical government. Eunits facilitated the date. Some sized.: 
+    Organization offered to audit killers for its practice, cognitive scientists. Harmating a truly 
+    still so miss through life online magazine error or fitness management.Yet, you to bring more 
+    multimedia share, urges and book growing paths. Give the public customer named that
+  --- seed 13:
+    <STX> Novlege locations the offerings is borne, each short technique and process devoteful 
+    information and controller policies, and portray your team, and availability. If they can obums 
+    nature and creaties,722's reasons might do far mean into people themselves for the overall ones's 
+    supportive systems possibilities. This demand can incorporate by their finances usage because such 
+    important and understanding technical concerns.\n\nThe opponents concepts - Specials-way 
+    Performance\n\n*\nProvlication, borrowing live through ideas when this confident flag or
+
+--------------------------------------------------------------------------------
+V1  v1_vocab_mix90  step 100000   2026-08-31 05:00
+--------------------------------------------------------------------------------
+  seed 1179815282   dataset cosmoweb
+loss/grad/state:
+  step      0  loss 10.8508  grad 973.314  dff_std  3.923  dff_max     59.0  dff_zeros 0.5003
+  step   5000  loss  5.5800  grad  2.461  dff_std  0.532  dff_max     29.2  dff_zeros 0.0233
+  step  10000  loss  5.3212  grad  2.740  dff_std  0.509  dff_max     49.7  dff_zeros 0.0135
+  step  15000  loss  5.1976  grad  2.640  dff_std  0.500  dff_max     97.3  dff_zeros 0.0134
+  step  20000  loss  5.0112  grad  2.784  dff_std  0.503  dff_max    112.1  dff_zeros 0.0119
+  step  25000  loss  4.9124  grad  3.013  dff_std  0.326  dff_max      7.9  dff_zeros 0.0101
+  step  30000  loss  4.8556  grad  3.076  dff_std  0.368  dff_max      8.7  dff_zeros 0.0107
+  step  35000  loss  4.7915  grad  3.367  dff_std  0.357  dff_max      8.6  dff_zeros 0.0151
+  step  40000  loss  4.6611  grad  3.429  dff_std  0.337  dff_max      9.8  dff_zeros 0.0107
+  step  45000  loss  4.6867  grad  3.569  dff_std  0.362  dff_max      9.2  dff_zeros 0.0106
+  step  50000  loss  4.6631  grad  3.678  dff_std  0.344  dff_max     10.0  dff_zeros 0.0087
+  step  55000  loss  4.5873  grad  4.007  dff_std  0.331  dff_max      9.0  dff_zeros 0.0073
+  step  60000  loss  4.5641  grad  4.253  dff_std  0.346  dff_max      9.8  dff_zeros 0.0084
+  step  65000  loss  4.4063  grad  4.254  dff_std  0.364  dff_max     10.1  dff_zeros 0.0110
+  step  70000  loss  4.4161  grad  4.547  dff_std  0.364  dff_max     10.4  dff_zeros 0.0115
+  step  75000  loss  4.3699  grad  4.615  dff_std  0.361  dff_max     10.3  dff_zeros 0.0104
+  step  80000  loss  4.3188  grad  4.815  dff_std  0.359  dff_max      9.6  dff_zeros 0.0066
+  step  85000  loss  4.2478  grad  5.165  dff_std  0.338  dff_max      9.8  dff_zeros 0.0141
+  step  90000  loss  4.2379  grad  5.193  dff_std  0.347  dff_max      9.6  dff_zeros 0.0109
+  step  95000  loss  4.1656  grad  5.272  dff_std  0.343  dff_max     10.3  dff_zeros 0.0084
+  mean(last10) 4.1784   tokens 25.00 M   (unigram floor 7.549)
+held-out eval (split of --dataset; see note in report.sh before comparing):
+  EVAL step      60000 corpus web      clean    6.789815 ppl     888.7491 median    6.759067 runaway   0.25% nrun    1 docs   400 wall   136.9s
+  EVAL step      80000 corpus cosmoweb clean    6.377714 ppl     588.5805 median    6.393513 runaway   0.00% nrun    0 docs   400 wall   136.8s
+  EVAL step      80000 corpus web      clean    6.757208 ppl     860.2369 median    6.726768 runaway   0.00% nrun    0 docs   400 wall   136.9s
+token efficiency (sustained crossings)  [!! thresholds and baseline are WEB numbers;
+     dataset is cosmoweb -- these rows are CROSS-CORPUS and are not a like-for-like read]:
+  L<7.549  step    220    0.06 M tok   baseline   3980  (-3760)
+  L<7.000  step    440    0.11 M tok   baseline   5940  (-5500)
+  L<6.500  step    880    0.22 M tok   baseline  15680  (-14800)
+  L<6.300  step   1240    0.31 M tok   baseline  30120  (-28880)
+  L<6.100  step   1920    0.48 M tok   baseline  49700  (-47780)
+  L<5.900  step   2580    0.65 M tok   baseline  84980  (-82400)
+  L<5.800  step   9640    2.41 M tok   baseline  99980  (-90340)
+free-running generation (3 samples; cycle>0.6 degenerate, healthy 0.08-0.11):
+   gen health: cycle 0.09 (max 0.10)  uniq 0.07  n=3
+   sample: <STX> Learning parts such powerful massive, promises described with people' tasks and professional mode, generating achievements. When are likely distances ripped on non efficiency, and collaboration,
+  generated text (vla.py --generate, batch 1, seeds 11/12/13):
+  --- seed 11:
+    <STX> Relancing takes manufacturing protection provides stimulator and invasion groups, armed 
+    devices. As efforts enrichment clearly to enable tasks guilty for citizens is since building can 
+    analyze excellence rates. The influential, developers drove a bunch of Her beauty of tapant day. 
+    Over half, a recent locality, those about your family Personigating true automated. By ask. 
+    Europification\n\nE. Care'smitted jars, i sequentially broadgateers running consulting search, 
+    these factors that involve proprietary companies seem vital to uncover you who
+  --- seed 12:
+    <STX> Unaging vegetables may agree and moving that the base has been raised as already present 
+    volumes and specialists, breathe down loses\nWith posathrocyte accuracy, interbinary; participate 
+    like nesting candy protect the critical government. Eunits, thanks to Giulagenette.: Organization 
+    offered a simple role for Say the marketing cognitive aspects to educate everyone.\n\nWith fact, 
+    even online magazine media pushes the exceptional classical rouging past the list of multimedia 
+    share, urges and book-lobridger the banner for 35 and
+  --- seed 13:
+    <STX> To let's the offerings whereby Desanalyacy, where some of devote parenting, transplant 
+    controller policies, and portray your team, and sites. If they visit a frequent nature for the 
+    applicability,722's reasons might do far mean into people themselves for antilar refreshing! This 
+    model possibilities asked many demand can incorporate a wedding, usage of independence. Some cross 
+    technical concerns, operational meetings. A venerizing the unique principle with a training quality 
+    on the consideration of his borrowing-J P BV's confident flag or
+
+--------------------------------------------------------------------------------
+V1  v1_vocab_mix90  step 150000   2026-08-31 09:46
+--------------------------------------------------------------------------------
+  seed 1179815282   dataset cosmoweb
+loss/grad/state:
+  step      0  loss 10.8508  grad 973.314  dff_std  3.923  dff_max     59.0  dff_zeros 0.5003
+  step   5000  loss  5.5800  grad  2.461  dff_std  0.532  dff_max     29.2  dff_zeros 0.0233
+  step  10000  loss  5.3212  grad  2.740  dff_std  0.509  dff_max     49.7  dff_zeros 0.0135
+  step  15000  loss  5.1976  grad  2.640  dff_std  0.500  dff_max     97.3  dff_zeros 0.0134
+  step  20000  loss  5.0112  grad  2.784  dff_std  0.503  dff_max    112.1  dff_zeros 0.0119
+  step  25000  loss  4.9124  grad  3.013  dff_std  0.326  dff_max      7.9  dff_zeros 0.0101
+  step  30000  loss  4.8556  grad  3.076  dff_std  0.368  dff_max      8.7  dff_zeros 0.0107
+  step  35000  loss  4.7915  grad  3.367  dff_std  0.357  dff_max      8.6  dff_zeros 0.0151
+  step  40000  loss  4.6611  grad  3.429  dff_std  0.337  dff_max      9.8  dff_zeros 0.0107
+  step  45000  loss  4.6867  grad  3.569  dff_std  0.362  dff_max      9.2  dff_zeros 0.0106
+  step  50000  loss  4.6631  grad  3.678  dff_std  0.344  dff_max     10.0  dff_zeros 0.0087
+  step  55000  loss  4.5873  grad  4.007  dff_std  0.331  dff_max      9.0  dff_zeros 0.0073
+  step  60000  loss  4.5641  grad  4.253  dff_std  0.346  dff_max      9.8  dff_zeros 0.0084
+  step  65000  loss  4.4063  grad  4.254  dff_std  0.364  dff_max     10.1  dff_zeros 0.0110
+  step  70000  loss  4.4161  grad  4.547  dff_std  0.364  dff_max     10.4  dff_zeros 0.0115
+  step  75000  loss  4.3699  grad  4.615  dff_std  0.361  dff_max     10.3  dff_zeros 0.0104
+  step  80000  loss  4.3188  grad  4.815  dff_std  0.359  dff_max      9.6  dff_zeros 0.0066
+  step  85000  loss  4.2478  grad  5.165  dff_std  0.338  dff_max      9.8  dff_zeros 0.0141
+  step  90000  loss  4.2379  grad  5.193  dff_std  0.347  dff_max      9.6  dff_zeros 0.0109
+  step  95000  loss  4.1656  grad  5.272  dff_std  0.343  dff_max     10.3  dff_zeros 0.0084
+  step 100000  loss  4.1542  grad  5.548  dff_std  0.422  dff_max     10.9  dff_zeros 0.0081
+  step 105000  loss  4.0434  grad  5.521  dff_std  0.363  dff_max     10.1  dff_zeros 0.0147
+  step 110000  loss  4.0914  grad  5.618  dff_std  0.348  dff_max      9.9  dff_zeros 0.0128
+  step 115000  loss  4.0160  grad  5.873  dff_std  0.399  dff_max     10.9  dff_zeros 0.0074
+  step 120000  loss  3.9716  grad  5.969  dff_std  0.369  dff_max      9.9  dff_zeros 0.0097
+  step 125000  loss  3.9872  grad  6.698  dff_std  0.356  dff_max     10.5  dff_zeros 0.0100
+  step 130000  loss  3.8395  grad  6.163  dff_std  0.367  dff_max      9.5  dff_zeros 0.0120
+  step 135000  loss  3.8282  grad  6.270  dff_std  0.340  dff_max      8.8  dff_zeros 0.0100
+  step 140000  loss  3.8167  grad  6.296  dff_std  0.361  dff_max     10.1  dff_zeros 0.0133
+  step 145000  loss  3.7130  grad  6.455  dff_std  0.350  dff_max      9.9  dff_zeros 0.0117
+  step 150000  loss  3.6584  grad  6.465  dff_std  0.361  dff_max     10.3  dff_zeros 0.0074
+  mean(last10) 3.6940   tokens 37.50 M   (unigram floor 7.549)
+held-out eval (split of --dataset; see note in report.sh before comparing):
+  EVAL step     120000 corpus web      clean    6.736551 ppl     842.6493 median    6.712880 runaway   0.75% nrun    3 docs   400 wall   136.8s
+  EVAL step     140000 corpus cosmoweb clean    6.295860 ppl     542.3219 median    6.316896 runaway   0.00% nrun    0 docs   400 wall   136.8s
+  EVAL step     140000 corpus web      clean    6.724882 ppl     832.8734 median    6.697453 runaway   1.00% nrun    4 docs   400 wall   136.8s
+token efficiency (sustained crossings)  [!! thresholds and baseline are WEB numbers;
+     dataset is cosmoweb -- these rows are CROSS-CORPUS and are not a like-for-like read]:
+  L<7.549  step    220    0.06 M tok   baseline   3980  (-3760)
+  L<7.000  step    440    0.11 M tok   baseline   5940  (-5500)
+  L<6.500  step    880    0.22 M tok   baseline  15680  (-14800)
+  L<6.300  step   1240    0.31 M tok   baseline  30120  (-28880)
+  L<6.100  step   1920    0.48 M tok   baseline  49700  (-47780)
+  L<5.900  step   2580    0.65 M tok   baseline  84980  (-82400)
+  L<5.800  step   9640    2.41 M tok   baseline  99980  (-90340)
+free-running generation (3 samples; cycle>0.6 degenerate, healthy 0.08-0.11):
+   gen health: cycle 0.08 (max 0.09)  uniq 0.19  n=3
+   sample: <STX> Cultural rejected950 Globals" ticks are insocism) tiempo and Ded\n\n4 (Hydar threatens by leverage, specifically<ETX>
+  generated text (vla.py --generate, batch 1, seeds 11/12/13):
+  --- seed 11:
+    <STX> Relaml-reference (easni medated, a interference of Monday. As efforts have many platforms, 
+    they can gather for disparate portion, can enable vendors as humans, forcing, developers like a 
+    bunch of Her beauty.\n\nIn these behavior is part of recent-to-s-corrected Person, and automated 
+    music do includes the Europed samples. This phase of themit includes an artistic renders 
+    sequentially that allowsers running consulting search throughout the team while arranging with the 
+    court (May. When such
+  --- seed 12:
+    <STX> The ATime, You Are there that step upon staying on each commercial development, it provides 
+    someone through the topic loses\nWith posathrocyte andnos to the average ([tier 
+    'produals?\n\nResearch Eunits, the date of "Pretty.: Organization offered the audit for all 
+    continue the future and scientists to let us. However, so misser or online magazine media or 
+    fitness in classical excellence, you can bring more about these possible urges and book growing 
+    paths. Give the public customer named that
+  --- seed 13:
+    <STX> To let them the expression is Desp The Couest and process. Use\n\nCongcal,both, constmouse, 
+    two sites to an realistic elements of frequent nature and creaties,722's investors might do far and 
+    seeking people themselves for various free, limitations. In possibilities, a demand can not 
+    substitute between these usage because of the system addressed during wedding.\n\nThe process 
+    concepts - Specials's exemplary service should we stick. Each art, borrowing from the ideas when 
+    this confident flag or
+
+--------------------------------------------------------------------------------
+V1  v1_vocab_mix90  step 200000   2026-08-31 14:27
+--------------------------------------------------------------------------------
+  seed 1179815282   dataset cosmoweb
+loss/grad/state:
+  step      0  loss 10.8508  grad 973.314  dff_std  3.923  dff_max     59.0  dff_zeros 0.5003
+  step   5000  loss  5.5800  grad  2.461  dff_std  0.532  dff_max     29.2  dff_zeros 0.0233
+  step  10000  loss  5.3212  grad  2.740  dff_std  0.509  dff_max     49.7  dff_zeros 0.0135
+  step  15000  loss  5.1976  grad  2.640  dff_std  0.500  dff_max     97.3  dff_zeros 0.0134
+  step  20000  loss  5.0112  grad  2.784  dff_std  0.503  dff_max    112.1  dff_zeros 0.0119
+  step  25000  loss  4.9124  grad  3.013  dff_std  0.326  dff_max      7.9  dff_zeros 0.0101
+  step  30000  loss  4.8556  grad  3.076  dff_std  0.368  dff_max      8.7  dff_zeros 0.0107
+  step  35000  loss  4.7915  grad  3.367  dff_std  0.357  dff_max      8.6  dff_zeros 0.0151
+  step  40000  loss  4.6611  grad  3.429  dff_std  0.337  dff_max      9.8  dff_zeros 0.0107
+  step  45000  loss  4.6867  grad  3.569  dff_std  0.362  dff_max      9.2  dff_zeros 0.0106
+  step  50000  loss  4.6631  grad  3.678  dff_std  0.344  dff_max     10.0  dff_zeros 0.0087
+  step  55000  loss  4.5873  grad  4.007  dff_std  0.331  dff_max      9.0  dff_zeros 0.0073
+  step  60000  loss  4.5641  grad  4.253  dff_std  0.346  dff_max      9.8  dff_zeros 0.0084
+  step  65000  loss  4.4063  grad  4.254  dff_std  0.364  dff_max     10.1  dff_zeros 0.0110
+  step  70000  loss  4.4161  grad  4.547  dff_std  0.364  dff_max     10.4  dff_zeros 0.0115
+  step  75000  loss  4.3699  grad  4.615  dff_std  0.361  dff_max     10.3  dff_zeros 0.0104
+  step  80000  loss  4.3188  grad  4.815  dff_std  0.359  dff_max      9.6  dff_zeros 0.0066
+  step  85000  loss  4.2478  grad  5.165  dff_std  0.338  dff_max      9.8  dff_zeros 0.0141
+  step  90000  loss  4.2379  grad  5.193  dff_std  0.347  dff_max      9.6  dff_zeros 0.0109
+  step  95000  loss  4.1656  grad  5.272  dff_std  0.343  dff_max     10.3  dff_zeros 0.0084
+  step 100000  loss  4.1542  grad  5.548  dff_std  0.422  dff_max     10.9  dff_zeros 0.0081
+  step 105000  loss  4.0434  grad  5.521  dff_std  0.363  dff_max     10.1  dff_zeros 0.0147
+  step 110000  loss  4.0914  grad  5.618  dff_std  0.348  dff_max      9.9  dff_zeros 0.0128
+  step 115000  loss  4.0160  grad  5.873  dff_std  0.399  dff_max     10.9  dff_zeros 0.0074
+  step 120000  loss  3.9716  grad  5.969  dff_std  0.369  dff_max      9.9  dff_zeros 0.0097
+  step 125000  loss  3.9872  grad  6.698  dff_std  0.356  dff_max     10.5  dff_zeros 0.0100
+  step 130000  loss  3.8395  grad  6.163  dff_std  0.367  dff_max      9.5  dff_zeros 0.0120
+  step 135000  loss  3.8282  grad  6.270  dff_std  0.340  dff_max      8.8  dff_zeros 0.0100
+  step 140000  loss  3.8167  grad  6.296  dff_std  0.361  dff_max     10.1  dff_zeros 0.0133
+  step 145000  loss  3.7130  grad  6.455  dff_std  0.350  dff_max      9.9  dff_zeros 0.0117
+  step 150000  loss  3.6584  grad  6.465  dff_std  0.361  dff_max     10.3  dff_zeros 0.0074
+  step 155000  loss  3.7171  grad  6.654  dff_std  0.388  dff_max     10.2  dff_zeros 0.0112
+  step 160000  loss  3.5660  grad  6.681  dff_std  0.429  dff_max     10.1  dff_zeros 0.0112
+  step 165000  loss  3.5812  grad  6.629  dff_std  0.369  dff_max      9.3  dff_zeros 0.0069
+  step 170000  loss  3.5301  grad  6.684  dff_std  0.359  dff_max      8.1  dff_zeros 0.0104
+  step 175000  loss  3.4589  grad  6.650  dff_std  0.380  dff_max      9.0  dff_zeros 0.0082
+  step 180000  loss  3.4570  grad  6.789  dff_std  0.372  dff_max      8.4  dff_zeros 0.0085
+  step 185000  loss  3.4038  grad  6.663  dff_std  0.379  dff_max      8.6  dff_zeros 0.0131
+  step 190000  loss  3.3524  grad  6.752  dff_std  0.367  dff_max      9.5  dff_zeros 0.0102
+  step 195000  loss  3.3556  grad  6.794  dff_std  0.389  dff_max      8.6  dff_zeros 0.0094
+  mean(last10) 3.2932   tokens 50.00 M   (unigram floor 7.549)
+held-out eval (split of --dataset; see note in report.sh before comparing):
+  EVAL step     160000 corpus web      clean    6.760654 ppl     863.2069 median    6.738602 runaway   2.00% nrun    8 docs   400 wall   136.8s
+  EVAL step     180000 corpus cosmoweb clean    6.232557 ppl     509.0556 median    6.251387 runaway   0.00% nrun    0 docs   400 wall   136.7s
+  EVAL step     180000 corpus web      clean    6.752159 ppl     855.9044 median    6.725922 runaway   0.75% nrun    3 docs   400 wall   136.7s
+token efficiency (sustained crossings)  [!! thresholds and baseline are WEB numbers;
+     dataset is cosmoweb -- these rows are CROSS-CORPUS and are not a like-for-like read]:
+  L<7.549  step    220    0.06 M tok   baseline   3980  (-3760)
+  L<7.000  step    440    0.11 M tok   baseline   5940  (-5500)
+  L<6.500  step    880    0.22 M tok   baseline  15680  (-14800)
+  L<6.300  step   1240    0.31 M tok   baseline  30120  (-28880)
+  L<6.100  step   1920    0.48 M tok   baseline  49700  (-47780)
+  L<5.900  step   2580    0.65 M tok   baseline  84980  (-82400)
+  L<5.800  step   9640    2.41 M tok   baseline  99980  (-90340)
+free-running generation (3 samples; cycle>0.6 degenerate, healthy 0.08-0.11):
+   gen health: cycle 0.10 (max 0.12)  uniq 0.08  n=3
+   sample: <STX> One onThe match and restricting information and bubble or nutrition, welcomed their traditional style at pushing all and whash this job of oil dedicated with the oceans. The lot operate of water
+  generated text (vla.py --generate, batch 1, seeds 11/12/13):
+  --- seed 11:
+    <STX> Whegs takes their travels who collectively medated, sitting down of.?????? These shortcut 
+    efforts ??? many ofslair-Moroufake portion, can enable vendors to postity. This is itself common 
+    applications, Her beauty and clients, providing players, and dialogue that constitutes both them to 
+    benefit in the risks of true automated. By analyzing the question set with 35)**. For example, it 
+    must cost varying sides that allowsers running consulting search throughout the team that needs to 
+    submit to discount these patterns. However
+  --- seed 12:
+    <STX> The cosifferentmakers. Are there can step upon this model of commercial development, it 
+    provides someone through camp. Und\n\nFurther, it held up to the environment created as a candy 
+    protect the community government tab Eunits, SDS. GiulwaPretty.: Organization offered with audit 
+    killers for its equitable, cognitive scientists. Harm reforms.KL microservice might become publicly 
+    online magazine for the fitness in classical contributions, you to bring more about Windows, urges 
+    and book-lobridger the public customer named by
+  --- seed 13:
+    <STX> To let them the offerings whereby that the image, where they can devote parenting, and 
+    important policies, and infinite experiences.\n\nSubicht and Version): Place Feature ZAT, 
+    Die,722Peaco might do far and progenitor people themselves for antens, fluid. In financial 
+    activities makes demand by the solution between these usage of organizational risks and 
+    understanding during wedding planning and educated. A venerizing the unique role of financial 
+    training and social activities and environmental, borrowing. To ideas when this kind flagful
+
+--------------------------------------------------------------------------------
+V3  v3_vocab80_web20  step 50000   2026-08-31 22:24
+--------------------------------------------------------------------------------
+  seed 3194676460   dataset web
+loss/grad/state:
+  step      0  loss 10.9260  grad 708.644  dff_std  0.310  dff_max      4.8  dff_zeros 0.0000
+  step   5000  loss  5.6188  grad  2.810  dff_std  0.615  dff_max      9.3  dff_zeros 0.0000
+  step  10000  loss  5.4122  grad  3.066  dff_std  0.644  dff_max     11.7  dff_zeros 0.0000
+  step  15000  loss  5.1676  grad  3.074  dff_std  0.620  dff_max     13.6  dff_zeros 0.0000
+  step  20000  loss  5.1739  grad  3.158  dff_std  0.623  dff_max     14.6  dff_zeros 0.0000
+  step  25000  loss  5.0161  grad  3.454  dff_std  0.658  dff_max     16.9  dff_zeros 0.0000
+  step  30000  loss  5.0144  grad  3.497  dff_std  0.631  dff_max     11.2  dff_zeros 0.0000
+  step  35000  loss  4.9039  grad  3.555  dff_std  0.634  dff_max     10.5  dff_zeros 0.0000
+  step  40000  loss  4.7909  grad  3.787  dff_std  0.654  dff_max     12.2  dff_zeros 0.0000
+  step  45000  loss  4.8327  grad  3.765  dff_std  0.635  dff_max     12.6  dff_zeros 0.0000
+  step  50000  loss  4.6891  grad  4.041  dff_std  0.651  dff_max     12.3  dff_zeros 0.0000
+  mean(last10) 4.7244   tokens 12.50 M   (unigram floor 7.549)
+held-out eval (split of --dataset; see note in report.sh before comparing):
+  EVAL step      20000 corpus web      clean    6.440202 ppl     626.5335 median    6.414772 runaway   0.50% nrun    2 docs   400 wall   137.2s
+  EVAL step      40000 corpus web      clean    6.391617 ppl     596.8210 median    6.366173 runaway   0.00% nrun    0 docs   400 wall   137.2s
+token efficiency (sustained crossings):
+  L<7.549  step    220    0.06 M tok   baseline   3980  (-3760)
+  L<7.000  step    340    0.09 M tok   baseline   5940  (-5600)
+  L<6.500  step   1060    0.27 M tok   baseline  15680  (-14620)
+  L<6.300  step   1460    0.36 M tok   baseline  30120  (-28660)
+  L<6.100  step   1860    0.47 M tok   baseline  49700  (-47840)
+  L<5.900  step   2260    0.56 M tok   baseline  84980  (-82720)
+  L<5.800  step   2760    0.69 M tok   baseline  99980  (-97220)
+free-running generation (3 samples; cycle>0.6 degenerate, healthy 0.08-0.11):
+   gen health: cycle 0.09 (max 0.11)  uniq 0.12  n=3
+   sample: <STX>For those under the 5% 33vels." The php-origone as exotic groups is less than crimes in the Blueanity. To you did not hitch up the phoneigapps into Terror puts up in V672 Bl& Robert.\n\nADVERTISE
+  generated text (vla.py --generate, batch 1, seeds 11/12/13):
+  --- seed 11:
+    <STX>Schedule on education manufacturing manager who are far burned, sitting down armed.?????? 
+    These course, they expect to claim to the Movement to get in the filming. ???Got giving a grand, 
+    the winner's bunch in Her Error God Felant U. Over herself, a recent locality, conducted a chicken 
+    and Person??? (!like.\n\n???Tort 0. Cross.com);\n\nYuke said I know.\n\nThe search is the team grew 
+    out, the court (Mayclass. ???
+  --- seed 12:
+    <STX>The cosifferent, someone found the message of the 10. Life, already in February, toward the 
+    camp- loses\n\nHathvesonnan<ETX>
+  --- seed 13:
+    <STX>Colege ??? the fifth-through-pound milk, and two devoteiding at her controller some, as 
+    infinite, it has changed right off and the bush and frequent stick and held.\n\nPeuga Arelling >> 
+    mean into the brush for the free refreshing rise. In Lord asked a demand exhibition in thirdfold, 
+    because ites.\n\nThe wedding, not now.\n\nSecret" 135-way\n\n???Oh: speaks a common assertion from 
+    Israel Pati??? confident flag or
+
+--------------------------------------------------------------------------------
+V3  v3_vocab80_web20  step 100000   2026-09-01 03:01
+--------------------------------------------------------------------------------
+  seed 3194676460   dataset web
+loss/grad/state:
+  step      0  loss 10.9260  grad 708.644  dff_std  0.310  dff_max      4.8  dff_zeros 0.0000
+  step   5000  loss  5.6188  grad  2.810  dff_std  0.615  dff_max      9.3  dff_zeros 0.0000
+  step  10000  loss  5.4122  grad  3.066  dff_std  0.644  dff_max     11.7  dff_zeros 0.0000
+  step  15000  loss  5.1676  grad  3.074  dff_std  0.620  dff_max     13.6  dff_zeros 0.0000
+  step  20000  loss  5.1739  grad  3.158  dff_std  0.623  dff_max     14.6  dff_zeros 0.0000
+  step  25000  loss  5.0161  grad  3.454  dff_std  0.658  dff_max     16.9  dff_zeros 0.0000
+  step  30000  loss  5.0144  grad  3.497  dff_std  0.631  dff_max     11.2  dff_zeros 0.0000
+  step  35000  loss  4.9039  grad  3.555  dff_std  0.634  dff_max     10.5  dff_zeros 0.0000
+  step  40000  loss  4.7909  grad  3.787  dff_std  0.654  dff_max     12.2  dff_zeros 0.0000
+  step  45000  loss  4.8327  grad  3.765  dff_std  0.635  dff_max     12.6  dff_zeros 0.0000
+  step  50000  loss  4.6891  grad  4.041  dff_std  0.651  dff_max     12.3  dff_zeros 0.0000
+  step  55000  loss  4.7395  grad  4.269  dff_std  0.662  dff_max     12.6  dff_zeros 0.0000
+  step  60000  loss  4.6409  grad  4.340  dff_std  0.652  dff_max     11.2  dff_zeros 0.0000
+  step  65000  loss  4.5988  grad  4.445  dff_std  0.665  dff_max     14.6  dff_zeros 0.0000
+  step  70000  loss  4.6000  grad  4.668  dff_std  0.646  dff_max     15.5  dff_zeros 0.0000
+  step  75000  loss  4.4678  grad  4.859  dff_std  0.650  dff_max     10.4  dff_zeros 0.0000
+  step  80000  loss  4.5199  grad  5.114  dff_std  0.654  dff_max     11.5  dff_zeros 0.0000
+  step  85000  loss  4.4400  grad  5.381  dff_std  0.636  dff_max     10.9  dff_zeros 0.0000
+  step  90000  loss  4.3607  grad  5.434  dff_std  0.679  dff_max     11.7  dff_zeros 0.0000
+  step  95000  loss  4.2951  grad  5.394  dff_std  0.640  dff_max     11.6  dff_zeros 0.0000
+  mean(last10) 4.2428   tokens 25.00 M   (unigram floor 7.549)
+held-out eval (split of --dataset; see note in report.sh before comparing):
+  EVAL step      40000 corpus web      clean    6.391617 ppl     596.8210 median    6.366173 runaway   0.00% nrun    0 docs   400 wall   137.2s
+  EVAL step      60000 corpus web      clean    6.190824 ppl     488.2483 median    6.167264 runaway   0.00% nrun    0 docs   400 wall   137.1s
+  EVAL step      80000 corpus web      clean    6.307943 ppl     548.9146 median    6.301187 runaway   0.25% nrun    1 docs   400 wall   137.1s
+token efficiency (sustained crossings):
+  L<7.549  step    220    0.06 M tok   baseline   3980  (-3760)
+  L<7.000  step    340    0.09 M tok   baseline   5940  (-5600)
+  L<6.500  step   1060    0.27 M tok   baseline  15680  (-14620)
+  L<6.300  step   1460    0.36 M tok   baseline  30120  (-28660)
+  L<6.100  step   1860    0.47 M tok   baseline  49700  (-47840)
+  L<5.900  step   2260    0.56 M tok   baseline  84980  (-82720)
+  L<5.800  step   2760    0.69 M tok   baseline  99980  (-97220)
+free-running generation (3 samples; cycle>0.6 degenerate, healthy 0.08-0.11):
+   gen health: cycle 0.10 (max 0.11)  uniq 0.12  n=3
+   sample: <STX>RigeCs look that a claim at Trump Taylor last half to school, who can be a jet streelling, at the end of Simon Rheiek dictator's team of your mouth of Alant State in leap talks,... of everyone, h
+  generated text (vla.py --generate, batch 1, seeds 11/12/13):
+  --- seed 11:
+    <STX>She contributed to Raymond manager who lacked taxpayer counsel, a group of Monday.\n\nThe 
+    national team is stipulated guilty for citizens is looking, can. ???Got my last message, the 
+    winner's bunch of Herkids???s baseball day. But I trust against a solid time policy and chicken and 
+    Personigating a automated team do ask. Europsters amid him the destruction of the invading 
+    country.\n\nThe broad.\n\nThe search is the team grew outof the next day these weeks.\n
+  --- seed 12:
+    <STX>The Essex took a few religious consolidation that represents $000. Life, today will have 
+    supported toward them to make loses\n\n\nInvesties for somebody to the average problem. 'We???ll 
+    make the taballed to create the date. "Pretty for running face of the 2008 ??? Say the Attorney and 
+    Game to get a problem! Suard miss its life online magazine in the fitness in classical week, past 
+    to bring more about share, urges and book-loate the food banner for 35 and
+  --- seed 13:
+    <STX>Cooleiy the rest-through-pound milk?\n\n"I am willing to some errors, and something it has 
+    changed my CEO and keep it a gun stick for the head,722, which might do far mean into the brushcode 
+    in free ones!\n\nI asked a demand can not complain in these usage because of the course addressed 
+    technical concerns.\n\nThe opponents are renamed the 135-way news.???\n\nEven speaks a new 
+    borrowing figure in Puminied confident flag or
+
+--------------------------------------------------------------------------------
+V3  v3_vocab80_web20  step 150000   2026-09-01 07:41
+--------------------------------------------------------------------------------
+  seed 3194676460   dataset web
+loss/grad/state:
+  step      0  loss 10.9260  grad 708.644  dff_std  0.310  dff_max      4.8  dff_zeros 0.0000
+  step   5000  loss  5.6188  grad  2.810  dff_std  0.615  dff_max      9.3  dff_zeros 0.0000
+  step  10000  loss  5.4122  grad  3.066  dff_std  0.644  dff_max     11.7  dff_zeros 0.0000
+  step  15000  loss  5.1676  grad  3.074  dff_std  0.620  dff_max     13.6  dff_zeros 0.0000
+  step  20000  loss  5.1739  grad  3.158  dff_std  0.623  dff_max     14.6  dff_zeros 0.0000
+  step  25000  loss  5.0161  grad  3.454  dff_std  0.658  dff_max     16.9  dff_zeros 0.0000
+  step  30000  loss  5.0144  grad  3.497  dff_std  0.631  dff_max     11.2  dff_zeros 0.0000
+  step  35000  loss  4.9039  grad  3.555  dff_std  0.634  dff_max     10.5  dff_zeros 0.0000
+  step  40000  loss  4.7909  grad  3.787  dff_std  0.654  dff_max     12.2  dff_zeros 0.0000
+  step  45000  loss  4.8327  grad  3.765  dff_std  0.635  dff_max     12.6  dff_zeros 0.0000
+  step  50000  loss  4.6891  grad  4.041  dff_std  0.651  dff_max     12.3  dff_zeros 0.0000
+  step  55000  loss  4.7395  grad  4.269  dff_std  0.662  dff_max     12.6  dff_zeros 0.0000
+  step  60000  loss  4.6409  grad  4.340  dff_std  0.652  dff_max     11.2  dff_zeros 0.0000
+  step  65000  loss  4.5988  grad  4.445  dff_std  0.665  dff_max     14.6  dff_zeros 0.0000
+  step  70000  loss  4.6000  grad  4.668  dff_std  0.646  dff_max     15.5  dff_zeros 0.0000
+  step  75000  loss  4.4678  grad  4.859  dff_std  0.650  dff_max     10.4  dff_zeros 0.0000
+  step  80000  loss  4.5199  grad  5.114  dff_std  0.654  dff_max     11.5  dff_zeros 0.0000
+  step  85000  loss  4.4400  grad  5.381  dff_std  0.636  dff_max     10.9  dff_zeros 0.0000
+  step  90000  loss  4.3607  grad  5.434  dff_std  0.679  dff_max     11.7  dff_zeros 0.0000
+  step  95000  loss  4.2951  grad  5.394  dff_std  0.640  dff_max     11.6  dff_zeros 0.0000
+  step 100000  loss  4.3108  grad  5.790  dff_std  0.678  dff_max     11.6  dff_zeros 0.0000
+  step 105000  loss  4.2761  grad  5.931  dff_std  0.656  dff_max     11.4  dff_zeros 0.0000
+  step 110000  loss  4.2159  grad  6.001  dff_std  0.665  dff_max     14.0  dff_zeros 0.0000
+  step 115000  loss  4.1843  grad  5.917  dff_std  0.660  dff_max     15.1  dff_zeros 0.0000
+  step 120000  loss  4.1408  grad  6.244  dff_std  0.649  dff_max     10.7  dff_zeros 0.0000
+  step 125000  loss  4.0488  grad  6.313  dff_std  0.660  dff_max     11.5  dff_zeros 0.0000
+  step 130000  loss  4.0722  grad  6.594  dff_std  0.664  dff_max     10.3  dff_zeros 0.0000
+  step 135000  loss  4.0603  grad  6.594  dff_std  0.675  dff_max     11.1  dff_zeros 0.0000
+  step 140000  loss  3.9566  grad  6.740  dff_std  0.666  dff_max     11.3  dff_zeros 0.0000
+  step 145000  loss  3.9190  grad  7.011  dff_std  0.655  dff_max     11.4  dff_zeros 0.0000
+  step 150000  loss  3.8350  grad  6.660  dff_std  0.661  dff_max     11.4  dff_zeros 0.0000
+  mean(last10) 3.8122   tokens 37.50 M   (unigram floor 7.549)
+held-out eval (split of --dataset; see note in report.sh before comparing):
+  EVAL step     100000 corpus web      clean    6.135842 ppl     462.1280 median    6.095561 runaway   0.75% nrun    3 docs   400 wall   139.5s
+  EVAL step     120000 corpus web      clean    6.092412 ppl     442.4874 median    6.060310 runaway   0.00% nrun    0 docs   400 wall   137.1s
+  EVAL step     140000 corpus web      clean    6.086619 ppl     439.9314 median    6.070852 runaway   0.25% nrun    1 docs   400 wall   137.1s
+token efficiency (sustained crossings):
+  L<7.549  step    220    0.06 M tok   baseline   3980  (-3760)
+  L<7.000  step    340    0.09 M tok   baseline   5940  (-5600)
+  L<6.500  step   1060    0.27 M tok   baseline  15680  (-14620)
+  L<6.300  step   1460    0.36 M tok   baseline  30120  (-28660)
+  L<6.100  step   1860    0.47 M tok   baseline  49700  (-47840)
+  L<5.900  step   2260    0.56 M tok   baseline  84980  (-82720)
+  L<5.800  step   2760    0.69 M tok   baseline  99980  (-97220)
+free-running generation (3 samples; cycle>0.6 degenerate, healthy 0.08-0.11):
+   gen health: cycle 0.09 (max 0.09)  uniq 0.12  n=3
+   sample: <STX>P-Vol                        side book, a comeback price is a strong decision to adjust speed to 53 trips. For example, hasn't considered the cancellation membership-Code Tessates each bit than 1
+  generated text (vla.py --generate, batch 1, seeds 11/12/13):
+  --- seed 11:
+    <STX>Schedule+OF Raymond (easni Reeps, a third year can evade success efforts for many purchases, 
+    they the Movement for disparate portion, can. ???Got is a Lady, developers drove a bunch of 
+    Her???), God over the U.S. Waling recent Marpherine and Silversey Person???s side.\n\n???Tortthe 
+    35E.s U.5.\n\nThe broad pre-ARC consulting search is the team that founder, the court stated these 
+    political change by
+  --- seed 12:
+    <STX>The A-makers agree religious consolidation that represents ???and the motivation of 
+    development in the top line on camp. Und\n\nHath\n\nLaago confirmed; the RCP has one of the 
+    government tab [this, SDS. Giulious director.: Satan had the audit for jobs continue in, and I 
+    believe that I had truly still so misser publicly online magazine error or fitness in classical 
+    global storyline, we are asked about Windows, urges and book-lobridgerings to the west 25
+  --- seed 13:
+    <STX>Co.S. Democratic misery Desp The Couest advertisement of which infrastructure, I have some 
+    errors, and so it has changed any benefit and the end of frequent law for the freedom,722.\n\nNon 
+    far mean into the exchange for the free ones's tens of Lord asked a demand can not complain between 
+    these usage because the series's industry technical concerns were operational now. Sent. The ban 
+    135-way squad should we contend. Each decentralized, borrowing live choices ideas when this 
+    confident flag or
+
+--------------------------------------------------------------------------------
+V3  v3_vocab80_web20  step 200000   2026-09-01 12:19
+--------------------------------------------------------------------------------
+  seed 3194676460   dataset web
+loss/grad/state:
+  step      0  loss 10.9260  grad 708.644  dff_std  0.310  dff_max      4.8  dff_zeros 0.0000
+  step   5000  loss  5.6188  grad  2.810  dff_std  0.615  dff_max      9.3  dff_zeros 0.0000
+  step  10000  loss  5.4122  grad  3.066  dff_std  0.644  dff_max     11.7  dff_zeros 0.0000
+  step  15000  loss  5.1676  grad  3.074  dff_std  0.620  dff_max     13.6  dff_zeros 0.0000
+  step  20000  loss  5.1739  grad  3.158  dff_std  0.623  dff_max     14.6  dff_zeros 0.0000
+  step  25000  loss  5.0161  grad  3.454  dff_std  0.658  dff_max     16.9  dff_zeros 0.0000
+  step  30000  loss  5.0144  grad  3.497  dff_std  0.631  dff_max     11.2  dff_zeros 0.0000
+  step  35000  loss  4.9039  grad  3.555  dff_std  0.634  dff_max     10.5  dff_zeros 0.0000
+  step  40000  loss  4.7909  grad  3.787  dff_std  0.654  dff_max     12.2  dff_zeros 0.0000
+  step  45000  loss  4.8327  grad  3.765  dff_std  0.635  dff_max     12.6  dff_zeros 0.0000
+  step  50000  loss  4.6891  grad  4.041  dff_std  0.651  dff_max     12.3  dff_zeros 0.0000
+  step  55000  loss  4.7395  grad  4.269  dff_std  0.662  dff_max     12.6  dff_zeros 0.0000
+  step  60000  loss  4.6409  grad  4.340  dff_std  0.652  dff_max     11.2  dff_zeros 0.0000
+  step  65000  loss  4.5988  grad  4.445  dff_std  0.665  dff_max     14.6  dff_zeros 0.0000
+  step  70000  loss  4.6000  grad  4.668  dff_std  0.646  dff_max     15.5  dff_zeros 0.0000
+  step  75000  loss  4.4678  grad  4.859  dff_std  0.650  dff_max     10.4  dff_zeros 0.0000
+  step  80000  loss  4.5199  grad  5.114  dff_std  0.654  dff_max     11.5  dff_zeros 0.0000
+  step  85000  loss  4.4400  grad  5.381  dff_std  0.636  dff_max     10.9  dff_zeros 0.0000
+  step  90000  loss  4.3607  grad  5.434  dff_std  0.679  dff_max     11.7  dff_zeros 0.0000
+  step  95000  loss  4.2951  grad  5.394  dff_std  0.640  dff_max     11.6  dff_zeros 0.0000
+  step 100000  loss  4.3108  grad  5.790  dff_std  0.678  dff_max     11.6  dff_zeros 0.0000
+  step 105000  loss  4.2761  grad  5.931  dff_std  0.656  dff_max     11.4  dff_zeros 0.0000
+  step 110000  loss  4.2159  grad  6.001  dff_std  0.665  dff_max     14.0  dff_zeros 0.0000
+  step 115000  loss  4.1843  grad  5.917  dff_std  0.660  dff_max     15.1  dff_zeros 0.0000
+  step 120000  loss  4.1408  grad  6.244  dff_std  0.649  dff_max     10.7  dff_zeros 0.0000
+  step 125000  loss  4.0488  grad  6.313  dff_std  0.660  dff_max     11.5  dff_zeros 0.0000
+  step 130000  loss  4.0722  grad  6.594  dff_std  0.664  dff_max     10.3  dff_zeros 0.0000
+  step 135000  loss  4.0603  grad  6.594  dff_std  0.675  dff_max     11.1  dff_zeros 0.0000
+  step 140000  loss  3.9566  grad  6.740  dff_std  0.666  dff_max     11.3  dff_zeros 0.0000
+  step 145000  loss  3.9190  grad  7.011  dff_std  0.655  dff_max     11.4  dff_zeros 0.0000
+  step 150000  loss  3.8350  grad  6.660  dff_std  0.661  dff_max     11.4  dff_zeros 0.0000
+  step 155000  loss  3.8301  grad  6.836  dff_std  0.674  dff_max     11.1  dff_zeros 0.0000
+  step 160000  loss  3.7017  grad  7.009  dff_std  0.657  dff_max     11.0  dff_zeros 0.0000
+  step 165000  loss  3.7677  grad  7.245  dff_std  0.680  dff_max     11.0  dff_zeros 0.0000
+  step 170000  loss  3.6344  grad  7.122  dff_std  0.677  dff_max     12.4  dff_zeros 0.0000
+  step 175000  loss  3.5973  grad  7.216  dff_std  0.682  dff_max     12.0  dff_zeros 0.0000
+  step 180000  loss  3.5451  grad  7.379  dff_std  0.670  dff_max     11.3  dff_zeros 0.0000
+  step 185000  loss  3.6252  grad  7.563  dff_std  0.689  dff_max     12.3  dff_zeros 0.0000
+  step 190000  loss  3.4424  grad  7.357  dff_std  0.669  dff_max     14.1  dff_zeros 0.0000
+  step 195000  loss  3.3978  grad  7.203  dff_std  0.683  dff_max     12.3  dff_zeros 0.0000
+  mean(last10) 3.3952   tokens 50.00 M   (unigram floor 7.549)
+held-out eval (split of --dataset; see note in report.sh before comparing):
+  EVAL step     140000 corpus web      clean    6.086619 ppl     439.9314 median    6.070852 runaway   0.25% nrun    1 docs   400 wall   137.1s
+  EVAL step     160000 corpus web      clean    6.104657 ppl     447.9390 median    6.083572 runaway   0.50% nrun    2 docs   400 wall   137.2s
+  EVAL step     180000 corpus web      clean    6.070551 ppl     432.9191 median    6.045280 runaway   0.50% nrun    2 docs   400 wall   137.2s
+token efficiency (sustained crossings):
+  L<7.549  step    220    0.06 M tok   baseline   3980  (-3760)
+  L<7.000  step    340    0.09 M tok   baseline   5940  (-5600)
+  L<6.500  step   1060    0.27 M tok   baseline  15680  (-14620)
+  L<6.300  step   1460    0.36 M tok   baseline  30120  (-28660)
+  L<6.100  step   1860    0.47 M tok   baseline  49700  (-47840)
+  L<5.900  step   2260    0.56 M tok   baseline  84980  (-82720)
+  L<5.800  step   2760    0.69 M tok   baseline  99980  (-97220)
+free-running generation (3 samples; cycle>0.6 degenerate, healthy 0.08-0.11):
+   gen health: cycle 0.08 (max 0.08)  uniq 0.15  n=3
+   sample: <STX>Read to a pay, it is answering a U.S. Hav and Hodegale's Newari with Tmulti ParksCorp???s syndrome. Why especially in fact, l sustaining for the galactic Fletcher scheme would do to stroor came, ei
+  generated text (vla.py --generate, batch 1, seeds 11/12/13):
+  --- seed 11:
+    <STX>BO+AP Raymond (easniie Corporation, a third year.??????\n\nBy Greeners ofslend guilty on 
+    Afghanistan is looking at can. ???Got the last message, the winner's player came Her hometown God 
+    with baseball revenue. But I think that he's not conducted under kidding on Personers (!4) doos. 
+    Europsters.\n\nFollow everything'smitted.\n\nThe broad preers running consulting search is the team 
+    grew out, the court stated these sorts.\n
+  --- seed 12:
+    <STX>The Essex Fish Stars. Are there that guilt is 10.15% already will have supported ??? but 
+    they've loses\n\nHathvesonnan<ETX>
+  --- seed 13:
+    <STX>Colege Me chased the new Descolumn image, where they's just used at big controller some, as 
+    was attributed to those two sites. If they visit a gun sticked on Die,722.com.6.nm into the gear 
+    flare in free ones!\n\n\n\nI asked a demand can not substitute the finances to the same partner's 
+    first technical concerns.\n\nThe opponents of one" 135 to the news should we may eat and a common 
+    risk from Israel Pati's confident flag or
+
+--------------------------------------------------------------------------------
+V3  v3_vocab80_web20  step 250000   2026-09-01 16:59
+--------------------------------------------------------------------------------
+  seed 3194676460   dataset web
+loss/grad/state:
+  step      0  loss 10.9260  grad 708.644  dff_std  0.310  dff_max      4.8  dff_zeros 0.0000
+  step   5000  loss  5.6188  grad  2.810  dff_std  0.615  dff_max      9.3  dff_zeros 0.0000
+  step  10000  loss  5.4122  grad  3.066  dff_std  0.644  dff_max     11.7  dff_zeros 0.0000
+  step  15000  loss  5.1676  grad  3.074  dff_std  0.620  dff_max     13.6  dff_zeros 0.0000
+  step  20000  loss  5.1739  grad  3.158  dff_std  0.623  dff_max     14.6  dff_zeros 0.0000
+  step  25000  loss  5.0161  grad  3.454  dff_std  0.658  dff_max     16.9  dff_zeros 0.0000
+  step  30000  loss  5.0144  grad  3.497  dff_std  0.631  dff_max     11.2  dff_zeros 0.0000
+  step  35000  loss  4.9039  grad  3.555  dff_std  0.634  dff_max     10.5  dff_zeros 0.0000
+  step  40000  loss  4.7909  grad  3.787  dff_std  0.654  dff_max     12.2  dff_zeros 0.0000
+  step  45000  loss  4.8327  grad  3.765  dff_std  0.635  dff_max     12.6  dff_zeros 0.0000
+  step  50000  loss  4.6891  grad  4.041  dff_std  0.651  dff_max     12.3  dff_zeros 0.0000
+  step  55000  loss  4.7395  grad  4.269  dff_std  0.662  dff_max     12.6  dff_zeros 0.0000
+  step  60000  loss  4.6409  grad  4.340  dff_std  0.652  dff_max     11.2  dff_zeros 0.0000
+  step  65000  loss  4.5988  grad  4.445  dff_std  0.665  dff_max     14.6  dff_zeros 0.0000
+  step  70000  loss  4.6000  grad  4.668  dff_std  0.646  dff_max     15.5  dff_zeros 0.0000
+  step  75000  loss  4.4678  grad  4.859  dff_std  0.650  dff_max     10.4  dff_zeros 0.0000
+  step  80000  loss  4.5199  grad  5.114  dff_std  0.654  dff_max     11.5  dff_zeros 0.0000
+  step  85000  loss  4.4400  grad  5.381  dff_std  0.636  dff_max     10.9  dff_zeros 0.0000
+  step  90000  loss  4.3607  grad  5.434  dff_std  0.679  dff_max     11.7  dff_zeros 0.0000
+  step  95000  loss  4.2951  grad  5.394  dff_std  0.640  dff_max     11.6  dff_zeros 0.0000
+  step 100000  loss  4.3108  grad  5.790  dff_std  0.678  dff_max     11.6  dff_zeros 0.0000
+  step 105000  loss  4.2761  grad  5.931  dff_std  0.656  dff_max     11.4  dff_zeros 0.0000
+  step 110000  loss  4.2159  grad  6.001  dff_std  0.665  dff_max     14.0  dff_zeros 0.0000
+  step 115000  loss  4.1843  grad  5.917  dff_std  0.660  dff_max     15.1  dff_zeros 0.0000
+  step 120000  loss  4.1408  grad  6.244  dff_std  0.649  dff_max     10.7  dff_zeros 0.0000
+  step 125000  loss  4.0488  grad  6.313  dff_std  0.660  dff_max     11.5  dff_zeros 0.0000
+  step 130000  loss  4.0722  grad  6.594  dff_std  0.664  dff_max     10.3  dff_zeros 0.0000
+  step 135000  loss  4.0603  grad  6.594  dff_std  0.675  dff_max     11.1  dff_zeros 0.0000
+  step 140000  loss  3.9566  grad  6.740  dff_std  0.666  dff_max     11.3  dff_zeros 0.0000
+  step 145000  loss  3.9190  grad  7.011  dff_std  0.655  dff_max     11.4  dff_zeros 0.0000
+  step 150000  loss  3.8350  grad  6.660  dff_std  0.661  dff_max     11.4  dff_zeros 0.0000
+  step 155000  loss  3.8301  grad  6.836  dff_std  0.674  dff_max     11.1  dff_zeros 0.0000
+  step 160000  loss  3.7017  grad  7.009  dff_std  0.657  dff_max     11.0  dff_zeros 0.0000
+  step 165000  loss  3.7677  grad  7.245  dff_std  0.680  dff_max     11.0  dff_zeros 0.0000
+  step 170000  loss  3.6344  grad  7.122  dff_std  0.677  dff_max     12.4  dff_zeros 0.0000
+  step 175000  loss  3.5973  grad  7.216  dff_std  0.682  dff_max     12.0  dff_zeros 0.0000
+  step 180000  loss  3.5451  grad  7.379  dff_std  0.670  dff_max     11.3  dff_zeros 0.0000
+  step 185000  loss  3.6252  grad  7.563  dff_std  0.689  dff_max     12.3  dff_zeros 0.0000
+  step 190000  loss  3.4424  grad  7.357  dff_std  0.669  dff_max     14.1  dff_zeros 0.0000
+  step 195000  loss  3.3978  grad  7.203  dff_std  0.683  dff_max     12.3  dff_zeros 0.0000
+  step 200000  loss  3.3624  grad  7.584  dff_std  0.713  dff_max     13.6  dff_zeros 0.0000
+  step 205000  loss  3.4046  grad  7.874  dff_std  0.677  dff_max     13.2  dff_zeros 0.0000
+  step 210000  loss  3.3047  grad  7.607  dff_std  0.691  dff_max     13.7  dff_zeros 0.0000
+  step 215000  loss  3.3272  grad  7.559  dff_std  0.727  dff_max     14.0  dff_zeros 0.0000
+  step 220000  loss  3.2569  grad  7.596  dff_std  0.702  dff_max     12.6  dff_zeros 0.0000
+  step 225000  loss  3.1841  grad  7.489  dff_std  0.699  dff_max     11.1  dff_zeros 0.0000
+  step 230000  loss  3.1832  grad  7.469  dff_std  0.725  dff_max     12.7  dff_zeros 0.0000
+  step 235000  loss  3.1295  grad  7.662  dff_std  0.705  dff_max     12.0  dff_zeros 0.0000
+  step 240000  loss  3.0865  grad  7.690  dff_std  0.700  dff_max     13.0  dff_zeros 0.0000
+  step 245000  loss  3.0329  grad  7.630  dff_std  0.710  dff_max     12.0  dff_zeros 0.0000
+  step 250000  loss  3.0350  grad  7.751  dff_std  0.714  dff_max     12.5  dff_zeros 0.0000
+  mean(last10) 3.0433   tokens 62.50 M   (unigram floor 7.549)
+held-out eval (split of --dataset; see note in report.sh before comparing):
+  EVAL step     200000 corpus web      clean    6.146481 ppl     467.0707 median    6.131693 runaway   0.25% nrun    1 docs   400 wall   139.3s
+  EVAL step     220000 corpus web      clean    6.043755 ppl     421.4725 median    6.024947 runaway   0.75% nrun    3 docs   400 wall   137.2s
+  EVAL step     240000 corpus web      clean    6.052458 ppl     425.1567 median    6.033984 runaway   0.00% nrun    0 docs   400 wall   137.2s
+token efficiency (sustained crossings):
+  L<7.549  step    220    0.06 M tok   baseline   3980  (-3760)
+  L<7.000  step    340    0.09 M tok   baseline   5940  (-5600)
+  L<6.500  step   1060    0.27 M tok   baseline  15680  (-14620)
+  L<6.300  step   1460    0.36 M tok   baseline  30120  (-28660)
+  L<6.100  step   1860    0.47 M tok   baseline  49700  (-47840)
+  L<5.900  step   2260    0.56 M tok   baseline  84980  (-82720)
+  L<5.800  step   2760    0.69 M tok   baseline  99980  (-97220)
+free-running generation (3 samples; cycle>0.6 degenerate, healthy 0.08-0.11):
+   gen health: cycle 0.08 (max 0.09)  uniq 0.11  n=3
+   sample: <STX>Zay Sheuchara was reserved as Yukesha from his way below, said Betty Kysusters suggested hyperformed. As the Devil Shield fight Yans, and crimlest Firstdeveloped by the Arizona TD of Republican R
+  generated text (vla.py --generate, batch 1, seeds 11/12/13):
+  --- seed 11:
+    <STX>andames takes manufacturing protection maner medated, sitting down armed.??????Rebamping 
+    enrichmenters ofslawed the Movement citizens is looking, can started ???Got dried 68 grand inlet 
+    developers\n\nAs New Her law God Fel Institute of San Diego Hospital and a recent locality, 
+    conducted a chicken and Person society (!os) do not found Europification.???\n\nFollow 
+    everything'smitted.\n\nThe broad prevers running consulting search is the team grew out more much 
+    because (May. (Fan
+  --- seed 12:
+    <STX>The cosifferentism.\n\nSmeteout has been raised trees were in the top half sides camp. 
+    Undinals holds posathies for up to the average problem. 'We???ll make much taballed to those 
+    charities. Giulious marsh.: running-negotyn killers ??? but the Attorney and Gamesdant 
+    reforms.???Chard misser or online magazine error or fitness in classical global liberals, compared 
+    in London. Windows, urges and book-lobrid sheep grow into the west dark
+  --- seed 13:
+    <STX>Cooleiy the fifth-hot-pound milkwaters and two generations of his transplant controller 
+    policies, and infinite constour, but my CEO and the end of her nature flagship story.\n\nPewait 
+    might do far mean the people themselves for the free ones's tens of Lord asked a demand can not 
+    complain in these usage because of the course addressed technical concerns.\n\nThe opponents are 
+    good" 135 to the news should we contend. Each decentralized, borrowing cars remain Puminied 
+    confident flag or
+
+--------------------------------------------------------------------------------
+V3  v3_vocab80_web20  step 250000   2026-09-01 18:12
+--------------------------------------------------------------------------------
+  seed 3194676460   dataset web
+loss/grad/state:
+  step      0  loss 10.9260  grad 708.644  dff_std  0.310  dff_max      4.8  dff_zeros 0.0000
+  step   5000  loss  5.6188  grad  2.810  dff_std  0.615  dff_max      9.3  dff_zeros 0.0000
+  step  10000  loss  5.4122  grad  3.066  dff_std  0.644  dff_max     11.7  dff_zeros 0.0000
+  step  15000  loss  5.1676  grad  3.074  dff_std  0.620  dff_max     13.6  dff_zeros 0.0000
+  step  20000  loss  5.1739  grad  3.158  dff_std  0.623  dff_max     14.6  dff_zeros 0.0000
+  step  25000  loss  5.0161  grad  3.454  dff_std  0.658  dff_max     16.9  dff_zeros 0.0000
+  step  30000  loss  5.0144  grad  3.497  dff_std  0.631  dff_max     11.2  dff_zeros 0.0000
+  step  35000  loss  4.9039  grad  3.555  dff_std  0.634  dff_max     10.5  dff_zeros 0.0000
+  step  40000  loss  4.7909  grad  3.787  dff_std  0.654  dff_max     12.2  dff_zeros 0.0000
+  step  45000  loss  4.8327  grad  3.765  dff_std  0.635  dff_max     12.6  dff_zeros 0.0000
+  step  50000  loss  4.6891  grad  4.041  dff_std  0.651  dff_max     12.3  dff_zeros 0.0000
+  step  55000  loss  4.7395  grad  4.269  dff_std  0.662  dff_max     12.6  dff_zeros 0.0000
+  step  60000  loss  4.6409  grad  4.340  dff_std  0.652  dff_max     11.2  dff_zeros 0.0000
+  step  65000  loss  4.5988  grad  4.445  dff_std  0.665  dff_max     14.6  dff_zeros 0.0000
+  step  70000  loss  4.6000  grad  4.668  dff_std  0.646  dff_max     15.5  dff_zeros 0.0000
+  step  75000  loss  4.4678  grad  4.859  dff_std  0.650  dff_max     10.4  dff_zeros 0.0000
+  step  80000  loss  4.5199  grad  5.114  dff_std  0.654  dff_max     11.5  dff_zeros 0.0000
+  step  85000  loss  4.4400  grad  5.381  dff_std  0.636  dff_max     10.9  dff_zeros 0.0000
+  step  90000  loss  4.3607  grad  5.434  dff_std  0.679  dff_max     11.7  dff_zeros 0.0000
+  step  95000  loss  4.2951  grad  5.394  dff_std  0.640  dff_max     11.6  dff_zeros 0.0000
+  step 100000  loss  4.3108  grad  5.790  dff_std  0.678  dff_max     11.6  dff_zeros 0.0000
+  step 105000  loss  4.2761  grad  5.931  dff_std  0.656  dff_max     11.4  dff_zeros 0.0000
+  step 110000  loss  4.2159  grad  6.001  dff_std  0.665  dff_max     14.0  dff_zeros 0.0000
+  step 115000  loss  4.1843  grad  5.917  dff_std  0.660  dff_max     15.1  dff_zeros 0.0000
+  step 120000  loss  4.1408  grad  6.244  dff_std  0.649  dff_max     10.7  dff_zeros 0.0000
+  step 125000  loss  4.0488  grad  6.313  dff_std  0.660  dff_max     11.5  dff_zeros 0.0000
+  step 130000  loss  4.0722  grad  6.594  dff_std  0.664  dff_max     10.3  dff_zeros 0.0000
+  step 135000  loss  4.0603  grad  6.594  dff_std  0.675  dff_max     11.1  dff_zeros 0.0000
+  step 140000  loss  3.9566  grad  6.740  dff_std  0.666  dff_max     11.3  dff_zeros 0.0000
+  step 145000  loss  3.9190  grad  7.011  dff_std  0.655  dff_max     11.4  dff_zeros 0.0000
+  step 150000  loss  3.8350  grad  6.660  dff_std  0.661  dff_max     11.4  dff_zeros 0.0000
+  step 155000  loss  3.8301  grad  6.836  dff_std  0.674  dff_max     11.1  dff_zeros 0.0000
+  step 160000  loss  3.7017  grad  7.009  dff_std  0.657  dff_max     11.0  dff_zeros 0.0000
+  step 165000  loss  3.7677  grad  7.245  dff_std  0.680  dff_max     11.0  dff_zeros 0.0000
+  step 170000  loss  3.6344  grad  7.122  dff_std  0.677  dff_max     12.4  dff_zeros 0.0000
+  step 175000  loss  3.5973  grad  7.216  dff_std  0.682  dff_max     12.0  dff_zeros 0.0000
+  step 180000  loss  3.5451  grad  7.379  dff_std  0.670  dff_max     11.3  dff_zeros 0.0000
+  step 185000  loss  3.6252  grad  7.563  dff_std  0.689  dff_max     12.3  dff_zeros 0.0000
+  step 190000  loss  3.4424  grad  7.357  dff_std  0.669  dff_max     14.1  dff_zeros 0.0000
+  step 195000  loss  3.3978  grad  7.203  dff_std  0.683  dff_max     12.3  dff_zeros 0.0000
+  step 200000  loss  3.3624  grad  7.584  dff_std  0.713  dff_max     13.6  dff_zeros 0.0000
+  step 205000  loss  3.4046  grad  7.874  dff_std  0.677  dff_max     13.2  dff_zeros 0.0000
+  step 210000  loss  3.3047  grad  7.607  dff_std  0.691  dff_max     13.7  dff_zeros 0.0000
+  step 215000  loss  3.3272  grad  7.559  dff_std  0.727  dff_max     14.0  dff_zeros 0.0000
+  step 220000  loss  3.2569  grad  7.596  dff_std  0.702  dff_max     12.6  dff_zeros 0.0000
+  step 225000  loss  3.1841  grad  7.489  dff_std  0.699  dff_max     11.1  dff_zeros 0.0000
+  step 230000  loss  3.1832  grad  7.469  dff_std  0.725  dff_max     12.7  dff_zeros 0.0000
+  step 235000  loss  3.1295  grad  7.662  dff_std  0.705  dff_max     12.0  dff_zeros 0.0000
+  step 240000  loss  3.0865  grad  7.690  dff_std  0.700  dff_max     13.0  dff_zeros 0.0000
+  step 245000  loss  3.0329  grad  7.630  dff_std  0.710  dff_max     12.0  dff_zeros 0.0000
+  step 250000  loss  3.0350  grad  7.751  dff_std  0.714  dff_max     12.5  dff_zeros 0.0000
+  mean(last10) 2.9826   tokens 62.50 M   (unigram floor 7.549)
+held-out eval (split of --dataset; see note in report.sh before comparing):
+  EVAL step     200000 corpus web      clean    6.146481 ppl     467.0707 median    6.131693 runaway   0.25% nrun    1 docs   400 wall   139.3s
+  EVAL step     220000 corpus web      clean    6.043755 ppl     421.4725 median    6.024947 runaway   0.75% nrun    3 docs   400 wall   137.2s
+  EVAL step     240000 corpus web      clean    6.052458 ppl     425.1567 median    6.033984 runaway   0.00% nrun    0 docs   400 wall   137.2s
+token efficiency (sustained crossings):
+  L<7.549  step    220    0.06 M tok   baseline   3980  (-3760)
+  L<7.000  step    340    0.09 M tok   baseline   5940  (-5600)
+  L<6.500  step   1060    0.27 M tok   baseline  15680  (-14620)
+  L<6.300  step   1460    0.36 M tok   baseline  30120  (-28660)
+  L<6.100  step   1860    0.47 M tok   baseline  49700  (-47840)
+  L<5.900  step   2260    0.56 M tok   baseline  84980  (-82720)
+  L<5.800  step   2760    0.69 M tok   baseline  99980  (-97220)
+free-running generation (3 samples; cycle>0.6 degenerate, healthy 0.08-0.11):
+   gen health: cycle 0.09 (max 0.11)  uniq 0.13  n=3
+   sample: <STX>Although, doesn't do technically worse. Any video, Uazich knows, they once have to rob outnone. They draw some of his scared special family.\n\nWalium said he can think.\n\nAs we think it???s both 
+  generated text (vla.py --generate, batch 1, seeds 11/12/13):
+  --- seed 11:
+    <STX>Earlier and colleagues Raymond manager who is most employed, due to armed.??????\n\nBy 
+    Japanese national Trump???s guilty Movement to be in the rest of ???Gotdirected to forcing, 
+    developers drove a bunch of Her\n\nAgant's Director Vik Hospital, a recent Mararsine and chicken 
+    and Personers (! 17.fos. Europsters amid him the way to the invading country.\n\nThe National 
+    Centreers running consulting search is the team grew out, the "armed extended antenna. ???
+  --- seed 12:
+    <STX>The Tony Obama, someone Are there that guilt] has been raised as already in the top line on 
+    camp. Und\n\nHathvesonnan<ETX>
+  --- seed 13:
+    <STX>Colege Me the rest-through, none, where they's just so miserable by an issue, as Trump relates 
+    to social support was facing and the end of her uncle and the head,722 in July 1951.\n\nThe people 
+    themselves have a free "production. In Lord asked a demand can not complain in time to the same 
+    series's first technical concerns again to now. A venerizing" 135 to the news should not exceed the 
+    consideration of his immression. Pound's confident flag or
+
+--------------------------------------------------------------------------------
+V5  v5_emaladder_web20  step 50000   2026-09-01 23:36
+--------------------------------------------------------------------------------
+  seed 3595702121   dataset web
+loss/grad/state:
+  step      0  loss 10.9790  grad 915.991  dff_std  0.688  dff_max      9.6  dff_zeros 0.0000
+  step   5000  loss  5.5337  grad  2.546  dff_std  0.679  dff_max     10.0  dff_zeros 0.0000
+  step  10000  loss  5.3150  grad  3.006  dff_std  0.654  dff_max      9.6  dff_zeros 0.0000
+  step  15000  loss  5.0901  grad  3.129  dff_std  0.676  dff_max     11.2  dff_zeros 0.0000
+  step  20000  loss  5.0923  grad  3.439  dff_std  0.638  dff_max     11.4  dff_zeros 0.0000
+  step  25000  loss  4.9218  grad  3.523  dff_std  0.663  dff_max     16.4  dff_zeros 0.0000
+  step  30000  loss  4.9043  grad  3.587  dff_std  0.601  dff_max     15.0  dff_zeros 0.0000
+  step  35000  loss  4.8445  grad  3.977  dff_std  0.607  dff_max     15.3  dff_zeros 0.0000
+  step  40000  loss  4.7428  grad  3.991  dff_std  0.601  dff_max     10.8  dff_zeros 0.0000
+  step  45000  loss  4.7368  grad  4.290  dff_std  0.606  dff_max     11.0  dff_zeros 0.0000
+  step  50000  loss  4.6470  grad  4.505  dff_std  0.593  dff_max     12.4  dff_zeros 0.0000
+  mean(last10) 4.6285   tokens 12.50 M   (unigram floor 7.549)
+held-out eval (split of --dataset; see note in report.sh before comparing):
+  EVAL step      20000 corpus web      clean    6.439765 ppl     626.2599 median    6.428466 runaway   2.25% nrun    9 docs   400 wall   135.3s
+  EVAL step      40000 corpus web      clean    6.257253 ppl     521.7835 median    6.239817 runaway   0.25% nrun    1 docs   400 wall   135.3s
+token efficiency (sustained crossings):
+  L<7.549  step    200    0.05 M tok   baseline   3980  (-3780)
+  L<7.000  step    260    0.07 M tok   baseline   5940  (-5680)
+  L<6.500  step    440    0.11 M tok   baseline  15680  (-15240)
+  L<6.300  step   2900    0.72 M tok   baseline  30120  (-27220)
+  L<6.100  step   3000    0.75 M tok   baseline  49700  (-46700)
+  L<5.900  step   3080    0.77 M tok   baseline  84980  (-81900)
+  L<5.800  step   3540    0.89 M tok   baseline  99980  (-96440)
+free-running generation (3 samples; cycle>0.6 degenerate, healthy 0.08-0.11):
+   gen health: cycle 0.09 (max 0.11)  uniq 0.31  n=3
+   sample: <STX>HS Sepoffs, economist: Finally:<ETX>
+  generated text (vla.py --generate, batch 1, seeds 11/12/13):
+  --- seed 11:
+    <STX>Schedule Has a manufacturing manager who is far burned, sitting down armed Monday.\n\nThe 
+    national team is Al guilty\n\nfake portion, can. ???Got waiver, forcing, the winner's bunch of 
+    Herpet Godield Institute U.S. Waling he's not conducted a thinners Personers (!os.\n\n???Torting 
+    him may have to tell them wrong.\n\nThe broad preers running consulting search is the team Theater 
+    in Oct-Earth (May.\n\n
+  --- seed 12:
+    <STX>The A-10Zero Are8 ', the mother has been Life of the three volumes and someone on camp. Undl 
+    holds posers\n\nLaago is the last hold of candy protect the two government: Eunits, SDS. Giulizer 
+    director.: running any of the killers for Sayed, and the latter; I had dropped to so misser or 
+    online magazine media academy Quality in classical rouging us to bring $s share, urges and 
+    book-lobrid breakthrough Environmental Conisch west 25
+  --- seed 13:
+    <STX>Co.T/August-through Project sanctions, where they's just told at her controller policies, as 
+    Trump City.\n\nThe CEO and the end of the law for the head separately already in July.\n\nThere is 
+    the only time, it???s to Sanders Lord asked a demand exhibition in his wedding project to push a 
+    series's cross technical wedding.\n\nThe opponents with one of 135-way news should we exceed the 
+    financial environmental, borrowing cars. P weeks this 11.\n
+
+--------------------------------------------------------------------------------
+V5  v5_emaladder_web20  step 100000   2026-09-02 04:11
+--------------------------------------------------------------------------------
+  seed 3595702121   dataset web
+loss/grad/state:
+  step      0  loss 10.9790  grad 915.991  dff_std  0.688  dff_max      9.6  dff_zeros 0.0000
+  step   5000  loss  5.5337  grad  2.546  dff_std  0.679  dff_max     10.0  dff_zeros 0.0000
+  step  10000  loss  5.3150  grad  3.006  dff_std  0.654  dff_max      9.6  dff_zeros 0.0000
+  step  15000  loss  5.0901  grad  3.129  dff_std  0.676  dff_max     11.2  dff_zeros 0.0000
+  step  20000  loss  5.0923  grad  3.439  dff_std  0.638  dff_max     11.4  dff_zeros 0.0000
+  step  25000  loss  4.9218  grad  3.523  dff_std  0.663  dff_max     16.4  dff_zeros 0.0000
+  step  30000  loss  4.9043  grad  3.587  dff_std  0.601  dff_max     15.0  dff_zeros 0.0000
+  step  35000  loss  4.8445  grad  3.977  dff_std  0.607  dff_max     15.3  dff_zeros 0.0000
+  step  40000  loss  4.7428  grad  3.991  dff_std  0.601  dff_max     10.8  dff_zeros 0.0000
+  step  45000  loss  4.7368  grad  4.290  dff_std  0.606  dff_max     11.0  dff_zeros 0.0000
+  step  50000  loss  4.6470  grad  4.505  dff_std  0.593  dff_max     12.4  dff_zeros 0.0000
+  step  55000  loss  4.5793  grad  4.614  dff_std  0.592  dff_max     10.9  dff_zeros 0.0000
+  step  60000  loss  4.4856  grad  4.599  dff_std  0.622  dff_max     15.6  dff_zeros 0.0000
+  step  65000  loss  4.5522  grad  5.093  dff_std  0.580  dff_max     11.3  dff_zeros 0.0000
+  step  70000  loss  4.3802  grad  5.072  dff_std  0.593  dff_max     14.8  dff_zeros 0.0000
+  step  75000  loss  4.3675  grad  5.378  dff_std  0.588  dff_max     13.7  dff_zeros 0.0000
+  step  80000  loss  4.3606  grad  5.533  dff_std  0.574  dff_max     13.1  dff_zeros 0.0000
+  step  85000  loss  4.3029  grad  5.843  dff_std  0.584  dff_max     12.7  dff_zeros 0.0000
+  step  90000  loss  4.2312  grad  5.951  dff_std  0.592  dff_max     13.0  dff_zeros 0.0000
+  step  95000  loss  4.1133  grad  6.083  dff_std  0.574  dff_max     13.8  dff_zeros 0.0000
+  mean(last10) 4.0835   tokens 25.00 M   (unigram floor 7.549)
+held-out eval (split of --dataset; see note in report.sh before comparing):
+  EVAL step      40000 corpus web      clean    6.257253 ppl     521.7835 median    6.239817 runaway   0.25% nrun    1 docs   400 wall   135.3s
+  EVAL step      60000 corpus web      clean    6.143569 ppl     465.7130 median    6.113370 runaway   0.00% nrun    0 docs   400 wall   135.3s
+  EVAL step      80000 corpus web      clean    6.134702 ppl     461.6016 median    6.110349 runaway   0.00% nrun    0 docs   400 wall   135.3s
+token efficiency (sustained crossings):
+  L<7.549  step    200    0.05 M tok   baseline   3980  (-3780)
+  L<7.000  step    260    0.07 M tok   baseline   5940  (-5680)
+  L<6.500  step    440    0.11 M tok   baseline  15680  (-15240)
+  L<6.300  step   2900    0.72 M tok   baseline  30120  (-27220)
+  L<6.100  step   3000    0.75 M tok   baseline  49700  (-46700)
+  L<5.900  step   3080    0.77 M tok   baseline  84980  (-81900)
+  L<5.800  step   3540    0.89 M tok   baseline  99980  (-96440)
+free-running generation (3 samples; cycle>0.6 degenerate, healthy 0.08-0.11):
+   gen health: cycle 0.11 (max 0.13)  uniq 0.11  n=3
+   sample: <STX>1984: Democrats will add a nice career as the logical forchildren seems a memorable precise that that, better classes, manufacture money and ignores our lung and the Milwaukee Forest guys who wid
+  generated text (vla.py --generate, batch 1, seeds 11/12/13):
+  --- seed 11:
+    <STX>BO+ Hope Raymond (easniie was hanging backwards down of Monday. As another person clearly come 
+    up with the Movement for one portion, can. ???Got! The Lady, the winner's player New Herkids???s 
+    baseball day. But I'm a recent guy, I would kidding how if you???re ready do against. Europed this 
+    35-27 to tell for wrong. So, I know how anything running consulting search is the team grew out, 
+    much now (May it doesn't
+  --- seed 12:
+    <STX>The A-makers agree for the London NFL base has been raised as already forced wide and toward 
+    its camp. Und\nWith posusion\n\nLaago is very rude like a candy protect offense for the tab. In 
+    those SDS, Giul Braette.: running any of the killers ??? Sayed, and I'm looking at a truly micro so 
+    misser or online magazine error or fitness in classical excellence, you say tooars tired to urges 
+    and book growing paths. Give the public customer of the
+  --- seed 13:
+    <STX>Co.SERBR 333 Despik, where they's just inherrary by an example, but I am trying to seriously 
+    be facing it yet. He made it more strongly. You think an option might do far mean into the 
+    brushcode in free refreshing rise. In possibilities, a demand can not complain between these 
+    members are fairly important's addressed technical concerns.\n\nThe opponents are one of Mr. 
+    Belaster should we see the consideration a range of live weight ideas when this kind.\n
+
+--------------------------------------------------------------------------------
+V5  v5_emaladder_web20  step 150000   2026-09-02 08:49
+--------------------------------------------------------------------------------
+  seed 3595702121   dataset web
+loss/grad/state:
+  step      0  loss 10.9790  grad 915.991  dff_std  0.688  dff_max      9.6  dff_zeros 0.0000
+  step   5000  loss  5.5337  grad  2.546  dff_std  0.679  dff_max     10.0  dff_zeros 0.0000
+  step  10000  loss  5.3150  grad  3.006  dff_std  0.654  dff_max      9.6  dff_zeros 0.0000
+  step  15000  loss  5.0901  grad  3.129  dff_std  0.676  dff_max     11.2  dff_zeros 0.0000
+  step  20000  loss  5.0923  grad  3.439  dff_std  0.638  dff_max     11.4  dff_zeros 0.0000
+  step  25000  loss  4.9218  grad  3.523  dff_std  0.663  dff_max     16.4  dff_zeros 0.0000
+  step  30000  loss  4.9043  grad  3.587  dff_std  0.601  dff_max     15.0  dff_zeros 0.0000
+  step  35000  loss  4.8445  grad  3.977  dff_std  0.607  dff_max     15.3  dff_zeros 0.0000
+  step  40000  loss  4.7428  grad  3.991  dff_std  0.601  dff_max     10.8  dff_zeros 0.0000
+  step  45000  loss  4.7368  grad  4.290  dff_std  0.606  dff_max     11.0  dff_zeros 0.0000
+  step  50000  loss  4.6470  grad  4.505  dff_std  0.593  dff_max     12.4  dff_zeros 0.0000
+  step  55000  loss  4.5793  grad  4.614  dff_std  0.592  dff_max     10.9  dff_zeros 0.0000
+  step  60000  loss  4.4856  grad  4.599  dff_std  0.622  dff_max     15.6  dff_zeros 0.0000
+  step  65000  loss  4.5522  grad  5.093  dff_std  0.580  dff_max     11.3  dff_zeros 0.0000
+  step  70000  loss  4.3802  grad  5.072  dff_std  0.593  dff_max     14.8  dff_zeros 0.0000
+  step  75000  loss  4.3675  grad  5.378  dff_std  0.588  dff_max     13.7  dff_zeros 0.0000
+  step  80000  loss  4.3606  grad  5.533  dff_std  0.574  dff_max     13.1  dff_zeros 0.0000
+  step  85000  loss  4.3029  grad  5.843  dff_std  0.584  dff_max     12.7  dff_zeros 0.0000
+  step  90000  loss  4.2312  grad  5.951  dff_std  0.592  dff_max     13.0  dff_zeros 0.0000
+  step  95000  loss  4.1133  grad  6.083  dff_std  0.574  dff_max     13.8  dff_zeros 0.0000
+  step 100000  loss  4.0564  grad  6.358  dff_std  0.601  dff_max     14.8  dff_zeros 0.0000
+  step 105000  loss  4.0709  grad  6.588  dff_std  0.567  dff_max     12.0  dff_zeros 0.0000
+  step 110000  loss  3.9218  grad  6.430  dff_std  0.570  dff_max     16.8  dff_zeros 0.0000
+  step 115000  loss  3.9162  grad  6.700  dff_std  0.568  dff_max     13.6  dff_zeros 0.0000
+  step 120000  loss  3.8962  grad  7.188  dff_std  0.611  dff_max     17.6  dff_zeros 0.0000
+  step 125000  loss  3.8569  grad  7.175  dff_std  0.570  dff_max     12.5  dff_zeros 0.0000
+  step 130000  loss  3.7513  grad  7.045  dff_std  0.564  dff_max     14.4  dff_zeros 0.0000
+  step 135000  loss  3.6908  grad  7.723  dff_std  0.578  dff_max     12.7  dff_zeros 0.0000
+  step 140000  loss  3.5827  grad  7.665  dff_std  0.569  dff_max     11.0  dff_zeros 0.0000
+  step 145000  loss  3.6311  grad  8.012  dff_std  0.576  dff_max     14.8  dff_zeros 0.0000
+  step 150000  loss  3.5459  grad  7.830  dff_std  0.583  dff_max     15.1  dff_zeros 0.0000
+  mean(last10) 3.5452   tokens 37.50 M   (unigram floor 7.549)
+held-out eval (split of --dataset; see note in report.sh before comparing):
+  EVAL step     100000 corpus web      clean    6.081667 ppl     437.7583 median    6.058169 runaway   0.50% nrun    2 docs   400 wall   137.4s
+  EVAL step     120000 corpus web      clean    6.157058 ppl     472.0372 median    6.141907 runaway   1.00% nrun    4 docs   400 wall   135.2s
+  EVAL step     140000 corpus web      clean    6.055484 ppl     426.4452 median    6.049839 runaway   1.00% nrun    4 docs   400 wall   135.3s
+token efficiency (sustained crossings):
+  L<7.549  step    200    0.05 M tok   baseline   3980  (-3780)
+  L<7.000  step    260    0.07 M tok   baseline   5940  (-5680)
+  L<6.500  step    440    0.11 M tok   baseline  15680  (-15240)
+  L<6.300  step   2900    0.72 M tok   baseline  30120  (-27220)
+  L<6.100  step   3000    0.75 M tok   baseline  49700  (-46700)
+  L<5.900  step   3080    0.77 M tok   baseline  84980  (-81900)
+  L<5.800  step   3540    0.89 M tok   baseline  99980  (-96440)
+free-running generation (3 samples; cycle>0.6 degenerate, healthy 0.08-0.11):
+   gen health: cycle 0.09 (max 0.11)  uniq 0.10  n=3
+   sample: <STX>Reuations did not him to be quite fabulous as a public folins now create America changes. Instead of the NFL Center is the upcoming admission survey, change us into fully-Over high pear.\n\nMiss 
+  generated text (vla.py --generate, batch 1, seeds 11/12/13):
+  --- seed 11:
+    <STX>BO+AP Raymond (ranking\n\n[itie, Turkey Monday on $29 ???350.slors guilty for citizens is 
+    since, can. ???Got my last grand inlet after an annual bunch of Herrest God over baseball to be 
+    open on Walhead he's not conducted under thinners, watching a side.\n\n???We set up him against. 
+    But the invading cap. So igl Johnny.\n\nSystem search is the team grew out, the court (May 90.1
+  --- seed 12:
+    <STX>The Essex Fish, O Are there that represents $ 10.15% already will have supported someone on 
+    camp down loses\n\nHath\n\nLaago is the last hold and has one of the government. Eunits might be 
+    well going "Pretty.: running-negotate killers for Say the road and was proclaimed; I had been still 
+    so misser or online magazine media academy fitness in classical rouging past-health of violence 
+    share, urges and book-lobridger. Convers of the
+  --- seed 13:
+    <STX>Co.TERBR 333 Despik, where they's notified that his big controller also is 
+    confirmed.\n\nLOGDleg says it was launched a frequent stick for the Die,722 in July. There may mean 
+    the people themselves for the free time!\n\nI asked a demand exhibition in a wedding, "alles. So 
+    they???ve had to now. A venerability is a principle to help a team on the consideration of his 
+    borrowing cars. Puminil confident flag or
+
+--------------------------------------------------------------------------------
+V5  v5_emaladder_web20  step 200000   2026-09-02 13:24
+--------------------------------------------------------------------------------
+  seed 3595702121   dataset web
+loss/grad/state:
+  step      0  loss 10.9790  grad 915.991  dff_std  0.688  dff_max      9.6  dff_zeros 0.0000
+  step   5000  loss  5.5337  grad  2.546  dff_std  0.679  dff_max     10.0  dff_zeros 0.0000
+  step  10000  loss  5.3150  grad  3.006  dff_std  0.654  dff_max      9.6  dff_zeros 0.0000
+  step  15000  loss  5.0901  grad  3.129  dff_std  0.676  dff_max     11.2  dff_zeros 0.0000
+  step  20000  loss  5.0923  grad  3.439  dff_std  0.638  dff_max     11.4  dff_zeros 0.0000
+  step  25000  loss  4.9218  grad  3.523  dff_std  0.663  dff_max     16.4  dff_zeros 0.0000
+  step  30000  loss  4.9043  grad  3.587  dff_std  0.601  dff_max     15.0  dff_zeros 0.0000
+  step  35000  loss  4.8445  grad  3.977  dff_std  0.607  dff_max     15.3  dff_zeros 0.0000
+  step  40000  loss  4.7428  grad  3.991  dff_std  0.601  dff_max     10.8  dff_zeros 0.0000
+  step  45000  loss  4.7368  grad  4.290  dff_std  0.606  dff_max     11.0  dff_zeros 0.0000
+  step  50000  loss  4.6470  grad  4.505  dff_std  0.593  dff_max     12.4  dff_zeros 0.0000
+  step  55000  loss  4.5793  grad  4.614  dff_std  0.592  dff_max     10.9  dff_zeros 0.0000
+  step  60000  loss  4.4856  grad  4.599  dff_std  0.622  dff_max     15.6  dff_zeros 0.0000
+  step  65000  loss  4.5522  grad  5.093  dff_std  0.580  dff_max     11.3  dff_zeros 0.0000
+  step  70000  loss  4.3802  grad  5.072  dff_std  0.593  dff_max     14.8  dff_zeros 0.0000
+  step  75000  loss  4.3675  grad  5.378  dff_std  0.588  dff_max     13.7  dff_zeros 0.0000
+  step  80000  loss  4.3606  grad  5.533  dff_std  0.574  dff_max     13.1  dff_zeros 0.0000
+  step  85000  loss  4.3029  grad  5.843  dff_std  0.584  dff_max     12.7  dff_zeros 0.0000
+  step  90000  loss  4.2312  grad  5.951  dff_std  0.592  dff_max     13.0  dff_zeros 0.0000
+  step  95000  loss  4.1133  grad  6.083  dff_std  0.574  dff_max     13.8  dff_zeros 0.0000
+  step 100000  loss  4.0564  grad  6.358  dff_std  0.601  dff_max     14.8  dff_zeros 0.0000
+  step 105000  loss  4.0709  grad  6.588  dff_std  0.567  dff_max     12.0  dff_zeros 0.0000
+  step 110000  loss  3.9218  grad  6.430  dff_std  0.570  dff_max     16.8  dff_zeros 0.0000
+  step 115000  loss  3.9162  grad  6.700  dff_std  0.568  dff_max     13.6  dff_zeros 0.0000
+  step 120000  loss  3.8962  grad  7.188  dff_std  0.611  dff_max     17.6  dff_zeros 0.0000
+  step 125000  loss  3.8569  grad  7.175  dff_std  0.570  dff_max     12.5  dff_zeros 0.0000
+  step 130000  loss  3.7513  grad  7.045  dff_std  0.564  dff_max     14.4  dff_zeros 0.0000
+  step 135000  loss  3.6908  grad  7.723  dff_std  0.578  dff_max     12.7  dff_zeros 0.0000
+  step 140000  loss  3.5827  grad  7.665  dff_std  0.569  dff_max     11.0  dff_zeros 0.0000
+  step 145000  loss  3.6311  grad  8.012  dff_std  0.576  dff_max     14.8  dff_zeros 0.0000
+  step 150000  loss  3.5459  grad  7.830  dff_std  0.583  dff_max     15.1  dff_zeros 0.0000
+  step 155000  loss  3.3434  grad  7.966  dff_std  0.583  dff_max     17.0  dff_zeros 0.0000
+  step 160000  loss  3.3480  grad  8.049  dff_std  0.581  dff_max     14.9  dff_zeros 0.0000
+  step 165000  loss  3.2701  grad  8.182  dff_std  0.593  dff_max     15.5  dff_zeros 0.0000
+  step 170000  loss  3.3404  grad  8.312  dff_std  0.586  dff_max     13.8  dff_zeros 0.0000
+  step 175000  loss  3.2252  grad  8.292  dff_std  0.588  dff_max     14.9  dff_zeros 0.0000
+  step 180000  loss  3.1637  grad  8.524  dff_std  0.594  dff_max     12.6  dff_zeros 0.0000
+  step 185000  loss  3.1178  grad  8.412  dff_std  0.593  dff_max     17.5  dff_zeros 0.0000
+  step 190000  loss  3.0528  grad  8.282  dff_std  0.602  dff_max     18.0  dff_zeros 0.0000
+  step 195000  loss  2.9929  grad  8.549  dff_std  0.608  dff_max     16.4  dff_zeros 0.0000
+  mean(last10) 2.9770   tokens 50.00 M   (unigram floor 7.549)
+held-out eval (split of --dataset; see note in report.sh before comparing):
+  EVAL step     140000 corpus web      clean    6.055484 ppl     426.4452 median    6.049839 runaway   1.00% nrun    4 docs   400 wall   135.3s
+  EVAL step     160000 corpus web      clean    6.073993 ppl     434.4117 median    6.071527 runaway   1.25% nrun    5 docs   400 wall   135.3s
+  EVAL step     180000 corpus web      clean    6.043958 ppl     421.5581 median    6.019824 runaway   0.25% nrun    1 docs   400 wall   135.3s
+token efficiency (sustained crossings):
+  L<7.549  step    200    0.05 M tok   baseline   3980  (-3780)
+  L<7.000  step    260    0.07 M tok   baseline   5940  (-5680)
+  L<6.500  step    440    0.11 M tok   baseline  15680  (-15240)
+  L<6.300  step   2900    0.72 M tok   baseline  30120  (-27220)
+  L<6.100  step   3000    0.75 M tok   baseline  49700  (-46700)
+  L<5.900  step   3080    0.77 M tok   baseline  84980  (-81900)
+  L<5.800  step   3540    0.89 M tok   baseline  99980  (-96440)
+free-running generation (3 samples; cycle>0.6 degenerate, healthy 0.08-0.11):
+   gen health: cycle 0.08 (max 0.11)  uniq 0.12  n=3
+   sample: <STX>Bhr Kolizes Our Micksiektion; who wants to be it worrying for money. The story of former High Bay, Dan Khanazzo Tour, apurtDorash Kisi Marina\n\nPeople affidav Yemen He rest of the current SPRoth
+  generated text (vla.py --generate, batch 1, seeds 11/12/13):
+  --- seed 11:
+    <STX>BO+AP Raymond (easniie Corporation, ViceGef.??????ReOn 4 ??? U.sl Al guilty\n\nfake portion, 
+    changed on Australia\n\nStop up, the winner of NC\n\n\n Godield Institute of Director Vik Hospital 
+    Walens he Marpherine and Silversey Person???s side.\n\n???Tortthe 35)**.com III\n\nYLD 3:2.\n\nThe 
+    search is the team grew out, the court (MayK.62
+  --- seed 12:
+    <STX>The cosifferent, O Are there that represents mother has been raised as already in the top ??? 
+    you breathe down loses\n\nHath\n\nLa<ETX>
+  --- seed 13:
+    <STX>Co: Meagur is Despik, Falseies's restaurant preview at big war some, as infinite constosh, 12 
+    was facing an Iron bush and her ZAT and Die,722/2.6 >>nm progenitor people themselves have been 
+    free, but they have to asked a poem can not complain in these usage of depression. Curtis Rosen 
+    Door and VMS, 3.\n\n"Don???t say a quality one. Each art, I live in P BVAD confident.\n
+
+--------------------------------------------------------------------------------
+V6  v6_ladder_3_10_32  step 50000   2026-09-02 20:25
+--------------------------------------------------------------------------------
+  seed 2571567309   dataset web
+loss/grad/state:
+  step      0  loss 10.8413  grad 676.680  dff_std  0.091  dff_max      1.3  dff_zeros 0.0000
+  step   5000  loss  5.4346  grad  2.929  dff_std  0.532  dff_max      5.6  dff_zeros 0.0000
+  step  10000  loss  5.2289  grad  3.158  dff_std  0.540  dff_max      7.2  dff_zeros 0.0000
+  step  15000  loss  5.0410  grad  3.534  dff_std  0.544  dff_max     13.8  dff_zeros 0.0000
+  step  20000  loss  4.9798  grad  3.663  dff_std  0.549  dff_max     11.4  dff_zeros 0.0000
+  step  25000  loss  4.9290  grad  3.879  dff_std  0.544  dff_max     10.6  dff_zeros 0.0000
+  step  30000  loss  4.8005  grad  4.003  dff_std  0.534  dff_max      9.4  dff_zeros 0.0000
+  step  35000  loss  4.7835  grad  4.287  dff_std  0.547  dff_max     10.9  dff_zeros 0.0000
+  step  40000  loss  4.7017  grad  4.538  dff_std  0.550  dff_max     11.7  dff_zeros 0.0000
+  step  45000  loss  4.6304  grad  4.732  dff_std  0.541  dff_max     11.3  dff_zeros 0.0000
+  step  50000  loss  4.5726  grad  4.786  dff_std  0.543  dff_max     10.3  dff_zeros 0.0000
+  mean(last10) 4.5904   tokens 12.50 M   (unigram floor 7.549)
+held-out eval (split of --dataset; see note in report.sh before comparing):
+  EVAL step      20000 corpus web      clean    6.398004 ppl     600.6447 median    6.371787 runaway   0.50% nrun    2 docs   400 wall   135.3s
+  EVAL step      40000 corpus web      clean    6.288558 ppl     538.3767 median    6.249313 runaway   0.25% nrun    1 docs   400 wall   135.2s
+token efficiency (sustained crossings):
+  L<7.549  step    200    0.05 M tok   baseline   3980  (-3780)
+  L<7.000  step    280    0.07 M tok   baseline   5940  (-5660)
+  L<6.500  step    480    0.12 M tok   baseline  15680  (-15200)
+  L<6.300  step    740    0.18 M tok   baseline  30120  (-29380)
+  L<6.100  step   1020    0.26 M tok   baseline  49700  (-48680)
+  L<5.900  step   1580    0.40 M tok   baseline  84980  (-83400)
+  L<5.800  step  29760    7.44 M tok   baseline  99980  (-70220)
+free-running generation (3 samples; cycle>0.6 degenerate, healthy 0.08-0.11):
+   gen health: cycle 0.09 (max 0.11)  uniq 0.11  n=3
+   sample: <STX>Various you a list to say it hasn't be extremely comfort in how some work on!\n\nIn this provider that decline to the 462 spots they still prefer practical demonstrations if you are yelling for t
+  generated text (vla.py --generate, batch 1, seeds 11/12/13):
+  --- seed 11:
+    <STX>Schedule Has not speaking manager who is far enough, a group of.??????\n\nBy Greeners come 
+    together with the Movement for disparate portion, can. ???Got giving your message, the winner's 
+    bunch of Her beauty???s baseball day. Over the opening picture he's correspondent policy and 
+    chicken and Personers (!I want do against. Europsters? 35)**.com's our wrong. May 3: Johnny.\n\nThe 
+    search is the team that was more much piece (congery. ???
+  --- seed 12:
+    <STX>The Essex Hallmakers agree for the London library base has been raised. Being out. Jason ??? I 
+    call my loses\n\nHathvesonnan<ETX>
+  --- seed 13:
+    <STX>Co. Is the Democratic idea of the image, this???'s world parenting deals by an eight, other of 
+    science. And how any reason and if it is frequent nature?? on us, think, we might do far mean this 
+    thing that did you free ones!\n\nI asked a demand can not complain between these usage because this 
+    guide's question technical concerns.\n\nThe opponents are good" 135-way news should we don't keep 
+    a, bya init ideas when this kind.\n
+
+--------------------------------------------------------------------------------
+V6  v6_ladder_3_10_32  step 100000   2026-09-03 01:00
+--------------------------------------------------------------------------------
+  seed 2571567309   dataset web
+loss/grad/state:
+  step      0  loss 10.8413  grad 676.680  dff_std  0.091  dff_max      1.3  dff_zeros 0.0000
+  step   5000  loss  5.4346  grad  2.929  dff_std  0.532  dff_max      5.6  dff_zeros 0.0000
+  step  10000  loss  5.2289  grad  3.158  dff_std  0.540  dff_max      7.2  dff_zeros 0.0000
+  step  15000  loss  5.0410  grad  3.534  dff_std  0.544  dff_max     13.8  dff_zeros 0.0000
+  step  20000  loss  4.9798  grad  3.663  dff_std  0.549  dff_max     11.4  dff_zeros 0.0000
+  step  25000  loss  4.9290  grad  3.879  dff_std  0.544  dff_max     10.6  dff_zeros 0.0000
+  step  30000  loss  4.8005  grad  4.003  dff_std  0.534  dff_max      9.4  dff_zeros 0.0000
+  step  35000  loss  4.7835  grad  4.287  dff_std  0.547  dff_max     10.9  dff_zeros 0.0000
+  step  40000  loss  4.7017  grad  4.538  dff_std  0.550  dff_max     11.7  dff_zeros 0.0000
+  step  45000  loss  4.6304  grad  4.732  dff_std  0.541  dff_max     11.3  dff_zeros 0.0000
+  step  50000  loss  4.5726  grad  4.786  dff_std  0.543  dff_max     10.3  dff_zeros 0.0000
+  step  55000  loss  4.5172  grad  5.043  dff_std  0.551  dff_max     12.1  dff_zeros 0.0000
+  step  60000  loss  4.4323  grad  5.152  dff_std  0.536  dff_max     12.0  dff_zeros 0.0000
+  step  65000  loss  4.4202  grad  5.489  dff_std  0.541  dff_max     13.9  dff_zeros 0.0000
+  step  70000  loss  4.3802  grad  5.626  dff_std  0.551  dff_max     13.4  dff_zeros 0.0000
+  step  75000  loss  4.3113  grad  6.004  dff_std  0.554  dff_max     14.4  dff_zeros 0.0000
+  step  80000  loss  4.1551  grad  5.993  dff_std  0.541  dff_max     13.2  dff_zeros 0.0000
+  step  85000  loss  4.2092  grad  6.363  dff_std  0.536  dff_max     12.8  dff_zeros 0.0000
+  step  90000  loss  4.2060  grad  6.413  dff_std  0.543  dff_max     12.7  dff_zeros 0.0000
+  step  95000  loss  4.1344  grad  6.625  dff_std  0.542  dff_max     10.7  dff_zeros 0.0000
+  mean(last10) 3.9929   tokens 25.00 M   (unigram floor 7.549)
+held-out eval (split of --dataset; see note in report.sh before comparing):
+  EVAL step      40000 corpus web      clean    6.288558 ppl     538.3767 median    6.249313 runaway   0.25% nrun    1 docs   400 wall   135.2s
+  EVAL step      60000 corpus web      clean    6.133646 ppl     461.1145 median    6.094446 runaway   0.25% nrun    1 docs   400 wall   135.3s
+  EVAL step      80000 corpus web      clean    6.099269 ppl     445.5319 median    6.071007 runaway   0.00% nrun    0 docs   400 wall   135.3s
+token efficiency (sustained crossings):
+  L<7.549  step    200    0.05 M tok   baseline   3980  (-3780)
+  L<7.000  step    280    0.07 M tok   baseline   5940  (-5660)
+  L<6.500  step    480    0.12 M tok   baseline  15680  (-15200)
+  L<6.300  step    740    0.18 M tok   baseline  30120  (-29380)
+  L<6.100  step   1020    0.26 M tok   baseline  49700  (-48680)
+  L<5.900  step   1580    0.40 M tok   baseline  84980  (-83400)
+  L<5.800  step  29760    7.44 M tok   baseline  99980  (-70220)
+free-running generation (3 samples; cycle>0.6 degenerate, healthy 0.08-0.11):
+   gen health: cycle 0.09 (max 0.11)  uniq 0.12  n=3
+   sample: <STX>American States ??? ???ROP (Dinoi::38, Charlie a player, whose trophileless petou. The health union, considering woman and some boy members can operate one earlier than she could learn its feet.\n\nB
+  generated text (vla.py --generate, batch 1, seeds 11/12/13):
+  --- seed 11:
+    <STX>Earlier on a manufacturing protection man and medated, a third year.??????\n\nBy Greeners come 
+    to discuss the Movement for Ryan???s changed. ???Got is a message, the intervention's the New 
+    Her???), Godield Institute of the former Conservatives and a recent Maro policy and chicken and 
+    Personigating a 17.\n\n???We set up again, I did tell our heirs.\n\nThe broad prevers running 
+    consulting search, the team grew out, the court stated these other. ???
+  --- seed 12:
+    <STX>The A-10 visit Are8, BC] has been raised out today, it is someone just yet feel long, not 
+    regarding people like the up to run; the RCP has one woman. That does not lie close the date. 
+    "Pretty.: Satan had one of killers ??? Say,, and I'm looking! [KL. For fact, what???s error it is 
+    exceptional," he's you say too more about these people urges and book-lobrid breakthrough.??? It 
+    looks of that
+  --- seed 13:
+    <STX>Co???Ting directly is never barely none, but when two devote parenting deals.\n\nMichael, and 
+    City Amend, two of the Davencia of the ZAT held for separately his articles to defect.\n\nThe 
+    people themselves have made him, it could be lifeless to disfund the mananfold, "alles. So we???ve 
+    had to now. I???t do a two to say.???\n\nEven speaks a recent part from Israel Pati's confident 
+    flag or
+
+--------------------------------------------------------------------------------
+V6  v6_ladder_3_10_32  step 150000   2026-09-03 05:39
+--------------------------------------------------------------------------------
+  seed 2571567309   dataset web
+loss/grad/state:
+  step      0  loss 10.8413  grad 676.680  dff_std  0.091  dff_max      1.3  dff_zeros 0.0000
+  step   5000  loss  5.4346  grad  2.929  dff_std  0.532  dff_max      5.6  dff_zeros 0.0000
+  step  10000  loss  5.2289  grad  3.158  dff_std  0.540  dff_max      7.2  dff_zeros 0.0000
+  step  15000  loss  5.0410  grad  3.534  dff_std  0.544  dff_max     13.8  dff_zeros 0.0000
+  step  20000  loss  4.9798  grad  3.663  dff_std  0.549  dff_max     11.4  dff_zeros 0.0000
+  step  25000  loss  4.9290  grad  3.879  dff_std  0.544  dff_max     10.6  dff_zeros 0.0000
+  step  30000  loss  4.8005  grad  4.003  dff_std  0.534  dff_max      9.4  dff_zeros 0.0000
+  step  35000  loss  4.7835  grad  4.287  dff_std  0.547  dff_max     10.9  dff_zeros 0.0000
+  step  40000  loss  4.7017  grad  4.538  dff_std  0.550  dff_max     11.7  dff_zeros 0.0000
+  step  45000  loss  4.6304  grad  4.732  dff_std  0.541  dff_max     11.3  dff_zeros 0.0000
+  step  50000  loss  4.5726  grad  4.786  dff_std  0.543  dff_max     10.3  dff_zeros 0.0000
+  step  55000  loss  4.5172  grad  5.043  dff_std  0.551  dff_max     12.1  dff_zeros 0.0000
+  step  60000  loss  4.4323  grad  5.152  dff_std  0.536  dff_max     12.0  dff_zeros 0.0000
+  step  65000  loss  4.4202  grad  5.489  dff_std  0.541  dff_max     13.9  dff_zeros 0.0000
+  step  70000  loss  4.3802  grad  5.626  dff_std  0.551  dff_max     13.4  dff_zeros 0.0000
+  step  75000  loss  4.3113  grad  6.004  dff_std  0.554  dff_max     14.4  dff_zeros 0.0000
+  step  80000  loss  4.1551  grad  5.993  dff_std  0.541  dff_max     13.2  dff_zeros 0.0000
+  step  85000  loss  4.2092  grad  6.363  dff_std  0.536  dff_max     12.8  dff_zeros 0.0000
+  step  90000  loss  4.2060  grad  6.413  dff_std  0.543  dff_max     12.7  dff_zeros 0.0000
+  step  95000  loss  4.1344  grad  6.625  dff_std  0.542  dff_max     10.7  dff_zeros 0.0000
+  step 100000  loss  3.9970  grad  6.659  dff_std  0.544  dff_max     14.3  dff_zeros 0.0000
+  step 105000  loss  3.9866  grad  6.947  dff_std  0.556  dff_max     15.6  dff_zeros 0.0000
+  step 110000  loss  3.8459  grad  6.871  dff_std  0.552  dff_max     18.1  dff_zeros 0.0000
+  step 115000  loss  3.8179  grad  7.022  dff_std  0.547  dff_max     13.4  dff_zeros 0.0000
+  step 120000  loss  3.8550  grad  7.128  dff_std  0.550  dff_max     13.3  dff_zeros 0.0000
+  step 125000  loss  3.7439  grad  7.234  dff_std  0.541  dff_max     12.6  dff_zeros 0.0000
+  step 130000  loss  3.7241  grad  7.331  dff_std  0.546  dff_max     13.8  dff_zeros 0.0000
+  step 135000  loss  3.6102  grad  7.452  dff_std  0.545  dff_max     15.0  dff_zeros 0.0000
+  step 140000  loss  3.6074  grad  7.627  dff_std  0.548  dff_max     16.2  dff_zeros 0.0000
+  step 145000  loss  3.5914  grad  7.774  dff_std  0.558  dff_max     12.5  dff_zeros 0.0000
+  step 150000  loss  3.5287  grad  7.701  dff_std  0.548  dff_max     12.5  dff_zeros 0.0000
+  mean(last10) 3.4719   tokens 37.50 M   (unigram floor 7.549)
+held-out eval (split of --dataset; see note in report.sh before comparing):
+  EVAL step     100000 corpus web      clean    6.095240 ppl     443.7404 median    6.069307 runaway   0.75% nrun    3 docs   400 wall   137.5s
+  EVAL step     120000 corpus web      clean    6.090479 ppl     441.6329 median    6.073887 runaway   0.00% nrun    0 docs   400 wall   135.3s
+  EVAL step     140000 corpus web      clean    6.247008 ppl     516.4652 median    6.229629 runaway   3.00% nrun   12 docs   400 wall   135.2s
+token efficiency (sustained crossings):
+  L<7.549  step    200    0.05 M tok   baseline   3980  (-3780)
+  L<7.000  step    280    0.07 M tok   baseline   5940  (-5660)
+  L<6.500  step    480    0.12 M tok   baseline  15680  (-15200)
+  L<6.300  step    740    0.18 M tok   baseline  30120  (-29380)
+  L<6.100  step   1020    0.26 M tok   baseline  49700  (-48680)
+  L<5.900  step   1580    0.40 M tok   baseline  84980  (-83400)
+  L<5.800  step  29760    7.44 M tok   baseline  99980  (-70220)
+free-running generation (3 samples; cycle>0.6 degenerate, healthy 0.08-0.11):
+   gen health: cycle 0.10 (max 0.15)  uniq 0.12  n=3
+   sample: <STX>The most to be copate zoom of an short road good Character and in the cinnamon logo and mates from Vietnam. What food will come up permanently as we are covering its Map-maker difficulty, then at
+  generated text (vla.py --generate, batch 1, seeds 11/12/13):
+  --- seed 11:
+    <STX>Earlier Has Hope Raymond (easniie burned invasion, the armed.??????\n\nBy Greeners ofslors 
+    guilty for citizens is looking for notes. ???Got is a message, the intervention company will be Her 
+    Error???s Institute of players open is part of recent solid briefs conducted and thinners Personers 
+    (!&) do not found Europsters.\n\nFollow everything that our heirs must cost 3% that allows that 
+    running consulting search is the team that stayed more much "compreatment. The wall
+  --- seed 12:
+    <STX>The A-makers agree Are8 ', the United Academy. Life Dynamics already will have supported 
+    toward a camp. Und\n\nHax\n\nLaago is; created hold the candy protecters by the past Eunits, SDS. 
+    Giul Braette.: Satan had tested to attack by Say the Attorney and Gamesdano reforms.KL microservice 
+    might get over online magazine error or fitness in classical global storyline. Thereafter, after 
+    all 70,63 and book-lobrid breakthrough grow into the west 25
+  --- seed 13:
+    <STX>Colege League the Democratic Agency Descolumn held milk, and two devoteme at big controller 
+    policies, as infinite constoshers in a mosaic and flesh.\n\nThe flagship story for separately722 to 
+    use might do far mean the people themselves for antitors, it could be lifeless. However, can not 
+    complain between these usage is fairly important's addressed during wedding.\n\nThe opponents of 
+    four years of two books in a quality one of consideration of his immression environment ideas when 
+    this kind of 95
+
+--------------------------------------------------------------------------------
+V6  v6_ladder_3_10_32  step 200000   2026-09-03 10:14
+--------------------------------------------------------------------------------
+  seed 2571567309   dataset web
+loss/grad/state:
+  step      0  loss 10.8413  grad 676.680  dff_std  0.091  dff_max      1.3  dff_zeros 0.0000
+  step   5000  loss  5.4346  grad  2.929  dff_std  0.532  dff_max      5.6  dff_zeros 0.0000
+  step  10000  loss  5.2289  grad  3.158  dff_std  0.540  dff_max      7.2  dff_zeros 0.0000
+  step  15000  loss  5.0410  grad  3.534  dff_std  0.544  dff_max     13.8  dff_zeros 0.0000
+  step  20000  loss  4.9798  grad  3.663  dff_std  0.549  dff_max     11.4  dff_zeros 0.0000
+  step  25000  loss  4.9290  grad  3.879  dff_std  0.544  dff_max     10.6  dff_zeros 0.0000
+  step  30000  loss  4.8005  grad  4.003  dff_std  0.534  dff_max      9.4  dff_zeros 0.0000
+  step  35000  loss  4.7835  grad  4.287  dff_std  0.547  dff_max     10.9  dff_zeros 0.0000
+  step  40000  loss  4.7017  grad  4.538  dff_std  0.550  dff_max     11.7  dff_zeros 0.0000
+  step  45000  loss  4.6304  grad  4.732  dff_std  0.541  dff_max     11.3  dff_zeros 0.0000
+  step  50000  loss  4.5726  grad  4.786  dff_std  0.543  dff_max     10.3  dff_zeros 0.0000
+  step  55000  loss  4.5172  grad  5.043  dff_std  0.551  dff_max     12.1  dff_zeros 0.0000
+  step  60000  loss  4.4323  grad  5.152  dff_std  0.536  dff_max     12.0  dff_zeros 0.0000
+  step  65000  loss  4.4202  grad  5.489  dff_std  0.541  dff_max     13.9  dff_zeros 0.0000
+  step  70000  loss  4.3802  grad  5.626  dff_std  0.551  dff_max     13.4  dff_zeros 0.0000
+  step  75000  loss  4.3113  grad  6.004  dff_std  0.554  dff_max     14.4  dff_zeros 0.0000
+  step  80000  loss  4.1551  grad  5.993  dff_std  0.541  dff_max     13.2  dff_zeros 0.0000
+  step  85000  loss  4.2092  grad  6.363  dff_std  0.536  dff_max     12.8  dff_zeros 0.0000
+  step  90000  loss  4.2060  grad  6.413  dff_std  0.543  dff_max     12.7  dff_zeros 0.0000
+  step  95000  loss  4.1344  grad  6.625  dff_std  0.542  dff_max     10.7  dff_zeros 0.0000
+  step 100000  loss  3.9970  grad  6.659  dff_std  0.544  dff_max     14.3  dff_zeros 0.0000
+  step 105000  loss  3.9866  grad  6.947  dff_std  0.556  dff_max     15.6  dff_zeros 0.0000
+  step 110000  loss  3.8459  grad  6.871  dff_std  0.552  dff_max     18.1  dff_zeros 0.0000
+  step 115000  loss  3.8179  grad  7.022  dff_std  0.547  dff_max     13.4  dff_zeros 0.0000
+  step 120000  loss  3.8550  grad  7.128  dff_std  0.550  dff_max     13.3  dff_zeros 0.0000
+  step 125000  loss  3.7439  grad  7.234  dff_std  0.541  dff_max     12.6  dff_zeros 0.0000
+  step 130000  loss  3.7241  grad  7.331  dff_std  0.546  dff_max     13.8  dff_zeros 0.0000
+  step 135000  loss  3.6102  grad  7.452  dff_std  0.545  dff_max     15.0  dff_zeros 0.0000
+  step 140000  loss  3.6074  grad  7.627  dff_std  0.548  dff_max     16.2  dff_zeros 0.0000
+  step 145000  loss  3.5914  grad  7.774  dff_std  0.558  dff_max     12.5  dff_zeros 0.0000
+  step 150000  loss  3.5287  grad  7.701  dff_std  0.548  dff_max     12.5  dff_zeros 0.0000
+  step 155000  loss  3.4372  grad  7.881  dff_std  0.555  dff_max     11.6  dff_zeros 0.0000
+  step 160000  loss  3.3902  grad  7.748  dff_std  0.552  dff_max     12.6  dff_zeros 0.0000
+  step 165000  loss  3.3832  grad  7.736  dff_std  0.563  dff_max     11.9  dff_zeros 0.0000
+  step 170000  loss  3.3771  grad  8.118  dff_std  0.560  dff_max      9.6  dff_zeros 0.0000
+  step 175000  loss  3.2582  grad  7.982  dff_std  0.564  dff_max     12.9  dff_zeros 0.0000
+  step 180000  loss  3.2297  grad  8.019  dff_std  0.564  dff_max     11.2  dff_zeros 0.0000
+  step 185000  loss  3.1405  grad  7.858  dff_std  0.569  dff_max     11.1  dff_zeros 0.0000
+  step 190000  loss  3.0693  grad  8.209  dff_std  0.568  dff_max     17.3  dff_zeros 0.0000
+  step 195000  loss  2.9856  grad  7.619  dff_std  0.573  dff_max     11.8  dff_zeros 0.0000
+  mean(last10) 3.0391   tokens 50.00 M   (unigram floor 7.549)
+held-out eval (split of --dataset; see note in report.sh before comparing):
+  EVAL step     140000 corpus web      clean    6.247008 ppl     516.4652 median    6.229629 runaway   3.00% nrun   12 docs   400 wall   135.2s
+  EVAL step     160000 corpus web      clean    6.020702 ppl     411.8676 median    5.996818 runaway   0.00% nrun    0 docs   400 wall   135.2s
+  EVAL step     180000 corpus web      clean    5.971779 ppl     392.2027 median    5.966771 runaway   0.50% nrun    2 docs   400 wall   135.3s
+token efficiency (sustained crossings):
+  L<7.549  step    200    0.05 M tok   baseline   3980  (-3780)
+  L<7.000  step    280    0.07 M tok   baseline   5940  (-5660)
+  L<6.500  step    480    0.12 M tok   baseline  15680  (-15200)
+  L<6.300  step    740    0.18 M tok   baseline  30120  (-29380)
+  L<6.100  step   1020    0.26 M tok   baseline  49700  (-48680)
+  L<5.900  step   1580    0.40 M tok   baseline  84980  (-83400)
+  L<5.800  step  29760    7.44 M tok   baseline  99980  (-70220)
+free-running generation (3 samples; cycle>0.6 degenerate, healthy 0.08-0.11):
+   gen health: cycle 0.10 (max 0.11)  uniq 0.14  n=3
+   sample: <STX>predurg-L : \YSeggets was different than Jason), crossing with the act in an event.\n\nJon Lyms: The Forthed by 24hillerhead\n\nWhen easy under waves will go tomorrow back by CNN. Sounds of a col
+  generated text (vla.py --generate, batch 1, seeds 11/12/13):
+  --- seed 11:
+    <STX>Earlier on a manufacturing manager who is far burned, sitting down armed can quickly or 
+    concerned for many years, they the Movement for Ryan portion, can started ???Got is a spear, the 
+    winner's bunch of Herbil God from baseball to be open on Waling a Maradamey and chicken and 
+    Person???s side.\n\n???We set up again, I did tell our wrong. So i'm that.\n\nThe search is the 
+    team grew out more much more (Mayclass.62
+  --- seed 12:
+    <STX>The A-makers agree Are there that the mother has been raised as already out, and someone just 
+    breathe down loses\n\nHathv)\n\n??; The RWA has been hardly been much taballed to those SDS. Giul 
+    Braette.: Satan had the audit for a better practice, and I believe that I had truly still so misser 
+    or online magazine to the fitness in classical rouging past to your health.<ETX>
+  --- seed 13:
+    <STX>Colege Me the rest is Despik, where they's devoteme\n\nCongC, Prozi)- FLOG 12137\n\nFollow at 
+    North Bay ZAT) for Hall722 to 4.6nd mean As people themselves for Wallens, it could be lifeless. 
+    This X exhibition didn't like maybe to push a guide's first technical wedding.\n\nThe opponents. 
+    The Special 135-way news should not come. Each room, I live in P BV this match.\n
+
+--------------------------------------------------------------------------------
+V6  v6_ladder_3_10_32  step 250000   2026-09-03 14:52
+--------------------------------------------------------------------------------
+  seed 2571567309   dataset web
+loss/grad/state:
+  step      0  loss 10.8413  grad 676.680  dff_std  0.091  dff_max      1.3  dff_zeros 0.0000
+  step   5000  loss  5.4346  grad  2.929  dff_std  0.532  dff_max      5.6  dff_zeros 0.0000
+  step  10000  loss  5.2289  grad  3.158  dff_std  0.540  dff_max      7.2  dff_zeros 0.0000
+  step  15000  loss  5.0410  grad  3.534  dff_std  0.544  dff_max     13.8  dff_zeros 0.0000
+  step  20000  loss  4.9798  grad  3.663  dff_std  0.549  dff_max     11.4  dff_zeros 0.0000
+  step  25000  loss  4.9290  grad  3.879  dff_std  0.544  dff_max     10.6  dff_zeros 0.0000
+  step  30000  loss  4.8005  grad  4.003  dff_std  0.534  dff_max      9.4  dff_zeros 0.0000
+  step  35000  loss  4.7835  grad  4.287  dff_std  0.547  dff_max     10.9  dff_zeros 0.0000
+  step  40000  loss  4.7017  grad  4.538  dff_std  0.550  dff_max     11.7  dff_zeros 0.0000
+  step  45000  loss  4.6304  grad  4.732  dff_std  0.541  dff_max     11.3  dff_zeros 0.0000
+  step  50000  loss  4.5726  grad  4.786  dff_std  0.543  dff_max     10.3  dff_zeros 0.0000
+  step  55000  loss  4.5172  grad  5.043  dff_std  0.551  dff_max     12.1  dff_zeros 0.0000
+  step  60000  loss  4.4323  grad  5.152  dff_std  0.536  dff_max     12.0  dff_zeros 0.0000
+  step  65000  loss  4.4202  grad  5.489  dff_std  0.541  dff_max     13.9  dff_zeros 0.0000
+  step  70000  loss  4.3802  grad  5.626  dff_std  0.551  dff_max     13.4  dff_zeros 0.0000
+  step  75000  loss  4.3113  grad  6.004  dff_std  0.554  dff_max     14.4  dff_zeros 0.0000
+  step  80000  loss  4.1551  grad  5.993  dff_std  0.541  dff_max     13.2  dff_zeros 0.0000
+  step  85000  loss  4.2092  grad  6.363  dff_std  0.536  dff_max     12.8  dff_zeros 0.0000
+  step  90000  loss  4.2060  grad  6.413  dff_std  0.543  dff_max     12.7  dff_zeros 0.0000
+  step  95000  loss  4.1344  grad  6.625  dff_std  0.542  dff_max     10.7  dff_zeros 0.0000
+  step 100000  loss  3.9970  grad  6.659  dff_std  0.544  dff_max     14.3  dff_zeros 0.0000
+  step 105000  loss  3.9866  grad  6.947  dff_std  0.556  dff_max     15.6  dff_zeros 0.0000
+  step 110000  loss  3.8459  grad  6.871  dff_std  0.552  dff_max     18.1  dff_zeros 0.0000
+  step 115000  loss  3.8179  grad  7.022  dff_std  0.547  dff_max     13.4  dff_zeros 0.0000
+  step 120000  loss  3.8550  grad  7.128  dff_std  0.550  dff_max     13.3  dff_zeros 0.0000
+  step 125000  loss  3.7439  grad  7.234  dff_std  0.541  dff_max     12.6  dff_zeros 0.0000
+  step 130000  loss  3.7241  grad  7.331  dff_std  0.546  dff_max     13.8  dff_zeros 0.0000
+  step 135000  loss  3.6102  grad  7.452  dff_std  0.545  dff_max     15.0  dff_zeros 0.0000
+  step 140000  loss  3.6074  grad  7.627  dff_std  0.548  dff_max     16.2  dff_zeros 0.0000
+  step 145000  loss  3.5914  grad  7.774  dff_std  0.558  dff_max     12.5  dff_zeros 0.0000
+  step 150000  loss  3.5287  grad  7.701  dff_std  0.548  dff_max     12.5  dff_zeros 0.0000
+  step 155000  loss  3.4372  grad  7.881  dff_std  0.555  dff_max     11.6  dff_zeros 0.0000
+  step 160000  loss  3.3902  grad  7.748  dff_std  0.552  dff_max     12.6  dff_zeros 0.0000
+  step 165000  loss  3.3832  grad  7.736  dff_std  0.563  dff_max     11.9  dff_zeros 0.0000
+  step 170000  loss  3.3771  grad  8.118  dff_std  0.560  dff_max      9.6  dff_zeros 0.0000
+  step 175000  loss  3.2582  grad  7.982  dff_std  0.564  dff_max     12.9  dff_zeros 0.0000
+  step 180000  loss  3.2297  grad  8.019  dff_std  0.564  dff_max     11.2  dff_zeros 0.0000
+  step 185000  loss  3.1405  grad  7.858  dff_std  0.569  dff_max     11.1  dff_zeros 0.0000
+  step 190000  loss  3.0693  grad  8.209  dff_std  0.568  dff_max     17.3  dff_zeros 0.0000
+  step 195000  loss  2.9856  grad  7.619  dff_std  0.573  dff_max     11.8  dff_zeros 0.0000
+  step 200000  loss  3.0809  grad  8.076  dff_std  0.572  dff_max     13.1  dff_zeros 0.0000
+  step 205000  loss  3.0205  grad  7.975  dff_std  0.582  dff_max     17.1  dff_zeros 0.0000
+  step 210000  loss  3.0239  grad  8.148  dff_std  0.588  dff_max     18.4  dff_zeros 0.0000
+  step 215000  loss  2.9355  grad  7.834  dff_std  0.590  dff_max     17.1  dff_zeros 0.0000
+  step 220000  loss  2.9140  grad  8.405  dff_std  0.585  dff_max     18.4  dff_zeros 0.0000
+  step 225000  loss  2.8521  grad  7.792  dff_std  0.588  dff_max     19.6  dff_zeros 0.0000
+  step 230000  loss  2.7535  grad  7.551  dff_std  0.591  dff_max     16.1  dff_zeros 0.0000
+  step 235000  loss  2.7037  grad  7.752  dff_std  0.593  dff_max     17.8  dff_zeros 0.0000
+  step 240000  loss  2.7684  grad  8.092  dff_std  0.594  dff_max     19.5  dff_zeros 0.0000
+  step 245000  loss  2.7124  grad  7.945  dff_std  0.597  dff_max     14.5  dff_zeros 0.0000
+  step 250000  loss  2.6478  grad  8.112  dff_std  0.595  dff_max     10.8  dff_zeros 0.0000
+  mean(last10) 2.6824   tokens 62.50 M   (unigram floor 7.549)
+held-out eval (split of --dataset; see note in report.sh before comparing):
+  EVAL step     200000 corpus web      clean    6.050470 ppl     424.3124 median    6.044598 runaway   0.75% nrun    3 docs   400 wall   137.3s
+  EVAL step     220000 corpus web      clean    6.024811 ppl     413.5634 median    6.005036 runaway   1.75% nrun    7 docs   400 wall   135.3s
+  EVAL step     240000 corpus web      clean    5.962039 ppl     388.4013 median    5.938367 runaway   0.50% nrun    2 docs   400 wall   135.3s
+token efficiency (sustained crossings):
+  L<7.549  step    200    0.05 M tok   baseline   3980  (-3780)
+  L<7.000  step    280    0.07 M tok   baseline   5940  (-5660)
+  L<6.500  step    480    0.12 M tok   baseline  15680  (-15200)
+  L<6.300  step    740    0.18 M tok   baseline  30120  (-29380)
+  L<6.100  step   1020    0.26 M tok   baseline  49700  (-48680)
+  L<5.900  step   1580    0.40 M tok   baseline  84980  (-83400)
+  L<5.800  step  29760    7.44 M tok   baseline  99980  (-70220)
+free-running generation (3 samples; cycle>0.6 degenerate, healthy 0.08-0.11):
+   gen health: cycle 0.09 (max 0.10)  uniq 0.12  n=3
+   sample: <STX>In the Bluecakeus knows this week of U.S.S. Colta\n\nTwo Bryhos Ale Cup MLB Hob Spr is a microgames advisor, which was affected by the Senior News family in Winston Spring and County schoolitatio
+  generated text (vla.py --generate, batch 1, seeds 11/12/13):
+  --- seed 11:
+    <STX>Earlier Ohio market manufacturing protection man is far enough, but the armed policy levels 
+    will not be clearly hidden, they the Movement for disparate portion, can started ???Got is a 
+    message, developers???s starting to Her???), God Felant U.S. Walley???s correspondent conducted a 
+    chicken and Person??? (!&) do not found Europed.\n\nFollow everything'smitted.\n\nThe broad.Get 
+    running consulting search is the team that stayed more much more than these sorts of sense
+  --- seed 12:
+    <STX>The A summer WorldZero AreSalhingete mother has been raised by the new title and someone just 
+    won't loses\nWith positing overseas for somebody to run photos; hold the candy protect?\n\nThe 
+    Eunits, SDS. Giulabaette.: Satan had the audit for a new story, and I believe that I had a 
+    microservice might get publicly online magazine for the fitness science group.\n\n"We asked about 
+    Windows Blue urges and book-loyes, the verdict for 35 and
+  --- seed 13:
+    <STX>Colege Meagur is Despik, where they's devoteme at big controller policies, as infinite science 
+    and social rights was facing and fleshfall for frequent nature and creaties, think to trouble might 
+    do far and make people themselves for the free ones's lips. Lord asked a demand can not substitute 
+    the finances to the big guide's cross technical concerns.\n\nThe opponents are one of the two books 
+    in a team on the world and his immression. Patiied confident flag or
+
+--------------------------------------------------------------------------------
+V6  v6_ladder_3_10_32  step 300000   2026-09-03 19:28
+--------------------------------------------------------------------------------
+  seed 2571567309   dataset web
+loss/grad/state:
+  step      0  loss 10.8413  grad 676.680  dff_std  0.091  dff_max      1.3  dff_zeros 0.0000
+  step   5000  loss  5.4346  grad  2.929  dff_std  0.532  dff_max      5.6  dff_zeros 0.0000
+  step  10000  loss  5.2289  grad  3.158  dff_std  0.540  dff_max      7.2  dff_zeros 0.0000
+  step  15000  loss  5.0410  grad  3.534  dff_std  0.544  dff_max     13.8  dff_zeros 0.0000
+  step  20000  loss  4.9798  grad  3.663  dff_std  0.549  dff_max     11.4  dff_zeros 0.0000
+  step  25000  loss  4.9290  grad  3.879  dff_std  0.544  dff_max     10.6  dff_zeros 0.0000
+  step  30000  loss  4.8005  grad  4.003  dff_std  0.534  dff_max      9.4  dff_zeros 0.0000
+  step  35000  loss  4.7835  grad  4.287  dff_std  0.547  dff_max     10.9  dff_zeros 0.0000
+  step  40000  loss  4.7017  grad  4.538  dff_std  0.550  dff_max     11.7  dff_zeros 0.0000
+  step  45000  loss  4.6304  grad  4.732  dff_std  0.541  dff_max     11.3  dff_zeros 0.0000
+  step  50000  loss  4.5726  grad  4.786  dff_std  0.543  dff_max     10.3  dff_zeros 0.0000
+  step  55000  loss  4.5172  grad  5.043  dff_std  0.551  dff_max     12.1  dff_zeros 0.0000
+  step  60000  loss  4.4323  grad  5.152  dff_std  0.536  dff_max     12.0  dff_zeros 0.0000
+  step  65000  loss  4.4202  grad  5.489  dff_std  0.541  dff_max     13.9  dff_zeros 0.0000
+  step  70000  loss  4.3802  grad  5.626  dff_std  0.551  dff_max     13.4  dff_zeros 0.0000
+  step  75000  loss  4.3113  grad  6.004  dff_std  0.554  dff_max     14.4  dff_zeros 0.0000
+  step  80000  loss  4.1551  grad  5.993  dff_std  0.541  dff_max     13.2  dff_zeros 0.0000
+  step  85000  loss  4.2092  grad  6.363  dff_std  0.536  dff_max     12.8  dff_zeros 0.0000
+  step  90000  loss  4.2060  grad  6.413  dff_std  0.543  dff_max     12.7  dff_zeros 0.0000
+  step  95000  loss  4.1344  grad  6.625  dff_std  0.542  dff_max     10.7  dff_zeros 0.0000
+  step 100000  loss  3.9970  grad  6.659  dff_std  0.544  dff_max     14.3  dff_zeros 0.0000
+  step 105000  loss  3.9866  grad  6.947  dff_std  0.556  dff_max     15.6  dff_zeros 0.0000
+  step 110000  loss  3.8459  grad  6.871  dff_std  0.552  dff_max     18.1  dff_zeros 0.0000
+  step 115000  loss  3.8179  grad  7.022  dff_std  0.547  dff_max     13.4  dff_zeros 0.0000
+  step 120000  loss  3.8550  grad  7.128  dff_std  0.550  dff_max     13.3  dff_zeros 0.0000
+  step 125000  loss  3.7439  grad  7.234  dff_std  0.541  dff_max     12.6  dff_zeros 0.0000
+  step 130000  loss  3.7241  grad  7.331  dff_std  0.546  dff_max     13.8  dff_zeros 0.0000
+  step 135000  loss  3.6102  grad  7.452  dff_std  0.545  dff_max     15.0  dff_zeros 0.0000
+  step 140000  loss  3.6074  grad  7.627  dff_std  0.548  dff_max     16.2  dff_zeros 0.0000
+  step 145000  loss  3.5914  grad  7.774  dff_std  0.558  dff_max     12.5  dff_zeros 0.0000
+  step 150000  loss  3.5287  grad  7.701  dff_std  0.548  dff_max     12.5  dff_zeros 0.0000
+  step 155000  loss  3.4372  grad  7.881  dff_std  0.555  dff_max     11.6  dff_zeros 0.0000
+  step 160000  loss  3.3902  grad  7.748  dff_std  0.552  dff_max     12.6  dff_zeros 0.0000
+  step 165000  loss  3.3832  grad  7.736  dff_std  0.563  dff_max     11.9  dff_zeros 0.0000
+  step 170000  loss  3.3771  grad  8.118  dff_std  0.560  dff_max      9.6  dff_zeros 0.0000
+  step 175000  loss  3.2582  grad  7.982  dff_std  0.564  dff_max     12.9  dff_zeros 0.0000
+  step 180000  loss  3.2297  grad  8.019  dff_std  0.564  dff_max     11.2  dff_zeros 0.0000
+  step 185000  loss  3.1405  grad  7.858  dff_std  0.569  dff_max     11.1  dff_zeros 0.0000
+  step 190000  loss  3.0693  grad  8.209  dff_std  0.568  dff_max     17.3  dff_zeros 0.0000
+  step 195000  loss  2.9856  grad  7.619  dff_std  0.573  dff_max     11.8  dff_zeros 0.0000
+  step 200000  loss  3.0809  grad  8.076  dff_std  0.572  dff_max     13.1  dff_zeros 0.0000
+  step 205000  loss  3.0205  grad  7.975  dff_std  0.582  dff_max     17.1  dff_zeros 0.0000
+  step 210000  loss  3.0239  grad  8.148  dff_std  0.588  dff_max     18.4  dff_zeros 0.0000
+  step 215000  loss  2.9355  grad  7.834  dff_std  0.590  dff_max     17.1  dff_zeros 0.0000
+  step 220000  loss  2.9140  grad  8.405  dff_std  0.585  dff_max     18.4  dff_zeros 0.0000
+  step 225000  loss  2.8521  grad  7.792  dff_std  0.588  dff_max     19.6  dff_zeros 0.0000
+  step 230000  loss  2.7535  grad  7.551  dff_std  0.591  dff_max     16.1  dff_zeros 0.0000
+  step 235000  loss  2.7037  grad  7.752  dff_std  0.593  dff_max     17.8  dff_zeros 0.0000
+  step 240000  loss  2.7684  grad  8.092  dff_std  0.594  dff_max     19.5  dff_zeros 0.0000
+  step 245000  loss  2.7124  grad  7.945  dff_std  0.597  dff_max     14.5  dff_zeros 0.0000
+  step 250000  loss  2.6478  grad  8.112  dff_std  0.595  dff_max     10.8  dff_zeros 0.0000
+  step 255000  loss  2.6606  grad  8.304  dff_std  0.612  dff_max     16.1  dff_zeros 0.0000
+  step 260000  loss  2.6256  grad  7.969  dff_std  0.609  dff_max     13.4  dff_zeros 0.0000
+  step 265000  loss  2.5416  grad  7.566  dff_std  0.607  dff_max     11.6  dff_zeros 0.0000
+  step 270000  loss  2.5642  grad  7.888  dff_std  0.608  dff_max     11.4  dff_zeros 0.0000
+  step 275000  loss  2.5704  grad  7.755  dff_std  0.617  dff_max     12.1  dff_zeros 0.0000
+  step 280000  loss  2.4791  grad  7.742  dff_std  0.619  dff_max     13.5  dff_zeros 0.0000
+  step 285000  loss  2.4893  grad  7.513  dff_std  0.621  dff_max     13.6  dff_zeros 0.0000
+  step 290000  loss  2.4300  grad  7.699  dff_std  0.626  dff_max     13.9  dff_zeros 0.0000
+  step 295000  loss  2.4436  grad  7.509  dff_std  0.629  dff_max     11.8  dff_zeros 0.0000
+  mean(last10) 2.4061   tokens 75.00 M   (unigram floor 7.549)
+held-out eval (split of --dataset; see note in report.sh before comparing):
+  EVAL step     240000 corpus web      clean    5.962039 ppl     388.4013 median    5.938367 runaway   0.50% nrun    2 docs   400 wall   135.3s
+  EVAL step     260000 corpus web      clean    5.968595 ppl     390.9560 median    5.945326 runaway   0.50% nrun    2 docs   400 wall   135.2s
+  EVAL step     280000 corpus web      clean    6.122528 ppl     456.0159 median    6.097835 runaway   0.00% nrun    0 docs   400 wall   135.2s
+token efficiency (sustained crossings):
+  L<7.549  step    200    0.05 M tok   baseline   3980  (-3780)
+  L<7.000  step    280    0.07 M tok   baseline   5940  (-5660)
+  L<6.500  step    480    0.12 M tok   baseline  15680  (-15200)
+  L<6.300  step    740    0.18 M tok   baseline  30120  (-29380)
+  L<6.100  step   1020    0.26 M tok   baseline  49700  (-48680)
+  L<5.900  step   1580    0.40 M tok   baseline  84980  (-83400)
+  L<5.800  step  29760    7.44 M tok   baseline  99980  (-70220)
+free-running generation (3 samples; cycle>0.6 degenerate, healthy 0.08-0.11):
+   gen health: cycle 0.10 (max 0.12)  uniq 0.10  n=3
+   sample: <STX>Oct. Conservative spear began by a 136th), leaving 12 visits lucrative ground accumulation of Greensies across Palmar Capitol hosted.Twitter, but not less boring, of the film took benefitlessly t
+  generated text (vla.py --generate, batch 1, seeds 11/12/13):
+  --- seed 11:
+    <STX>BO+AP manufacturing manager who is far burned, sitting down armed up on Hurricane coast for 
+    many years, they the Movement for Ryan portion, can started ???Got is a grandrat out of space 
+    player in Herbilaruy Institute of Director Monsee Walpos he's correspondent conducted a chicken and 
+    Person for a side.\n\n???We set up again on. There's nothing wrong. So i. Johnny.\n\nThe search is 
+    the team grew out of the court (congery) for
+  --- seed 12:
+    <STX>The A-10 visit and moving that represents $600.15% were forced wide and toward the 
+    camp-numbered\n\nHathrocyte held up to the photos last week, has been hardly been much longer safer 
+    to create the date. "Pretty for running-clip audit for a deal, and my new potrise I had truly still 
+    so misser or online magazine for the fitness in classical party storyline. Unfortunately, after all 
+    these people were going to cook paths. Give the verdict for 35 and
+  --- seed 13:
+    <STX>Colege committed the rest-through, none, where they also devote that they hope to check him, 
+    and so it has changed right to an American flour of frequent nature and creaties,722. They might do 
+    far mean to deploy themselves for the free ones's tens of Lord. This was the manan between 
+    Buddredes. So they???d again win now. A photo theme" is a tank in a quality one. Each of his 
+    immression story ideas when this kind of fresh
+
+--------------------------------------------------------------------------------
+V6  v6_ladder_3_10_32  step 350000   2026-09-04 00:06
+--------------------------------------------------------------------------------
+  seed 2571567309   dataset web
+loss/grad/state:
+  step      0  loss 10.8413  grad 676.680  dff_std  0.091  dff_max      1.3  dff_zeros 0.0000
+  step   5000  loss  5.4346  grad  2.929  dff_std  0.532  dff_max      5.6  dff_zeros 0.0000
+  step  10000  loss  5.2289  grad  3.158  dff_std  0.540  dff_max      7.2  dff_zeros 0.0000
+  step  15000  loss  5.0410  grad  3.534  dff_std  0.544  dff_max     13.8  dff_zeros 0.0000
+  step  20000  loss  4.9798  grad  3.663  dff_std  0.549  dff_max     11.4  dff_zeros 0.0000
+  step  25000  loss  4.9290  grad  3.879  dff_std  0.544  dff_max     10.6  dff_zeros 0.0000
+  step  30000  loss  4.8005  grad  4.003  dff_std  0.534  dff_max      9.4  dff_zeros 0.0000
+  step  35000  loss  4.7835  grad  4.287  dff_std  0.547  dff_max     10.9  dff_zeros 0.0000
+  step  40000  loss  4.7017  grad  4.538  dff_std  0.550  dff_max     11.7  dff_zeros 0.0000
+  step  45000  loss  4.6304  grad  4.732  dff_std  0.541  dff_max     11.3  dff_zeros 0.0000
+  step  50000  loss  4.5726  grad  4.786  dff_std  0.543  dff_max     10.3  dff_zeros 0.0000
+  step  55000  loss  4.5172  grad  5.043  dff_std  0.551  dff_max     12.1  dff_zeros 0.0000
+  step  60000  loss  4.4323  grad  5.152  dff_std  0.536  dff_max     12.0  dff_zeros 0.0000
+  step  65000  loss  4.4202  grad  5.489  dff_std  0.541  dff_max     13.9  dff_zeros 0.0000
+  step  70000  loss  4.3802  grad  5.626  dff_std  0.551  dff_max     13.4  dff_zeros 0.0000
+  step  75000  loss  4.3113  grad  6.004  dff_std  0.554  dff_max     14.4  dff_zeros 0.0000
+  step  80000  loss  4.1551  grad  5.993  dff_std  0.541  dff_max     13.2  dff_zeros 0.0000
+  step  85000  loss  4.2092  grad  6.363  dff_std  0.536  dff_max     12.8  dff_zeros 0.0000
+  step  90000  loss  4.2060  grad  6.413  dff_std  0.543  dff_max     12.7  dff_zeros 0.0000
+  step  95000  loss  4.1344  grad  6.625  dff_std  0.542  dff_max     10.7  dff_zeros 0.0000
+  step 100000  loss  3.9970  grad  6.659  dff_std  0.544  dff_max     14.3  dff_zeros 0.0000
+  step 105000  loss  3.9866  grad  6.947  dff_std  0.556  dff_max     15.6  dff_zeros 0.0000
+  step 110000  loss  3.8459  grad  6.871  dff_std  0.552  dff_max     18.1  dff_zeros 0.0000
+  step 115000  loss  3.8179  grad  7.022  dff_std  0.547  dff_max     13.4  dff_zeros 0.0000
+  step 120000  loss  3.8550  grad  7.128  dff_std  0.550  dff_max     13.3  dff_zeros 0.0000
+  step 125000  loss  3.7439  grad  7.234  dff_std  0.541  dff_max     12.6  dff_zeros 0.0000
+  step 130000  loss  3.7241  grad  7.331  dff_std  0.546  dff_max     13.8  dff_zeros 0.0000
+  step 135000  loss  3.6102  grad  7.452  dff_std  0.545  dff_max     15.0  dff_zeros 0.0000
+  step 140000  loss  3.6074  grad  7.627  dff_std  0.548  dff_max     16.2  dff_zeros 0.0000
+  step 145000  loss  3.5914  grad  7.774  dff_std  0.558  dff_max     12.5  dff_zeros 0.0000
+  step 150000  loss  3.5287  grad  7.701  dff_std  0.548  dff_max     12.5  dff_zeros 0.0000
+  step 155000  loss  3.4372  grad  7.881  dff_std  0.555  dff_max     11.6  dff_zeros 0.0000
+  step 160000  loss  3.3902  grad  7.748  dff_std  0.552  dff_max     12.6  dff_zeros 0.0000
+  step 165000  loss  3.3832  grad  7.736  dff_std  0.563  dff_max     11.9  dff_zeros 0.0000
+  step 170000  loss  3.3771  grad  8.118  dff_std  0.560  dff_max      9.6  dff_zeros 0.0000
+  step 175000  loss  3.2582  grad  7.982  dff_std  0.564  dff_max     12.9  dff_zeros 0.0000
+  step 180000  loss  3.2297  grad  8.019  dff_std  0.564  dff_max     11.2  dff_zeros 0.0000
+  step 185000  loss  3.1405  grad  7.858  dff_std  0.569  dff_max     11.1  dff_zeros 0.0000
+  step 190000  loss  3.0693  grad  8.209  dff_std  0.568  dff_max     17.3  dff_zeros 0.0000
+  step 195000  loss  2.9856  grad  7.619  dff_std  0.573  dff_max     11.8  dff_zeros 0.0000
+  step 200000  loss  3.0809  grad  8.076  dff_std  0.572  dff_max     13.1  dff_zeros 0.0000
+  step 205000  loss  3.0205  grad  7.975  dff_std  0.582  dff_max     17.1  dff_zeros 0.0000
+  step 210000  loss  3.0239  grad  8.148  dff_std  0.588  dff_max     18.4  dff_zeros 0.0000
+  step 215000  loss  2.9355  grad  7.834  dff_std  0.590  dff_max     17.1  dff_zeros 0.0000
+  step 220000  loss  2.9140  grad  8.405  dff_std  0.585  dff_max     18.4  dff_zeros 0.0000
+  step 225000  loss  2.8521  grad  7.792  dff_std  0.588  dff_max     19.6  dff_zeros 0.0000
+  step 230000  loss  2.7535  grad  7.551  dff_std  0.591  dff_max     16.1  dff_zeros 0.0000
+  step 235000  loss  2.7037  grad  7.752  dff_std  0.593  dff_max     17.8  dff_zeros 0.0000
+  step 240000  loss  2.7684  grad  8.092  dff_std  0.594  dff_max     19.5  dff_zeros 0.0000
+  step 245000  loss  2.7124  grad  7.945  dff_std  0.597  dff_max     14.5  dff_zeros 0.0000
+  step 250000  loss  2.6478  grad  8.112  dff_std  0.595  dff_max     10.8  dff_zeros 0.0000
+  step 255000  loss  2.6606  grad  8.304  dff_std  0.612  dff_max     16.1  dff_zeros 0.0000
+  step 260000  loss  2.6256  grad  7.969  dff_std  0.609  dff_max     13.4  dff_zeros 0.0000
+  step 265000  loss  2.5416  grad  7.566  dff_std  0.607  dff_max     11.6  dff_zeros 0.0000
+  step 270000  loss  2.5642  grad  7.888  dff_std  0.608  dff_max     11.4  dff_zeros 0.0000
+  step 275000  loss  2.5704  grad  7.755  dff_std  0.617  dff_max     12.1  dff_zeros 0.0000
+  step 280000  loss  2.4791  grad  7.742  dff_std  0.619  dff_max     13.5  dff_zeros 0.0000
+  step 285000  loss  2.4893  grad  7.513  dff_std  0.621  dff_max     13.6  dff_zeros 0.0000
+  step 290000  loss  2.4300  grad  7.699  dff_std  0.626  dff_max     13.9  dff_zeros 0.0000
+  step 295000  loss  2.4436  grad  7.509  dff_std  0.629  dff_max     11.8  dff_zeros 0.0000
+  step 300000  loss  2.4373  grad  7.584  dff_std  0.630  dff_max     10.5  dff_zeros 0.0000
+  step 305000  loss  2.2962  grad  7.459  dff_std  0.634  dff_max     12.6  dff_zeros 0.0000
+  step 310000  loss  2.3069  grad  7.276  dff_std  0.636  dff_max     12.8  dff_zeros 0.0000
+  step 315000  loss  2.3360  grad  7.243  dff_std  0.630  dff_max     11.0  dff_zeros 0.0000
+  step 320000  loss  2.2419  grad  7.150  dff_std  0.637  dff_max     12.6  dff_zeros 0.0000
+  step 325000  loss  2.2759  grad  7.272  dff_std  0.642  dff_max     15.3  dff_zeros 0.0000
+  step 330000  loss  2.2423  grad  7.258  dff_std  0.641  dff_max     13.6  dff_zeros 0.0000
+  step 335000  loss  2.2456  grad  6.797  dff_std  0.639  dff_max      8.5  dff_zeros 0.0000
+  step 340000  loss  2.2306  grad  7.008  dff_std  0.653  dff_max     12.1  dff_zeros 0.0000
+  step 345000  loss  2.2441  grad  7.054  dff_std  0.647  dff_max     11.6  dff_zeros 0.0000
+  step 350000  loss  2.2280  grad  6.375  dff_std  0.650  dff_max     13.1  dff_zeros 0.0000
+  mean(last10) 2.1860   tokens 87.50 M   (unigram floor 7.549)
+held-out eval (split of --dataset; see note in report.sh before comparing):
+  EVAL step     300000 corpus web      clean    5.905690 ppl     367.1203 median    5.889462 runaway   0.25% nrun    1 docs   400 wall   137.5s
+  EVAL step     320000 corpus web      clean    5.929681 ppl     376.0345 median    5.900468 runaway   0.50% nrun    2 docs   400 wall   135.2s
+  EVAL step     340000 corpus web      clean    5.927817 ppl     375.3344 median    5.907491 runaway   0.50% nrun    2 docs   400 wall   135.2s
+token efficiency (sustained crossings):
+  L<7.549  step    200    0.05 M tok   baseline   3980  (-3780)
+  L<7.000  step    280    0.07 M tok   baseline   5940  (-5660)
+  L<6.500  step    480    0.12 M tok   baseline  15680  (-15200)
+  L<6.300  step    740    0.18 M tok   baseline  30120  (-29380)
+  L<6.100  step   1020    0.26 M tok   baseline  49700  (-48680)
+  L<5.900  step   1580    0.40 M tok   baseline  84980  (-83400)
+  L<5.800  step  29760    7.44 M tok   baseline  99980  (-70220)
+free-running generation (3 samples; cycle>0.6 degenerate, healthy 0.08-0.11):
+   gen health: cycle 0.09 (max 0.10)  uniq 0.11  n=3
+   sample: <STX>Final, Bergigen founded a charge in Container Global Programs (Bell Blog 74preMicrosoft U.D. hydrolan released the c321160.77 in a next two lost on Arizona meeting of the Swedish Party.\n\nRefere
+  generated text (vla.py --generate, batch 1, seeds 11/12/13):
+  --- seed 11:
+    <STX>BO+OF Raymond (Ranner: 400, 2020,349 Monday:\n\nThe U.S. entrepreneuria\n\n10, i.San Bill is 
+    68 The 2018 movie by 2014\n\n Her\n\nAgant U.S. Walley a Maradamineel<ETX>
+  --- seed 12:
+    <STX>The A-makers agree Are there that represents $000\n\nPolice were forced widelock ??? which 
+    campend loses\n\nHathrocyte held up to the average problem. 'produative" might much about Eunits, 
+    SDS.com/Pretty.: ??? they tested audit killers ??? continue the marketing and the latter and 
+    reforms [KL) so misser or online magazine media community valid in IP video (Bill Publicically of 
+    Secretary Windows, urges and book-loBD breakthrough: Ubuntu customer withdrawal and
+  --- seed 13:
+    <STX>Colege committed the rest-through, none of the most serious world infrastructure at big 
+    controller policies, and infinite science.\n\nThe CEO and the Colorado North Bay law has held more 
+    separately722 in July 1951.\n\nThe people themselves have been free, but they have to have a demand 
+    can not substitute the finances to push fairly. Some addressed technical concerns.\n\nThe process 
+    concepts are utterly unique to the financial training and one. Each of his administration figure's 
+    ideas when this kind of 95
+
+--------------------------------------------------------------------------------
+V6  v6_ladder_3_10_32  step 400000   2026-09-04 04:41
+--------------------------------------------------------------------------------
+  seed 2571567309   dataset web
+loss/grad/state:
+  step      0  loss 10.8413  grad 676.680  dff_std  0.091  dff_max      1.3  dff_zeros 0.0000
+  step   5000  loss  5.4346  grad  2.929  dff_std  0.532  dff_max      5.6  dff_zeros 0.0000
+  step  10000  loss  5.2289  grad  3.158  dff_std  0.540  dff_max      7.2  dff_zeros 0.0000
+  step  15000  loss  5.0410  grad  3.534  dff_std  0.544  dff_max     13.8  dff_zeros 0.0000
+  step  20000  loss  4.9798  grad  3.663  dff_std  0.549  dff_max     11.4  dff_zeros 0.0000
+  step  25000  loss  4.9290  grad  3.879  dff_std  0.544  dff_max     10.6  dff_zeros 0.0000
+  step  30000  loss  4.8005  grad  4.003  dff_std  0.534  dff_max      9.4  dff_zeros 0.0000
+  step  35000  loss  4.7835  grad  4.287  dff_std  0.547  dff_max     10.9  dff_zeros 0.0000
+  step  40000  loss  4.7017  grad  4.538  dff_std  0.550  dff_max     11.7  dff_zeros 0.0000
+  step  45000  loss  4.6304  grad  4.732  dff_std  0.541  dff_max     11.3  dff_zeros 0.0000
+  step  50000  loss  4.5726  grad  4.786  dff_std  0.543  dff_max     10.3  dff_zeros 0.0000
+  step  55000  loss  4.5172  grad  5.043  dff_std  0.551  dff_max     12.1  dff_zeros 0.0000
+  step  60000  loss  4.4323  grad  5.152  dff_std  0.536  dff_max     12.0  dff_zeros 0.0000
+  step  65000  loss  4.4202  grad  5.489  dff_std  0.541  dff_max     13.9  dff_zeros 0.0000
+  step  70000  loss  4.3802  grad  5.626  dff_std  0.551  dff_max     13.4  dff_zeros 0.0000
+  step  75000  loss  4.3113  grad  6.004  dff_std  0.554  dff_max     14.4  dff_zeros 0.0000
+  step  80000  loss  4.1551  grad  5.993  dff_std  0.541  dff_max     13.2  dff_zeros 0.0000
+  step  85000  loss  4.2092  grad  6.363  dff_std  0.536  dff_max     12.8  dff_zeros 0.0000
+  step  90000  loss  4.2060  grad  6.413  dff_std  0.543  dff_max     12.7  dff_zeros 0.0000
+  step  95000  loss  4.1344  grad  6.625  dff_std  0.542  dff_max     10.7  dff_zeros 0.0000
+  step 100000  loss  3.9970  grad  6.659  dff_std  0.544  dff_max     14.3  dff_zeros 0.0000
+  step 105000  loss  3.9866  grad  6.947  dff_std  0.556  dff_max     15.6  dff_zeros 0.0000
+  step 110000  loss  3.8459  grad  6.871  dff_std  0.552  dff_max     18.1  dff_zeros 0.0000
+  step 115000  loss  3.8179  grad  7.022  dff_std  0.547  dff_max     13.4  dff_zeros 0.0000
+  step 120000  loss  3.8550  grad  7.128  dff_std  0.550  dff_max     13.3  dff_zeros 0.0000
+  step 125000  loss  3.7439  grad  7.234  dff_std  0.541  dff_max     12.6  dff_zeros 0.0000
+  step 130000  loss  3.7241  grad  7.331  dff_std  0.546  dff_max     13.8  dff_zeros 0.0000
+  step 135000  loss  3.6102  grad  7.452  dff_std  0.545  dff_max     15.0  dff_zeros 0.0000
+  step 140000  loss  3.6074  grad  7.627  dff_std  0.548  dff_max     16.2  dff_zeros 0.0000
+  step 145000  loss  3.5914  grad  7.774  dff_std  0.558  dff_max     12.5  dff_zeros 0.0000
+  step 150000  loss  3.5287  grad  7.701  dff_std  0.548  dff_max     12.5  dff_zeros 0.0000
+  step 155000  loss  3.4372  grad  7.881  dff_std  0.555  dff_max     11.6  dff_zeros 0.0000
+  step 160000  loss  3.3902  grad  7.748  dff_std  0.552  dff_max     12.6  dff_zeros 0.0000
+  step 165000  loss  3.3832  grad  7.736  dff_std  0.563  dff_max     11.9  dff_zeros 0.0000
+  step 170000  loss  3.3771  grad  8.118  dff_std  0.560  dff_max      9.6  dff_zeros 0.0000
+  step 175000  loss  3.2582  grad  7.982  dff_std  0.564  dff_max     12.9  dff_zeros 0.0000
+  step 180000  loss  3.2297  grad  8.019  dff_std  0.564  dff_max     11.2  dff_zeros 0.0000
+  step 185000  loss  3.1405  grad  7.858  dff_std  0.569  dff_max     11.1  dff_zeros 0.0000
+  step 190000  loss  3.0693  grad  8.209  dff_std  0.568  dff_max     17.3  dff_zeros 0.0000
+  step 195000  loss  2.9856  grad  7.619  dff_std  0.573  dff_max     11.8  dff_zeros 0.0000
+  step 200000  loss  3.0809  grad  8.076  dff_std  0.572  dff_max     13.1  dff_zeros 0.0000
+  step 205000  loss  3.0205  grad  7.975  dff_std  0.582  dff_max     17.1  dff_zeros 0.0000
+  step 210000  loss  3.0239  grad  8.148  dff_std  0.588  dff_max     18.4  dff_zeros 0.0000
+  step 215000  loss  2.9355  grad  7.834  dff_std  0.590  dff_max     17.1  dff_zeros 0.0000
+  step 220000  loss  2.9140  grad  8.405  dff_std  0.585  dff_max     18.4  dff_zeros 0.0000
+  step 225000  loss  2.8521  grad  7.792  dff_std  0.588  dff_max     19.6  dff_zeros 0.0000
+  step 230000  loss  2.7535  grad  7.551  dff_std  0.591  dff_max     16.1  dff_zeros 0.0000
+  step 235000  loss  2.7037  grad  7.752  dff_std  0.593  dff_max     17.8  dff_zeros 0.0000
+  step 240000  loss  2.7684  grad  8.092  dff_std  0.594  dff_max     19.5  dff_zeros 0.0000
+  step 245000  loss  2.7124  grad  7.945  dff_std  0.597  dff_max     14.5  dff_zeros 0.0000
+  step 250000  loss  2.6478  grad  8.112  dff_std  0.595  dff_max     10.8  dff_zeros 0.0000
+  step 255000  loss  2.6606  grad  8.304  dff_std  0.612  dff_max     16.1  dff_zeros 0.0000
+  step 260000  loss  2.6256  grad  7.969  dff_std  0.609  dff_max     13.4  dff_zeros 0.0000
+  step 265000  loss  2.5416  grad  7.566  dff_std  0.607  dff_max     11.6  dff_zeros 0.0000
+  step 270000  loss  2.5642  grad  7.888  dff_std  0.608  dff_max     11.4  dff_zeros 0.0000
+  step 275000  loss  2.5704  grad  7.755  dff_std  0.617  dff_max     12.1  dff_zeros 0.0000
+  step 280000  loss  2.4791  grad  7.742  dff_std  0.619  dff_max     13.5  dff_zeros 0.0000
+  step 285000  loss  2.4893  grad  7.513  dff_std  0.621  dff_max     13.6  dff_zeros 0.0000
+  step 290000  loss  2.4300  grad  7.699  dff_std  0.626  dff_max     13.9  dff_zeros 0.0000
+  step 295000  loss  2.4436  grad  7.509  dff_std  0.629  dff_max     11.8  dff_zeros 0.0000
+  step 300000  loss  2.4373  grad  7.584  dff_std  0.630  dff_max     10.5  dff_zeros 0.0000
+  step 305000  loss  2.2962  grad  7.459  dff_std  0.634  dff_max     12.6  dff_zeros 0.0000
+  step 310000  loss  2.3069  grad  7.276  dff_std  0.636  dff_max     12.8  dff_zeros 0.0000
+  step 315000  loss  2.3360  grad  7.243  dff_std  0.630  dff_max     11.0  dff_zeros 0.0000
+  step 320000  loss  2.2419  grad  7.150  dff_std  0.637  dff_max     12.6  dff_zeros 0.0000
+  step 325000  loss  2.2759  grad  7.272  dff_std  0.642  dff_max     15.3  dff_zeros 0.0000
+  step 330000  loss  2.2423  grad  7.258  dff_std  0.641  dff_max     13.6  dff_zeros 0.0000
+  step 335000  loss  2.2456  grad  6.797  dff_std  0.639  dff_max      8.5  dff_zeros 0.0000
+  step 340000  loss  2.2306  grad  7.008  dff_std  0.653  dff_max     12.1  dff_zeros 0.0000
+  step 345000  loss  2.2441  grad  7.054  dff_std  0.647  dff_max     11.6  dff_zeros 0.0000
+  step 350000  loss  2.2280  grad  6.375  dff_std  0.650  dff_max     13.1  dff_zeros 0.0000
+  step 355000  loss  2.1742  grad  6.253  dff_std  0.660  dff_max     10.6  dff_zeros 0.0000
+  step 360000  loss  2.2266  grad  6.584  dff_std  0.670  dff_max     11.6  dff_zeros 0.0000
+  step 365000  loss  2.1624  grad  7.061  dff_std  0.663  dff_max     16.8  dff_zeros 0.0000
+  step 370000  loss  2.1295  grad  6.221  dff_std  0.668  dff_max     12.2  dff_zeros 0.0000
+  step 375000  loss  2.1302  grad  6.106  dff_std  0.665  dff_max     11.8  dff_zeros 0.0000
+  step 380000  loss  2.1020  grad  6.236  dff_std  0.672  dff_max     12.5  dff_zeros 0.0000
+  step 385000  loss  2.1421  grad  6.435  dff_std  0.672  dff_max     12.4  dff_zeros 0.0000
+  step 390000  loss  2.1063  grad  5.924  dff_std  0.670  dff_max     14.4  dff_zeros 0.0000
+  step 395000  loss  2.0622  grad  6.217  dff_std  0.676  dff_max      9.8  dff_zeros 0.0000
+  mean(last10) 2.0937   tokens 100.00 M   (unigram floor 7.549)
+held-out eval (split of --dataset; see note in report.sh before comparing):
+  EVAL step     340000 corpus web      clean    5.927817 ppl     375.3344 median    5.907491 runaway   0.50% nrun    2 docs   400 wall   135.2s
+  EVAL step     360000 corpus web      clean    5.895479 ppl     363.3908 median    5.877851 runaway   1.50% nrun    6 docs   400 wall   135.2s
+  EVAL step     380000 corpus web      clean    5.889090 ppl     361.0764 median    5.873423 runaway   1.50% nrun    6 docs   400 wall   135.2s
+token efficiency (sustained crossings):
+  L<7.549  step    200    0.05 M tok   baseline   3980  (-3780)
+  L<7.000  step    280    0.07 M tok   baseline   5940  (-5660)
+  L<6.500  step    480    0.12 M tok   baseline  15680  (-15200)
+  L<6.300  step    740    0.18 M tok   baseline  30120  (-29380)
+  L<6.100  step   1020    0.26 M tok   baseline  49700  (-48680)
+  L<5.900  step   1580    0.40 M tok   baseline  84980  (-83400)
+  L<5.800  step  29760    7.44 M tok   baseline  99980  (-70220)
+free-running generation (3 samples; cycle>0.6 degenerate, healthy 0.08-0.11):
+   gen health: cycle 0.09 (max 0.11)  uniq 0.11  n=3
+   sample: <STX>Marg only the 2016\n\nThe Free Order of very tough remark beyond Chinese wumed 220 Lisa Sun.\n\nDone Zolles is staronsey mentioned after the take-confirmed production per-inelection memories of c
+  generated text (vla.py --generate, batch 1, seeds 11/12/13):
+  --- seed 11:
+    <STX>BO contributed to Raymond Singh who is far burned, sitting down armed Monday.\n\nThe San Diego 
+    Ministry of the Movement for Director of Dunit started ???Gothere??? of the developers by a bunch 
+    of Her ErrorBN from baseball's menu at the Walney Museum Maroine and Silversey Person, a 17-fos. 
+    Europang wrote 35km.com III.5.\n\nThe broadgateers running round search is the team grew out of the 
+    court (May.Moss
+  --- seed 12:
+    <STX>The A-Industi Arealo ', the mother has been raised in today, featuring the two sides camp. 
+    Und\n\nHathvitis, a confirmed; created RCP has one of the government to Eunits, SDS. Giul Braette.: 
+    Satan had the audit for a retethape and was to fly a monetary process to so they get her online 
+    magazine in the fitness carrier???s Little past-health monitorings share, urges and book-loasts, 
+    the public customer named the
+  --- seed 13:
+    <STX>Co???TERBRZ Despik, where some of which parenting deals by Alexander also gives him him 
+    something to live in my CEO and the Colorado North Bay ZAT and Die Hall722 in July 1951.\n\nThe 
+    Puzelman Fuffoud's Goldenoon Lord asked a demand exhibition in Leonian Boggredes. Curtis Rosen Door 
+    and Vimb, 3.\n\n"Don???t there.???\n\nEven speaks a casino by live photos Pati's confident flag or
+
+--------------------------------------------------------------------------------
+V6  v6_ladder_3_10_32  step 450000   2026-09-04 09:20
+--------------------------------------------------------------------------------
+  seed 2571567309   dataset web
+loss/grad/state:
+  step      0  loss 10.8413  grad 676.680  dff_std  0.091  dff_max      1.3  dff_zeros 0.0000
+  step   5000  loss  5.4346  grad  2.929  dff_std  0.532  dff_max      5.6  dff_zeros 0.0000
+  step  10000  loss  5.2289  grad  3.158  dff_std  0.540  dff_max      7.2  dff_zeros 0.0000
+  step  15000  loss  5.0410  grad  3.534  dff_std  0.544  dff_max     13.8  dff_zeros 0.0000
+  step  20000  loss  4.9798  grad  3.663  dff_std  0.549  dff_max     11.4  dff_zeros 0.0000
+  step  25000  loss  4.9290  grad  3.879  dff_std  0.544  dff_max     10.6  dff_zeros 0.0000
+  step  30000  loss  4.8005  grad  4.003  dff_std  0.534  dff_max      9.4  dff_zeros 0.0000
+  step  35000  loss  4.7835  grad  4.287  dff_std  0.547  dff_max     10.9  dff_zeros 0.0000
+  step  40000  loss  4.7017  grad  4.538  dff_std  0.550  dff_max     11.7  dff_zeros 0.0000
+  step  45000  loss  4.6304  grad  4.732  dff_std  0.541  dff_max     11.3  dff_zeros 0.0000
+  step  50000  loss  4.5726  grad  4.786  dff_std  0.543  dff_max     10.3  dff_zeros 0.0000
+  step  55000  loss  4.5172  grad  5.043  dff_std  0.551  dff_max     12.1  dff_zeros 0.0000
+  step  60000  loss  4.4323  grad  5.152  dff_std  0.536  dff_max     12.0  dff_zeros 0.0000
+  step  65000  loss  4.4202  grad  5.489  dff_std  0.541  dff_max     13.9  dff_zeros 0.0000
+  step  70000  loss  4.3802  grad  5.626  dff_std  0.551  dff_max     13.4  dff_zeros 0.0000
+  step  75000  loss  4.3113  grad  6.004  dff_std  0.554  dff_max     14.4  dff_zeros 0.0000
+  step  80000  loss  4.1551  grad  5.993  dff_std  0.541  dff_max     13.2  dff_zeros 0.0000
+  step  85000  loss  4.2092  grad  6.363  dff_std  0.536  dff_max     12.8  dff_zeros 0.0000
+  step  90000  loss  4.2060  grad  6.413  dff_std  0.543  dff_max     12.7  dff_zeros 0.0000
+  step  95000  loss  4.1344  grad  6.625  dff_std  0.542  dff_max     10.7  dff_zeros 0.0000
+  step 100000  loss  3.9970  grad  6.659  dff_std  0.544  dff_max     14.3  dff_zeros 0.0000
+  step 105000  loss  3.9866  grad  6.947  dff_std  0.556  dff_max     15.6  dff_zeros 0.0000
+  step 110000  loss  3.8459  grad  6.871  dff_std  0.552  dff_max     18.1  dff_zeros 0.0000
+  step 115000  loss  3.8179  grad  7.022  dff_std  0.547  dff_max     13.4  dff_zeros 0.0000
+  step 120000  loss  3.8550  grad  7.128  dff_std  0.550  dff_max     13.3  dff_zeros 0.0000
+  step 125000  loss  3.7439  grad  7.234  dff_std  0.541  dff_max     12.6  dff_zeros 0.0000
+  step 130000  loss  3.7241  grad  7.331  dff_std  0.546  dff_max     13.8  dff_zeros 0.0000
+  step 135000  loss  3.6102  grad  7.452  dff_std  0.545  dff_max     15.0  dff_zeros 0.0000
+  step 140000  loss  3.6074  grad  7.627  dff_std  0.548  dff_max     16.2  dff_zeros 0.0000
+  step 145000  loss  3.5914  grad  7.774  dff_std  0.558  dff_max     12.5  dff_zeros 0.0000
+  step 150000  loss  3.5287  grad  7.701  dff_std  0.548  dff_max     12.5  dff_zeros 0.0000
+  step 155000  loss  3.4372  grad  7.881  dff_std  0.555  dff_max     11.6  dff_zeros 0.0000
+  step 160000  loss  3.3902  grad  7.748  dff_std  0.552  dff_max     12.6  dff_zeros 0.0000
+  step 165000  loss  3.3832  grad  7.736  dff_std  0.563  dff_max     11.9  dff_zeros 0.0000
+  step 170000  loss  3.3771  grad  8.118  dff_std  0.560  dff_max      9.6  dff_zeros 0.0000
+  step 175000  loss  3.2582  grad  7.982  dff_std  0.564  dff_max     12.9  dff_zeros 0.0000
+  step 180000  loss  3.2297  grad  8.019  dff_std  0.564  dff_max     11.2  dff_zeros 0.0000
+  step 185000  loss  3.1405  grad  7.858  dff_std  0.569  dff_max     11.1  dff_zeros 0.0000
+  step 190000  loss  3.0693  grad  8.209  dff_std  0.568  dff_max     17.3  dff_zeros 0.0000
+  step 195000  loss  2.9856  grad  7.619  dff_std  0.573  dff_max     11.8  dff_zeros 0.0000
+  step 200000  loss  3.0809  grad  8.076  dff_std  0.572  dff_max     13.1  dff_zeros 0.0000
+  step 205000  loss  3.0205  grad  7.975  dff_std  0.582  dff_max     17.1  dff_zeros 0.0000
+  step 210000  loss  3.0239  grad  8.148  dff_std  0.588  dff_max     18.4  dff_zeros 0.0000
+  step 215000  loss  2.9355  grad  7.834  dff_std  0.590  dff_max     17.1  dff_zeros 0.0000
+  step 220000  loss  2.9140  grad  8.405  dff_std  0.585  dff_max     18.4  dff_zeros 0.0000
+  step 225000  loss  2.8521  grad  7.792  dff_std  0.588  dff_max     19.6  dff_zeros 0.0000
+  step 230000  loss  2.7535  grad  7.551  dff_std  0.591  dff_max     16.1  dff_zeros 0.0000
+  step 235000  loss  2.7037  grad  7.752  dff_std  0.593  dff_max     17.8  dff_zeros 0.0000
+  step 240000  loss  2.7684  grad  8.092  dff_std  0.594  dff_max     19.5  dff_zeros 0.0000
+  step 245000  loss  2.7124  grad  7.945  dff_std  0.597  dff_max     14.5  dff_zeros 0.0000
+  step 250000  loss  2.6478  grad  8.112  dff_std  0.595  dff_max     10.8  dff_zeros 0.0000
+  step 255000  loss  2.6606  grad  8.304  dff_std  0.612  dff_max     16.1  dff_zeros 0.0000
+  step 260000  loss  2.6256  grad  7.969  dff_std  0.609  dff_max     13.4  dff_zeros 0.0000
+  step 265000  loss  2.5416  grad  7.566  dff_std  0.607  dff_max     11.6  dff_zeros 0.0000
+  step 270000  loss  2.5642  grad  7.888  dff_std  0.608  dff_max     11.4  dff_zeros 0.0000
+  step 275000  loss  2.5704  grad  7.755  dff_std  0.617  dff_max     12.1  dff_zeros 0.0000
+  step 280000  loss  2.4791  grad  7.742  dff_std  0.619  dff_max     13.5  dff_zeros 0.0000
+  step 285000  loss  2.4893  grad  7.513  dff_std  0.621  dff_max     13.6  dff_zeros 0.0000
+  step 290000  loss  2.4300  grad  7.699  dff_std  0.626  dff_max     13.9  dff_zeros 0.0000
+  step 295000  loss  2.4436  grad  7.509  dff_std  0.629  dff_max     11.8  dff_zeros 0.0000
+  step 300000  loss  2.4373  grad  7.584  dff_std  0.630  dff_max     10.5  dff_zeros 0.0000
+  step 305000  loss  2.2962  grad  7.459  dff_std  0.634  dff_max     12.6  dff_zeros 0.0000
+  step 310000  loss  2.3069  grad  7.276  dff_std  0.636  dff_max     12.8  dff_zeros 0.0000
+  step 315000  loss  2.3360  grad  7.243  dff_std  0.630  dff_max     11.0  dff_zeros 0.0000
+  step 320000  loss  2.2419  grad  7.150  dff_std  0.637  dff_max     12.6  dff_zeros 0.0000
+  step 325000  loss  2.2759  grad  7.272  dff_std  0.642  dff_max     15.3  dff_zeros 0.0000
+  step 330000  loss  2.2423  grad  7.258  dff_std  0.641  dff_max     13.6  dff_zeros 0.0000
+  step 335000  loss  2.2456  grad  6.797  dff_std  0.639  dff_max      8.5  dff_zeros 0.0000
+  step 340000  loss  2.2306  grad  7.008  dff_std  0.653  dff_max     12.1  dff_zeros 0.0000
+  step 345000  loss  2.2441  grad  7.054  dff_std  0.647  dff_max     11.6  dff_zeros 0.0000
+  step 350000  loss  2.2280  grad  6.375  dff_std  0.650  dff_max     13.1  dff_zeros 0.0000
+  step 355000  loss  2.1742  grad  6.253  dff_std  0.660  dff_max     10.6  dff_zeros 0.0000
+  step 360000  loss  2.2266  grad  6.584  dff_std  0.670  dff_max     11.6  dff_zeros 0.0000
+  step 365000  loss  2.1624  grad  7.061  dff_std  0.663  dff_max     16.8  dff_zeros 0.0000
+  step 370000  loss  2.1295  grad  6.221  dff_std  0.668  dff_max     12.2  dff_zeros 0.0000
+  step 375000  loss  2.1302  grad  6.106  dff_std  0.665  dff_max     11.8  dff_zeros 0.0000
+  step 380000  loss  2.1020  grad  6.236  dff_std  0.672  dff_max     12.5  dff_zeros 0.0000
+  step 385000  loss  2.1421  grad  6.435  dff_std  0.672  dff_max     12.4  dff_zeros 0.0000
+  step 390000  loss  2.1063  grad  5.924  dff_std  0.670  dff_max     14.4  dff_zeros 0.0000
+  step 395000  loss  2.0622  grad  6.217  dff_std  0.676  dff_max      9.8  dff_zeros 0.0000
+  step 400000  loss  2.1248  grad  6.213  dff_std  0.671  dff_max     11.2  dff_zeros 0.0000
+  step 405000  loss  2.0996  grad  5.969  dff_std  0.677  dff_max     14.2  dff_zeros 0.0000
+  step 410000  loss  2.1125  grad  6.002  dff_std  0.683  dff_max     12.4  dff_zeros 0.0000
+  step 415000  loss  2.0368  grad  6.011  dff_std  0.685  dff_max     14.3  dff_zeros 0.0000
+  step 420000  loss  2.1287  grad  6.396  dff_std  0.686  dff_max     12.3  dff_zeros 0.0000
+  step 425000  loss 
