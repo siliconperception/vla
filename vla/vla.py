@@ -273,7 +273,28 @@ parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFo
 parser.add_argument('--context',       default=7,     type=int,
                     help='spatial size S of the DFF grid (S×S)')
 parser.add_argument('--n_hidden',      default=512,   type=int,
-                    help='ContextCNN channel depth')
+                    help='DFF state channel depth: the state carried between steps is '
+                         '[n_hidden, context, context], and every module that touches it '
+                         '(text_proj, deep_proj, linout, qproj, tap, decoder) is sized by '
+                         'it. ContextCNN\'s INTERIOR width is --c_context, which defaults '
+                         'to this')
+parser.add_argument('--c_context',     default=None,  type=int,
+                    help='ContextCNN INTERIOR conv width, independent of --n_hidden '
+                         '(default: n_hidden, which is the historical behavior and builds '
+                         'a byte-identical state_dict). The module\'s contract is fixed by '
+                         'the DFF it updates -- [n_hidden, S, S] in, the same out -- so '
+                         'only the interior is free: conv 1 widens n_hidden -> c_context, '
+                         'convs 2..depth-1 run c_context -> c_context, and the last conv '
+                         'narrows back to n_hidden. This decouples the two things '
+                         'n_hidden used to set at once: how much state is CARRIED between '
+                         'tokens, and how much width is spent COMPUTING the update. Cost '
+                         'is quadratic in the interior: a depth-D layer is '
+                         '(D-2)*c_context^2 + 2*n_hidden*c_context weights per kernel tap '
+                         'against D*n_hidden^2 before, so c_context < n_hidden is the '
+                         'cheaper-update knob and c_context > n_hidden the wider-update '
+                         'one, neither of which changes the state size or the DFF shapes. '
+                         'At --depth 1 there is no interior -- the single conv must be '
+                         'n_hidden -> n_hidden -- and this is ignored with a warning')
 parser.add_argument('--c_text',        default=1,     type=int,
                     help='token embedding channels (None → n_hidden). Ignored by every '
                          'pretrained --tokenizer, which takes it from that model\'s '
@@ -1029,7 +1050,7 @@ _mix = _parse_mix(args.mix)
 
 # ── restore architecture args from checkpoint ─────────────────────────────────
 
-_ARCH_ARGS = ('context', 'n_hidden', 'c_text', 'n_layers', 'depth', 'kernel',
+_ARCH_ARGS = ('context', 'n_hidden', 'c_context', 'c_text', 'n_layers', 'depth', 'kernel',
               'tokenizer', 'head_norm', 'clock', 'accumulate', 'ema', 'ema_ladder', 'qproj',
               'tap', 'linout',
               'init', 'clock_base', 'clock_max', 'clock_ends', 'clip_dff', 'tap_norm', 'norm', 'norm_groups', 'dff_norm', 'bn_track', 'bn_affine',
@@ -1086,6 +1107,15 @@ if args.load is not None:
 if args.c_text is None:          # default token embedding width to n_hidden
     args.c_text = args.n_hidden
 
+# Resolved AFTER _restore_arch, so a checkpoint's own interior width wins over the default
+# on --load. Unset means n_hidden, which is what every run before this flag existed built.
+if args.c_context is None:       # default ContextCNN interior width to n_hidden
+    args.c_context = args.n_hidden
+if args.c_context != args.n_hidden and args.depth < 2:
+    print(f'WARNING: --c_context {args.c_context} ignored at --depth {args.depth}: a '
+          f'single conv has to map the DFF state to itself, so there is no interior to '
+          f'widen or narrow. Building n_hidden -> n_hidden.')
+
 # ── log / device / seed ───────────────────────────────────────────────────────
 
 if args.log is None:
@@ -1127,6 +1157,12 @@ class ContextCNN(nn.Module):
     Input:  [B, n_hidden, S, S]
     Output: [B, n_hidden, S, S]
 
+    The interior runs at c_context channels (--c_context, default n_hidden): the first
+    conv is n_hidden -> c_context, the last c_context -> n_hidden, and everything between
+    is c_context -> c_context. The input and output widths are NOT free -- they are the
+    DFF state's -- so this is the one width in the model that can move without touching
+    the recurrent state, text_proj, deep_proj, linout, qproj, tap or the decoder.
+
     --norm none removes the BatchNorm entirely, leaving conv2d + ReLU. That is a
     bigger change than it looks, because BatchNorm is the source of every
     train/eval discrepancy this model has: it is the ONLY module whose function
@@ -1151,12 +1187,22 @@ class ContextCNN(nn.Module):
     train than a normalized one; that is the experiment.
     """
     def __init__(self, n_hidden, depth, kernel, norm='batch', groups=32,
-                 bn_track=True, bn_affine=False, bn_momentum=0.1, bn_eps=1e-5):
+                 bn_track=True, bn_affine=False, bn_momentum=0.1, bn_eps=1e-5,
+                 c_context=None):
         super().__init__()
         pad = kernel // 2
         self.norm_kind = norm
-        def block():
-            conv = nn.Conv2d(n_hidden, n_hidden, kernel, padding=pad)
+        # --c_context: the interior width. The ENDS are pinned by the DFF state this module
+        # updates -- it reads [B, n_hidden, S, S] and its output is written back to a
+        # register of that shape -- so the first conv widens into the interior and the last
+        # narrows out of it. depth 1 has no interior and stays n_hidden -> n_hidden.
+        # The EFFECTIVE width, not the requested one: at depth 1 there is no interior, so
+        # what gets built is n_hidden -> n_hidden and that is what this must report --
+        # saved_args reads it back, and a --load has to rebuild the stack that was trained.
+        self.c_context = int(c_context) if (c_context and depth > 1) else n_hidden
+        w = self.c_context
+        def block(cin, cout):
+            conv = nn.Conv2d(cin, cout, kernel, padding=pad)
             if norm == 'group':
                 # GroupNorm normalizes each SAMPLE over channel groups and space, so it
                 # carries no running statistics and computes the same function in train
@@ -1165,7 +1211,7 @@ class ContextCNN(nn.Module):
                 # none turned out to need.  affine=False keeps the parameter count
                 # identical to the BatchNorm path.
                 return nn.Sequential(conv,
-                                     nn.GroupNorm(max(1, min(groups, n_hidden)), n_hidden,
+                                     nn.GroupNorm(max(1, min(groups, cout)), cout,
                                                   affine=False),
                                      nn.ReLU())
             if norm == 'none':
@@ -1182,11 +1228,13 @@ class ContextCNN(nn.Module):
             # statistics come from whatever batch is fed: at batch 1 BatchNorm2d degenerates
             # to InstanceNorm over the SxS grid, a well-defined but different function.
             return nn.Sequential(conv,
-                                 nn.BatchNorm2d(n_hidden, affine=bn_affine,
+                                 nn.BatchNorm2d(cout, affine=bn_affine,
                                                 track_running_stats=bn_track,
                                                 momentum=bn_momentum, eps=bn_eps),
                                  nn.ReLU())
-        self.layers = nn.ModuleList(block() for _ in range(depth))
+        self.layers = nn.ModuleList(
+            block(n_hidden if i == 0 else w, n_hidden if i == depth - 1 else w)
+            for i in range(depth))
 
     def forward(self, x):
         for layer in self.layers:
@@ -1401,7 +1449,7 @@ class VLAModel(nn.Module, _HubMixin):
     between the decoder and the head; head_norm (--head_norm) optionally normalizes the
     readout there, since the borrowed head was trained downstream of a final norm."""
     def __init__(self, n_hidden, depth, kernel, S,
-                 c_text=None, n_layers=1, tokenizer='char', head_norm='none',
+                 c_context=None, c_text=None, n_layers=1, tokenizer='char', head_norm='none',
                  clock='sync', accumulate=False, ema=None, qproj='none', tap=False,
                  clock_base=None, clock_max=None, clock_ends='both', clip_dff=0.0,
                  tap_norm='none', norm='batch', norm_groups=32, dff_norm='none',
@@ -1409,6 +1457,9 @@ class VLAModel(nn.Module, _HubMixin):
         super().__init__()
         self.S          = S
         self.n_hidden   = n_hidden
+        # ContextCNN's interior width (--c_context). n_hidden still sizes the DFF state and
+        # every module that reads or writes it; this sizes only the conv chain in between.
+        self.c_context  = int(c_context) if c_context else n_hidden
         self.c_text     = c_text if c_text is not None else n_hidden
         self.n_layers   = max(1, n_layers)    # stacked (ContextCNN + feedback) layers (see --n_layers)
         # --clock/--accumulate: how often each layer writes its DFF state and what it writes
@@ -1474,7 +1525,7 @@ class VLAModel(nn.Module, _HubMixin):
                                     groups=self.norm_groups, bn_track=self.bn_track,
                                     bn_affine=self.bn_affine,
                                     bn_momentum=(self.bn_momentum or None),
-                                    bn_eps=self.bn_eps)
+                                    bn_eps=self.bn_eps, c_context=self.c_context)
         self.decoder   = DecoderCNN(n_hidden, S, self.c_text if tokenizer != 'char' else 256,
                                     norm2d=self.head_norm_kind == 'batch2d')
         # token grid (c_text) → n_hidden, summed into the DFF state
@@ -1507,7 +1558,7 @@ class VLAModel(nn.Module, _HubMixin):
                                     groups=self.norm_groups, bn_track=self.bn_track,
                                     bn_affine=self.bn_affine,
                                     bn_momentum=(self.bn_momentum or None),
-                                    bn_eps=self.bn_eps)
+                                    bn_eps=self.bn_eps, c_context=self.c_context)
                 for _ in range(self.n_layers - 1))
             self.deep_proj = nn.ModuleList(
                 nn.Conv2d(n_hidden, n_hidden, 1) for _ in range(self.n_layers - 1))
@@ -3072,7 +3123,8 @@ if args.pretrained:
     model = VLAModel.from_pretrained(args.pretrained, revision=args.revision)
     _cfg  = getattr(model, '_hub_mixin_config', None) or {}
     _restore_arch({_k: _cfg[_a] for _k, _a in
-                   (('context', 'S'), ('n_hidden', 'n_hidden'), ('c_text', 'c_text'),
+                   (('context', 'S'), ('n_hidden', 'n_hidden'), ('c_context', 'c_context'),
+                    ('c_text', 'c_text'),
                     ('n_layers', 'n_layers'), ('depth', 'depth'), ('kernel', 'kernel'),
                     ('tokenizer', 'tokenizer'),
                     ('head_norm', 'head_norm'),
@@ -3097,6 +3149,7 @@ else:
         depth     = args.depth,
         kernel    = args.kernel,
         S         = args.context,
+        c_context = args.c_context,
         c_text    = args.c_text,
         n_layers  = args.n_layers,
         clock      = args.clock,
@@ -3131,6 +3184,9 @@ _tokenizer = model.tok
 # saved_args must describe the model that was actually built or a --load would rebuild
 # a different one.
 args.c_text = model.c_text
+# likewise --c_context: --depth 1 forces it to n_hidden, so saved_args must record the width
+# that was built or a --load would rebuild a different stack.
+args.c_context = model.context.c_context
 # likewise --head_norm: char forces it to 'none', and so does an ln_f that the source model
 # turned out not to expose, so read back what was actually built.
 args.head_norm = model.head_norm_kind
@@ -3320,8 +3376,11 @@ if model.qproj is not None:
              if model.qproj_mode == 'read' else
              'layer output -> DFF register, FROZEN random orthogonal')
           + ')', model.qproj[0], input_size=_dff_shape)
-_summ('context (layer 1)' if model.n_layers > 1 else 'context',
-      model.context, input_size=_dff_shape)
+_ctx_label = 'context (layer 1)' if model.n_layers > 1 else 'context'
+if model.context.c_context != model.n_hidden:
+    _ctx_label += (f' -- interior {model.context.c_context} channels (--c_context), '
+                   f'ends pinned to n_hidden {model.n_hidden} by the DFF')
+_summ(_ctx_label, model.context, input_size=_dff_shape)
 if model.clock != 'sync' and not model.gated:
     # asked for a clock and got none: exp has no middle layers to clock below 3, and no mode
     # clocks a single layer. Say so rather than run silently as sync.
@@ -3430,7 +3489,9 @@ def _param_summary(model):
     says how big the model is in total and where the weights actually sit. It matters here
     because the answer is not obvious from the flags: --linout REPLACES deep_proj, a frozen
     pretrained embedding can outweigh everything trained, and the conv stack scales as
-    n_layers * depth * n_hidden**2 so a width change moves the total quadratically. The
+    n_layers * ((depth-2)*c_context**2 + 2*n_hidden*c_context) -- n_layers * depth *
+    n_hidden**2 when --c_context is unset -- so a width change moves the total
+    quadratically. The
     weight ROM is the thing being sized for hardware, so print it, not just infer it.
 
     Modules are walked by NAME off the model, then anything not claimed by a named module is
