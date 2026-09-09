@@ -294,7 +294,13 @@ parser.add_argument('--c_context',     default=None,  type=int,
                          'cheaper-update knob and c_context > n_hidden the wider-update '
                          'one, neither of which changes the state size or the DFF shapes. '
                          'At --depth 1 there is no interior -- the single conv must be '
-                         'n_hidden -> n_hidden -- and this is ignored with a warning')
+                         'n_hidden -> n_hidden -- and this is ignored with a warning.\n'
+                         'WITH --linout the last conv does NOT widen: the chain stays at '
+                         'c_context throughout and linout projects c_context -> n_hidden, so '
+                         'the cost is (depth-1)*c_context^2 + n_hidden*c_context per layer '
+                         'and the final ReLU is at c_context. Without --linout nothing '
+                         'downstream can widen, so the last conv is c_context -> n_hidden '
+                         'and the ReLU is at n_hidden.')
 parser.add_argument('--c_text',        default=1,     type=int,
                     help='token embedding channels (None → n_hidden). Ignored by every '
                          'pretrained --tokenizer, which takes it from that model\'s '
@@ -626,7 +632,16 @@ parser.add_argument('--linout',        default=False, action='store_true',
                          'ReLU output and becomes signed as the weights move -- within a few '
                          'steps in practice. Note step 0 is NOT identical to the baseline, '
                          'unlike --tap: dropping deep_proj changes the upward path even at '
-                         'identity.')
+                         'identity.\n'
+                         'WITH --c_context THIS 1x1 IS ALSO THE WIDENING. ContextCNN then '
+                         'runs at c_context end to end -- final BN and ReLU included -- and '
+                         'this conv projects c_context -> n_hidden, replacing a 3x3 that '
+                         'would have cost 9x its weights to do the same job. The nonlinearity '
+                         'therefore sits at the INTERIOR width and the only thing that widens '
+                         'to the register is linear, which is the intended shape. Init is '
+                         'semi-orthogonal rather than identity in that case (an identity '
+                         'needs a square matrix): norm-preserving, and dense/signed from step '
+                         '0 instead of leaving n_hidden-c_context channels at zero.')
 parser.add_argument('--tap',           default=False, action='store_true',
                     help='put two pointwise 1x1 linear conv2d projections in series after '
                          'each layer\'s last conv2d-BN-ReLU -- the tensor that normally feeds '
@@ -1158,10 +1173,11 @@ class ContextCNN(nn.Module):
     Output: [B, n_hidden, S, S]
 
     The interior runs at c_context channels (--c_context, default n_hidden): the first
-    conv is n_hidden -> c_context, the last c_context -> n_hidden, and everything between
-    is c_context -> c_context. The input and output widths are NOT free -- they are the
-    DFF state's -- so this is the one width in the model that can move without touching
-    the recurrent state, text_proj, deep_proj, linout, qproj, tap or the decoder.
+    conv is n_hidden -> c_context and everything after is c_context -> c_context. The INPUT
+    width is not free -- it is the DFF state's -- and the output width is c_out, which is
+    n_hidden when this module has to widen back to the register itself, or c_context under
+    --linout, where the 1x1 does the widening and the whole chain, final ReLU included,
+    stays narrow.
 
     --norm none removes the BatchNorm entirely, leaving conv2d + ReLU. That is a
     bigger change than it looks, because BatchNorm is the source of every
@@ -1188,7 +1204,7 @@ class ContextCNN(nn.Module):
     """
     def __init__(self, n_hidden, depth, kernel, norm='batch', groups=32,
                  bn_track=True, bn_affine=False, bn_momentum=0.1, bn_eps=1e-5,
-                 c_context=None):
+                 c_context=None, c_out=None):
         super().__init__()
         pad = kernel // 2
         self.norm_kind = norm
@@ -1201,6 +1217,11 @@ class ContextCNN(nn.Module):
         # saved_args reads it back, and a --load has to rebuild the stack that was trained.
         self.c_context = int(c_context) if (c_context and depth > 1) else n_hidden
         w = self.c_context
+        # c_out: what the LAST conv produces. n_hidden by default -- the chain widens back to
+        # the DFF's width itself, because its output goes straight into the register. Under
+        # --linout the caller passes c_out=c_context instead and lets the 1x1 do the widening,
+        # so the chain never runs a wide conv and the final ReLU sits at the interior width.
+        self.c_out = int(c_out) if c_out else n_hidden
         def block(cin, cout):
             conv = nn.Conv2d(cin, cout, kernel, padding=pad)
             if norm == 'group':
@@ -1233,7 +1254,7 @@ class ContextCNN(nn.Module):
                                                 momentum=bn_momentum, eps=bn_eps),
                                  nn.ReLU())
         self.layers = nn.ModuleList(
-            block(n_hidden if i == 0 else w, n_hidden if i == depth - 1 else w)
+            block(n_hidden if i == 0 else w, self.c_out if i == depth - 1 else w)
             for i in range(depth))
 
     def forward(self, x):
@@ -1521,11 +1542,19 @@ class VLAModel(nn.Module, _HubMixin):
         self.end_id    = self.tok.end_id
         self.null_id   = self.tok.null_id
 
+        # --linout puts a 1x1 at the end of every layer, and that 1x1 is the natural place
+        # for the widening: with it on, the conv chain STAYS at c_context (final BN+ReLU
+        # included) and linout projects c_context -> n_hidden. Without it there is nothing
+        # downstream to widen, so the chain's last conv has to reach n_hidden itself.
+        # Decided here because it sets ContextCNN's output width. When c_context == n_hidden
+        # (the default) both paths build exactly the same convs as before either flag existed.
+        self.ctx_out   = self.c_context if getattr(args, 'linout', False) else n_hidden
         self.context   = ContextCNN(n_hidden, depth, kernel, norm=self.norm_kind,
                                     groups=self.norm_groups, bn_track=self.bn_track,
                                     bn_affine=self.bn_affine,
                                     bn_momentum=(self.bn_momentum or None),
-                                    bn_eps=self.bn_eps, c_context=self.c_context)
+                                    bn_eps=self.bn_eps, c_context=self.c_context,
+                                    c_out=self.ctx_out)
         self.decoder   = DecoderCNN(n_hidden, S, self.c_text if tokenizer != 'char' else 256,
                                     norm2d=self.head_norm_kind == 'batch2d')
         # token grid (c_text) → n_hidden, summed into the DFF state
@@ -1558,7 +1587,8 @@ class VLAModel(nn.Module, _HubMixin):
                                     groups=self.norm_groups, bn_track=self.bn_track,
                                     bn_affine=self.bn_affine,
                                     bn_momentum=(self.bn_momentum or None),
-                                    bn_eps=self.bn_eps, c_context=self.c_context)
+                                    bn_eps=self.bn_eps, c_context=self.c_context,
+                                    c_out=self.ctx_out)
                 for _ in range(self.n_layers - 1))
             self.deep_proj = nn.ModuleList(
                 nn.Conv2d(n_hidden, n_hidden, 1) for _ in range(self.n_layers - 1))
@@ -1578,10 +1608,25 @@ class VLAModel(nn.Module, _HubMixin):
             if getattr(args, 'tap', False):
                 raise SystemExit('--linout and --tap are mutually exclusive: both put a 1x1 '
                                  'on the register path, and --tap also keeps deep_proj')
-            self.linout = nn.ModuleList(nn.Conv2d(n_hidden, n_hidden, 1)
+            # in_channels is the CHAIN's output width: n_hidden when --c_context is unset,
+            # c_context when it is -- in which case this 1x1 IS the widening, and the last
+            # 3x3 (c_context x n_hidden x 9 weights) disappears in favour of it
+            # (c_context x n_hidden x 1).
+            self.linout = nn.ModuleList(nn.Conv2d(self.ctx_out, n_hidden, 1)
                                         for _ in range(self.n_layers))
             for _c in self.linout:
-                nn.init.dirac_(_c.weight)
+                if self.ctx_out == n_hidden:
+                    nn.init.dirac_(_c.weight)     # square: exactly the old identity start
+                else:
+                    # Rectangular, so there is no identity. Semi-orthogonal instead: it
+                    # preserves the norm of the channel vector at every position (no rescaling
+                    # inside a recurrence that is prone to blowing up) and makes the register
+                    # dense and SIGNED from step 0 -- which is the entire point of --linout.
+                    # dirac_ would also "work" here, but it would copy the ReLU output into
+                    # the first c_context channels and leave the other n_hidden-c_context at
+                    # zero, i.e. a sparse non-negative register: the thing the flag exists to
+                    # avoid, and 75% of the state dead at init when c_context is n_hidden/4.
+                    nn.init.orthogonal_(_c.weight.view(n_hidden, self.ctx_out))
                 nn.init.zeros_(_c.bias)
             self.deep_proj = None          # its job is done by linout now
 
