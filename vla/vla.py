@@ -2190,6 +2190,15 @@ _TEXT_DATASETS = {
     'sebooks':   ('Nelathan/standardebooks', None, 'train', 'text'),
     'smolcosmo': ('HuggingFaceTB/smollm-corpus', 'cosmopedia-v2',     'train', 'text'),
     'smolfwedu': ('HuggingFaceTB/smollm-corpus', 'fineweb-edu-dedup', 'train', 'text'),
+    # HuggingFaceTB/dclm-edu: DCLM-baseline re-filtered with the FineWeb-Edu classifier
+    # (edu_int_score >= 2 kept), 1769 parquet shards of ~2.9 GB each -- ~5 TB, so it is in
+    # _HUB_SUBSET like the smollm configs and a spread subset is fetched by hand. Plain
+    # 'text' column; the other columns (edu_score, url, language) are metadata we ignore.
+    # This is REAL WEB TEXT that an education classifier liked, which is what it contributes
+    # to a mix whose other two members are synthetic prose (smolcosmo) and a differently
+    # filtered slice of the SAME web (smolfwedu, fineweb-edu-dedup): the three are not
+    # independent samples, they are three filters over overlapping crawls.
+    'dclmedu':   ('HuggingFaceTB/dclm-edu', None, 'train', 'text'),
     # finephrase: reasoning-shaped generations over fineweb-edu documents. The corpus we
     # train on is rollout_results, NOT the `text` column -- `text` is the source document
     # verbatim, i.e. fineweb-edu, which --dataset fwedu already provides. See _fmt_finephrase.
@@ -2225,6 +2234,9 @@ _TEXT_DATASETS = {
 _HUB_SUBSET = {
     'smolcosmo': ('HuggingFaceTB/smollm-corpus', 'cosmopedia-v2'),
     'smolfwedu': ('HuggingFaceTB/smollm-corpus', 'fineweb-edu-dedup'),
+    # dclm-edu's shards live under data/ rather than a config directory, so 'data' is the
+    # subdirectory _hub_subset_files globs -- not a config name (the repo has none).
+    'dclmedu': ('HuggingFaceTB/dclm-edu', 'data'),
     'fpfaq':  ('HuggingFaceFW/finephrase', 'faq'),
     'fpmath': ('HuggingFaceFW/finephrase', 'math'),
     'fptut':  ('HuggingFaceFW/finephrase', 'tutorial'),
@@ -2265,7 +2277,7 @@ def _fmt_finephrase(ex):
 # Corpora with a real held-out split (tiny/c4/pile/web) are NOT hashed: they keep the exact
 # sets every earlier number in PLAN.txt was measured on.
 _HASH_HOLDOUT = {'swiki', 'fwedu', 'cosmo', 'cosmoweb', 'fpfaq', 'fpmath', 'fptut',
-                 'smolcosmo', 'smolfwedu', 'strangetb', 'sebooks'}
+                 'smolcosmo', 'smolfwedu', 'strangetb', 'sebooks', 'dclmedu'}
 _HOLDOUT_MOD = 32                       # ~3.1% held out. Sized by the SCAN COST of building
                                         # the eval set, not by statistics: the filters
                                         # compound. cosmo keeps 26.5% (audience) x 1/MOD
