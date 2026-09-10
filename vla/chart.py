@@ -205,9 +205,12 @@ loss_mean = np.convolve(loss, weights, mode='same')
 
 #fig = plt.figure(figsize=(10,40))
 plt.style.use('dark_background')
-# --verbose shows all six panels; otherwise just loss and grad
-nplots = 6 if args.verbose else 2
-fig = plt.figure(figsize=(12, 14 if args.verbose else 6))
+# --verbose shows all six panels; otherwise loss, grad and the DFF state (std + mean).
+# The DFF panel is third in BOTH layouts, so --verbose is unchanged by its promotion: it
+# is the one panel that says whether the recurrent state is healthy, and a run that is
+# quietly drifting toward a blow-up shows it here long before the loss moves.
+nplots = 6 if args.verbose else 3
+fig = plt.figure(figsize=(12, 14 if args.verbose else 9))
 if title:
     fig.suptitle(title)
 ax1 = fig.add_subplot(nplots,1,1)
@@ -229,41 +232,46 @@ if ax2b is not None:
     ax2b.set_ylim(bottom=0, top=float(bs.max()) * 1.2 or 1)
     ax2b.set_ylabel('batch size', color='orange')
 
+# DFF state: std on the host axis, mean on a twin. Same colours and styling the --verbose
+# layout has always used for them, so charts from either mode read the same.
+ax3  = fig.add_subplot(nplots, 1, 3, sharex=ax1)
+ax3b = ax3.twinx()
+ax3.plot(step, std, '-r', linewidth=1.0, alpha=0.5)
+ax3b.plot(step, mean, '-b', linewidth=1.0, alpha=0.5)
+# std is non-negative and spikes at init like grad does, so it gets the same capped top.
+# mean is SIGNED under --linout (a dense signed register straddles zero), so its twin is
+# left to autoscale rather than pinned at zero.
+ax3.set_ylim(bottom=0, top=ylim_top(std, 'dff_std'))
+
 ax1.set_ylabel('loss', color='w')
 ax2.set_ylabel('grad', color='y')
+ax3.set_ylabel('dff_std', color='r')
+ax3b.set_ylabel('dff_mean', color='b')
 
 # y axis: minor ticks between the majors, and a hairline major gridline in the trace's own
 # colour, so the grid reads as part of its plot instead of competing with the samples
-for ax, color in ((ax1, 'w'), (ax2, 'y')):
+for ax, color in ((ax1, 'w'), (ax2, 'y'), (ax3, 'r')):
     ax.yaxis.set_minor_locator(ticker.AutoMinorLocator())
     ax.grid(axis='y', which='major', color=color, linewidth=1, alpha=0.2)
 
 # twins are tracked separately: twinx hides their x axis, so the shared x-axis label has to
 # land on a host subplot, never on a twin
-axes, twins = [ax1, ax2], ([ax2b] if ax2b is not None else [])
+axes = [ax1, ax2, ax3]
+twins = ([ax2b] if ax2b is not None else []) + [ax3b]
 if args.verbose:
-    ax3 = fig.add_subplot(nplots,1,3, sharex=ax1)
-    ax3b = ax3.twinx()
     ax4 = fig.add_subplot(nplots,1,4, sharex=ax1)
     ax5 = fig.add_subplot(nplots,1,5, sharex=ax1)
     ax6 = fig.add_subplot(nplots,1,6, sharex=ax1)
-    #ax3.set_ylim(bottom=0, top=20)
-    #ax3b.set_ylim(bottom=-1, top=1)
-    ax3.plot(step, std, '-r', linewidth=1.0,alpha=0.5)
-    ax3b.plot(step, mean, '-b', linewidth=1.0,alpha=0.5)
     ax4.yaxis.set_major_formatter(ticker.FormatStrFormatter('%.7f'))
     ax4.plot(step, lr, '-c', linewidth=2.0,alpha=0.5)
     ax5.plot(step, dmax, '-m', linewidth=2.0,alpha=0.5)
     ax6.set_ylim(bottom=0, top=1)
     ax6.plot(step, zero, '-g', linewidth=2.0,alpha=0.5)
 
-    ax3.set_ylabel('std', color='r')
-    ax3b.set_ylabel('mean', color='b')
     ax4.set_ylabel('lr', color='c')
     ax5.set_ylabel('dff_max', color='m')
     ax6.set_ylabel('sparsity', color='g')
-    axes += [ax3, ax4, ax5, ax6]
-    twins += [ax3b]
+    axes += [ax4, ax5, ax6]
 
 # only the bottom subplot carries the shared x-axis label and tick labels
 for ax in axes[:-1] + twins:
