@@ -1063,6 +1063,29 @@ def _parse_mix(spec):
 
 _mix = _parse_mix(args.mix)
 
+# How many of the --batch slots the batchwise vocab stream occupies. worker() derives the
+# same number for slot construction; it is computed here too because the training loop logs
+# the vocab and corpus halves of the loss separately and has to know where the split is.
+# Slot order is vocab-first (see worker()), so rows [0:_N_VOCAB] are the vocab channel.
+_N_VOCAB = (min(args.vocab_slots, args.batch)
+            if (args.vocab_files or '').strip() and args.vocab_slots else 0)
+
+# Validated HERE, in the main thread, not in worker(): worker runs as a thread, and a
+# SystemExit raised there kills only that thread -- the training loop then blocks forever
+# on an empty clip queue instead of exiting. Anything that can be checked from the flags
+# alone therefore has to be checked before the worker starts.
+if _N_VOCAB:
+    _vf = [f.strip() for f in args.vocab_files.split(',') if f.strip()]
+    _fr = {os.path.splitext(os.path.basename(f))[0]
+           for f in (args.vocab_framed or '').split(',') if f.strip()}
+    if _N_VOCAB < len(_vf) and _fr and len(_fr) < len(_vf):
+        raise SystemExit(
+            f'--vocab_slots {_N_VOCAB} with {len(_vf)} --vocab_files merges several files '
+            f'into one slot, but --vocab_framed names only {sorted(_fr)}. A framed pool '
+            f'resets the recurrent state between examples and an unframed one never does; '
+            f'one slot cannot do both. Either frame all of them, none of them, or give each '
+            f'file its own slot (--vocab_slots >= {len(_vf)}).')
+
 # ── restore architecture args from checkpoint ─────────────────────────────────
 
 _ARCH_ARGS = ('context', 'n_hidden', 'c_context', 'c_text', 'n_layers', 'depth', 'kernel',
@@ -2098,6 +2121,10 @@ _epoch_frac  = {}
 # Pools kept OUT of the epoch column's mean (--vocab_framed). Written once at worker
 # start-up, before any thread reads it.
 _epoch_mean_exclude = set()
+# --vocab_slots: pool name -> example count, published once at worker start-up. The STEP
+# line's epoch_vocab column needs the DENOMINATOR of the vocab channel's own consumption,
+# which otherwise lives only in worker()'s closure.
+_vocab_total = {}
 
 def _epoch_set(name, n):
     with _epoch_lock:
@@ -2130,6 +2157,22 @@ def _epoch_num():
         if frac:
             return sum(frac.values()) / len(frac)
         return float(min(_epoch_stats.values())) if _epoch_stats else 0.0
+
+
+def _epoch_vocab():
+    """The STEP line's `epoch_vocab` column: fractional passes over the vocab stream as a
+    WHOLE, i.e. every example the vocab slots have drawn divided by the size of the pool
+    they draw from. With several files merged into one channel that is the number that
+    describes the channel -- the per-file breakdown is still in the EPOCH line.
+
+    Distinct from the `epoch` column, which is the MEAN of the per-file fractions: the two
+    agree only when the files are the same length (vocab_phase1/2 are both 10k lines, so
+    they do here). 0 before the worker starts."""
+    with _epoch_lock:
+        tot = sum(_vocab_total.values())
+        if not tot:
+            return 0.0
+        return sum(_vocab_consumed.get(k, 0) for k in _vocab_total) / tot
 
 
 def _epoch_report():
@@ -2238,6 +2281,13 @@ _TEXT_DATASETS = {
     # Readability and reasoning are anti-correlated on raw web text.
     'swiki':   ('wikimedia/wikipedia', '20231101.simple', 'train', 'text'),
     'fwedu':   ('HuggingFaceFW/fineweb-edu', 'sample-10BT', 'train', 'text'),
+    # The SAME 10BT sample of the SAME crawl as fwedu, but WITHOUT the edu classifier:
+    # HuggingFaceFW/fineweb sample-10BT is 15 parquet files of 2.15 GB (~10B tokens, ~667M
+    # per file), the unfiltered FineWeb pipeline output. Registered so 'raw web' and
+    # 'edu-filtered web' can be compared with the filter as the only variable -- fwedu is
+    # this corpus after the classifier, and smolfwedu is fwedu after exact dedup. Too large
+    # to materialize casually (32 GB), so pair it with --streaming.
+    'fineweb': ('HuggingFaceFW/fineweb', 'sample-10BT', 'train', 'text'),
     # cosmo is cosmopedia/stories UNFILTERED as of 2026-08-29. It previously kept only
     # audience == 'young_children' (26.3% of rows, the same rows format == 'story_children'
     # selects) via _fmt_cosmo, which has been REMOVED. BACKWARD COMPATIBILITY IS BROKEN ON
@@ -2333,6 +2383,12 @@ _HUB_SUBSET = {
     # dclm-edu's shards live under data/ rather than a config directory, so 'data' is the
     # subdirectory _hub_subset_files globs -- not a config name (the repo has none).
     'dclmedu': ('HuggingFaceTB/dclm-edu', 'data'),
+    # fineweb's 10BT sample lives under sample/10BT/, so that path is what gets globbed --
+    # a subdirectory, not a config name, even though 'sample-10BT' IS a real config of the
+    # repo. Going through _HUB_SUBSET rather than load_dataset(repo, 'sample-10BT') keeps
+    # the read on the 15 files already in the cache: no repo resolution, no network, and
+    # with --streaming no arrow build either (the parquet loader streams local files).
+    'fineweb': ('HuggingFaceFW/fineweb', 'sample/10BT'),
     'fpfaq':  ('HuggingFaceFW/finephrase', 'faq'),
     'fpmath': ('HuggingFaceFW/finephrase', 'math'),
     'fptut':  ('HuggingFaceFW/finephrase', 'tutorial'),
@@ -2372,7 +2428,7 @@ def _fmt_finephrase(ex):
 # order or --seed -- none of which is true of "take the first N documents".
 # Corpora with a real held-out split (tiny/c4/pile/web) are NOT hashed: they keep the exact
 # sets every earlier number in PLAN.txt was measured on.
-_HASH_HOLDOUT = {'swiki', 'fwedu', 'cosmo', 'cosmoweb', 'fpfaq', 'fpmath', 'fptut',
+_HASH_HOLDOUT = {'swiki', 'fwedu', 'fineweb', 'cosmo', 'cosmoweb', 'fpfaq', 'fpmath', 'fptut',
                  'smolcosmo', 'smolfwedu', 'strangetb', 'sebooks', 'dclmedu'}
 _HOLDOUT_MOD = 32                       # ~3.1% held out. Sized by the SCAN COST of building
                                         # the eval set, not by statistics: the filters
@@ -2883,10 +2939,14 @@ class _VocabSlot:
     Each slot keeps its own shuffled permutation and reshuffles on wrap, so N slots are
     N independent orderings of the same file rather than N copies of one ordering."""
     __slots__ = ['pool', 'texts', 'name', 'rng', 'order', 'oi', 'ids', 'pos',
-                 'framed', 'steps']
+                 'framed', 'steps', 'names']
 
-    def __init__(self, pool, name, seed, texts=None, framed=False):
+    def __init__(self, pool, name, seed, texts=None, framed=False, names=None):
         self.pool, self.name, self.texts = pool, name, texts
+        # names: the SOURCE FILE of each example, when this slot merges several pools (see
+        # the slot assignment in worker()). Epoch and text-sample accounting stay per FILE
+        # even though the stream is one channel; None means every example came from `name`.
+        self.names  = names
         self.framed = framed
         self.rng   = random.Random(seed)
         self.order = list(range(len(pool)))
@@ -2909,16 +2969,18 @@ class _VocabSlot:
         ids = [_tokenizer.start_id] + list(self.pool[j]) + [_tokenizer.end_id]
         self.steps = [(ids[i], ids[i + 1]) for i in range(len(ids) - 1)]
         self.pos   = 0
-        _vocab_consumed[self.name] = _vocab_consumed.get(self.name, 0) + 1
+        k = self.names[j] if self.names else self.name
+        _vocab_consumed[k] = _vocab_consumed.get(k, 0) + 1
         _text_tally(len(ids), sample=(self.texts[j] if self.texts else ''),
-                    vocab=self.name)
+                    vocab=k)
 
     def _append_next(self):
         j = self._next_index()
         ids = self.pool[j]
         self.ids.extend(ids)
-        _vocab_consumed[self.name] = _vocab_consumed.get(self.name, 0) + 1
-        _text_tally(len(ids), sample=(self.texts[j] if self.texts else ''), vocab=self.name)
+        k = self.names[j] if self.names else self.name
+        _vocab_consumed[k] = _vocab_consumed.get(k, 0) + 1
+        _text_tally(len(ids), sample=(self.texts[j] if self.texts else ''), vocab=k)
 
     def done(self):      return False       # never refilled from clip_q
 
@@ -3047,6 +3109,7 @@ def worker(stop, q, datasets, args, mix=None):
         keys  = sorted(pools)
         for k in keys:
             _vocab_consumed[k] = 0
+            _vocab_total[k] = pools[k][2]
             _epoch_set(k, 1)
             if pools[k][4]:
                 _epoch_mean_exclude.add(k)   # framed pools sit outside the epoch mean
@@ -3055,12 +3118,42 @@ def worker(stop, q, datasets, args, mix=None):
         if _epoch_mean_exclude:
             print(f'epoch mean over {[k for k in keys if k not in _epoch_mean_exclude]}, '
                   f'excluding framed {sorted(_epoch_mean_exclude)}', flush=True)
+        def _merge(ks):
+            """Several files as ONE stream: pools concatenated, each example remembering
+            which file it came from. Drawn uniformly over the union, so files contribute in
+            proportion to their LINE COUNTS (two 10k-line files are 50/50)."""
+            fr = {pools[k][4] for k in ks}
+            if len(fr) > 1:
+                raise SystemExit(
+                    f'--vocab_slots {n_vocab} would merge {",".join(ks)} into one slot, but '
+                    f'they disagree on framing (--vocab_framed). A framed pool resets the '
+                    f'state between examples and an unframed one never does; one slot cannot '
+                    f'do both. Give them separate slots (--vocab_slots >= {len(keys)}).')
+            pool, texts, nm = [], [], []
+            for k in ks:
+                pool.extend(pools[k][0])
+                texts.extend(pools[k][3])
+                nm.extend([k] * pools[k][2])
+            return pool, texts, nm, fr.pop()
+
         for i in range(n_vocab):
-            k = keys[i % len(keys)]                       # round robin -> even slot split
-            slots.append(_VocabSlot(pools[k][0], k, args.seed + 9973 * i, pools[k][3],
-                                    framed=pools[k][4]))
+            # More slots than files: round robin, one file per slot (the historical split).
+            # FEWER slots than files: each slot merges a stripe of the files into a single
+            # undelimited stream, so --vocab_slots 1 with two files is ONE channel carrying
+            # both -- not the first file only, which is what a bare round robin would give.
+            my = [keys[i % len(keys)]] if n_vocab >= len(keys) else keys[i::n_vocab]
+            if len(my) == 1:
+                k = my[0]
+                slots.append(_VocabSlot(pools[k][0], k, args.seed + 9973 * i, pools[k][3],
+                                        framed=pools[k][4]))
+            else:
+                _pl, _tx, _nm, _fr = _merge(my)
+                print(f'vocab slot {i}: {" + ".join(my)} merged, {len(_pl)} examples, '
+                      f'{"<STX>/<ETX> framed" if _fr else "undelimited"}', flush=True)
+                slots.append(_VocabSlot(_pl, '+'.join(my), args.seed + 9973 * i, _tx,
+                                        framed=_fr, names=_nm))
         print(f'batchwise mix: {n_vocab}/{args.batch} vocab slots '
-              f'({100.0*n_vocab/args.batch:.0f}% of tokens), '
+              f'({100.0*n_vocab/args.batch:.1f}% of tokens), '
               f'{args.batch-n_vocab} corpus slots', flush=True)
     slots += [_ClipSlot() for _ in range(args.batch - n_vocab)]
 
@@ -4741,6 +4834,7 @@ if args.eval and args.eval_corpora:
 
 larr, garr = [], []
 carr = []             # --clip: 1.0 on steps whose grad norm hit the limit
+varr, aarr = [], []   # --vocab_slots: per-step loss over the vocab slots / the corpus slots
 i = _start_step        # continue the step count from the resumed checkpoint (0 if fresh)
 # cumulative count of training examples (one <STX>..<ETX> clip) begun, over all slots;
 # a slot's flag is True on the step it emits its <STX>, so summing flags counts examples.
@@ -4878,6 +4972,17 @@ try:
         model.train()
         logits, loss = model(x, targets=y, flag=flag)
 
+        # ── instrumentation: the vocab channel's loss, separately from the corpus ──────
+        # The batch loss is dominated by the 249 corpus slots, so a single vocab slot is
+        # invisible in it -- 0.4% of the mean. These two numbers are what say whether the
+        # channel is being learned at all, and they are free: reduction='none' over the
+        # logits the training forward already produced, no second forward and no gradient.
+        if _N_VOCAB:
+            with torch.no_grad():
+                _per = F.cross_entropy(logits, y.long(), reduction='none')
+                varr.append(float(_per[:_N_VOCAB].mean()))
+                aarr.append(float(_per[_N_VOCAB:].mean()))
+
         # halt immediately on non-finite loss — do NOT backward/step/save, so the
         # last good checkpoint on disk is preserved.
         if not torch.isfinite(loss):
@@ -4939,13 +5044,21 @@ try:
             # (chart.py looks fields up by name and defaults a missing one to 0.0)
             if args.clip > 0:
                 s += ' clipped {:8.5f}'.format(float(np.mean(carr[-args.monitor:])) if carr else 0.0)
+            # loss_vocab / loss_corpus: the same monitor-window mean the loss column uses,
+            # split by slot group. Present only under --vocab_slots, so logs from every
+            # other run stay byte-identical (chart.py looks fields up by name).
+            if _N_VOCAB and varr:
+                s += (' loss_vocab {:12.9f} loss_corpus {:12.9f} epoch_vocab {:10.3f}'
+                      .format(float(np.mean(varr[-args.monitor:])),
+                              float(np.mean(aarr[-args.monitor:])),
+                              _epoch_vocab()))
             print(s)
             with open(args.log, 'a') as f:
                 print(s, file=f)
 
             # bound monitor history so host RAM stays flat over long runs (these are
             # only ever read as [-monitor:]; without this they grow once per step forever)
-            for _a in (larr, garr, carr):
+            for _a in (larr, garr, carr, varr, aarr):
                 if len(_a) > args.monitor:
                     del _a[:-args.monitor]
 
