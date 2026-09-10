@@ -232,21 +232,29 @@ if ax2b is not None:
     ax2b.set_ylim(bottom=0, top=float(bs.max()) * 1.2 or 1)
     ax2b.set_ylabel('batch size', color='orange')
 
-# DFF state: std on the host axis, mean on a twin. Same colours and styling the --verbose
-# layout has always used for them, so charts from either mode read the same.
-ax3  = fig.add_subplot(nplots, 1, 3, sharex=ax1)
-ax3b = ax3.twinx()
-ax3.plot(step, std, '-r', linewidth=1.0, alpha=0.5)
-ax3b.plot(step, mean, '-b', linewidth=1.0, alpha=0.5)
-# std is non-negative and spikes at init like grad does, so it gets the same capped top.
-# mean is SIGNED under --linout (a dense signed register straddles zero), so its twin is
-# left to autoscale rather than pinned at zero.
-ax3.set_ylim(bottom=0, top=ylim_top(std, 'dff_std'))
+# DFF state: std and mean on ONE shared y axis, not a twin. They are the same quantity in
+# the same units -- the spread of the register and where it sits -- so a shared scale is
+# what makes them comparable: it shows at a glance whether the mean is small against the
+# spread (a centred register) or riding out with it (a register drifting off zero), which
+# two independently autoscaled axes actively hide.
+ax3 = fig.add_subplot(nplots, 1, 3, sharex=ax1)
+ax3.plot(step, std,  '-r', linewidth=1.0, alpha=0.5, label='std')
+ax3.plot(step, mean, '-b', linewidth=1.0, alpha=0.5, label='mean')
+# Top from std, which is non-negative and spikes at init the way grad does, so it gets the
+# same capped top -- then raised if the mean runs above it. Bottom follows the mean below
+# zero: under --linout the register is dense and SIGNED, and a bottom=0 axis would draw it
+# off-panel.
+_top = ylim_top(std, 'dff_std') or 1.0
+_top = max(_top, float(mean.max()) * 1.05) if mean.size else _top
+_bot = min(0.0, float(mean.min()) * 1.05) if mean.size else 0.0
+ax3.set_ylim(bottom=_bot, top=_top)
+if _bot < 0:
+    ax3.axhline(y=0, color='w', linewidth=0.5, alpha=0.3)   # sign reference for the mean
+ax3.legend(loc='upper right', fontsize=8, framealpha=0.3)
 
 ax1.set_ylabel('loss', color='w')
 ax2.set_ylabel('grad', color='y')
-ax3.set_ylabel('dff_std', color='r')
-ax3b.set_ylabel('dff_mean', color='b')
+ax3.set_ylabel('dff std / mean', color='w')
 
 # y axis: minor ticks between the majors, and a hairline major gridline in the trace's own
 # colour, so the grid reads as part of its plot instead of competing with the samples
@@ -257,7 +265,7 @@ for ax, color in ((ax1, 'w'), (ax2, 'y'), (ax3, 'r')):
 # twins are tracked separately: twinx hides their x axis, so the shared x-axis label has to
 # land on a host subplot, never on a twin
 axes = [ax1, ax2, ax3]
-twins = ([ax2b] if ax2b is not None else []) + [ax3b]
+twins = ([ax2b] if ax2b is not None else [])
 if args.verbose:
     ax4 = fig.add_subplot(nplots,1,4, sharex=ax1)
     ax5 = fig.add_subplot(nplots,1,5, sharex=ax1)
