@@ -56,6 +56,16 @@ _FIELDS = ['batch', 'loss', 'grad', 'lr', 'dff_mean', 'dff_std', 'dff_max', 'dff
            'a_std', 'i_std']
 _NUM    = r'(-?[\d.]+(?:[eE][-+]?\d+)?)'
 
+# GENSCORE lines carry the fluency of the periodic generation samples, scored by the frozen
+# reference LM (--gen_score):
+#   GENSCORE step        500 [<STX>]: nats 7.865 fluency -23% rep1 0.09
+# Same units as the loss column -- nats per token -- so they belong on the loss panel, but
+# they are a different quantity: the loss is our model's fit to REAL text, this is a
+# reference model's opinion of the text OUR model wrote free-running. There is one line per
+# --gen_prompts prompt per report, so several can share a step.
+gs_pat = re.compile(r'^GENSCORE\s+step\s+(\d+).*?\bnats\s+' + r'(-?[\d.]+(?:[eE][-+]?\d+)?)')
+
+
 def parselog(fn):
     global batch_size
     step_pat = re.compile(r'^STEP\s+(\d+)')
@@ -63,8 +73,14 @@ def parselog(fn):
     pats     = {k: re.compile(r'\b' + k + r'\s+' + _NUM) for k in _FIELDS}
     data     = {k: [] for k in ['step'] + _FIELDS}
     data['wall'] = []
+    gs_step, gs_nats = [], []
     with open(fn, 'r') as f:
         for l in f:
+            mg = gs_pat.match(l)
+            if mg:
+                gs_step.append(float(mg.group(1)))
+                gs_nats.append(float(mg.group(2)))
+                continue
             ms = step_pat.match(l)
             if ms:
                 data['step'].append(float(ms.group(1)))
@@ -77,7 +93,12 @@ def parselog(fn):
                 match = re.search(r"batch=(\d+)", l)
                 if match:
                     batch_size = int(match.group(1))
-    return {k: np.array(v)[args.head:] for k, v in data.items()}
+    out = {k: np.array(v)[args.head:] for k, v in data.items()}
+    # NOT sliced by --head: that is a count of STEP samples, and these are keyed by step
+    # number instead. They are filtered by step below, once the trim is known.
+    out['gs_step'] = np.array(gs_step)
+    out['gs_nats'] = np.array(gs_nats)
+    return out
 
 print('loading log file')
 d = parselog(args.log)
@@ -88,6 +109,7 @@ step = d['step']
 loss = d['loss']
 grad = d['grad']
 lr   = d['lr']
+gs_step, gs_nats = d['gs_step'], d['gs_nats']
 mean = d['dff_mean']
 std  = d['dff_std']
 dmax = d['dff_max']
@@ -198,6 +220,9 @@ if cut:
           f'body of the run fills the upper half of the loss/grad panels; --outliers keeps them')
     step, loss, grad, lr = step[cut:], loss[cut:], grad[cut:], lr[cut:]
     mean, std, dmax, zero, bs = mean[cut:], std[cut:], dmax[cut:], zero[cut:], bs[cut:]
+    if gs_step.size:                       # by STEP NUMBER: these are not per-sample rows
+        _keep   = gs_step >= step[0]
+        gs_step, gs_nats = gs_step[_keep], gs_nats[_keep]
 
 window_size = 10
 weights = np.ones(window_size) / window_size
@@ -219,8 +244,22 @@ ax2 = fig.add_subplot(nplots,1,2, sharex=ax1)
 # changes. Off by default -- the twin's own gridless scale reads as clutter otherwise.
 ax2b = ax2.twinx() if args.batch else None
 #ax1.set_ylim(bottom=0, top=np.log(50257))
-ax1.set_ylim(bottom=0, top=ylim_top(loss, 'loss'))
+# The panel scales to BOTH series: the generation score opens far above the loss (13 nats
+# of word salad against a loss of 8) and settles toward it, so scaling to the loss alone
+# would put every early point off-panel. ylim_top's cap still applies, so a run whose
+# samples stay bad does not flatten the loss trace to read them.
+_l_top = ylim_top(np.concatenate([loss, gs_nats]) if gs_nats.size else loss, 'loss')
+ax1.set_ylim(bottom=0, top=_l_top)
 ax1.plot(step, loss, '.w', linewidth=0.1,alpha=1.0, markersize=1)
+if gs_nats.size:
+    # scatter, not a line: several prompts are scored at the same step, and the spread
+    # between them at one step is itself the reading -- a line would average it away.
+    ax1.plot(gs_step, gs_nats, 'o', color='orange', markersize=3, alpha=0.7,
+             linestyle='none', label='GENSCORE nats')
+    ax1.legend(loc='upper right', fontsize=8, framealpha=0.3)
+    _off = int((gs_nats > _l_top).sum()) if _l_top else 0
+    if _off:
+        print(f'GENSCORE: {_off}/{gs_nats.size} points above the loss axis top {_l_top:.4g}')
 #ax1.plot(step, loss_mean, '-w', linewidth=1,alpha=0.8)
 ax1.axhline(y=np.min(loss), color='g', linestyle='-',linewidth=1,label='min')
 #ax2.plot(step, grad, '-y', linewidth=2.0,alpha=0.5)
