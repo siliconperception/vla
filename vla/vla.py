@@ -4834,7 +4834,7 @@ if args.eval and args.eval_corpora:
 
 larr, garr = [], []
 carr = []             # --clip: 1.0 on steps whose grad norm hit the limit
-varr, aarr = [], []   # --vocab_slots: per-step loss over the vocab slots / the corpus slots
+varr = []             # --vocab_slots: per-step loss over the vocab slots alone
 i = _start_step        # continue the step count from the resumed checkpoint (0 if fresh)
 # cumulative count of training examples (one <STX>..<ETX> clip) begun, over all slots;
 # a slot's flag is True on the step it emits its <STX>, so summing flags counts examples.
@@ -4974,14 +4974,14 @@ try:
 
         # ── instrumentation: the vocab channel's loss, separately from the corpus ──────
         # The batch loss is dominated by the 249 corpus slots, so a single vocab slot is
-        # invisible in it -- 0.4% of the mean. These two numbers are what say whether the
-        # channel is being learned at all, and they are free: reduction='none' over the
-        # logits the training forward already produced, no second forward and no gradient.
+        # invisible in it -- 0.4% of the mean. This is what says whether the channel is
+        # being learned at all, and it is free: reduction='none' over the logits the
+        # training forward already produced, no second forward and no gradient. There is no
+        # loss_corpus column because the loss column already IS it to within that 0.4%.
         if _N_VOCAB:
             with torch.no_grad():
                 _per = F.cross_entropy(logits, y.long(), reduction='none')
                 varr.append(float(_per[:_N_VOCAB].mean()))
-                aarr.append(float(_per[_N_VOCAB:].mean()))
 
         # halt immediately on non-finite loss — do NOT backward/step/save, so the
         # last good checkpoint on disk is preserved.
@@ -5031,14 +5031,21 @@ try:
             # batch is logged per step, not just in the ARGS line: a run resumed from a
             # checkpoint at a different --batch appends to a new log, so chart.py needs the
             # batch size that produced each point (loss/grad both scale with it).
+            # The epoch column reports the VOCAB channel's own passes when that channel
+            # exists: it is the finite, repeating stream, and the corpus alongside it is
+            # effectively infinite (fineweb pins at 1 forever), so its passes are the only
+            # epoch number that means anything in such a run. Without a vocab channel the
+            # column is the corpus epoch, exactly as before.
+            _ep_name, _ep_val = (('epoch_vocab', _epoch_vocab()) if _N_VOCAB
+                                 else ('epoch', _epoch_num()))
             s = ('STEP {:10} wall {} loss {:12.9f} grad {:12.6f} '
                  'lr {:10.9f} dff_mean {:12.5f} dff_std {:12.5f} dff_max {:11.3f} '
-                 'dff_zeros {:8.5f} batch {:6d} examples {:12d} epoch {:10.3f}').format(
+                 'dff_zeros {:8.5f} batch {:6d} examples {:12d} {} {:10.3f}').format(
                 i, datetime.datetime.now(),
                 np.mean(larr[-args.monitor:]),
                 np.mean(garr[-args.monitor:]),
                 optimizer.param_groups[0]['lr'],
-                _dmean, _dstd, _dmax, _dzero, args.batch, n_examples, _epoch_num(),
+                _dmean, _dstd, _dmax, _dzero, args.batch, n_examples, _ep_name, _ep_val,
             )
             # appended only when clipping is on, so logs from non-clip runs stay byte-identical
             # (chart.py looks fields up by name and defaults a missing one to 0.0)
@@ -5048,17 +5055,14 @@ try:
             # split by slot group. Present only under --vocab_slots, so logs from every
             # other run stay byte-identical (chart.py looks fields up by name).
             if _N_VOCAB and varr:
-                s += (' loss_vocab {:12.9f} loss_corpus {:12.9f} epoch_vocab {:10.3f}'
-                      .format(float(np.mean(varr[-args.monitor:])),
-                              float(np.mean(aarr[-args.monitor:])),
-                              _epoch_vocab()))
+                s += ' loss_vocab {:12.9f}'.format(float(np.mean(varr[-args.monitor:])))
             print(s)
             with open(args.log, 'a') as f:
                 print(s, file=f)
 
             # bound monitor history so host RAM stays flat over long runs (these are
             # only ever read as [-monitor:]; without this they grow once per step forever)
-            for _a in (larr, garr, carr, varr, aarr):
+            for _a in (larr, garr, carr, varr):
                 if len(_a) > args.monitor:
                     del _a[:-args.monitor]
 
