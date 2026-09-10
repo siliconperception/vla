@@ -254,7 +254,7 @@ ax1.plot(step, loss, '.w', linewidth=0.1,alpha=1.0, markersize=1)
 if gs_nats.size:
     # scatter, not a line: several prompts are scored at the same step, and the spread
     # between them at one step is itself the reading -- a line would average it away.
-    ax1.plot(gs_step, gs_nats, 'o', color='orange', markersize=3, alpha=0.7,
+    ax1.plot(gs_step, gs_nats, 'o', color='orange', markersize=1.5, alpha=0.7,
              linestyle='none', label='GENSCORE nats')
     ax1.legend(loc='upper right', fontsize=8, framealpha=0.3)
     _off = int((gs_nats > _l_top).sum()) if _l_top else 0
