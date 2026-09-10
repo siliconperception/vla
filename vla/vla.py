@@ -642,6 +642,23 @@ parser.add_argument('--linout',        default=False, action='store_true',
                          'semi-orthogonal rather than identity in that case (an identity '
                          'needs a square matrix): norm-preserving, and dense/signed from step '
                          '0 instead of leaving n_hidden-c_context channels at zero.')
+parser.add_argument('--linout_kernel', default=1,     type=int, metavar='K',
+                    help='kernel size of the --linout conv2d (odd; default 1 = pointwise). '
+                         'K=3 makes it a 3x3 with zero padding K//2, so the S x S grid comes '
+                         'out the size it went in and nothing else in the model changes '
+                         'shape. What DOES change is reach: at 1x1 the projection mixes '
+                         'channels at a single position and every spatial interaction in the '
+                         'layer comes from ContextCNN\'s own convs, so the tensor written to '
+                         'the DFF register is a per-position recombination of that layer\'s '
+                         'output. At 3x3 the write itself is spatial -- each position of the '
+                         'register sees a 3x3 neighbourhood of the layer output -- which adds '
+                         'one more hop of receptive field per step to the recurrence, on the '
+                         'path the state actually travels. Costs 9x the linout weights '
+                         '(n_hidden * c_context * 9), which is small next to the conv stack '
+                         'but not next to a 1x1: at n_hidden 4096, c_context 256 it is 9.4M '
+                         'against 1.0M. Identity init still holds -- dirac_ puts the identity '
+                         'on the CENTRE tap and zeros the rest, so K=3 starts as exactly K=1 '
+                         'and grows its neighbourhood as the off-centre taps move.')
 parser.add_argument('--tap',           default=False, action='store_true',
                     help='put two pointwise 1x1 linear conv2d projections in series after '
                          'each layer\'s last conv2d-BN-ReLU -- the tensor that normally feeds '
@@ -1090,7 +1107,7 @@ if _N_VOCAB:
 
 _ARCH_ARGS = ('context', 'n_hidden', 'c_context', 'c_text', 'n_layers', 'depth', 'kernel',
               'tokenizer', 'head_norm', 'clock', 'accumulate', 'ema', 'ema_ladder', 'qproj',
-              'tap', 'linout',
+              'tap', 'linout', 'linout_kernel',
               'init', 'clock_base', 'clock_max', 'clock_ends', 'clip_dff', 'tap_norm', 'norm', 'norm_groups', 'dff_norm', 'bn_track', 'bn_affine',
                   'bn_momentum', 'bn_eps')
 
@@ -1635,11 +1652,20 @@ class VLAModel(nn.Module, _HubMixin):
             # c_context when it is -- in which case this 1x1 IS the widening, and the last
             # 3x3 (c_context x n_hidden x 9 weights) disappears in favour of it
             # (c_context x n_hidden x 1).
-            self.linout = nn.ModuleList(nn.Conv2d(self.ctx_out, n_hidden, 1)
+            _lk = int(getattr(args, 'linout_kernel', 1) or 1)
+            if _lk < 1 or _lk % 2 == 0:
+                raise SystemExit(f'--linout_kernel {_lk}: must be a positive ODD integer '
+                                 f'(even kernels cannot keep the grid the same size with '
+                                 f'symmetric padding)')
+            # padding K//2 with the default zeros padding_mode: S x S in, S x S out, so the
+            # register, the feedback add and the decoder all keep the shapes they had.
+            self.linout = nn.ModuleList(nn.Conv2d(self.ctx_out, n_hidden, _lk, padding=_lk // 2)
                                         for _ in range(self.n_layers))
             for _c in self.linout:
                 if self.ctx_out == n_hidden:
-                    nn.init.dirac_(_c.weight)     # square: exactly the old identity start
+                    # square: dirac_ is the identity on the CENTRE tap (and zeros elsewhere
+                    # when K>1), so K=3 starts out computing exactly what K=1 does
+                    nn.init.dirac_(_c.weight)
                 else:
                     # Rectangular, so there is no identity. Semi-orthogonal instead: it
                     # preserves the norm of the channel vector at every position (no rescaling
@@ -1649,7 +1675,13 @@ class VLAModel(nn.Module, _HubMixin):
                     # the first c_context channels and leave the other n_hidden-c_context at
                     # zero, i.e. a sparse non-negative register: the thing the flag exists to
                     # avoid, and 75% of the state dead at init when c_context is n_hidden/4.
-                    nn.init.orthogonal_(_c.weight.view(n_hidden, self.ctx_out))
+                    _w = torch.empty(n_hidden, self.ctx_out)
+                    nn.init.orthogonal_(_w)
+                    with torch.no_grad():
+                        _c.weight.zero_()
+                        # centre tap carries the whole projection; the off-centre taps start
+                        # at zero, so K>1 is again exactly K=1 at step 0 and grows from there
+                        _c.weight[:, :, _lk // 2, _lk // 2] = _w
                 nn.init.zeros_(_c.bias)
             self.deep_proj = None          # its job is done by linout now
 
