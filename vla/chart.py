@@ -256,6 +256,17 @@ if gs_nats.size:
     # between them at one step is itself the reading -- a line would average it away.
     ax1.plot(gs_step, gs_nats, 'o', color='orange', markersize=1.5, alpha=0.7,
              linestyle='none', label='GENSCORE nats')
+    # Rolling mean over the scatter. The per-sample spread is wide -- free-running
+    # generation is stochastic and each point is one sample of ~200 tokens -- so the
+    # question the scatter alone cannot answer is whether the CENTRE is moving. Centred and
+    # 'valid', so the line spans only the steps that have a full window behind and ahead of
+    # them: no half-window ramp at either end pretending to be a trend.
+    _w = int(max(3, min(15, gs_nats.size // 10)))
+    if gs_nats.size >= _w:
+        _roll = np.convolve(gs_nats, np.ones(_w) / _w, mode='valid')
+        _half = (_w - 1) // 2
+        ax1.plot(gs_step[_half:_half + _roll.size], _roll, '-', color='#ffd699',
+                 linewidth=1.5, alpha=0.9, label=f'GENSCORE mean ({_w})')
     ax1.legend(loc='upper right', fontsize=8, framealpha=0.3)
     _off = int((gs_nats > _l_top).sum()) if _l_top else 0
     if _off:
