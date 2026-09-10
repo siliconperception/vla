@@ -247,6 +247,14 @@ ax3.plot(step, mean, '-b', linewidth=1.0, alpha=0.5, label='mean')
 _top = ylim_top(std, 'dff_std') or 1.0
 _top = max(_top, float(mean.max()) * 1.05) if mean.size else _top
 _bot = min(0.0, float(mean.min()) * 1.05) if mean.size else 0.0
+# A negative mean has to be VISIBLY negative. Scaling the bottom to the mean alone is not
+# enough when the two series differ in magnitude: v49 runs mean -0.005 against std 0.31, so
+# a bottom of -0.005 is 1.6% of the panel, the tick reads 0.00 and the trace lies on the
+# axis floor -- indistinguishable from a mean pinned at zero, which is the opposite reading.
+# So whenever any sample is negative, at least NEG_SHARE of the panel goes below zero.
+NEG_SHARE = 0.15
+if _bot < 0:
+    _bot = min(_bot, -NEG_SHARE * _top)
 ax3.set_ylim(bottom=_bot, top=_top)
 if _bot < 0:
     ax3.axhline(y=0, color='w', linewidth=0.5, alpha=0.3)   # sign reference for the mean
