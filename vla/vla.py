@@ -726,6 +726,20 @@ parser.add_argument('--datarep',       default=1,     type=int, metavar='N',
                          'Costs N steps per token: at a fixed step budget the model sees 1/N '
                          'of the data, and at a fixed data budget the run takes N times '
                          'longer.')
+parser.add_argument('--gen_pool',      default='last', choices=('last', 'mean'),
+                    help='--datarep > 1: which of a token\'s N replica steps the next-token '
+                         'distribution is drawn from during DECODE (--generate, --vis, the '
+                         'periodic GEN samples). "last" (default) samples from the final '
+                         'replica\'s logits -- the state has settled longest there, and it '
+                         'is what the training stream\'s last replica is optimized to '
+                         'predict. "mean" averages the LOGITS across all N replicas first, '
+                         'which is a geometric mean of the N distributions once softmaxed: '
+                         'it lets the early, less-settled replicas vote, damping a single '
+                         'replica that happens to be confidently wrong at the cost of '
+                         'blurring a sharp late prediction. Every replica is trained against '
+                         'the same target, so both readings are of the same quantity -- this '
+                         'chooses which one the sampler sees. No effect at --datarep 1, '
+                         'where there is one replica and the two are identical.')
 parser.add_argument('--vocab_files',   default=None,
                     help='comma-separated local files of ONE SENTENCE PER LINE that feed a '
                          'BATCHWISE stream (see --vocab_slots). These are NOT framed: no '
@@ -2119,17 +2133,22 @@ class VLAModel(nn.Module, _HubMixin):
                 return None
             return logits
 
+        _pool = getattr(args, 'gen_pool', 'last')
+
         def _feed(b):
-            """--datarep: one token, N steps. The logits returned are the LAST replica's,
-            which is the one that has seen the token settle through the state -- and at
-            N=1 this is exactly _step(). Everything above it therefore reads the same at
-            any --datarep: one sample per token, one token per output position."""
-            lg = None
+            """--datarep: one token, N steps. The logits returned are the LAST replica's by
+            default -- the one that has seen the token settle longest -- or the MEAN over
+            all N replicas under --gen_pool mean. At N=1 both are exactly _step().
+            Everything above it therefore reads the same at any --datarep: one sample per
+            token, one token per output position."""
+            lg = acc = None
             for _ in range(_DATAREP):
                 lg = _step(b)
                 if lg is None:
                     return None
-            return lg
+                if _pool == 'mean':
+                    acc = lg.clone() if acc is None else acc + lg
+            return (acc / _DATAREP) if _pool == 'mean' else lg
 
         # feed each prompt token exactly once; logits after the last one seed generation
         logits = None
@@ -4191,10 +4210,15 @@ if args.vis:
             # ticker then advance one token per frame at any --datarep, which is what keeps
             # the display reading the same -- the intermediate replicas are state settling,
             # not new text, and drawing them would just slow the tape down N-fold.
+            _acc = None
             for _ in range(_DATAREP):
                 stack, new_ctx = model._layers(dff, tok, clk)      # last-layer output
                 dff = [d.detach().clone() for d in stack]
-            logits  = model.readout(model.decoder(new_ctx))
+                logits = model.readout(model.decoder(new_ctx))
+                if args.gen_pool == 'mean':                        # see --gen_pool
+                    _acc = logits.clone() if _acc is None else _acc + logits
+            if args.gen_pool == 'mean':
+                logits = _acc / _DATAREP
         _nstep += _DATAREP
 
         prob = F.softmax(logits[0] / max(args.temperature, 1e-6), dim=-1)
