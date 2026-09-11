@@ -715,6 +715,11 @@ parser.add_argument('--datarep',       default=1,     type=int, metavar='N',
                          'any other token, and the (x, y) pair repeats with them, so every '
                          'replica is trained to predict the SAME next token -- the later '
                          'replicas simply get to use a more settled state to do it.\n'
+                         'CADENCES: --gen_interval, --eval_interval and --checkpoint are '
+                         'scaled by N so they stay fixed in TOKENS -- an eval every 20k '
+                         'tokens is the same amount of training at any N. --monitor is NOT '
+                         'scaled: the STEP line reads in raw steps, so the log resolves the '
+                         'replicas instead of hiding them.\n'
                          'DECODE mirrors training: the prompt is fed N times per token and '
                          'the sample is drawn from the logits of the LAST replica, then that '
                          'sample is itself replicated N times, so one output token appears '
@@ -1137,13 +1142,18 @@ if _DATAREP < 1:
 # NOT dedupable: the loss VALUE. Slots stream independent clips, so at any given step the
 # batch holds a mix of replica positions -- there is no "last replica" step to report.
 if _DATAREP > 1:
-    for _f in ('monitor', 'gen_interval', 'eval_interval', 'checkpoint'):
+    # --monitor is NOT scaled: it is the STEP line cadence and reads in raw steps, so
+    # `--monitor 100` prints every 100 steps at any --datarep and the log resolves the
+    # replicas rather than hiding them. The work cadences are scaled, since those are
+    # about how often a run stops to generate, score or save, which is properly measured
+    # in tokens -- an eval every 20k TOKENS is the same amount of training at any N.
+    for _f in ('gen_interval', 'eval_interval', 'checkpoint'):
         _v = getattr(args, _f, 0) or 0
         if _v > 0:
             setattr(args, _f, _v * _DATAREP)
-    print(f'--datarep {_DATAREP}: each token is fed {_DATAREP}x; monitor/gen/eval/checkpoint '
-          f'intervals scaled to {args.monitor}/{args.gen_interval}/{args.eval_interval}/'
-          f'{args.checkpoint} steps so they stay every {args.monitor // _DATAREP}/'
+    print(f'--datarep {_DATAREP}: each token is fed {_DATAREP}x; --monitor {args.monitor} is '
+          f'raw STEPS; gen/eval/checkpoint scaled to {args.gen_interval}/'
+          f'{args.eval_interval}/{args.checkpoint} steps so they stay every '
           f'{args.gen_interval // _DATAREP if args.gen_interval else 0}/'
           f'{args.eval_interval // _DATAREP if args.eval_interval else 0}/'
           f'{args.checkpoint // _DATAREP} TOKENS', flush=True)
