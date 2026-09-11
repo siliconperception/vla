@@ -726,23 +726,6 @@ parser.add_argument('--datarep',       default=1,     type=int, metavar='N',
                          'Costs N steps per token: at a fixed step budget the model sees 1/N '
                          'of the data, and at a fixed data budget the run takes N times '
                          'longer.')
-parser.add_argument('--loss_last',     default=False, action='store_true',
-                    help='--datarep > 1: take the training loss ONLY on each token\'s LAST '
-                         'replica. The intermediate replicas still run -- they are what '
-                         'evolves the state -- but they are not scored, so the model is free '
-                         'to use them as thinking steps and is graded only on the answer it '
-                         'gives at the end. Pairs with --gen_pool last, which decodes from '
-                         'exactly that step.\n'
-                         'NOTE what this does NOT do: the DFF is detached between steps '
-                         '(gradient horizon 1), so no gradient reaches the thinking steps '
-                         'from the scored one. They are shaped only indirectly, by sharing '
-                         'weights with the step that is scored. This is not BPTT over the '
-                         'replicas.\n'
-                         'One optimizer step per TOKEN rather than per replica: the '
-                         'unscored steps do a forward only, so a --datarep N run does N '
-                         'times fewer updates for the same steps. Held-out EVAL scores the '
-                         'same last-replica positions, so its nats/token measure what the '
-                         'model is actually trained to produce.')
 parser.add_argument('--gen_pool',      default='last', choices=('last', 'mean'),
                     help='--datarep > 1: which of a token\'s N replica steps the next-token '
                          'distribution is drawn from during DECODE (--generate, --vis, the '
@@ -1145,11 +1128,6 @@ _N_VOCAB = (min(args.vocab_slots, args.batch)
 _DATAREP = int(args.datarep or 1)
 if _DATAREP < 1:
     raise SystemExit(f'--datarep {_DATAREP}: must be >= 1 (1 is off)')
-# --loss_last is meaningless without replicas: at N=1 every step IS the last replica.
-_LOSS_LAST = bool(getattr(args, 'loss_last', False)) and _DATAREP > 1
-if getattr(args, 'loss_last', False) and _DATAREP == 1:
-    print('WARNING: --loss_last has no effect at --datarep 1: every step is already a '
-          'token\'s last (and only) replica.')
 # Every human-facing cadence is scaled by N so the run READS the same at any --datarep: a
 # STEP line every --monitor tokens, a sample every --gen_interval tokens, an eval every
 # --eval_interval tokens, a checkpoint every --checkpoint tokens. Without this, N=8 would
@@ -3051,14 +3029,6 @@ class _ClipSlot:
     def done(self):       return self.pos >= len(self.steps)
     def is_start(self):   return self.pos == 0
 
-    def at_last_rep(self):
-        """--loss_last: is the step about to be emitted a token's LAST replica?
-
-        clip_text replicates each pair N times consecutively from index 0, and a clip's
-        length is therefore always a multiple of N, so the replica index of position p is
-        simply p % N -- no extra state to keep, and correct across clip boundaries."""
-        return (self.pos % _DATAREP) == _DATAREP - 1
-
     def advance(self):
         item     = self.steps[self.pos]
         self.pos += 1
@@ -3149,16 +3119,6 @@ class _VocabSlot:
         if self.pos >= len(self.steps):     # called before advance(), so fill here too
             self._load_example()
         return self.pos == 0
-
-    def at_last_rep(self):
-        """--loss_last, vocab slot. Framed pools carry a pre-replicated steps list, so the
-        index gives the phase exactly as it does for a corpus clip; the unframed stream
-        holds its phase in its own counter instead."""
-        if self.framed:
-            if self.pos >= len(self.steps):
-                self._load_example()
-            return (self.pos % _DATAREP) == _DATAREP - 1
-        return self.rep == _DATAREP - 1
 
     def advance(self):
         if self.framed:
@@ -3394,18 +3354,14 @@ def worker(stop, q, datasets, args, mix=None):
                 _epoch_set(k, 1 + _vocab_consumed[k] // pools[k][2])
                 _epoch_frac_set(k, _vocab_consumed[k] / pools[k][2])
 
-        x_list, y_list, flag_list, last_list = [], [], [], []
+        x_list, y_list, flag_list = [], [], []
         for slot in slots:
             flag_list.append(slot.is_start())
-            # asked BEFORE advance(), like is_start(): both describe the step about to be
-            # emitted. Always computed -- it is one modulo per row -- so the queue payload
-            # has the same shape at every --datarep and nothing downstream has to branch.
-            last_list.append(slot.at_last_rep())
             x, y = slot.advance()
             x_list.append(x)
             y_list.append(y)
 
-        q.put((x_list, y_list, flag_list, last_list))
+        q.put((x_list, y_list, flag_list))
 
 
 # ── dataset loading (before CUDA init) ───────────────────────────────────────
@@ -4788,15 +4744,6 @@ def _heldout_eval_one(step, corpus):
                     X[r, :len(st)] = torch.tensor([x for x, _ in st], dtype=torch.long)
                     Y[r, :len(st)] = torch.tensor([y for _, y in st], dtype=torch.long)
                     M[r, :len(st)] = True
-                if _LOSS_LAST:
-                    # score the same positions training scores: a token's LAST replica.
-                    # Every document starts at replica 0 (clip_text replicates from index
-                    # 0), so position t's replica index is t % N for every row. Without
-                    # this the eval would average in the thinking steps the model is never
-                    # graded on, and its nats/token would not be the quantity being trained.
-                    _lastpos = torch.zeros(T, dtype=torch.bool)
-                    _lastpos[_DATAREP - 1::_DATAREP] = True
-                    M &= _lastpos.unsqueeze(0)
                 X, Y, M = X.to(_dev), Y.to(_dev), M.to(_dev)
                 model.dff = None        # fresh context per document (see _new_dff/--init)
                 rs = torch.zeros(B, device=_dev)
@@ -5045,7 +4992,6 @@ if args.eval and args.eval_corpora:
 larr, garr = [], []
 carr = []             # --clip: 1.0 on steps whose grad norm hit the limit
 varr = []             # --vocab_slots: per-step loss over the vocab slots alone
-_scored_n = 0         # --loss_last: steps that actually carried a loss (see the monitor)
 i = _start_step        # continue the step count from the resumed checkpoint (0 if fresh)
 # cumulative count of training examples (one <STX>..<ETX> clip) begun, over all slots;
 # a slot's flag is True on the step it emits its <STX>, so summing flags counts examples.
@@ -5064,7 +5010,7 @@ _gen_interval = args.gen_interval or args.checkpoint
 if args.preroll:
     _pre = 0
     while True:
-        _, _y_list, _, _ = q.get()
+        _, _y_list, _ = q.get()
         _pre += 1
         if model.end_id in _y_list:   # a slot just emitted the <ETX> target ending its clip
             break
@@ -5172,34 +5118,16 @@ try:
                 print('\n' + '\n'.join(lines) + '\n', file=f)
 
         # ── fetch batch ───────────────────────────────────────────────────────
-        x_list, y_list, flag_list, last_list = q.get()
+        x_list, y_list, flag_list = q.get()
         n_examples += sum(flag_list)
         x    = torch.tensor(x_list,    dtype=torch.long).to(args.device)
         y    = torch.tensor(y_list,    dtype=torch.long).to(args.device)
         flag = torch.tensor(flag_list, dtype=torch.bool).to(args.device)
-        lastm = (torch.tensor(last_list, dtype=torch.bool).to(args.device)
-                 if _LOSS_LAST else None)
 
         # ── train step ────────────────────────────────────────────────────────
         dff_prev = model.dff                                    # save pre-step DFF
         model.train()
         logits, loss = model(x, targets=y, flag=flag)
-
-        # ── --loss_last: score only the rows on a token's last replica ───────────────
-        # The unscored steps still ran: they evolved the DFF the scored step reads, which
-        # is the whole point -- the model gets N-1 free steps to settle before it is graded.
-        # They receive no gradient of their own (the state is detached between steps), so
-        # this is thinking-by-shared-weights, not BPTT over the replicas.
-        # `_scored` False means NO row is on its last replica this step, so there is nothing
-        # to learn from: skip backward and the optimizer entirely and let the state advance.
-        _scored = True
-        if _LOSS_LAST:
-            _n_last = int(lastm.sum())
-            if _n_last:
-                _per = F.cross_entropy(logits, y.long(), reduction='none')
-                loss = (_per * lastm).sum() / _n_last     # mean over the scored rows only
-            else:
-                _scored = False
 
         # ── instrumentation: the vocab channel's loss, separately from the corpus ──────
         # The batch loss is dominated by the 249 corpus slots, so a single vocab slot is
@@ -5222,19 +5150,6 @@ try:
             print(f'  grads(prev step): {_diag(model)}')
             break
 
-        if not _scored:
-            # Forward-only step: no loss, no update. The state bookkeeping still has to
-            # match a scored step exactly -- restore the pre-step DFF and recompute it in
-            # EVAL mode -- or the thinking steps would advance the state through train-mode
-            # BatchNorm while the scored steps use eval-mode, and the two would disagree.
-            model.dff = dff_prev
-            model.eval()
-            with torch.no_grad():
-                _, _ = model(x, targets=y, flag=flag)
-            i += 1
-            continue
-
-        _scored_n += 1
         loss.backward()
 
         # --clip rescales every gradient so the global norm is at most args.clip.
@@ -5268,13 +5183,7 @@ try:
         if _plateau:
             _plat_sum, _plat_n = _plat_sum + larr[-1], _plat_n + 1   # binned at --checkpoint
 
-        # --loss_last makes only 1 step in N scored, and args.monitor was scaled by N, so
-        # `i % args.monitor` would land on an unscored step every time and never print.
-        # Count scored steps instead: one STEP line every (monitor / N) of them, which is
-        # the same cadence in TOKENS the flag-scaling already promises.
-        _due = ((_scored_n % max(1, args.monitor // _DATAREP)) == 0 if _LOSS_LAST
-                else (i % args.monitor) == 0)
-        if _due:
+        if (i % args.monitor) == 0:
             _dmean, _dstd, _dmax, _dzero = _dff_stats(model.dff)
             # batch is logged per step, not just in the ARGS line: a run resumed from a
             # checkpoint at a different --batch appends to a new log, so chart.py needs the
