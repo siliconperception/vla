@@ -707,6 +707,25 @@ parser.add_argument('--bdict_file',    default='basic_dict_e3.txt',
                          'and is a strict superset (same 848 words, same first 3 sentences '
                          'verbatim), so a pair of runs isolates "more text per item" from '
                          'every other variable.')
+parser.add_argument('--datarep',       default=1,     type=int, metavar='N',
+                    help='feed every token N TIMES IN A ROW, giving the recurrent state N '
+                         'steps of computation per input token instead of one (default 1 = '
+                         'off, byte-identical to before this flag existed). The replication '
+                         'is per slot and covers the framing: <STX> and <ETX> repeat like '
+                         'any other token, and the (x, y) pair repeats with them, so every '
+                         'replica is trained to predict the SAME next token -- the later '
+                         'replicas simply get to use a more settled state to do it.\n'
+                         'DECODE mirrors training: the prompt is fed N times per token and '
+                         'the sample is drawn from the logits of the LAST replica, then that '
+                         'sample is itself replicated N times, so one output token appears '
+                         'every N steps (--generate, --vis and the periodic GEN samples all '
+                         'work this way). Held-out eval replicates too, since it frames '
+                         'documents with the same clip_text the trainer uses -- so its '
+                         'nats/token stay comparable WITHIN a --datarep setting but not '
+                         'across two different ones.\n'
+                         'Costs N steps per token: at a fixed step budget the model sees 1/N '
+                         'of the data, and at a fixed data budget the run takes N times '
+                         'longer.')
 parser.add_argument('--vocab_files',   default=None,
                     help='comma-separated local files of ONE SENTENCE PER LINE that feed a '
                          'BATCHWISE stream (see --vocab_slots). These are NOT framed: no '
@@ -1086,6 +1105,31 @@ _mix = _parse_mix(args.mix)
 # Slot order is vocab-first (see worker()), so rows [0:_N_VOCAB] are the vocab channel.
 _N_VOCAB = (min(args.vocab_slots, args.batch)
             if (args.vocab_files or '').strip() and args.vocab_slots else 0)
+
+# --datarep, resolved once at module scope: clip_text, the vocab slots, generate() and the
+# --vis loop all read it, and they run in different threads.
+_DATAREP = int(args.datarep or 1)
+if _DATAREP < 1:
+    raise SystemExit(f'--datarep {_DATAREP}: must be >= 1 (1 is off)')
+# Every human-facing cadence is scaled by N so the run READS the same at any --datarep: a
+# STEP line every --monitor tokens, a sample every --gen_interval tokens, an eval every
+# --eval_interval tokens, a checkpoint every --checkpoint tokens. Without this, N=8 would
+# print 8x the STEP lines and generate 8x the samples for the same data.
+# NOT scaled: --run_steps, which is the step budget the user is explicitly spending, and the
+# step NUMBER itself, which is the optimizer clock the checkpoint and resume logic run on.
+# NOT dedupable: the loss VALUE. Slots stream independent clips, so at any given step the
+# batch holds a mix of replica positions -- there is no "last replica" step to report.
+if _DATAREP > 1:
+    for _f in ('monitor', 'gen_interval', 'eval_interval', 'checkpoint'):
+        _v = getattr(args, _f, 0) or 0
+        if _v > 0:
+            setattr(args, _f, _v * _DATAREP)
+    print(f'--datarep {_DATAREP}: each token is fed {_DATAREP}x; monitor/gen/eval/checkpoint '
+          f'intervals scaled to {args.monitor}/{args.gen_interval}/{args.eval_interval}/'
+          f'{args.checkpoint} steps so they stay every {args.monitor // _DATAREP}/'
+          f'{args.gen_interval // _DATAREP if args.gen_interval else 0}/'
+          f'{args.eval_interval // _DATAREP if args.eval_interval else 0}/'
+          f'{args.checkpoint // _DATAREP} TOKENS', flush=True)
 
 # Validated HERE, in the main thread, not in worker(): worker runs as a thread, and a
 # SystemExit raised there kills only that thread -- the training loop then blocks forever
@@ -2075,10 +2119,22 @@ class VLAModel(nn.Module, _HubMixin):
                 return None
             return logits
 
+        def _feed(b):
+            """--datarep: one token, N steps. The logits returned are the LAST replica's,
+            which is the one that has seen the token settle through the state -- and at
+            N=1 this is exactly _step(). Everything above it therefore reads the same at
+            any --datarep: one sample per token, one token per output position."""
+            lg = None
+            for _ in range(_DATAREP):
+                lg = _step(b)
+                if lg is None:
+                    return None
+            return lg
+
         # feed each prompt token exactly once; logits after the last one seed generation
         logits = None
         for b in prompt_ids:
-            logits = _step(b)
+            logits = _feed(b)
             if logits is None:
                 return []
 
@@ -2094,7 +2150,7 @@ class VLAModel(nn.Module, _HubMixin):
                 break
             if bval != self.null_id:   # null_id is None outside byte mode: nothing filtered
                 out.append(bval)
-            logits = _step(bval)
+            logits = _feed(bval)           # the sample is replicated too, like a real token
             if logits is None:
                 break
         return out
@@ -2278,9 +2334,18 @@ def _text_anchors():
 
 def clip_text(text):
     """One step per token: input/target are consecutive ids of [START]+text+[END].
-    Tokens are raw bytes or BPE ids depending on --tokenizer; nothing downstream cares."""
+    Tokens are raw bytes or BPE ids depending on --tokenizer; nothing downstream cares.
+
+    --datarep N repeats each (x, y) pair N times, so the stream is the same tokens with the
+    same targets, N steps each. Done HERE because this is the one place both the training
+    clips and the held-out eval documents are framed -- putting it in the slot instead would
+    replicate training and leave eval scoring a different stream. _ClipSlot needs no change:
+    its is_start() is pos == 0, which is still the first replica of the first pair, so the
+    state resets once per document rather than once per replica."""
     full = [_tokenizer.start_id] + _tokenizer.encode(text) + [_tokenizer.end_id]
     steps = [(full[i], full[i + 1]) for i in range(len(full) - 1)]
+    if _DATAREP > 1:
+        steps = [pair for pair in steps for _ in range(_DATAREP)]
     return steps, text
 
 
@@ -2971,7 +3036,7 @@ class _VocabSlot:
     Each slot keeps its own shuffled permutation and reshuffles on wrap, so N slots are
     N independent orderings of the same file rather than N copies of one ordering."""
     __slots__ = ['pool', 'texts', 'name', 'rng', 'order', 'oi', 'ids', 'pos',
-                 'framed', 'steps', 'names']
+                 'framed', 'steps', 'names', 'rep']
 
     def __init__(self, pool, name, seed, texts=None, framed=False, names=None):
         self.pool, self.name, self.texts = pool, name, texts
@@ -2984,6 +3049,7 @@ class _VocabSlot:
         self.order = list(range(len(pool)))
         self.rng.shuffle(self.order)
         self.oi, self.ids, self.pos = 0, [], 0
+        self.rep   = 0        # --datarep: replicas of the current pair already emitted
         self.steps = []
 
     def _next_index(self):
@@ -3000,6 +3066,8 @@ class _VocabSlot:
         j   = self._next_index()
         ids = [_tokenizer.start_id] + list(self.pool[j]) + [_tokenizer.end_id]
         self.steps = [(ids[i], ids[i + 1]) for i in range(len(ids) - 1)]
+        if _DATAREP > 1:                       # same replication clip_text applies
+            self.steps = [pair for pair in self.steps for _ in range(_DATAREP)]
         self.pos   = 0
         k = self.names[j] if self.names else self.name
         _vocab_consumed[k] = _vocab_consumed.get(k, 0) + 1
@@ -3034,6 +3102,12 @@ class _VocabSlot:
         while self.pos + 1 >= len(self.ids):
             self._append_next()
         x, y = self.ids[self.pos], self.ids[self.pos + 1]
+        # --datarep: hold this pair for N steps before moving down the stream. The unframed
+        # slot has no steps list to pre-expand, so the counter lives here instead.
+        self.rep += 1
+        if self.rep < _DATAREP:
+            return (x, y)
+        self.rep = 0
         self.pos += 1
         if self.pos > 8192:                 # drop the consumed prefix; keeps memory flat
             self.ids = self.ids[self.pos:]
@@ -4113,10 +4187,15 @@ if args.vis:
         with torch.no_grad():
             bi   = torch.tensor([_b], dtype=torch.long, device=_dev)
             tok  = model.tok_embed(bi).view(1, model.c_text, 1, 1).expand(-1, -1, model.S, model.S)
-            stack, new_ctx = model._layers(dff, tok, clk)          # last-layer output
-            dff     = [d.detach().clone() for d in stack]
+            # --datarep: N model steps per FRAME, not N frames per token. The panels and the
+            # ticker then advance one token per frame at any --datarep, which is what keeps
+            # the display reading the same -- the intermediate replicas are state settling,
+            # not new text, and drawing them would just slow the tape down N-fold.
+            for _ in range(_DATAREP):
+                stack, new_ctx = model._layers(dff, tok, clk)      # last-layer output
+                dff = [d.detach().clone() for d in stack]
             logits  = model.readout(model.decoder(new_ctx))
-        _nstep += 1
+        _nstep += _DATAREP
 
         prob = F.softmax(logits[0] / max(args.temperature, 1e-6), dim=-1)
 
@@ -4777,7 +4856,10 @@ def _reason_eval(step):
                         model.dff = None
                         acc = torch.zeros(B, device=_dev)
                         for t in range(T):
-                            lg, _ = model(X[:, t])
+                            # --datarep: N steps per token, scored on the last replica --
+                            # the same contract training and generate() use
+                            for _ in range(_DATAREP):
+                                lg, _ = model(X[:, t])
                             lp = -F.cross_entropy(lg, Y[:, t], reduction='none')
                             lp = torch.where(torch.isfinite(lp), lp, torch.full_like(lp, -1e30))
                             acc += lp * M[:, t]
