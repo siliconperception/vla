@@ -715,11 +715,11 @@ parser.add_argument('--datarep',       default=1,     type=int, metavar='N',
                          'any other token, and the (x, y) pair repeats with them, so every '
                          'replica is trained to predict the SAME next token -- the later '
                          'replicas simply get to use a more settled state to do it.\n'
-                         'CADENCES: --gen_interval, --eval_interval and --checkpoint are '
-                         'scaled by N so they stay fixed in TOKENS -- an eval every 20k '
-                         'tokens is the same amount of training at any N. --monitor is NOT '
-                         'scaled: the STEP line reads in raw steps, so the log resolves the '
-                         'replicas instead of hiding them.\n'
+                         'CADENCES: --monitor, --gen_interval and --checkpoint are RAW '
+                         'STEPS at any N -- they say what they mean and they are what the '
+                         'operator watches. Only --eval_interval is scaled by N, because its '
+                         'number is compared ACROSS runs: "held-out at 20k tokens" has to be '
+                         'the same amount of training whatever N is.\n'
                          'DECODE mirrors training: the prompt is fed N times per token and '
                          'the sample is drawn from the logits of the LAST replica, then that '
                          'sample is itself replicated N times, so one output token appears '
@@ -1142,21 +1142,20 @@ if _DATAREP < 1:
 # NOT dedupable: the loss VALUE. Slots stream independent clips, so at any given step the
 # batch holds a mix of replica positions -- there is no "last replica" step to report.
 if _DATAREP > 1:
-    # --monitor is NOT scaled: it is the STEP line cadence and reads in raw steps, so
-    # `--monitor 100` prints every 100 steps at any --datarep and the log resolves the
-    # replicas rather than hiding them. The work cadences are scaled, since those are
-    # about how often a run stops to generate, score or save, which is properly measured
-    # in tokens -- an eval every 20k TOKENS is the same amount of training at any N.
-    for _f in ('gen_interval', 'eval_interval', 'checkpoint'):
-        _v = getattr(args, _f, 0) or 0
-        if _v > 0:
-            setattr(args, _f, _v * _DATAREP)
-    print(f'--datarep {_DATAREP}: each token is fed {_DATAREP}x; --monitor {args.monitor} is '
-          f'raw STEPS; gen/eval/checkpoint scaled to {args.gen_interval}/'
-          f'{args.eval_interval}/{args.checkpoint} steps so they stay every '
-          f'{args.gen_interval // _DATAREP if args.gen_interval else 0}/'
-          f'{args.eval_interval // _DATAREP if args.eval_interval else 0}/'
-          f'{args.checkpoint // _DATAREP} TOKENS', flush=True)
+    # Only --eval_interval is scaled. Everything else reads in RAW STEPS, which is what
+    # the flags say and what the operator is watching: --monitor prints every N steps,
+    # --gen_interval samples every N steps, --checkpoint saves every N steps, at any
+    # --datarep. The held-out eval is the exception because its number is compared ACROSS
+    # runs -- "held-out at 20k tokens" has to mean the same amount of training whatever N
+    # is, or two runs' EVAL lines are not measuring the same point.
+    _v = getattr(args, 'eval_interval', 0) or 0
+    if _v > 0:
+        args.eval_interval = _v * _DATAREP
+    print(f'--datarep {_DATAREP}: each token is fed {_DATAREP}x. RAW STEPS: --monitor '
+          f'{args.monitor}, --gen_interval {args.gen_interval}, --checkpoint '
+          f'{args.checkpoint}. SCALED: --eval_interval {args.eval_interval} steps '
+          f'(= every {args.eval_interval // _DATAREP if args.eval_interval else 0} tokens, '
+          f'so EVAL stays comparable across --datarep)', flush=True)
 
 # Validated HERE, in the main thread, not in worker(): worker runs as a thread, and a
 # SystemExit raised there kills only that thread -- the training loop then blocks forever
