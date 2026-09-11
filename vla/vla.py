@@ -4252,6 +4252,8 @@ if args.vis:
     _b      = _queue.pop(0)   # current token being injected
     _ticker = _ptext          # ticker-tape display buffer (trailing _VIS_WIN chars)
     _nstep  = 0
+    _rep    = 0               # --datarep: replicas of the current token drawn so far
+    _acc    = None            # --gen_pool mean: probabilities pooled across them
     dff     = model._new_dff(1, _dev)
     clk     = model._new_clock(1, _dev)   # this episode's --clock state
 
@@ -4259,25 +4261,29 @@ if args.vis:
         with torch.no_grad():
             bi   = torch.tensor([_b], dtype=torch.long, device=_dev)
             tok  = model.tok_embed(bi).view(1, model.c_text, 1, 1).expand(-1, -1, model.S, model.S)
-            # --datarep: N model steps per FRAME, not N frames per token. The panels and the
-            # ticker then advance one token per frame at any --datarep, which is what keeps
-            # the display reading the same -- the intermediate replicas are state settling,
-            # not new text, and drawing them would just slow the tape down N-fold.
-            _acc = None
-            for _ in range(_DATAREP):
-                stack, new_ctx = model._layers(dff, tok, clk)      # last-layer output
-                dff = [d.detach().clone() for d in stack]
-                logits = model.readout(model.decoder(new_ctx))
-                if args.gen_pool == 'mean':                        # see --gen_pool
-                    _p   = F.softmax(logits, dim=-1)
-                    _acc = _p if _acc is None else _acc + _p
-            if args.gen_pool == 'mean':
-                logits = torch.log((_acc / _DATAREP).clamp_min(1e-20))
-        _nstep += _DATAREP
+            # ONE model step per FRAME, at every --datarep: the replicas are exactly what
+            # this display exists to show -- the state settling within a token -- so they
+            # are drawn, not collapsed. The token only ADVANCES on the last replica, so the
+            # ticker still gains one character per token while the panels update N times.
+            stack, new_ctx = model._layers(dff, tok, clk)          # last-layer output
+            dff    = [d.detach().clone() for d in stack]
+            logits = model.readout(model.decoder(new_ctx))
+            if args.gen_pool == 'mean':                            # see --gen_pool
+                _p   = F.softmax(logits, dim=-1)
+                _acc = _p if _acc is None else _acc + _p
+        _nstep += 1
+        _rep  += 1
+        _last  = _rep >= _DATAREP
 
-        prob = F.softmax(logits[0] / max(args.temperature, 1e-6), dim=-1)
+        # The grid shows THIS replica's distribution as it forms; on the last replica it
+        # shows the one actually sampled from (pooled under --gen_pool mean).
+        _lg = (torch.log((_acc / _DATAREP).clamp_min(1e-20))
+               if (_last and args.gen_pool == 'mean') else logits)
+        prob = F.softmax(_lg[0] / max(args.temperature, 1e-6), dim=-1)
 
-        if _queue:
+        if not _last:
+            pass                           # thinking step: draw it, emit nothing
+        elif _queue:
             _b = _queue.pop(0)             # still draining the prompt
         else:
             nxt = int(torch.multinomial(prob, 1).item())
@@ -4295,6 +4301,9 @@ if args.vis:
                     _ticker += _vc(nxt)
                 _b = nxt
             _ticker = _ticker[-_VIS_WIN:]  # slide + bound the visible window (ticker tape)
+
+        if _last:                          # token consumed: start the next one's replicas
+            _rep, _acc = 0, None
 
         # ── render ──────────────────────────────────────────────────────────
         # DFF-std panel shows the last layer's state (the one feeding the decoder).
