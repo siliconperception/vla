@@ -732,14 +732,17 @@ parser.add_argument('--gen_pool',      default='last', choices=('last', 'mean'),
                          'periodic GEN samples). "last" (default) samples from the final '
                          'replica\'s logits -- the state has settled longest there, and it '
                          'is what the training stream\'s last replica is optimized to '
-                         'predict. "mean" averages the LOGITS across all N replicas first, '
-                         'which is a geometric mean of the N distributions once softmaxed: '
-                         'it lets the early, less-settled replicas vote, damping a single '
-                         'replica that happens to be confidently wrong at the cost of '
-                         'blurring a sharp late prediction. Every replica is trained against '
-                         'the same target, so both readings are of the same quantity -- this '
-                         'chooses which one the sampler sees. No effect at --datarep 1, '
-                         'where there is one replica and the two are identical.')
+                         'predict. "mean" takes the ARITHMETIC MEAN OF THE PROBABILITIES '
+                         'across all N replicas -- softmax each, average, sample from that -- '
+                         'so the replicas vote as distributions and one confidently wrong '
+                         'replica is outvoted rather than dominating. (An arithmetic mean of '
+                         'probabilities, not of logits: a logit mean is a GEOMETRIC mean once '
+                         'softmaxed, where a single near-zero probability vetoes a token no '
+                         'matter what the others say.) --temperature still applies, to the '
+                         'pooled distribution. Every replica is trained against the same '
+                         'target, so both readings are of the same quantity -- this chooses '
+                         'which one the sampler sees. No effect at --datarep 1, where there '
+                         'is one replica and the two are identical.')
 parser.add_argument('--vocab_files',   default=None,
                     help='comma-separated local files of ONE SENTENCE PER LINE that feed a '
                          'BATCHWISE stream (see --vocab_slots). These are NOT framed: no '
@@ -2147,8 +2150,14 @@ class VLAModel(nn.Module, _HubMixin):
                 if lg is None:
                     return None
                 if _pool == 'mean':
-                    acc = lg.clone() if acc is None else acc + lg
-            return (acc / _DATAREP) if _pool == 'mean' else lg
+                    p = F.softmax(lg, dim=-1)          # pool PROBABILITIES, not logits
+                    acc = p if acc is None else acc + p
+            if _pool != 'mean':
+                return lg
+            # Returned as log(mean p) so every caller downstream is unchanged: they do
+            # softmax(x / T), and softmax(log p / T) is p^(1/T)/Z -- the temperature applied
+            # to the POOLED distribution, and exactly p at T=1. clamp keeps log(0) finite.
+            return torch.log((acc / _DATAREP).clamp_min(1e-20))
 
         # feed each prompt token exactly once; logits after the last one seed generation
         logits = None
@@ -4216,9 +4225,10 @@ if args.vis:
                 dff = [d.detach().clone() for d in stack]
                 logits = model.readout(model.decoder(new_ctx))
                 if args.gen_pool == 'mean':                        # see --gen_pool
-                    _acc = logits.clone() if _acc is None else _acc + logits
+                    _p   = F.softmax(logits, dim=-1)
+                    _acc = _p if _acc is None else _acc + _p
             if args.gen_pool == 'mean':
-                logits = _acc / _DATAREP
+                logits = torch.log((_acc / _DATAREP).clamp_min(1e-20))
         _nstep += _DATAREP
 
         prob = F.softmax(logits[0] / max(args.temperature, 1e-6), dim=-1)
