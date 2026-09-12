@@ -540,7 +540,14 @@ parser.add_argument('--clock_base',    default=2.0,   type=float, metavar='B',
                          '--clock sync/incr/exp, whose ladders are not geometric')
 parser.add_argument('--accumulate',    default=False,
                     action=argparse.BooleanOptionalAction,
-                    help='what a clocked layer writes: the mean of every output it computed '
+                    help='DEPRECATED, ACCEPTED AND IGNORED. It only ever applied to a layer '
+                         'that HOLDS its register, and nothing holds any more: --ema_ladder '
+                         'forces every period to 1 and --clock sync writes every layer every '
+                         'step, so the "mean of the outputs since the last write" was always '
+                         'a mean over one output. The flag stays parseable so the command '
+                         'lines in ./doit still run; it warns and has no effect. Original '
+                         'behaviour, for reading old runs: '
+                         'what a clocked layer writes: the mean of every output it computed '
                          'since its last write, instead of just the one from the step it '
                          'writes on. Applies to every --clock mode. Without it a held layer '
                          'samples -- the outputs computed while it was holding never reach '
@@ -1131,6 +1138,16 @@ _N_VOCAB = (min(args.vocab_slots, args.batch)
 
 # --datarep, resolved once at module scope: clip_text, the vocab slots, generate() and the
 # --vis loop all read it, and they run in different threads.
+# --accumulate is deprecated: accepted so old command lines still run, ignored so it cannot
+# silently change a run. It only ever did anything for a layer that HELD its register, and
+# with --ema_ladder (periods forced to 1) or --clock sync nothing holds.
+if getattr(args, 'accumulate', False):
+    print('WARNING: --accumulate is DEPRECATED and ignored. It applied only to layers that '
+          'hold their register between writes; --ema_ladder and --clock sync both write '
+          'every layer every step, so it averaged a single output. Drop it from the command '
+          'line.', flush=True)
+    args.accumulate = False
+
 _DATAREP = int(args.datarep or 1)
 if _DATAREP < 1:
     raise SystemExit(f'--datarep {_DATAREP}: must be >= 1 (1 is off)')

@@ -52,7 +52,7 @@ CMD=(python vla.py
   --opt sgd --momentum 0.0 --weight_decay 0.0
   --schedule const --lr_max 0.03 --device cuda
   --n_layers 3 --depth 17 --clock fixed --clock_base 13.15
-  --init zero --ema 0.5 --accumulate
+  --init zero --ema 0.5
   --run_steps $((S+1)) --checkpoint 5000
   --gen_interval 500 --eval_interval 5000
   --log log/exp.$M --save checkpoint/$M.pt
