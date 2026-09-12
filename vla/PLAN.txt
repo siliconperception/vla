@@ -1,4 +1,59 @@
 ============================================================================
+                 EMA WINDOW SWEEP -- RESULT, 2026-09-12
+============================================================================
+THE DFF FEEDBACK IS THE MODEL.  Not the conv depth: two runs with an IDENTICAL
+parameter count (57,561,344), identical conv depth, identical linout on both
+layers, identical data in identical order, differing only in whether layer 2
+owns a register (--dff_every 2):
+
+    L1 8 tok + L2 16 tok registers     final500  6.7188
+    L1 8 tok only, L2 straight through final500  7.2219     +0.503 nats
+
+One register plus a passive conv layer is worse than TWO REPLACE-OUTRIGHT
+registers (2L 1,1 = 6.9486).  The recurrent state is carrying the work; depth
+is not a substitute for it.
+
+THE EMA WINDOW HAS AN OPTIMUM AT 64-256 TOKENS.  One layer, fixed corpus
+(--dataset file data/fineweb2k.jsonl, no shuffle), 1000 steps, one seed, only
+--ema_ladder changing.  n_hidden 4096, c_context 256, depth 16, context 16,
+batch 250, lr 0.03 sgd, --linout --linout_kernel 3:
+
+    window  blend      @500     final250
+         1  1.0        7.5513   7.3851      replace outright
+         4  0.25       7.4042   7.1898
+        16  0.0625     7.2963   7.0612
+        64  0.015625   7.1781   7.0200   <- best @500
+       256  0.0039062  7.2397   7.0176   <- best final250
+      1024  0.00097656 7.3594   7.2202
+      4096  0.00024414 7.4323   7.3018
+     16384  6.1035e-05 7.4495   7.3627
+     65536  1.5259e-05 7.4514   7.4158
+
+64 and 256 are a tie (0.0024 apart, below within-run jitter).  Both sides fall
+away steeply: 1024 is 0.20 worse than the peak, back at window-16 level.
+
+THE FAR END IS THE POINT.  Window 65536 (7.4158) is WORSE THAN WINDOW 1
+(7.3851): as the blend rate goes to zero the register stops tracking and the
+layer is left reading a stale state, which is worse than no memory at all.  So
+the window is a real optimum, not a monotone "longer is better" -- and the
+degradation starts around the MEAN DOCUMENT LENGTH (~800 tokens here), which is
+where the register begins averaging across <ETX> boundaries faster than they
+can clear it.
+
+METHOD NOTE, and the reason these numbers can be trusted at 0.01 nats where the
+earlier sweeps could not: --dataset file reads a fixed JSONL corpus in file
+order with no shuffle, and two runs at the same --seed are BIT-IDENTICAL at
+every logged step (verified at 2 and 12 workers).  On a hub corpus the
+streaming shuffle is not seed-controlled, and the run-to-run sigma (0.02-0.07,
+0.42 at step 200 between an identical pair) swamped everything below ~0.1 nats.
+The shuffled-corpus ladder sweeps that preceded this resolved only BANDS:
+memory vs none (0.24-0.35 nats) and 1 layer vs 2 (0.06-0.09), while the seven
+2-layer ladders with memory spanned 0.041 and reshuffled by up to 3 places
+between step 1000 and step 2000 (Spearman rho 0.714 within that band).
+
+NEXT: two layers, L2 pinned at 256, sweeping L1 = 4, 16, 64, 256.
+
+============================================================================
                     READ THIS FIRST -- PHASE 3 HANDOFF
                  written 2026-09-07, end of the Phase 2 session
 ============================================================================
