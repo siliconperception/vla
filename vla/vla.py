@@ -702,6 +702,34 @@ parser.add_argument('--mix',           default=None,
                     help='joint multi-dataset training, "name:weight,..." e.g. '
                          '"brt:0.5,web:0.5"; overrides --dataset, samples one dataset per clip '
                          '(token-proportional)')
+parser.add_argument('--shuffle',       default=None,
+                    action=argparse.BooleanOptionalAction,
+                    help='shuffle the corpus, or read it in FILE ORDER. Unset (the default) '
+                         'is per-dataset: on for every hub corpus, which is what every run '
+                         'before this flag did, and OFF for --dataset file, whose whole '
+                         'purpose is a fixed sequence. --shuffle forces it on even for a '
+                         'file, --no-shuffle forces it off even for a hub corpus.\n'
+                         'What "on" means depends on the load: a buffer when streaming, a '
+                         'true permutation for a corpus small enough to fit page cache, a '
+                         'sharded buffer otherwise (see _make_iter). None of those is '
+                         'reproducible across runs -- the builder threads race for the '
+                         'iterator -- so --no-shuffle is what makes two runs see the same '
+                         'documents in the same order, and the only way to tell a 0.04-nat '
+                         'config difference from a different draw.')
+parser.add_argument('--data_file',     default='data/fineweb2k.jsonl',
+                    help='file backing --dataset file: a LOCAL JSONL corpus, one JSON object '
+                         'per line with a "text" field. Unlike every hub corpus this one is '
+                         'READ IN FILE ORDER AND NEVER SHUFFLED -- not at load, not in a '
+                         'buffer, not per epoch -- so two runs see the same documents in the '
+                         'same sequence and the data stops being a source of run-to-run '
+                         'variance. That is the point: the streaming shuffle is not '
+                         'seed-controlled, so on a hub corpus even --seed leaves the batch '
+                         'composition thread-scheduling dependent, and a 0.04-nat difference '
+                         'between two configs cannot be told from a different draw. JSONL '
+                         'rather than plain lines because documents contain newlines; '
+                         'data/fineweb2k.jsonl (2000 fineweb docs, 6.3M chars) is the one '
+                         'this repo ships. Small enough to wrap many times in a run: the '
+                         'epoch column counts passes and they are IDENTICAL passes.')
 parser.add_argument('--bdict_file',    default='basic_dict_e3.txt',
                     help='file backing --dataset bdict: a LOCAL plain-text corpus, ONE '
                          'DOCUMENT PER LINE. Unlike every other corpus here it is authored '
@@ -2516,6 +2544,10 @@ _TEXT_DATASETS = {
     # before the repo is read -- but the 'text' column and 'train' split still have to be
     # here so _corpus_text and _split_for_name resolve exactly as for a hub corpus.
     'bdict':   (None, None, 'train', 'text'),
+    # Local JSONL, --data_file. repo None for the same reason bdict's is: _init_one_dataset
+    # intercepts the name before the repo is read. Split and column still have to be here so
+    # _corpus_text and _split_for_name resolve exactly as for a hub corpus.
+    'file':    (None, None, 'train', 'text'),
 }
 
 # Repos where only a SUBSET of the files is on disk, loaded from the hub cache directly.
@@ -2916,6 +2948,14 @@ def _init_one_dataset(name, streaming, shards=None):
                                args.teacher_topk, args.teacher_topp, args.synth_min,
                                args.synth_max, args.teacher_device or args.device,
                                seed=args.seed, rep_penalty=args.teacher_rep_penalty)
+    if name == 'file':
+        path = args.data_file
+        if not os.path.exists(path):
+            raise SystemExit(f'--dataset file: no such file: {path} (set --data_file)')
+        n = sum(1 for _ in open(path))
+        _how = 'SHUFFLED (--shuffle)' if args.shuffle else 'file order, NOT shuffled'
+        print(f'file: {path} ({n} documents, {_how})', flush=True)
+        return load_dataset('json', data_files={'train': path}, streaming=streaming)
     if name == 'bdict':
         # one document per LINE. datasets' 'text' builder with the default sample_by='line'
         # is exactly that, so the rest of the pipeline (shuffle, epoch wrap, _corpus_text)
@@ -3003,12 +3043,18 @@ def _init_one_dataset(name, streaming, shards=None):
 _EXACT_SHUFFLE_BYTES = 1 << 30
 
 
-def _make_iter(ds, split, streaming, seed, buffer_size=10000):
+def _make_iter(ds, split, streaming, seed, buffer_size=10000, shuffle=True):
     # a SyntheticCorpus is already an infinite iid stream: there is no split to select and
     # nothing a shuffle buffer could reorder that is not already random.
     if isinstance(ds, SyntheticCorpus):
         return iter(ds)
     split_ds = ds[split] if split in ds else ds['train']
+    # --dataset file: iterate in FILE ORDER. Every other branch below shuffles somehow --
+    # a buffer when streaming, a permutation when small, a sharded buffer otherwise -- and
+    # none of that is reproducible across runs, so a fixed corpus is the only way to take
+    # the data out of the comparison. Returned before any of them.
+    if not shuffle:
+        return iter(split_ds)
     if streaming:
         return iter(split_ds.shuffle(buffer_size=buffer_size, seed=seed))
     # SMALL corpus: a true permutation. The amplification disaster described below is a
@@ -3209,7 +3255,11 @@ def worker(stop, q, datasets, args, mix=None):
     # at 1 forever, since _epoch_num() takes the minimum across datasets.
     _track_corpus_epochs = not (args.vocab_files and args.vocab_slots)
     for n in set(names):
-        _iters[n]  = _make_iter(datasets[n], _split_for_name(n), args.streaming, args.seed)
+        # --shuffle unset: file order for --dataset file, shuffled for everything else.
+        # Set either way, it applies to every corpus in the mix.
+        _shuf      = (n != 'file') if args.shuffle is None else bool(args.shuffle)
+        _iters[n]  = _make_iter(datasets[n], _split_for_name(n), args.streaming, args.seed,
+                                shuffle=_shuf)
         _locks[n]  = threading.Lock()   # HF streaming iterator is not thread-safe
         _epochs[n] = [1]
         if _track_corpus_epochs:
