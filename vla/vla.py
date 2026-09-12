@@ -649,6 +649,24 @@ parser.add_argument('--linout',        default=False, action='store_true',
                          'semi-orthogonal rather than identity in that case (an identity '
                          'needs a square matrix): norm-preserving, and dense/signed from step '
                          '0 instead of leaving n_hidden-c_context channels at zero.')
+parser.add_argument('--dff_every',     default=1,     type=int, metavar='K',
+                    help='give only every Kth layer a DFF register, counting from the first: '
+                         'K=1 (default) is every layer, as before this flag; K=2 makes L1 '
+                         'recurrent, L2 straight through, L3 recurrent, L4 straight, and so '
+                         'on. A straight-through layer has NO register, NO feedback add and '
+                         'NO --linout of its own -- it is a plain conv stack that transforms '
+                         'what the layer below produced and hands it up, so a pair of layers '
+                         'becomes "compute, then remember" instead of two independent '
+                         'memories.\n'
+                         'Its ContextCNN is built n_hidden -> n_hidden (the widening a '
+                         'recurrent layer leaves to linout has to happen inside the chain '
+                         'when there is no linout), so a straight-through layer costs MORE '
+                         'conv weight than a recurrent one at the same --c_context, while '
+                         'saving that layer\'s register: a [batch, n_hidden, S, S] tensor, '
+                         'which at n_hidden 4096 / S 16 / batch 250 is 1.0 GB.\n'
+                         'The --ema_ladder and --clock ladders apply to the LAYERS THAT HAVE '
+                         'REGISTERS, in order, so at K=2 a two-entry ladder describes L1 and '
+                         'L3 -- not L1 and L2.')
 parser.add_argument('--linout_kernel', default=1,     type=int, metavar='K',
                     help='kernel size of the --linout conv2d (odd; default 1 = pointwise). '
                          'K=3 makes it a 3x3 with zero padding K//2, so the S x S grid comes '
@@ -1218,7 +1236,7 @@ if _N_VOCAB:
 
 _ARCH_ARGS = ('context', 'n_hidden', 'c_context', 'c_text', 'n_layers', 'depth', 'kernel',
               'tokenizer', 'head_norm', 'clock', 'accumulate', 'ema', 'ema_ladder', 'qproj',
-              'tap', 'linout', 'linout_kernel',
+              'tap', 'linout', 'linout_kernel', 'dff_every',
               'init', 'clock_base', 'clock_max', 'clock_ends', 'clip_dff', 'tap_norm', 'norm', 'norm_groups', 'dff_norm', 'bn_track', 'bn_affine',
                   'bn_momentum', 'bn_eps')
 
@@ -1650,6 +1668,15 @@ class VLAModel(nn.Module, _HubMixin):
         self.bn_eps      = float(bn_eps)
         self.dff_norm_kind = dff_norm or 'none'
         self.dff_softmax   = nn.Softmax2d() if self.dff_norm_kind == 'softmax' else None
+        # --dff_every K: layers 0, K, 2K, ... own a register; the rest are straight through.
+        # Set BEFORE set_clock, which sizes the clock and EMA ladders to the number of
+        # REGISTERS -- with n_dff missing it would silently fall back to n_layers and pad a
+        # two-entry ladder out to four.
+        _K = max(1, int(getattr(args, 'dff_every', 1) or 1))
+        self.dff_every  = _K
+        self.dff_layers = [li for li in range(self.n_layers) if li % _K == 0]
+        self.dff_slot   = {li: k for k, li in enumerate(self.dff_layers)}
+        self.n_dff      = len(self.dff_layers)
         self.set_clock(clock, accumulate, ema, clock_base, clock_ends,
                        getattr(args, 'ema_ladder', None))
         self.tokenizer  = tokenizer           # vocabulary / token path (see --tokenizer)
@@ -1733,14 +1760,18 @@ class VLAModel(nn.Module, _HubMixin):
         # their own DFF state. Only built when n_layers>1, so the n_layers=1 state_dict is
         # byte-identical to the single-layer model.
         if self.n_layers > 1:
+            # A recurrent layer ends at ctx_out and lets linout widen to n_hidden; a
+            # straight-through layer has no linout, so its own chain has to end at n_hidden
+            # or the layer above could not consume it.
             self.deep_context = nn.ModuleList(
                 ContextCNN(n_hidden, depth, kernel, norm=self.norm_kind,
                                     groups=self.norm_groups, bn_track=self.bn_track,
                                     bn_affine=self.bn_affine,
                                     bn_momentum=(self.bn_momentum or None),
                                     bn_eps=self.bn_eps, c_context=self.c_context,
-                                    c_out=self.ctx_out)
-                for _ in range(self.n_layers - 1))
+                                    c_out=(self.ctx_out if (li + 1) in self.dff_slot
+                                           else n_hidden))
+                for li in range(self.n_layers - 1))
             self.deep_proj = nn.ModuleList(
                 nn.Conv2d(n_hidden, n_hidden, 1) for _ in range(self.n_layers - 1))
         else:
@@ -1770,8 +1801,9 @@ class VLAModel(nn.Module, _HubMixin):
                                  f'symmetric padding)')
             # padding K//2 with the default zeros padding_mode: S x S in, S x S out, so the
             # register, the feedback add and the decoder all keep the shapes they had.
+            # one per RECURRENT layer (see --dff_every); a straight-through layer has none
             self.linout = nn.ModuleList(nn.Conv2d(self.ctx_out, n_hidden, _lk, padding=_lk // 2)
-                                        for _ in range(self.n_layers))
+                                        for _ in range(self.n_dff))
             for _c in self.linout:
                 if self.ctx_out == n_hidden:
                     # square: dirac_ is the identity on the CENTRE tap (and zeros elsewhere
@@ -1818,8 +1850,10 @@ class VLAModel(nn.Module, _HubMixin):
                              "the DFF, which is detached every step, so it could never train. "
                              "Use --qproj read (trainable) or --qproj none.")
         self.qproj_mode = qproj if qproj in _QPROJ_MODES else ('read' if qproj else 'none')
+        # per RECURRENT layer (--dff_every): both sit on the register path, and a
+        # straight-through layer has no register to read from or write to.
         self.qproj = (nn.ModuleList(nn.Conv2d(n_hidden, n_hidden, 1)
-                                    for _ in range(self.n_layers))
+                                    for _ in range(self.n_dff))
                       if self.qproj_mode != 'none' else None)
         if self.qproj is not None:
             for _c in self.qproj:
@@ -1836,18 +1870,18 @@ class VLAModel(nn.Module, _HubMixin):
         self.tap_norm = None
         if tap:
             self.tap = nn.ModuleList(nn.Conv2d(n_hidden, n_hidden, 1)
-                                     for _ in range(self.n_layers))
+                                     for _ in range(self.n_dff))
             # --tap_norm: normalize what leaves the tap, so the feedback gain is bounded by
             # construction rather than left to whatever the weights drift to. affine=False in
             # both cases, so no parameters are added; group additionally has no running
             # statistics, so train and eval compute the same function.
             if self.tap_norm_kind == 'batch':
                 self.tap_norm = nn.ModuleList(nn.BatchNorm2d(n_hidden, affine=False)
-                                              for _ in range(self.n_layers))
+                                              for _ in range(self.n_dff))
             elif self.tap_norm_kind == 'group':
                 self.tap_norm = nn.ModuleList(
                     nn.GroupNorm(min(32, n_hidden), n_hidden, affine=False)
-                    for _ in range(self.n_layers))
+                    for _ in range(self.n_dff))
             for _c in self.tap:
                 nn.init.dirac_(_c.weight)
                 nn.init.zeros_(_c.bias)
@@ -1907,7 +1941,7 @@ class VLAModel(nn.Module, _HubMixin):
         init is forgotten fast -- relative divergence between a zero and a gaussian start
         falls to 3% by 20 bytes and to float32 noise by 50 -- so --init only changes what
         the model sees for the first few dozen bytes of a context."""
-        shapes = [(B, self.n_hidden, self.S, self.S)] * self.n_layers
+        shapes = [(B, self.n_hidden, self.S, self.S)] * self.n_dff
         if self.init_mode == 'gaussian':
             return [torch.randn(s, device=device) for s in shapes]
         if self.init_mode == 'relu':
@@ -1938,7 +1972,11 @@ class VLAModel(nn.Module, _HubMixin):
         if ema_ladder is not None:
             _spec = str(ema_ladder).strip()
             self.ema_ladder = _spec if _spec else None
-        self.periods = _clock_periods(self.n_layers, self.clock,
+        # Ladders are indexed over the layers that HAVE registers (--dff_every): a clock or
+        # an EMA describes a register, and a straight-through layer has none. At K=1 this is
+        # every layer and nothing changes.
+        _nreg = getattr(self, 'n_dff', self.n_layers)
+        self.periods = _clock_periods(_nreg, self.clock,
                                       getattr(self, 'clock_base', None),
                                       getattr(self, 'clock_ends', 'both'))
         # --ema_ladder: the ladder moves from WHEN a layer writes to HOW MUCH of the new value
@@ -1953,7 +1991,7 @@ class VLAModel(nn.Module, _HubMixin):
                 _w = [float(x) for x in _spec.split(',') if x.strip()]
                 if not _w:
                     raise SystemExit(f'--ema_ladder {_spec!r}: no windows parsed')
-                _w = (_w + [_w[-1]] * self.n_layers)[:self.n_layers]
+                _w = (_w + [_w[-1]] * _nreg)[:_nreg]
                 if any(x <= 0 for x in _w):
                     raise SystemExit(f'--ema_ladder {_spec!r}: windows must be > 0')
                 self.ema = [min(1.0, 1.0 / x) for x in _w]
@@ -1962,8 +2000,8 @@ class VLAModel(nn.Module, _HubMixin):
                 if _b <= 1.0:
                     raise SystemExit(f'--ema_ladder {_spec!r}: a bare BASE must be > 1 '
                                      f'(use a comma-separated window list for anything else)')
-                self.ema = [min(1.0, 1.0 / (_b ** i)) for i in range(self.n_layers)]
-            self.periods = [1] * self.n_layers
+                self.ema = [min(1.0, 1.0 / (_b ** i)) for i in range(_nreg)]
+            self.periods = [1] * _nreg
         # a mode with nothing to clock (one layer, or exp with no middle layers) is sync,
         # and there is nothing to average where nothing is ever held
         # gated: some layer actually holds, so there is a window to average over.
@@ -2106,15 +2144,25 @@ class VLAModel(nn.Module, _HubMixin):
             # ONE 1x1 per layer. `o` leaves the projection already dense and signed, and is
             # both stored in the register and handed straight to the layer above -- there is
             # no second projection on the way up, which is the whole difference from --tap.
+            # Layer 0 always owns a register (--dff_every counts from it).
             x0   = self._fb(0, dff[0]) + tok
             o    = self.linout[0](self.context(x0))
             outs = [o]
             if record is not None:
                 record.append({'in': x0, 'out': o})
             for li in range(self.n_layers - 1):
-                x = self._fb(li + 1, dff[li + 1]) + o
-                o = self.linout[li + 1](self.deep_context[li](x))
-                outs.append(o)
+                _l = li + 1
+                _sl = self.dff_slot.get(_l)
+                if _sl is None:
+                    # STRAIGHT THROUGH (--dff_every): no register to read, so no feedback
+                    # add; no register to write, so nothing appended to outs; and no linout,
+                    # so this chain already ends at n_hidden for the layer above.
+                    x = o
+                    o = self.deep_context[li](x)
+                else:
+                    x = self._fb(_sl, dff[_sl]) + o
+                    o = self.linout[_sl](self.deep_context[li](x))
+                    outs.append(o)
                 if record is not None:
                     record.append({'in': x, 'out': o})
         else:
@@ -2124,9 +2172,15 @@ class VLAModel(nn.Module, _HubMixin):
             if record is not None:
                 record.append({'in': x0, 'out': o})
             for li in range(self.n_layers - 1):
-                x = self._fb(li + 1, dff[li + 1]) + self.deep_proj[li](o)
-                o = self._tap(li + 1, self.deep_context[li](x))
-                outs.append(o)
+                _l = li + 1
+                _sl = self.dff_slot.get(_l)
+                if _sl is None:                      # straight through, see --dff_every
+                    x = o
+                    o = self.deep_context[li](x)
+                else:
+                    x = self._fb(_sl, dff[_sl]) + self.deep_proj[li](o)
+                    o = self._tap(_sl, self.deep_context[li](x))
+                    outs.append(o)
                 if record is not None:
                     record.append({'in': x, 'out': o})
         # --clock: a layer that does not write this step keeps the state it had, while still
@@ -3737,10 +3791,13 @@ if model.clocked and (not (args.generate or args.vis or args.altvis or args.push
     # so state it explicitly: it is the single biggest change to what the stack does.
     if isinstance(model.ema, (list, tuple)):
         # --ema_ladder: the periods are all 1 and say nothing; the blend rates are the ladder.
-        _txt = ('DFF blend rate per layer '
-                + ', '.join(f'L{i + 1}={e:.4g} (~{1.0 / e:.0f} tok window)'
+        # labelled by the MODEL LAYER that owns each register: under --dff_every 2 the
+        # second ladder entry is L3, not L2, and printing "L2" there would misdescribe it.
+        _lbl = getattr(model, 'dff_layers', list(range(len(model.ema))))
+        _txt = ('DFF blend rate per register '
+                + ', '.join(f'L{_lbl[i] + 1}={e:.4g} (~{1.0 / e:.0f} tok window)'
                             for i, e in enumerate(model.ema))
-                + '  -- every layer writes every step')
+                + '  -- every register is written every step')
         print(f'--ema_ladder {model.ema_ladder}: {_txt}')  # spec as typed
         with open(args.log, 'a') as f:
             print(f'INFO --ema_ladder {model.ema_ladder}: {_txt}', file=f)
