@@ -537,23 +537,15 @@ parser.add_argument('--linout',        default=False, action='store_true',
                          'needs a square matrix): norm-preserving, and dense/signed from step '
                          '0 instead of leaving n_hidden-c_context channels at zero.')
 parser.add_argument('--dff_every',     default=1,     type=int, metavar='K',
-                    help='give only every Kth layer a DFF register, counting from the first: '
-                         'K=1 (default) is every layer, as before this flag; K=2 makes L1 '
-                         'recurrent, L2 straight through, L3 recurrent, L4 straight, and so '
-                         'on. A straight-through layer has NO register, NO feedback add and '
-                         'NO --linout of its own -- it is a plain conv stack that transforms '
-                         'what the layer below produced and hands it up, so a pair of layers '
-                         'becomes "compute, then remember" instead of two independent '
-                         'memories.\n'
-                         'Its ContextCNN is built n_hidden -> n_hidden (the widening a '
-                         'recurrent layer leaves to linout has to happen inside the chain '
-                         'when there is no linout), so a straight-through layer costs MORE '
-                         'conv weight than a recurrent one at the same --c_context, while '
-                         'saving that layer\'s register: a [batch, n_hidden, S, S] tensor, '
-                         'which at n_hidden 4096 / S 16 / batch 250 is 1.0 GB.\n'
-                         'The --ema_ladder and --clock ladders apply to the LAYERS THAT HAVE '
-                         'REGISTERS, in order, so at K=2 a two-entry ladder describes L1 and '
-                         'L3 -- not L1 and L2.')
+                    help='DEPRECATED, ACCEPTED AND IGNORED. K=2 used to leave every other '
+                         'layer straight through -- no register, no feedback add. EVERY '
+                         'LAYER NOW HAS A DFF AND A FEEDBACK ADD. The measurement that '
+                         'settled it: at identical parameter count, identical conv depth and '
+                         'identical data, removing one of two registers cost 0.503 nats '
+                         '(6.7188 -> 7.2219) and landed WORSE than two replace-outright '
+                         'registers -- the recurrent state is what the model runs on, so a '
+                         'layer without one is not worth its convs. Kept parseable so the '
+                         'command lines in ./doit still run.')
 parser.add_argument('--linout_kernel', default=1,     type=int, metavar='K',
                     help='kernel size of the --linout conv2d (odd; default 1 = pointwise). '
                          'K=3 makes it a 3x3 with zero padding K//2, so the S x S grid comes '
@@ -1074,6 +1066,12 @@ _N_VOCAB = (min(args.vocab_slots, args.batch)
 # --accumulate is deprecated: accepted so old command lines still run, ignored so it cannot
 # silently change a run. It only ever did anything for a layer that HELD its register, and
 # with --ema_ladder (periods forced to 1) or --clock sync nothing holds.
+if int(getattr(args, 'dff_every', 1) or 1) != 1:
+    print(f'WARNING: --dff_every {args.dff_every} is DEPRECATED and ignored: every layer has '
+          f'a DFF register and a feedback add. Removing one cost 0.503 nats at equal '
+          f'parameter count (see PLAN.txt).', flush=True)
+    args.dff_every = 1
+
 _dead = [f for f in ('clock', 'clock_base', 'clock_max', 'clock_ends')
          if getattr(args, f, None) is not None]
 if _dead:
@@ -1446,15 +1444,13 @@ class VLAModel(nn.Module, _HubMixin):
         self.bn_eps      = float(bn_eps)
         self.dff_norm_kind = dff_norm or 'none'
         self.dff_softmax   = nn.Softmax2d() if self.dff_norm_kind == 'softmax' else None
-        # --dff_every K: layers 0, K, 2K, ... own a register; the rest are straight through.
-        # Set BEFORE set_ema, which sizes the blend-rate ladder to the number of
-        # REGISTERS -- with n_dff missing it would silently fall back to n_layers and pad a
-        # two-entry ladder out to four.
-        _K = max(1, int(getattr(args, 'dff_every', 1) or 1))
-        self.dff_every  = _K
-        self.dff_layers = [li for li in range(self.n_layers) if li % _K == 0]
-        self.dff_slot   = {li: k for k, li in enumerate(self.dff_layers)}
-        self.n_dff      = len(self.dff_layers)
+        # Every layer owns a DFF register and reads a feedback add. (--dff_every, which
+        # made every Kth layer straight through, is deprecated: removing a register cost
+        # 0.503 nats at identical parameter count and conv depth.) These are kept as the
+        # identity map because the ladder reporting and --altvis index through them.
+        self.dff_layers = list(range(self.n_layers))
+        self.dff_slot   = {li: li for li in range(self.n_layers)}
+        self.n_dff      = self.n_layers
         self.set_ema(ema, getattr(args, 'ema_ladder', None))
         self.tokenizer  = tokenizer           # vocabulary / token path (see --tokenizer)
         # --head_norm only has a job when there is a borrowed head to feed; with char the
@@ -1537,11 +1533,8 @@ class VLAModel(nn.Module, _HubMixin):
         # their own DFF state. Only built when n_layers>1, so the n_layers=1 state_dict is
         # byte-identical to the single-layer model.
         if self.n_layers > 1:
-            # EVERY layer is built the same: n_hidden in, c_context through the chain,
-            # linout back out to n_hidden. --dff_every changes only whether a layer owns a
-            # register and reads a feedback add -- not its shape -- so the stack stays
-            # symmetric and a straight-through layer is a recurrent one with the memory
-            # taken out.
+            # Every layer is built the same: n_hidden in, c_context through the chain,
+            # linout back out to n_hidden.
             self.deep_context = nn.ModuleList(
                 ContextCNN(n_hidden, depth, kernel, norm=self.norm_kind,
                                     groups=self.norm_groups, bn_track=self.bn_track,
@@ -1903,18 +1896,9 @@ class VLAModel(nn.Module, _HubMixin):
             if record is not None:
                 record.append({'in': x0, 'out': o})
             for li in range(self.n_layers - 1):
-                _l = li + 1
-                _sl = self.dff_slot.get(_l)
-                if _sl is None:
-                    # STRAIGHT THROUGH (--dff_every): same chain and same linout as any
-                    # other layer -- what it lacks is the MEMORY. No register to read, so
-                    # no feedback add; no register to write, so nothing appended to outs.
-                    x = o
-                    o = self.linout[_l](self.deep_context[li](x))
-                else:
-                    x = self._fb(_sl, dff[_sl]) + o
-                    o = self.linout[_l](self.deep_context[li](x))
-                    outs.append(o)
+                x = self._fb(li + 1, dff[li + 1]) + o
+                o = self.linout[li + 1](self.deep_context[li](x))
+                outs.append(o)
                 if record is not None:
                     record.append({'in': x, 'out': o})
         else:
@@ -1924,15 +1908,9 @@ class VLAModel(nn.Module, _HubMixin):
             if record is not None:
                 record.append({'in': x0, 'out': o})
             for li in range(self.n_layers - 1):
-                _l = li + 1
-                _sl = self.dff_slot.get(_l)
-                if _sl is None:                      # straight through, see --dff_every
-                    x = o
-                    o = self.deep_context[li](x)
-                else:
-                    x = self._fb(_sl, dff[_sl]) + self.deep_proj[li](o)
-                    o = self._tap(_sl, self.deep_context[li](x))
-                    outs.append(o)
+                x = self._fb(li + 1, dff[li + 1]) + self.deep_proj[li](o)
+                o = self._tap(li + 1, self.deep_context[li](x))
+                outs.append(o)
                 if record is not None:
                     record.append({'in': x, 'out': o})
         # --clock: a layer that does not write this step keeps the state it had, while still
@@ -2269,6 +2247,13 @@ _TEXT_DATASETS = {
     # this corpus after the classifier, and smolfwedu is fwedu after exact dedup. Too large
     # to materialize casually (32 GB), so pair it with --streaming.
     'fineweb': ('HuggingFaceFW/fineweb', 'sample-10BT', 'train', 'text'),
+    # ONE CRAWL of fineweb rather than the cross-crawl 10BT sample. FineWeb's MinHash
+    # dedup runs WITHIN a crawl and not across them, so a single dump is already clean of
+    # near-duplicates while a sample drawn over 110 crawls is not -- the same page recrawled
+    # in 2023 and 2025 survives as two documents there. CC-MAIN-2025-26 is the newest dump
+    # (250 shards, 450 GB); 18 shards is ~10B tokens, matching sample-10BT's budget with the
+    # duplicate structure removed. In _HUB_SUBSET, so only the fetched shards are read.
+    'fwcrawl': ('HuggingFaceFW/fineweb', 'CC-MAIN-2025-26', 'train', 'text'),
     # cosmo is cosmopedia/stories UNFILTERED as of 2026-08-29. It previously kept only
     # audience == 'young_children' (26.3% of rows, the same rows format == 'story_children'
     # selects) via _fmt_cosmo, which has been REMOVED. BACKWARD COMPATIBILITY IS BROKEN ON
@@ -2374,6 +2359,7 @@ _HUB_SUBSET = {
     # the read on the 15 files already in the cache: no repo resolution, no network, and
     # with --streaming no arrow build either (the parquet loader streams local files).
     'fineweb': ('HuggingFaceFW/fineweb', 'sample/10BT'),
+    'fwcrawl': ('HuggingFaceFW/fineweb', 'data/CC-MAIN-2025-26'),
     'fpfaq':  ('HuggingFaceFW/finephrase', 'faq'),
     'fpmath': ('HuggingFaceFW/finephrase', 'math'),
     'fptut':  ('HuggingFaceFW/finephrase', 'tutorial'),
@@ -2413,7 +2399,7 @@ def _fmt_finephrase(ex):
 # order or --seed -- none of which is true of "take the first N documents".
 # Corpora with a real held-out split (tiny/c4/pile/web) are NOT hashed: they keep the exact
 # sets every earlier number in PLAN.txt was measured on.
-_HASH_HOLDOUT = {'swiki', 'fwedu', 'fineweb', 'cosmo', 'cosmoweb', 'fpfaq', 'fpmath', 'fptut',
+_HASH_HOLDOUT = {'swiki', 'fwedu', 'fineweb', 'fwcrawl', 'cosmo', 'cosmoweb', 'fpfaq', 'fpmath', 'fptut',
                  'smolcosmo', 'smolfwedu', 'strangetb', 'sebooks', 'dclmedu'}
 _HOLDOUT_MOD = 32                       # ~3.1% held out. Sized by the SCAN COST of building
                                         # the eval set, not by statistics: the filters
