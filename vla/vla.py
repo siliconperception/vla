@@ -4005,6 +4005,18 @@ if args.generate:
 _vis_exit        = False
 _vis_stats_line  = 'initializing...'
 _VIS_WIN         = 180   # ticker-tape display width, in characters (display only)
+_AV_WIN          = 220   # --altvis draws a longer tape (its figure is taller, not wider)
+_VIS_HDR_PT      = 7     # header/ticker point size, both displays
+
+
+def _ticker_width_in(nchars, pt=_VIS_HDR_PT, left=0.01, slack=1.04):
+    """Figure width, in inches, that fits `nchars` monospace characters on one line.
+
+    The ticker is the widest thing either display draws and it does not wrap, so a figure
+    sized for the PANELS alone clips it -- which is what --altvis did at --n_layers 1,
+    where its width is 4*n_layers = 4 inches against a 220-character tape. DejaVu Sans
+    Mono advances 0.602 em; the margin and a little slack are added on top."""
+    return (nchars * pt * 0.602 / 72.0) / (1.0 - left) * slack
 
 
 def _vc(t):
@@ -4032,7 +4044,11 @@ if args.altvis:
     plt.style.use('dark_background')
     plt.ion()
     _NL = model.n_layers
-    _av_fig, _av_axes = plt.subplots(3, _NL, figsize=(4 * _NL, 10), squeeze=False)
+    # 4in per layer for the panels, but never narrower than the ticker needs: at
+    # --n_layers 1 the panel rule alone gives 4 inches and the tape is cut off at ~15% of
+    # its length.
+    _av_w = max(4 * _NL, _ticker_width_in(_AV_WIN + 8))
+    _av_fig, _av_axes = plt.subplots(3, _NL, figsize=(_av_w, 10), squeeze=False)
     _av_fig.subplots_adjust(top=0.85, bottom=0.05, left=0.05, right=0.98,
                             hspace=0.25, wspace=0.12)
     # Row 3 is the REGISTER, and it is the one that does not move every step: the clock gates
@@ -4126,7 +4142,7 @@ if args.altvis:
                 f'state {dff[c].std().item():6.3f} '
                 f'{"held " + str(_av_held[c]) if _av_held[c] else "WROTE"}'
                 for c in range(_NL))
-            + '\n' + _ticker[-220:])
+            + '\n' + _ticker[-_AV_WIN:])
 
         if _queue:
             _b = _queue.pop(0)
@@ -4166,7 +4182,10 @@ if args.vis:
 
     plt.style.use('dark_background')
     plt.ion()
-    _vis_fig, _vis_axes_grid = plt.subplots(1, 3, figsize=(12, 4))
+    # 12in fits the three panels comfortably; the max() guarantees the tape fits too, so
+    # raising _VIS_WIN later cannot silently start clipping it.
+    _vis_fig, _vis_axes_grid = plt.subplots(
+        1, 3, figsize=(max(12, _ticker_width_in(_VIS_WIN + 5)), 4))
     _vis_fig.subplots_adjust(top=0.78, bottom=0.10, left=0.04, right=0.98,
                               hspace=0.1, wspace=0.08)
     _vis_ax_dff, _vis_ax_zero, _vis_ax_prob = _vis_axes_grid
