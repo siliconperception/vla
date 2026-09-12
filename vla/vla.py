@@ -215,56 +215,11 @@ _QPROJ_MODES = ('none', 'read')   # where the 1x1 state projection sits (--qproj
 # so it could never receive gradient and was permanently random. It answered a narrow question
 # about signed-vs-rectified state and cost a live option to keep around.
 
-_CLOCK_MODES = ('sync', 'fixed', 'incr', 'dither', 'exp')
-_CLOCK_BASE  = 2      # fixed/dither: layer li writes at rate 1 / _CLOCK_BASE**li
-_CLOCK_MAX   = 1024   # exp: cap on one hold, in steps
-_CLOCK_EXP   = -1     # period sentinel: this layer holds 2**Geometric(1/2) steps
-
-
-def _clock_periods(n_layers, mode, base=None, ends='both'):
-    """Write period per layer -- the whole schedule, in one place. 1 means the layer writes
-    every step, >1 is a ladder, _CLOCK_EXP is exp's heavy-tailed hold.
-
-    Two ladders: fixed/dither grow geometrically (1, 2, 4, 8, ...) and incr linearly
-    (1, 2, 3, 4, ...). The geometric one buys a long memory in few layers but the deepest
-    layer of a tall stack can end up slower than a whole document -- layer 10 writes every
-    512 steps -- while incr keeps every layer's period on the order of the stack's depth.
-
-    exp pins the two ends to every step and clocks only the middle: layer 1 takes the token
-    injection and layer N feeds the decoder, so those are the layers whose state the rest of
-    the model reads most directly. It therefore needs --n_layers > 2 to have anything to
-    clock."""
-    if mode in ('fixed', 'dither'):
-        # --clock_base generalizes the ladder off the hard-coded 2. Reach is set by the
-        # slowest layer's period, so with L layers the base that lands p_max on a target T
-        # is T**(1/(L-1)) -- b=2 at L=7 gives 64, which overshoots a ~200-token example and
-        # leaves the deepest layer writing only 3 times per document.
-        b = _CLOCK_BASE if base is None else float(base)
-        return [max(1, int(round(b ** li))) for li in range(n_layers)]
-    if mode == 'incr':
-        return [li + 1 for li in range(n_layers)]
-    if mode == 'exp':
-        # --clock_ends: which ends are pinned to write every step. The default 'both' is
-        # exp's original behavior and is a real design choice, not a detail -- layer 1 is
-        # where the token is injected and layer N is what the decoder reads, so pinning them
-        # keeps the fastest-moving state at both ends of the stack and puts the random holds
-        # only in the middle. 'none' clocks every layer and is the ablation that says whether
-        # that pinning is what makes exp work.
-        pin_first = ends in ('both', 'first')
-        pin_last  = ends in ('both', 'last')
-        return [1 if (li == 0 and pin_first) or (li == n_layers - 1 and pin_last)
-                else _CLOCK_EXP for li in range(n_layers)]
-    return [1] * n_layers
-
-
-def _exp_mean_hold(cap=_CLOCK_MAX):
-    """Mean of the exp mode's hold: 2**k with k ~ Geometric(1/2), truncated at cap. The
-    untruncated distribution has no finite mean (every k contributes 1/2 a step), so the cap
-    is what sets the rate -- it comes out as log2(cap)/2 + 1."""
-    return sum(2.0 ** -(j + 1) * min(2 ** j, cap) for j in range(63))
-
-
-_CLOCK_MEAN = _exp_mean_hold()
+# The DFF write rule. There is only one: every register is written every step, blended by
+# --ema / --ema_ladder. The clock that used to gate writes per layer (sync/fixed/incr/
+# dither/exp, with --accumulate to average a hold) is gone -- an EMA every step spans the
+# same timescales continuously, and the ladders it needed are now expressed directly as
+# per-register blend rates.
 
 # ── args ──────────────────────────────────────────────────────────────────────
 
@@ -347,40 +302,11 @@ parser.add_argument('--n_layers',      default=3,     type=int,
                     help='stack N (ContextCNN + feedback) recurrent layers in series between '
                          'the thin encoder and decoder; each layer keeps its own DFF state. '
                          '1 = original single-layer behavior')
-parser.add_argument('--clock',         default='sync', choices=_CLOCK_MODES,
-                    help='when each layer commits its newly computed output to its own DFF '
-                         'state. Only the state *write* is gated: every layer runs its convs '
-                         'every step and passes its output up the stack whatever the clock '
-                         'says, so the decoder keeps seeing a per-step signal and the logits '
-                         'still change every token. Modes (no numeric knobs -- the ladders are '
-                         f'hard-coded at powers of {_CLOCK_BASE}, or at 1,2,3,... for incr): '
-                         '"sync" (default) writes every '
-                         'layer every step, the original behavior. "fixed" writes layer li '
-                         f'every {_CLOCK_BASE}**li steps -- layer 1 every step, layer 2 every '
-                         f'{_CLOCK_BASE}, layer 3 every {_CLOCK_BASE**2} -- on a phase counted '
-                         'from each row\'s document start, so deeper layers hold a context '
-                         'that changes exponentially more slowly. "incr" is the same idea on '
-                         'a linear ladder, layer li every li steps (1, 2, 3, 4, ...): a '
-                         'gentler spread than fixed, and it keeps the deepest layer of a tall '
-                         'stack from running slower than the documents it reads (fixed puts '
-                         f'layer 10 at {_CLOCK_BASE**9} steps, incr at 10). "dither" keeps '
-                         'the geometric mean '
-                         'rates but drops the phase: an independent coin flip of probability '
-                         '1/period per row per layer per step (layer 1 100%%, layer 2 50%%, '
-                         'layer 3 25%%). "exp" drops the ladder too and gives the middle '
-                         'layers the same heavy-tailed hold: after a write the next one comes '
-                         '2**k steps later, k ~ Geometric(1/2) -- 1 step 50%% of the time, 2 '
-                         f'steps 25%%, 4 steps 12.5%%, ... capped at {_CLOCK_MAX} (mean '
-                         f'{_CLOCK_MEAN:g} steps), drawn independently per layer and per row. '
-                         'exp writes layers 1 and N every step -- the one the token is '
-                         'injected into and the one the decoder reads -- so it needs '
-                         '--n_layers > 2 to clock anything. '
-                         'The first token of a document always writes every layer, so a fresh '
-                         'context is never left unwritten. The random modes apply in training, '
-                         '--eval, --generate and --vis alike (they are part of the dynamics, '
-                         'not train-only regularizers), which makes generation and eval loss '
-                         'nondeterministic. No new parameters, so any mode can be toggled on '
-                         'an existing checkpoint. No effect when --n_layers 1')
+parser.add_argument('--clock',       default=None,
+                             help='DEPRECATED, ACCEPTED AND IGNORED. The DFF write clock is gone: every\n'
+                                  'register is written every step and the timescale is the --ema/\n'
+                                  '--ema_ladder blend rate, which spans the same spans continuously.\n'
+                                  'Kept parseable so the command lines in ./doit still run.')
 parser.add_argument('--bn_track',      default=True, action=argparse.BooleanOptionalAction,
                     help='--norm batch: track_running_stats.  Default on, the historical '
                          'behavior.  --no-bn_track makes BatchNorm use BATCH statistics in '
@@ -501,66 +427,27 @@ parser.add_argument('--clip_dff',      default=0.0,   type=float, metavar='MAX',
                          'the blow-up without touching normal dynamics. Applies in training, '
                          '--generate, --eval and --vis alike; adds no parameters, so it can '
                          'be toggled on an existing checkpoint')
-parser.add_argument('--clock_ends',    default='both',
-                    choices=['both', 'none', 'first', 'last'],
-                    help='--clock exp only: which ends of the stack are pinned to write '
-                         'their DFF state every step instead of drawing a random hold. '
-                         '"both" (default) pins layer 1 and layer N -- the layer the token '
-                         'is injected into and the layer the decoder reads -- so only the '
-                         'middle holds. "none" clocks every layer, which is the ablation for '
-                         'whether that pinning is what makes exp work rather than the '
-                         'randomization itself. "first"/"last" pin one end only, to say '
-                         'which of the two matters. No parameters, so it can be toggled on '
-                         'an existing checkpoint')
-parser.add_argument('--clock_max',     default=1024,  type=int,   metavar='N',
-                    help='--clock exp only: cap on one hold, in steps. exp draws 2**k with '
-                         'k ~ Geometric(1/2), whose mean is log2(N)/2 + 1 -- so N is a weak '
-                         'lever on the mean (1024 gives ~6 steps, 64 gives ~4) and a direct '
-                         'one on the tail: a layer holds >= 2**j steps with probability '
-                         '2**-j, truncated at N. It is therefore the knob for how long the '
-                         'longest-lived middle layer can sit on a context, which is what '
-                         'sets reach. No parameters, so it can be toggled on an existing '
-                         'checkpoint; no effect under any other --clock mode')
-parser.add_argument('--clock_base',    default=2.0,   type=float, metavar='B',
-                    help='base of the geometric schedule, in both places one appears. Under '
-                         '--clock fixed/dither it is the ladder: layer li writes every '
-                         'round(B**li) steps. Default 2.0 (1,2,4,8,...). Reach is set by the '
-                         'slowest layer\'s period, so the base that lands it on a target T '
-                         'with L layers is T**(1/(L-1)) -- at --n_layers 7, B=2 puts the '
-                         'deepest layer at 64 steps, which is a third of a TinyStories '
-                         'example and leaves it only ~3 writes per document, while B=1.87 '
-                         'puts it at 43. Below ~1.4 consecutive layers round to the same '
-                         'period and the ladder shortens. Under --clock exp it is the hold '
-                         'base instead -- a middle layer holds B**k steps, k ~ Geometric(1/2) '
-                         '-- where E[hold] = 1/(2-B) for B<2 and DIVERGES at B=2, which is '
-                         'what --clock_max exists to truncate. B=1.9 gives a mean of 10 with '
-                         'a tail 40%% lighter at 64 steps; B<2 needs no cap at all. '
-                         'No parameters, so it can be '
-                         'toggled on an existing checkpoint, and no effect under '
-                         '--clock sync/incr/exp, whose ladders are not geometric')
+parser.add_argument('--clock_ends',  default=None,
+                                  help='DEPRECATED, ACCEPTED AND IGNORED. The DFF write clock is gone: every\n'
+                                       'register is written every step and the timescale is the --ema/\n'
+                                       '--ema_ladder blend rate, which spans the same spans continuously.\n'
+                                       'Kept parseable so the command lines in ./doit still run.')
+parser.add_argument('--clock_max',   default=None,
+                                 help='DEPRECATED, ACCEPTED AND IGNORED. The DFF write clock is gone: every\n'
+                                      'register is written every step and the timescale is the --ema/\n'
+                                      '--ema_ladder blend rate, which spans the same spans continuously.\n'
+                                      'Kept parseable so the command lines in ./doit still run.')
+parser.add_argument('--clock_base',  default=None,
+                                  help='DEPRECATED, ACCEPTED AND IGNORED. The DFF write clock is gone: every\n'
+                                       'register is written every step and the timescale is the --ema/\n'
+                                       '--ema_ladder blend rate, which spans the same spans continuously.\n'
+                                       'Kept parseable so the command lines in ./doit still run.')
 parser.add_argument('--accumulate',    default=False,
                     action=argparse.BooleanOptionalAction,
-                    help='DEPRECATED, ACCEPTED AND IGNORED. It only ever applied to a layer '
-                         'that HOLDS its register, and nothing holds any more: --ema_ladder '
-                         'forces every period to 1 and --clock sync writes every layer every '
-                         'step, so the "mean of the outputs since the last write" was always '
-                         'a mean over one output. The flag stays parseable so the command '
-                         'lines in ./doit still run; it warns and has no effect. Original '
-                         'behaviour, for reading old runs: '
-                         'what a clocked layer writes: the mean of every output it computed '
-                         'since its last write, instead of just the one from the step it '
-                         'writes on. Applies to every --clock mode. Without it a held layer '
-                         'samples -- the outputs computed while it was holding never reach '
-                         'its state (they did propagate up the stack when computed), so it '
-                         'sees one token in N and is blind to the rest; with it the state is '
-                         'a decimated average and nothing between two writes is dropped. Same '
-                         'write rate either way, and the mean keeps the state at the scale '
-                         'the layer already runs at (a sum would not: an exp hold can run to '
-                         f'{_CLOCK_MAX} steps). Costs one extra DFF-sized buffer per layer. '
-                         'Inert under --clock sync, where every layer writes every step and '
-                         'the mean is over one output. --no-accumulate turns it back off, so '
-                         'a checkpoint trained with it can be run both ways (see --clock on '
-                         'overriding what a checkpoint was trained with)')
+                    help='DEPRECATED, ACCEPTED AND IGNORED. It averaged the outputs a layer '
+                         'computed while HOLDING its register, and nothing holds any more: '
+                         'the DFF write clock is gone and every register is written every '
+                         'step. Kept parseable so the command lines in ./doit still run.')
 parser.add_argument('--ema_ladder',    default=None,  type=str, nargs='?', const='13.15',
                     metavar='SPEC',
                     help='put the TIMESCALE LADDER IN THE EMA INSTEAD OF THE CLOCK. Every layer '
@@ -1187,6 +1074,13 @@ _N_VOCAB = (min(args.vocab_slots, args.batch)
 # --accumulate is deprecated: accepted so old command lines still run, ignored so it cannot
 # silently change a run. It only ever did anything for a layer that HELD its register, and
 # with --ema_ladder (periods forced to 1) or --clock sync nothing holds.
+_dead = [f for f in ('clock', 'clock_base', 'clock_max', 'clock_ends')
+         if getattr(args, f, None) is not None]
+if _dead:
+    print(f'WARNING: {", ".join("--" + f for f in _dead)} DEPRECATED and ignored. The DFF '
+          f'write clock is gone -- every register is written every step and the timescale '
+          f'is the --ema/--ema_ladder blend rate.', flush=True)
+
 if getattr(args, 'accumulate', False):
     print('WARNING: --accumulate is DEPRECATED and ignored. It applied only to layers that '
           'hold their register between writes; --ema_ladder and --clock sync both write '
@@ -1235,7 +1129,7 @@ if _N_VOCAB:
 # ── restore architecture args from checkpoint ─────────────────────────────────
 
 _ARCH_ARGS = ('context', 'n_hidden', 'c_context', 'c_text', 'n_layers', 'depth', 'kernel',
-              'tokenizer', 'head_norm', 'clock', 'accumulate', 'ema', 'ema_ladder', 'qproj',
+              'tokenizer', 'head_norm', 'ema', 'ema_ladder', 'qproj',
               'tap', 'linout', 'linout_kernel', 'dff_every',
               'init', 'clock_base', 'clock_max', 'clock_ends', 'clip_dff', 'tap_norm', 'norm', 'norm_groups', 'dff_norm', 'bn_track', 'bn_affine',
                   'bn_momentum', 'bn_eps')
@@ -1249,7 +1143,7 @@ _ARCH_ARGS = ('context', 'n_hidden', 'c_context', 'c_text', 'n_layers', 'depth',
 # a checkpoint sampled without it was being seeded differently than it was trained -- it adds
 # no parameters, so it restores like the rest and overrides like the other write-schedule
 # options.
-_ARCH_OVERRIDE = ('clock', 'accumulate', 'ema', 'ema_ladder', 'init', 'clock_base', 'clock_max', 'clock_ends', 'clip_dff', 'tap_norm', 'norm', 'norm_groups', 'dff_norm', 'bn_track', 'bn_affine',
+_ARCH_OVERRIDE = ('ema', 'ema_ladder', 'init', 'clip_dff', 'tap_norm', 'norm', 'norm_groups', 'dff_norm', 'bn_track', 'bn_affine',
                   'bn_momentum', 'bn_eps')
 
 
@@ -1455,153 +1349,41 @@ class DecoderCNN(nn.Module):
         return self.pool(self.norm(self.proj(x))).squeeze(-1).squeeze(-1)
 
 
-class DFFClock:
-    """Decides, for one step, which layers commit their newly computed output to their own
-    DFF state -- per batch row, since every row is at a different point in a different
-    document. Layers always run their convs and always pass their output up the stack; only
-    the state *write* is gated, so the top layer's output (and with it the decoder and the
-    logits) still moves every step under every mode.
+class DFFEma:
+    """How a register commits the value its layer just computed.
 
-    A clock belongs to a context, not to the model: forward() keeps one beside self.dff,
-    while generate() and --vis keep their own beside their local state, so a sample drawn
-    during training cannot disturb the training clock. Modes (see --clock):
+    Every register is written every step -- there is no gating and no schedule -- so all
+    this holds is the blend: register <- register + e*(new - register), with e from
+    --ema/--ema_ladder. e == 1.0 (or ema None) replaces outright.
 
-      sync    every layer, every step. Never instantiated -- the model skips the clock
-              entirely -- so the default path is exactly the unclocked model.
-      fixed   layer li writes every periods[li] steps, phase counted from t=0 -- a geometric
-              ladder, 1, 2, 4, 8, ...
-      incr    the same, on a linear ladder: 1, 2, 3, 4, ... (see _clock_periods).
-      dither  fixed's mean rate with no phase: independent Bernoulli(1/periods[li]).
-      exp     no ladder at all -- the middle layers each draw their next hold from the same
-              heavy-tailed distribution, 2**k steps with k ~ Geometric(1/2) (1 step 50% of
-              the time, 2 steps 25%, 4 steps 12.5%, ...), capped at clock_max, while the two
-              ends write every step. Timescales are resampled continuously instead of being
-              assigned by depth, so a middle layer is sometimes fast and sometimes slow, and
-              the stack covers a spread of spans at any moment.
+    It owns one piece of state, a per-row step counter, and that exists for a single rule:
+    a row's FIRST write of a document must replace the register outright rather than blend,
+    or (1-e) of the --init seed would survive in the state for the rest of the document.
 
-    t=0 -- the first token of a document -- always writes every layer, so a context is never
-    left sitting at its --init seed.
+    One writer belongs to one context, like the DFF list beside it: forward() keeps its own,
+    generate() and --vis keep theirs, so a sample drawn mid-training cannot disturb the
+    training state."""
 
-    accumulate (--accumulate) changes what a write commits, not when it happens, and so
-    composes with every mode: see write()."""
-    def __init__(self, mode, periods, B, device, clock_max=_CLOCK_MAX, accumulate=False,
-                 ema=None, base=_CLOCK_BASE):
-        self.mode      = mode
-        self.ema       = ema           # --ema decay, or None to replace outright
-        self.periods   = periods
-        self.B         = B
-        self.device    = torch.device(device)
-        self.clock_max = int(clock_max)
-        self.base      = float(base)   # exp: hold is base**k (see _draw)
-        self.t    = torch.zeros(B, dtype=torch.long, device=self.device)
-        # exp: steps left before layer li writes again (0 = write now)
-        self.hold = ([torch.zeros(B, dtype=torch.long, device=self.device) for _ in periods]
-                     if _CLOCK_EXP in periods else None)
-        # accumulate: running sum of the outputs each layer has computed since its last
-        # write, and how many they are. The sums are allocated on first use -- one write()
-        # call carries the shape, so the clock needs to know nothing about widths or S.
-        self.acc = [None] * len(periods) if accumulate else None
-        self.n   = ([torch.zeros(B, dtype=torch.long, device=self.device) for _ in periods]
-                    if accumulate else None)
-
-    def reset(self, flag):
-        """Rows restarting a document go back to step 0, write every layer, and start their
-        accumulation over -- nothing from the previous document leaks into the first write of
-        the next one."""
-        self.t = self.t.clone()
-        self.t[flag] = 0
-        if self.hold is not None:
-            self.hold = [h.clone() for h in self.hold]
-            for h in self.hold:
-                h[flag] = 0
-        if self.acc is not None:
-            self.n = [c.clone() for c in self.n]
-            for li, c in enumerate(self.n):
-                c[flag] = 0
-                if self.acc[li] is not None:
-                    self.acc[li] = self.acc[li].clone()
-                    self.acc[li][flag] = 0
-
-    def _draw(self):
-        """[B] holds: 2**k with k ~ Geometric(1/2), capped. floor(-log2 u) for u ~ U(0,1] is
-        k with probability 2**-(k+1), which is the 50/25/12.5% ladder; k is clamped before
-        the shift so 2**k cannot overflow int64 on a very small u."""
-        u = torch.rand(self.B, device=self.device).clamp_min(torch.finfo(torch.float32).tiny)
-        k = (-u.log2()).floor().clamp_(0, 62)
-        # Two separate bases live here. k ~ Geometric(1/2) is the *probability* ladder and is
-        # fixed. self.base is the *hold* base, --clock_base: hold = base**k, so
-        #     E[h] = sum_j 2**-(j+1) base**j = 1/(2 - base)   for base < 2,
-        # which diverges exactly at base 2 -- the historical hard-coded value, and the reason
-        # a cap had to exist at all. Below 2 the mean is finite and the tail is genuinely
-        # lighter: P(h >= 64) is 1/64 at base 2 but 1/1220 at base 1.5.
-        gap = torch.round(torch.pow(self.base, k)).long().clamp_(min=1)
-        return gap.clamp_(max=self.clock_max) if self.clock_max > 0 else gap
-
-    def mask(self, li):
-        """[B] bool -- which rows write layer li this step; None means all of them.
-        Call exactly once per layer per step: exp advances its countdown here."""
-        p = self.periods[li]
-        if p == 1:
-            return None                      # every step: layer 1, and exp's two ends
-        if p == _CLOCK_EXP:
-            m = self.hold[li] == 0
-            # rows that just wrote draw a new hold; the rest count one step closer
-            self.hold[li] = torch.where(m, self._draw(), self.hold[li]) - 1
-            return m
-        if self.mode == 'dither':
-            return (torch.rand(self.B, device=self.device) < 1.0 / p) | (self.t == 0)
-        return (self.t % p) == 0
+    def __init__(self, ema, B, device):
+        self.ema = ema                       # float, or one per register (--ema_ladder)
+        self.t   = torch.zeros(B, dtype=torch.long, device=device)
 
     def write(self, li, o, prev):
-        """Layer li's DFF state after this step: it has just computed `o` and was holding
-        `prev`. Rows that are not writing keep prev.
-
-        By default a write commits `o` -- the output of the one step it happens on -- so the
-        state is a *sample* of the layer's activity: whatever the layer computed while it was
-        holding never reaches its state (it did propagate up the stack at the time, it just
-        left no trace in the memory). --accumulate commits the mean of every output since the
-        last write instead, so the state is a decimated average at the same write rate and
-        nothing in between is dropped. The mean and not the sum: the state feeds straight back
-        into a conv, and a sum over a hold that exp can stretch to clock_max steps would be
-        nowhere near the scale the layer was trained at.
-
-        --ema is the other half of the same question and composes with it: --accumulate
-        decides what value a write proposes, --ema decides how that value is committed --
-        blended into the register as prev + ema*(cand - prev) rather than replacing it. It
-        needs no buffer at all, so it is the cheap way to hold a moving average; what it
-        gives up against --accumulate is exactness, an exponential window instead of the box
-        mean over the hold, and it cannot see the outputs of steps where the layer did not
-        write. The effective window is ~1/ema writes, so ~period/ema tokens.
-
-        The accumulator is detached. The returned state never carries gradient anyway -- the
-        caller detaches it, gradient horizon 1 -- and summing live graph nodes across steps
-        would pin every one of those steps' graphs in memory."""
-        m = self.mask(li)
-        cand = o                         # what this step proposes for the register
-        if m is not None and self.acc is not None:
-            # --accumulate: fold this step's output into the running mean. Skipped when m is
-            # None, where the layer writes every step and that mean would be over one value.
-            if self.acc[li] is None:
-                self.acc[li] = torch.zeros_like(o)
-            self.acc[li] = self.acc[li] + o.detach()
-            self.n[li]   = self.n[li] + 1
-            cand = self.acc[li] / self.n[li].view(-1, 1, 1, 1)
-            keep = ~m                    # rows that just wrote start a fresh interval
-            self.acc[li] = self.acc[li] * keep.view(-1, 1, 1, 1)
-            self.n[li]   = self.n[li] * keep
-        if self.ema is not None:
-            # --ema: blend into what is already there instead of overwriting it, except on a
-            # row's first write of a document, which must discard the --init seed outright
-            # rather than leave (1-ema) of it in the state.
-            # A LIST here is --ema_ladder: one decay per layer, deeper layers blending less.
-            _e = self.ema[li] if isinstance(self.ema, (list, tuple)) else self.ema
-            cand = torch.where((self.t == 0).view(-1, 1, 1, 1), cand,
-                               prev + _e * (cand - prev))
-        return cand if m is None else torch.where(m.view(-1, 1, 1, 1), cand, prev)
+        if self.ema is None:
+            return o
+        e = self.ema[li] if isinstance(self.ema, (list, tuple)) else self.ema
+        if e >= 1.0:
+            return o
+        # first write of a document replaces; every later one blends
+        return torch.where((self.t == 0).view(-1, 1, 1, 1), o, prev + e * (o - prev))
 
     def advance(self):
         """One step of the token stream has been consumed."""
         self.t = self.t + 1
+
+    def reset(self, flag):
+        """Rows starting a new document are back at their first write."""
+        self.t = torch.where(flag, torch.zeros_like(self.t), self.t)
 
 
 # PyTorchModelHubMixin gives VLAModel save_pretrained()/push_to_hub()/from_pretrained()
@@ -1640,8 +1422,7 @@ class VLAModel(nn.Module, _HubMixin):
     readout there, since the borrowed head was trained downstream of a final norm."""
     def __init__(self, n_hidden, depth, kernel, S,
                  c_context=None, c_text=None, n_layers=1, tokenizer='char', head_norm='none',
-                 clock='sync', accumulate=False, ema=None, qproj='none', tap=False,
-                 clock_base=None, clock_max=None, clock_ends='both', clip_dff=0.0,
+                 ema=None, qproj='none', tap=False, clip_dff=0.0,
                  tap_norm='none', norm='batch', norm_groups=32, dff_norm='none',
                  bn_track=True, bn_affine=False, bn_momentum=0.1, bn_eps=1e-5):
         super().__init__()
@@ -1652,12 +1433,9 @@ class VLAModel(nn.Module, _HubMixin):
         self.c_context  = int(c_context) if c_context else n_hidden
         self.c_text     = c_text if c_text is not None else n_hidden
         self.n_layers   = max(1, n_layers)    # stacked (ContextCNN + feedback) layers (see --n_layers)
-        # --clock/--accumulate: how often each layer writes its DFF state and what it writes
-        # (see DFFClock). Only the write is gated; the convs run every step at every layer.
-        self.clock = self.accumulate = self.ema = None   # derived in set_clock
-        self.clock_base = _CLOCK_BASE if clock_base is None else float(clock_base)
-        self.clock_max  = _CLOCK_MAX if clock_max is None else int(clock_max)
-        self.clock_ends = clock_ends or 'both'
+        # --ema/--ema_ladder: how much of its new output each register takes. Every
+        # register is written every step (see DFFEma); the convs run every step regardless.
+        self.ema = None                                  # derived in set_ema
         self.clip_dff   = float(clip_dff or 0.0)
         self.tap_norm_kind = tap_norm or 'none'
         self.norm_kind     = norm or 'batch'
@@ -1669,7 +1447,7 @@ class VLAModel(nn.Module, _HubMixin):
         self.dff_norm_kind = dff_norm or 'none'
         self.dff_softmax   = nn.Softmax2d() if self.dff_norm_kind == 'softmax' else None
         # --dff_every K: layers 0, K, 2K, ... own a register; the rest are straight through.
-        # Set BEFORE set_clock, which sizes the clock and EMA ladders to the number of
+        # Set BEFORE set_ema, which sizes the blend-rate ladder to the number of
         # REGISTERS -- with n_dff missing it would silently fall back to n_layers and pad a
         # two-entry ladder out to four.
         _K = max(1, int(getattr(args, 'dff_every', 1) or 1))
@@ -1677,8 +1455,7 @@ class VLAModel(nn.Module, _HubMixin):
         self.dff_layers = [li for li in range(self.n_layers) if li % _K == 0]
         self.dff_slot   = {li: k for k, li in enumerate(self.dff_layers)}
         self.n_dff      = len(self.dff_layers)
-        self.set_clock(clock, accumulate, ema, clock_base, clock_ends,
-                       getattr(args, 'ema_ladder', None))
+        self.set_ema(ema, getattr(args, 'ema_ladder', None))
         self.tokenizer  = tokenizer           # vocabulary / token path (see --tokenizer)
         # --head_norm only has a job when there is a borrowed head to feed; with char the
         # decoder emits logits directly and normalizing them would just rescale the
@@ -1760,18 +1537,19 @@ class VLAModel(nn.Module, _HubMixin):
         # their own DFF state. Only built when n_layers>1, so the n_layers=1 state_dict is
         # byte-identical to the single-layer model.
         if self.n_layers > 1:
-            # A recurrent layer ends at ctx_out and lets linout widen to n_hidden; a
-            # straight-through layer has no linout, so its own chain has to end at n_hidden
-            # or the layer above could not consume it.
+            # EVERY layer is built the same: n_hidden in, c_context through the chain,
+            # linout back out to n_hidden. --dff_every changes only whether a layer owns a
+            # register and reads a feedback add -- not its shape -- so the stack stays
+            # symmetric and a straight-through layer is a recurrent one with the memory
+            # taken out.
             self.deep_context = nn.ModuleList(
                 ContextCNN(n_hidden, depth, kernel, norm=self.norm_kind,
                                     groups=self.norm_groups, bn_track=self.bn_track,
                                     bn_affine=self.bn_affine,
                                     bn_momentum=(self.bn_momentum or None),
                                     bn_eps=self.bn_eps, c_context=self.c_context,
-                                    c_out=(self.ctx_out if (li + 1) in self.dff_slot
-                                           else n_hidden))
-                for li in range(self.n_layers - 1))
+                                    c_out=self.ctx_out)
+                for _ in range(self.n_layers - 1))
             self.deep_proj = nn.ModuleList(
                 nn.Conv2d(n_hidden, n_hidden, 1) for _ in range(self.n_layers - 1))
         else:
@@ -1801,9 +1579,10 @@ class VLAModel(nn.Module, _HubMixin):
                                  f'symmetric padding)')
             # padding K//2 with the default zeros padding_mode: S x S in, S x S out, so the
             # register, the feedback add and the decoder all keep the shapes they had.
-            # one per RECURRENT layer (see --dff_every); a straight-through layer has none
+            # one per LAYER, recurrent or not: every chain ends at c_context and every
+            # layer widens back to n_hidden with its own 1x1/3x3 (see --dff_every).
             self.linout = nn.ModuleList(nn.Conv2d(self.ctx_out, n_hidden, _lk, padding=_lk // 2)
-                                        for _ in range(self.n_dff))
+                                        for _ in range(self.n_layers))
             for _c in self.linout:
                 if self.ctx_out == n_hidden:
                     # square: dirac_ is the identity on the CENTRE tap (and zeros elsewhere
@@ -1948,46 +1727,31 @@ class VLAModel(nn.Module, _HubMixin):
             return [torch.randn(s, device=device).relu() for s in shapes]
         return [torch.zeros(s, device=device) for s in shapes]
 
-    def set_clock(self, clock=None, accumulate=None, ema=None, clock_base=None,
-                  clock_ends=None, ema_ladder=None):
-        """Set (or change) the DFF write schedule; None leaves that half alone. Neither knob
-        adds a parameter or changes a shape, so this is safe on a model whose weights are
-        already loaded -- it is what lets --clock/--accumulate on the command line override
-        what a checkpoint was trained with (see _ARCH_OVERRIDE), e.g. training with --clock
-        dither and sampling with --clock fixed. Any live clock is dropped and rebuilt with
-        the next context."""
-        if clock is not None:
-            self.clock = clock if clock in _CLOCK_MODES else 'sync'
-        if accumulate is not None:
-            self.accumulate = bool(accumulate)
+    def set_ema(self, ema=None, ema_ladder=None):
+        """Set (or change) the DFF blend rate; None leaves it alone. It adds no parameter
+        and changes no shape, so this is safe on a model whose weights are already loaded --
+        it is what lets --ema/--ema_ladder on the command line override what a checkpoint was
+        trained with (see _ARCH_OVERRIDE). Any live writer is dropped and rebuilt with the
+        next context.
+
+        Rates are indexed over the layers that HAVE REGISTERS (--dff_every): a blend rate
+        describes a register, and a straight-through layer has none. At --dff_every 1 that
+        is every layer."""
         if ema is not None:
             if isinstance(ema, (list, tuple)):
-                self.ema = list(ema)          # a per-layer ladder, already built
+                self.ema = list(ema)          # a per-register ladder, already built
             else:
                 self.ema = float(ema) if 0.0 < float(ema) < 1.0 else None
-        if clock_base is not None:
-            self.clock_base = float(clock_base)
-        if clock_ends is not None:
-            self.clock_ends = clock_ends
         if ema_ladder is not None:
             _spec = str(ema_ladder).strip()
             self.ema_ladder = _spec if _spec else None
-        # Ladders are indexed over the layers that HAVE registers (--dff_every): a clock or
-        # an EMA describes a register, and a straight-through layer has none. At K=1 this is
-        # every layer and nothing changes.
         _nreg = getattr(self, 'n_dff', self.n_layers)
-        self.periods = _clock_periods(_nreg, self.clock,
-                                      getattr(self, 'clock_base', None),
-                                      getattr(self, 'clock_ends', 'both'))
-        # --ema_ladder: the ladder moves from WHEN a layer writes to HOW MUCH of the new value
-        # it takes. Every layer writes every step; layer li blends with ema = 1/BASE**li, an
-        # effective window of BASE**li tokens -- the same spans the clock ladder produced, but
-        # the deep register now drifts continuously instead of jumping once per period.
         if getattr(self, 'ema_ladder', None):
             _spec = str(self.ema_ladder)
             if ',' in _spec:
-                # per-layer WINDOWS in tokens. Short lists repeat their last entry, long ones
-                # are truncated, so the spec never has to be re-typed when --n_layers changes.
+                # per-register WINDOWS in tokens. Short lists repeat their last entry, long
+                # ones are truncated, so the spec need not be re-typed when --n_layers or
+                # --dff_every changes.
                 _w = [float(x) for x in _spec.split(',') if x.strip()]
                 if not _w:
                     raise SystemExit(f'--ema_ladder {_spec!r}: no windows parsed')
@@ -2001,31 +1765,19 @@ class VLAModel(nn.Module, _HubMixin):
                     raise SystemExit(f'--ema_ladder {_spec!r}: a bare BASE must be > 1 '
                                      f'(use a comma-separated window list for anything else)')
                 self.ema = [min(1.0, 1.0 / (_b ** i)) for i in range(_nreg)]
-            self.periods = [1] * _nreg
-        # a mode with nothing to clock (one layer, or exp with no middle layers) is sync,
-        # and there is nothing to average where nothing is ever held
-        # gated: some layer actually holds, so there is a window to average over.
-        # clocked: a DFFClock has to exist at all -- also true under --ema, which blends on
-        # every write even when every layer writes every step.
-        self.gated      = any(p != 1 for p in self.periods)
-        self.accumulate = bool(self.accumulate) and self.gated
-        self.clocked    = self.gated or self.ema is not None
         self.clk = None
 
-    def _new_clock(self, B, device):
-        """The write schedule for one context (None under --clock sync, which never gates)."""
-        return (DFFClock(self.clock, self.periods, B, device,
-                         clock_max=getattr(self, 'clock_max', _CLOCK_MAX),
-                         base=getattr(self, 'clock_base', _CLOCK_BASE),
-                         accumulate=self.accumulate, ema=self.ema)
-                if self.clocked else None)
+    def _new_writer(self, B, device):
+        """The blend state for one context. None when there is nothing to blend -- no --ema
+        and no --ema_ladder -- where a write is a plain replace and needs no state."""
+        return DFFEma(self.ema, B, device) if self.ema is not None else None
 
     def _init_dff(self, B, device):
         dev = torch.device(device)
         if (self.dff is None or len(self.dff) != self.n_layers
                 or self.dff[0].shape[0] != B or self.dff[0].device != dev):
             self.dff = self._new_dff(B, device)
-            self.clk = self._new_clock(B, dev)   # the clock is state too: rebuilt with it
+            self.clk = self._new_writer(B, dev)   # blend state too: rebuilt with the DFF
 
     def _fb(self, li, d):
         """Layer li's DFF state as the feedback add sees it (--qproj read). Off, this is the
@@ -2154,14 +1906,14 @@ class VLAModel(nn.Module, _HubMixin):
                 _l = li + 1
                 _sl = self.dff_slot.get(_l)
                 if _sl is None:
-                    # STRAIGHT THROUGH (--dff_every): no register to read, so no feedback
-                    # add; no register to write, so nothing appended to outs; and no linout,
-                    # so this chain already ends at n_hidden for the layer above.
+                    # STRAIGHT THROUGH (--dff_every): same chain and same linout as any
+                    # other layer -- what it lacks is the MEMORY. No register to read, so
+                    # no feedback add; no register to write, so nothing appended to outs.
                     x = o
-                    o = self.deep_context[li](x)
+                    o = self.linout[_l](self.deep_context[li](x))
                 else:
                     x = self._fb(_sl, dff[_sl]) + o
-                    o = self.linout[_sl](self.deep_context[li](x))
+                    o = self.linout[_l](self.deep_context[li](x))
                     outs.append(o)
                 if record is not None:
                     record.append({'in': x, 'out': o})
@@ -2223,7 +1975,7 @@ class VLAModel(nn.Module, _HubMixin):
         self.eval()
         dev = next(self.parameters()).device
         dff = self._new_dff(1, dev)
-        clk = self._new_clock(1, dev)   # its own clock: generate runs on a local state
+        clk = self._new_writer(1, dev)   # its own blend state: generate runs locally
 
         def _step(b):
             nonlocal dff
@@ -3530,11 +3282,11 @@ if args.pretrained:
                     ('accumulate', 'accumulate'), ('ema', 'ema'),
                     ('qproj', 'qproj'), ('tap', 'tap')) if _a in _cfg},
                   'pretrained config')
-    # from_pretrained built the model straight from that config, so an overridden clock has
-    # to be pushed onto the model too -- unlike --load, there is no later construction step.
-    if _CLI_GIVEN & {'clock', 'clock_base', 'accumulate', 'ema'}:
-        model.set_clock(args.clock, args.accumulate, args.ema, args.clock_base,
-                        ema_ladder=args.ema_ladder)
+    # from_pretrained built the model straight from that config, so an overridden blend
+    # rate has to be pushed onto the model too -- unlike --load there is no later
+    # construction step.
+    if _CLI_GIVEN & {'ema', 'ema_ladder'}:
+        model.set_ema(args.ema, ema_ladder=args.ema_ladder)
     print('pretrained config', _cfg)
     # The ARGS line was logged before the hub config was known, so it still shows the CLI
     # arch defaults. Re-log the corrected args, or the log would misattribute the run.
@@ -3550,10 +3302,6 @@ else:
         c_context = args.c_context,
         c_text    = args.c_text,
         n_layers  = args.n_layers,
-        clock      = args.clock,
-        clock_base = args.clock_base,
-        clock_max  = args.clock_max,
-        clock_ends = args.clock_ends,
         clip_dff   = args.clip_dff,
         tap_norm   = args.tap_norm,
         norm       = args.norm,
@@ -3563,7 +3311,6 @@ else:
         bn_affine  = args.bn_affine,
         bn_momentum= args.bn_momentum,
         bn_eps     = args.bn_eps,
-        accumulate = args.accumulate,
         ema        = args.ema,
         qproj      = args.qproj,
         tap        = args.tap,
@@ -3588,12 +3335,6 @@ args.c_context = model.context.c_context
 # likewise --head_norm: char forces it to 'none', and so does an ln_f that the source model
 # turned out not to expose, so read back what was actually built.
 args.head_norm = model.head_norm_kind
-# and --clock, which falls back to sync on an unknown mode, and --accumulate, which needs a
-# clock to have anything to average.
-args.clock      = model.clock
-args.clock_base = model.clock_base
-args.clock_max  = model.clock_max
-args.clock_ends = model.clock_ends
 args.clip_dff   = model.clip_dff
 args.tap_norm   = model.tap_norm_kind
 args.norm       = model.norm_kind
@@ -3601,7 +3342,6 @@ args.norm_groups = model.norm_groups
 args.dff_norm   = model.dff_norm_kind
 args.bn_track   = model.bn_track
 args.bn_affine  = model.bn_affine
-args.accumulate = model.accumulate
 # Only a SCALAR ema syncs back. Under --ema_ladder model.ema is a per-layer list, and
 # writing that into args would put a list in saved_args['ema'] -- which _restore_arch then
 # hands to set_clock on the next --load, where float(list) raises. ema_ladder is the source
@@ -3779,64 +3519,27 @@ if model.context.c_context != model.n_hidden:
     _ctx_label += (f' -- interior {model.context.c_context} channels (--c_context), '
                    f'ends pinned to n_hidden {model.n_hidden} by the DFF')
 _summ(_ctx_label, model.context, input_size=_dff_shape)
-if model.clock != 'sync' and not model.gated:
-    # asked for a clock and got none: exp has no middle layers to clock below 3, and no mode
-    # clocks a single layer. Say so rather than run silently as sync.
-    print(f'WARNING: --clock {model.clock} has nothing to clock at --n_layers '
-          f'{model.n_layers}: every layer writes every step, as --clock sync'
-          + (' (exp clocks the middle layers only, so it needs --n_layers > 2)'
-             if model.clock == 'exp' else ''))
-if model.clocked and (not (args.generate or args.vis or args.altvis or args.push or args.eval) or args.verbose):
-    # the clock is invisible in the layer summaries (it adds no parameters and no shapes),
-    # so state it explicitly: it is the single biggest change to what the stack does.
+# The blend rate is invisible in the layer summaries (it adds no parameters and no shapes),
+# so state it explicitly: it is the only thing deciding how long the state remembers.
+if model.ema is not None and (not (args.generate or args.vis or args.altvis or args.push
+                                   or args.eval) or args.verbose):
+    _lbl = getattr(model, 'dff_layers', list(range(model.n_layers)))
     if isinstance(model.ema, (list, tuple)):
-        # --ema_ladder: the periods are all 1 and say nothing; the blend rates are the ladder.
-        # labelled by the MODEL LAYER that owns each register: under --dff_every 2 the
-        # second ladder entry is L3, not L2, and printing "L2" there would misdescribe it.
-        _lbl = getattr(model, 'dff_layers', list(range(len(model.ema))))
         _txt = ('DFF blend rate per register '
                 + ', '.join(f'L{_lbl[i] + 1}={e:.4g} (~{1.0 / e:.0f} tok window)'
-                            for i, e in enumerate(model.ema))
-                + '  -- every register is written every step')
-        print(f'--ema_ladder {model.ema_ladder}: {_txt}')  # spec as typed
-        with open(args.log, 'a') as f:
-            print(f'INFO --ema_ladder {model.ema_ladder}: {_txt}', file=f)
-    _per = lambda fmt: ', '.join(fmt(li, p) for li, p in enumerate(model.periods))
-    _ladder = lambda: ('DFF state write period per layer '
-                       + _per(lambda li, p: f'L{li + 1}={p}') + ' steps')
-    _clk_txt = {
-        'fixed':  _ladder,
-        'incr':   _ladder,
-        'dither': lambda: 'DFF state write probability per layer '
-                          + _per(lambda li, p: f'L{li + 1}={100.0 / p:g}%')
-                          + ' (random per row, mean period '
-                          + _per(lambda li, p: str(p)) + ' steps)',
-        'sync':   lambda: 'every layer writes its DFF state every step',
-        'exp':    lambda: f'layers 2..{model.n_layers - 1} hold '
-                          f'{model.clock_base:g}**k steps, k ~ Geometric(1/2), '
-                          + (f'mean hold {1.0 / (2.0 - model.clock_base):.1f} steps'
-                             if model.clock_base < 2.0 else
-                             'mean hold unbounded at base >= 2, set only by the cap')
-                          + f', capped at {model.clock_max} (drawn per layer per row); ' + {
-                              'both':  f'L1 and L{model.n_layers} write every step',
-                              'none':  'every layer is clocked, including both ends',
-                              'first': 'L1 writes every step, '
-                                       f'L{model.n_layers} is clocked',
-                              'last':  f'L{model.n_layers} writes every step, L1 is clocked',
-                          }[model.clock_ends],
-    }[model.clock]()
-    _clk_txt = (f'── clock ──\n--clock {model.clock}: {_clk_txt}'
-                + ('\n--accumulate: each write commits the mean of every output that layer '
-                   'computed since its last write' if model.accumulate else '')
-                + (f'\n--ema {model.ema:g}: a write blends into the register '
-                   f'(register += {model.ema:g} * (new - register)) instead of replacing it; '
-                   f'effective window ~{1.0 / model.ema:g} writes'
-                   # a LIST is --ema_ladder, already reported above with its per-layer windows
-                   if isinstance(model.ema, float) else ''))
-    print(_clk_txt)
+                            for i, e in enumerate(model.ema)))
+        print(f'--ema_ladder {model.ema_ladder}: {_txt}')          # spec as typed
+        _line = f'--ema_ladder {model.ema_ladder}: {_txt}'
+    else:
+        _line = (f'--ema {model.ema:.4g}: every register blends '
+                 f'register + {model.ema:.4g}*(new - register) every step '
+                 f'(~{1.0 / model.ema:.0f} token window)')
+        print(_line)
     with open(args.log, 'a') as f:
-        for line in _clk_txt.splitlines():
-            print(f'INFO {line}', file=f)
+        print(f'INFO {_line}', file=f)
+elif model.ema is None and not (args.generate or args.vis or args.altvis or args.push
+                                or args.eval):
+    print('no --ema/--ema_ladder: every register REPLACES its contents every step')
 
 if model.deep_context is not None:
     _summ(f'deep_context x{model.n_layers - 1} (layers 2..{model.n_layers})',
@@ -4175,21 +3878,23 @@ if args.altvis:
     _av_fig, _av_axes = plt.subplots(3, _NL, figsize=(_av_w, 10), squeeze=False)
     _av_fig.subplots_adjust(top=0.85, bottom=0.05, left=0.05, right=0.98,
                             hspace=0.25, wspace=0.12)
-    # Row 3 is the REGISTER, and it is the one that does not move every step: the clock gates
-    # the write, so layer 1 updates every step, layer 2 every periods[1], and so on up the
-    # ladder. Rows 1 and 2 are recomputed every step whatever the clock does -- a layer always
-    # runs its convs and always passes its output up -- so only this row goes still.
-    _av_per = list(getattr(clk_probe, 'periods', [])) if (clk_probe := model._new_clock(1, 'cpu')) \
-              else []
-    if not _av_per:
-        _av_per = [1] * _NL
+    # Row 3 is the REGISTER. Every register is written every step (there is no clock any
+    # more), so what this row shows is how fast the state MOVES -- which is the --ema blend
+    # rate, not a write schedule. Under --dff_every a layer may own no register at all, and
+    # its panel says so rather than showing another layer's state.
+    _sl_of = getattr(model, 'dff_slot', {c: c for c in range(_NL)})
+    _emas  = model.ema if isinstance(model.ema, (list, tuple)) else None
     for _r, _lbl in enumerate(('input', 'output', 'state')):
         for _c in range(_NL):
             _ax = _av_axes[_r][_c]
             if _lbl == 'state':
-                _p = int(_av_per[_c]) if _c < len(_av_per) else 1
-                _t = (f'layer {_c + 1} DFF state std  (writes every {_p} step'
-                      f'{"" if _p == 1 else "s"})')
+                if _c in _sl_of:
+                    _e = (_emas[_sl_of[_c]] if _emas else
+                          (model.ema if model.ema is not None else 1.0))
+                    _t = (f'layer {_c + 1} DFF state std  (ema {_e:.4g}, '
+                          f'~{1.0 / _e:.0f} tok window)')
+                else:
+                    _t = f'layer {_c + 1}: no register (--dff_every)'
             else:
                 _t = f'layer {_c + 1} DFF {_lbl} std / {model.n_hidden} ch'
             _ax.set_title(_t, fontsize=8, pad=3)
@@ -4198,8 +3903,6 @@ if args.altvis:
             _ax.set_xticks([]); _ax.set_yticks([])
     _av_imgs   = [[None] * _NL for _ in range(3)]
     _av_vmax   = [[None] * _NL for _ in range(3)]   # slow-tracking scale, as --vis does
-    _av_prev   = [None] * _NL     # last state map per layer, to detect a held (unwritten) step
-    _av_held   = [0] * _NL        # consecutive steps this layer's register has not changed
     _av_header = _av_fig.text(0.01, 0.99, '', family='monospace', fontsize=7,
                               va='top', ha='left')
 
@@ -4222,7 +3925,7 @@ if args.altvis:
     _ticker = _ptext
     _nstep  = 0
     dff     = model._new_dff(1, _dev)
-    clk     = model._new_clock(1, _dev)
+    clk     = model._new_writer(1, _dev)
 
     while not _vis_exit:
         rec = []
@@ -4238,13 +3941,10 @@ if args.altvis:
         for _r in range(3):
             for _c in range(_NL):
                 if _r == 2:
-                    # the register itself, AFTER the clock decided whether to write it
-                    m = _std_map(dff[_c])
-                    if _av_prev[_c] is not None and np.array_equal(m, _av_prev[_c]):
-                        _av_held[_c] += 1
-                    else:
-                        _av_held[_c] = 0
-                    _av_prev[_c] = m
+                    # the register itself, after this step's blend. A straight-through layer
+                    # has none, so its panel stays blank rather than borrowing a neighbour's.
+                    m = (_std_map(dff[_sl_of[_c]]) if _c in _sl_of
+                         else np.zeros_like(_std_map(rec[_c]['out'])))
                 else:
                     m = _std_map(rec[_c]['in' if _r == 0 else 'out'])
                 # ease the colour ceiling upward and let it decay, so a single spike does not
@@ -4263,8 +3963,7 @@ if args.altvis:
         _av_header.set_text(
             f'step {_nstep}   ' + '   '.join(
                 f'L{c+1} in {rec[c]["in"].std().item():6.3f} out {rec[c]["out"].std().item():6.3f} '
-                f'state {dff[c].std().item():6.3f} '
-                f'{"held " + str(_av_held[c]) if _av_held[c] else "WROTE"}'
+                + (f'state {dff[_sl_of[c]].std().item():6.3f}' if c in _sl_of else 'no reg')
                 for c in range(_NL))
             + '\n' + _ticker[-_AV_WIN:])
 
@@ -4275,7 +3974,7 @@ if args.altvis:
             if nxt == model.end_id:
                 _ticker += ETX_TEXT
                 dff    = model._new_dff(1, _dev)
-                clk    = model._new_clock(1, _dev)
+                clk    = model._new_writer(1, _dev)
                 _queue = list(_prompt)
                 _b     = _queue.pop(0)
                 _ticker += _ptext
@@ -4359,7 +4058,7 @@ if args.vis:
     _rep    = 0               # --datarep: replicas of the current token drawn so far
     _acc    = None            # --gen_pool mean: probabilities pooled across them
     dff     = model._new_dff(1, _dev)
-    clk     = model._new_clock(1, _dev)   # this episode's --clock state
+    clk     = model._new_writer(1, _dev)   # this episode's blend state
 
     while not _vis_exit:
         with torch.no_grad():
@@ -4396,7 +4095,7 @@ if args.vis:
             if nxt == model.end_id:
                 _ticker += ETX_TEXT        # mark the episode break in the ticker
                 dff    = model._new_dff(1, _dev)
-                clk    = model._new_clock(1, _dev)
+                clk    = model._new_writer(1, _dev)
                 _queue = list(_prompt)     # episode over: reset state, restart prompt
                 _b     = _queue.pop(0)
                 _ticker += _ptext          # new episode opens with <STX> again
