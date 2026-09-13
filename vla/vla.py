@@ -599,6 +599,26 @@ parser.add_argument('--mix',           default=None,
                     help='joint multi-dataset training, "name:weight,..." e.g. '
                          '"brt:0.5,web:0.5"; overrides --dataset, samples one dataset per clip '
                          '(token-proportional)')
+parser.add_argument('--mix_slots',     default=False, action='store_true',
+                    help='read the --mix weights as SLOT fractions instead of sampling '
+                         'weights: each dataset gets its own round(w * --batch) slots and its '
+                         'own clip queue, fed by builder threads pinned to that dataset. '
+                         'Every slot contributes one token per step, so this is an EXACT '
+                         'token split -- "fwcrawl:0.5,tinytb:0.5 --batch 250" is 125 slots '
+                         'each, every step -- where plain --mix only holds on average and '
+                         'only after its running mean of clip lengths has settled. Same '
+                         'batchwise idea as --vocab_slots, for hub corpora.')
+parser.add_argument('--unframed',      default=None,
+                    help='comma-separated --dataset/--mix corpora whose documents are NOT '
+                         'wrapped in <STX>/<ETX>: on those slots the raw tokens of one '
+                         'document are followed directly by the first token of the next, the '
+                         'slot never signals a document start, and the recurrent state is '
+                         'never reset -- the same contract as an unframed --vocab_files pool, '
+                         'applied to a streaming corpus. Because a slot is either resetting '
+                         'or not, an unframed corpus needs slots of its own: with --mix this '
+                         'requires --mix_slots. Held-out eval (--eval_corpora) still scores '
+                         'that corpus FRAMED, one document at a time from a reset state, so '
+                         'its EVAL line measures the same thing as a framed run\'s.')
 parser.add_argument('--shuffle',       default=None,
                     action=argparse.BooleanOptionalAction,
                     help='shuffle the corpus, or read it in FILE ORDER. Unset (the default) '
@@ -1053,6 +1073,19 @@ def _parse_mix(spec):
     return names, [w / s for w in weights]
 
 _mix = _parse_mix(args.mix)
+
+# --unframed: every name must be a corpus this run trains on, and with several corpora the
+# unframed one has to own its slots (see the help text), which is what --mix_slots does.
+_UNFRAMED = {n.strip() for n in (args.unframed or '').split(',') if n.strip()}
+if _UNFRAMED:
+    _train_names = set(_mix[0]) if _mix else {args.dataset}
+    if _UNFRAMED - _train_names:
+        raise SystemExit(f'--unframed: not in --dataset/--mix: '
+                         f'{",".join(sorted(_UNFRAMED - _train_names))}')
+    if _mix and not args.mix_slots:
+        raise SystemExit('--unframed with --mix needs --mix_slots: a slot either resets on '
+                         'every document or never does, so an unframed corpus cannot share '
+                         'the one clip queue --mix feeds every slot from')
 
 # How many of the --batch slots the batchwise vocab stream occupies. worker() derives the
 # same number for slot construction; it is computed here too because the training loop logs
@@ -2873,13 +2906,15 @@ def _make_iter(ds, split, streaming, seed, buffer_size=10000, shuffle=True):
 # ── worker ─────────────────────────────────────────────────────────────────────
 
 class _ClipSlot:
-    """One batch slot: independent clip stream."""
-    __slots__ = ['steps', 'pos', 'caption']
+    """One batch slot: independent clip stream. `name` is the dataset whose clip queue
+    refills it under --mix_slots; None means the shared queue every slot draws from."""
+    __slots__ = ['steps', 'pos', 'caption', 'name']
 
-    def __init__(self):
+    def __init__(self, name=None):
         self.steps   = []
         self.pos     = 0
         self.caption = ''
+        self.name    = name
 
     def load(self, steps, caption=''):
         self.steps   = steps
@@ -2893,6 +2928,41 @@ class _ClipSlot:
         item     = self.steps[self.pos]
         self.pos += 1
         return item   # (x_byte, y_byte)
+
+
+class _StreamSlot(_ClipSlot):
+    """A corpus slot for an --unframed dataset. The builder hands it raw token ids rather
+    than <STX>...<ETX> pairs, load() APPENDS them to a running buffer instead of replacing
+    the clip, and the (x, y) pair that straddles a document boundary is the last token of
+    one document -> the first of the next. is_start() is always False, so the recurrent
+    state is never reset on this slot. Identical to the unframed _VocabSlot contract, for a
+    streaming corpus instead of a local file; the buffer trim and --datarep handling are
+    the same code."""
+    __slots__ = ['ids', 'rep']
+
+    def __init__(self, name=None):
+        super().__init__(name)
+        self.ids = []
+        self.rep = 0
+
+    def load(self, ids, caption=''):
+        self.ids.extend(ids)
+        self.caption = caption
+
+    def done(self):       return self.pos + 1 >= len(self.ids)
+    def is_start(self):   return False
+
+    def advance(self):
+        x, y = self.ids[self.pos], self.ids[self.pos + 1]
+        self.rep += 1
+        if self.rep < _DATAREP:
+            return (x, y)
+        self.rep = 0
+        self.pos += 1
+        if self.pos > 8192:                 # drop the consumed prefix; keeps memory flat
+            self.ids = self.ids[self.pos:]
+            self.pos = 0
+        return (x, y)
 
 
 # Sentences drawn per vocab file, so the epoch column can report passes over the FILE
@@ -3091,6 +3161,8 @@ def worker(stop, q, datasets, args, mix=None):
             return ([], '')
         if name in _HASH_HOLDOUT and _is_heldout(text):
             return ([], '')
+        if name in _UNFRAMED:             # raw ids; the _StreamSlot runs them head to tail
+            return (_tokenizer.encode(text), text)
         return clip_text(text)
 
     # BATCHWISE MIX. The first --vocab_slots slots stream undelimited sentences from
@@ -3153,12 +3225,47 @@ def worker(stop, q, datasets, args, mix=None):
         print(f'batchwise mix: {n_vocab}/{args.batch} vocab slots '
               f'({100.0*n_vocab/args.batch:.1f}% of tokens), '
               f'{args.batch-n_vocab} corpus slots', flush=True)
-    slots += [_ClipSlot() for _ in range(args.batch - n_vocab)]
+    n_corpus = args.batch - n_vocab
+    _slot_of = lambda n: _StreamSlot(n) if n in _UNFRAMED else _ClipSlot(n)
+    if args.mix_slots and mix is not None:
+        # --mix_slots: round(w * slots) each, the remainder to the largest fractional parts
+        # so the counts sum exactly to n_corpus. A weight that rounds to zero slots is a
+        # corpus that would silently never be trained on, so it is an error.
+        _exact = [w * n_corpus for w in weights]
+        _cnt   = [int(e) for e in _exact]
+        for i in sorted(range(len(names)), key=lambda i: _exact[i] - _cnt[i], reverse=True):
+            if sum(_cnt) >= n_corpus:
+                break
+            _cnt[i] += 1
+        _zero = [n for n, c in zip(names, _cnt) if c == 0]
+        if _zero:
+            raise SystemExit(f'--mix_slots: {",".join(_zero)} rounds to 0 of {n_corpus} slots')
+        for n, c in zip(names, _cnt):
+            slots += [_slot_of(n) for _ in range(c)]
+        print('batchwise mix: ' + ', '.join(
+            f'{n} {c} slots ({"undelimited" if n in _UNFRAMED else "<STX>/<ETX> framed"})'
+            for n, c in zip(names, _cnt)), flush=True)
+    else:
+        # one shared queue (slot name None); a single --dataset may be --unframed, in which
+        # case every corpus slot is a _StreamSlot
+        _un = mix is None and names[0] in _UNFRAMED
+        slots += [(_StreamSlot() if _un else _ClipSlot()) for _ in range(n_corpus)]
 
     # Pool of builder threads runs the dataset pull/encode in parallel and parks
     # finished clips in clip_q, so the stepping loop below never blocks on one clip.
+    # Under --mix_slots each dataset has its own queue and its own builders (pinned round
+    # robin, so every dataset gets at least one): a shared queue would let one corpus's
+    # clips block the other's slots, and a random per-clip dataset choice would let a full
+    # queue on one side stall a builder the other side needs.
     n_builders = max(1, args.workers)
     clip_q     = queue.Queue(maxsize=2 * n_builders)
+    if args.mix_slots and mix is not None:
+        _ds_list = sorted(set(names))
+        _pinned  = [_ds_list[i % len(_ds_list)] for i in range(max(n_builders, len(_ds_list)))]
+        clip_qs  = {n: queue.Queue(maxsize=2 * _pinned.count(n)) for n in _ds_list}
+    else:
+        _pinned  = [None] * n_builders
+        clip_qs  = {None: clip_q}
 
     # token-proportional dataset sampling: `weights` is the desired *token* mix, but
     # datasets have very different tokens-per-example, so choosing examples directly by
@@ -3174,10 +3281,11 @@ def worker(stop, q, datasets, args, mix=None):
             return [w / max(_len_sum[n] / _len_cnt[n] if _len_cnt[n] else 1.0, 1e-9)
                     for n, w in zip(names, weights)]
 
-    def builder():
+    def builder(fixed=None):
         rng = random.Random()   # per-clip dataset choice (thread-local instance)
+        cq  = clip_qs[fixed]    # --mix_slots: this thread's dataset and its queue
         while not stop.is_set():
-            name = rng.choices(names, weights=_mix_weights(), k=1)[0]
+            name = fixed if fixed is not None else rng.choices(names, weights=_mix_weights(), k=1)[0]
             try:
                 steps, caption = _build_clip(name, _next_example(name))
             except Exception as e:
@@ -3191,12 +3299,12 @@ def worker(stop, q, datasets, args, mix=None):
             _text_tally(len(steps), sample=caption)
             while not stop.is_set():
                 try:
-                    clip_q.put((steps, caption), timeout=0.5)
+                    cq.put((steps, caption), timeout=0.5)
                     break
                 except queue.Full:
                     pass
 
-    builders = [threading.Thread(target=builder, daemon=True) for _ in range(n_builders)]
+    builders = [threading.Thread(target=builder, args=(f,), daemon=True) for f in _pinned]
     for b in builders:
         b.start()
 
@@ -3204,7 +3312,7 @@ def worker(stop, q, datasets, args, mix=None):
         for slot in slots:
             while slot.done():
                 try:
-                    steps, caption = clip_q.get(timeout=0.5)
+                    steps, caption = clip_qs[slot.name].get(timeout=0.5)
                 except queue.Empty:
                     if stop.is_set():
                         return
