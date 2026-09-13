@@ -1982,11 +1982,18 @@ class VLAModel(nn.Module, _HubMixin):
     @torch.no_grad()
     def generate(self, prompt_ids, n_tokens, temperature=1.0):
         """Autoregressive generation seeded by prompt_ids (temperature 0 = argmax).
-        Stops at the first END, which is included in the output so callers render <ETX>."""
+
+        Returns n_tokens tokens. An END ends a SEQUENCE, not the sample: it is kept in the
+        output so callers render <ETX>, and if the budget is not yet filled the state is
+        reset, the prompt fed again, and a fresh sequence appended -- exactly what the
+        model does at a document boundary in training. Without this a model that has
+        learned to end documents returns a few dozen tokens of a 200-token budget and the
+        sample stops showing what it does mid-document. Both --generate and the in-training
+        GEN line go through here, so they see the same behaviour. Capped at 20 sequences so
+        a model that emits END immediately cannot spin. Returns short only on NaN/Inf."""
         self.eval()
         dev = next(self.parameters()).device
-        dff = self._new_dff(1, dev)
-        clk = self._new_writer(1, dev)   # its own blend state: generate runs locally
+        dff = clk = None
 
         def _step(b):
             nonlocal dff
@@ -2026,27 +2033,31 @@ class VLAModel(nn.Module, _HubMixin):
             # to the POOLED distribution, and exactly p at T=1. clamp keeps log(0) finite.
             return torch.log((acc / _DATAREP).clamp_min(1e-20))
 
-        # feed each prompt token exactly once; logits after the last one seed generation
-        logits = None
-        for b in prompt_ids:
-            logits = _feed(b)
-            if logits is None:
-                return []
-
-        if logits is None:
-            return []
-
         out = []
-        for _ in range(n_tokens):
-            prob = F.softmax(logits[0] / max(temperature, 1e-6), dim=-1)
-            bval = torch.multinomial(prob, 1).item()
-            if bval == self.end_id:
-                out.append(bval)   # keep the terminator so callers render <ETX>
-                break
-            if bval != self.null_id:   # null_id is None outside byte mode: nothing filtered
-                out.append(bval)
-            logits = _feed(bval)           # the sample is replicated too, like a real token
+        for _ in range(20):
+            # fresh state per sequence: its own dff and blend state, so generate runs locally
+            dff = self._new_dff(1, dev)
+            clk = self._new_writer(1, dev)
+            # feed each prompt token exactly once; logits after the last one seed generation
+            logits = None
+            for b in prompt_ids:
+                logits = _feed(b)
+                if logits is None:
+                    return out
             if logits is None:
+                return out
+            while len(out) < n_tokens:
+                prob = F.softmax(logits[0] / max(temperature, 1e-6), dim=-1)
+                bval = torch.multinomial(prob, 1).item()
+                if bval == self.end_id:
+                    out.append(bval)   # keep the terminator so callers render <ETX>
+                    break
+                if bval != self.null_id:   # null_id is None outside byte mode: nothing filtered
+                    out.append(bval)
+                logits = _feed(bval)           # the sample is replicated too, like a real token
+                if logits is None:
+                    return out
+            if len(out) >= n_tokens:
                 break
         return out
 
