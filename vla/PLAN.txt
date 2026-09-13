@@ -1,4 +1,54 @@
 ============================================================================
+        TWO-LAYER LADDER: 16,256 BEATS FLAT 256,256 -- 2026-09-12
+============================================================================
+Fixed corpus data/fineweb5k.jsonl (5000 documents, file order, no shuffle,
+DISJOINT from the fineweb2k the ladder was tuned on -- verified 0 overlap),
+5000 steps, one seed, n_hidden 4096, c_context 256, n_layers 2, depth 16,
+context 16, batch 250, lr 0.03 sgd, --linout --linout_kernel 3:
+
+    L1,L2      @1000    @2500    @4000   final500   late slope/100
+    16,256     6.8794   6.6260   6.5559  6.5380     -0.0164
+    256,256    6.9274   6.7453   6.6536  6.6219     -0.0137
+
+THE GAP WIDENS: 0.048 at 1K -> 0.098 at 2.5K -> 0.084 at the end, and 16,256
+has the STEEPER late slope, so it is still pulling away.  At 1K on the earlier
+corpus 256,256 had the steeper slope and looked like it might be catching up --
+5K says the opposite.  A ladder with a real spread beats a flat one.
+
+Both runs are still descending at 5K; these are not converged values, only a
+fair comparison point.
+
+THE 1K L1 SWEEP that chose 16 (2000 docs, fineweb2k, L2 pinned at 256):
+    4,256   7.0558      16,256  6.9741      64,256  6.9920      256,256  6.9999
+L1=4 is clearly out (+0.082 vs the winner); 16/64/256 span only 0.026.  L1 wants
+to be SHORT BUT NOT VERY SHORT, with L2 long.
+
+STILL OPEN: 1 layer vs 2.  The 2L runs start ~0.27 nats behind at step 250 and
+close to ~0.04 by 1K while still descending 1.5-2x faster, so the 1K comparison
+is a warm-up artifact and no 1L run exists on fineweb5k to compare against.
+
+CORPUS LENGTH DISTRIBUTIONS, pythia31m, 6000 docs each -- these differ enough
+that the 64-256 window optimum should NOT be assumed to transfer:
+
+                   tinytb    fwcrawl
+    mean              640        741
+    median            616        437
+    std               203       1391
+    p25/p75       508/740    209/853
+    p99              1251       4788
+    max              3061      61298
+    mean/median      1.04       1.70
+    tokens in docs >1024 tok:  7.0%   56.8%
+
+tinytb is generated to a spec: symmetric, IQR 232, 96% of docs in 256-1024, and
+93% of its TOKENS come from that band.  fwcrawl is heavy-tailed: a third of
+documents are under 256 tokens, but 57% of its tokens live in documents longer
+than 1024.  So the <ETX> reset cadence and how often a register window straddles
+a document boundary are completely different between them.
+
+NEXT: 1B-token run, ema 16,256, --mix fwcrawl:0.5,tinytb:0.5.
+
+============================================================================
                  EMA WINDOW SWEEP -- RESULT, 2026-09-12
 ============================================================================
 THE DFF FEEDBACK IS THE MODEL.  Not the conv depth: two runs with an IDENTICAL
