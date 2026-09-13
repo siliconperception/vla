@@ -1,4 +1,81 @@
 ============================================================================
+              SESSION HANDOFF -- 2026-09-12, read this first
+============================================================================
+
+RUNNING NOW
+  v103_mix_1b -- 1B tokens (4M steps at batch 250), under exp/longrun.sh.
+    --mix fwcrawl:0.5,tinytb:0.5 --streaming
+    --n_hidden 4096 --c_context 256 --n_layers 2 --depth 16 --context 16
+    --batch 250 --lr_max 0.03 sgd --linout --linout_kernel 3
+    --ema_ladder 16,256 --monitor 100 --checkpoint 500 --gen_interval 500
+    --eval_interval 20000 --eval_corpora fwcrawl,tinytb --eval_docs 100
+  log/exp.v103_mix_1b, checkpoint/v103_mix_1b.pt (333 MB, rewritten every 500
+  steps ~= every 4.6 min).  ~1.8 steps/s, so ~25 days to 4M steps.  Note tinytb
+  is only ~255M tokens, so its half of the mix WRAPS ~2x over the run; fwcrawl
+  (~13B available) is single-pass.
+
+WHAT THE MODEL IS NOW, after this session's removals
+  Every layer has a DFF register and a feedback add.  Every layer is built the
+  same: n_hidden in, c_context through the conv chain, --linout back out to
+  n_hidden.  Registers are written EVERY STEP and blended by --ema/--ema_ladder.
+  There is no write clock, no hold, no accumulate, no straight-through layer.
+
+  DEPRECATED BUT STILL PARSEABLE (warn + ignore, so ./doit lines still run):
+    --clock --clock_base --clock_max --clock_ends   the write clock
+    --accumulate                                    averaged a hold
+    --dff_every                                     straight-through layers
+
+  NEW THIS SESSION
+    --c_context K       ContextCNN interior width, independent of --n_hidden
+    --linout_kernel K   3x3 linout instead of 1x1 (zero-padded, same grid)
+    --datarep N         feed each token N times; decode reads the last replica
+    --gen_pool last|mean  which replica the sampler reads (decode only, no grads)
+    --dataset file      fixed local JSONL, --data_file, read in FILE ORDER
+    --shuffle/--no-shuffle  per-dataset default: off for file, on for hub
+    --dataset fwcrawl   ONE fineweb crawl (CC-MAIN-2025-26), 18 shards, ~13B tok
+    --dataset dclmedu   HuggingFaceTB/dclm-edu, 2 shards, ~2.1B tok
+    --dataset fineweb   fineweb sample-10BT, 15 shards local, ~10B tok
+
+WHAT WAS MEASURED (all numbers in PLAN sections below)
+  1. The DFF feedback IS the model.  Removing one of two registers at identical
+     parameter count and conv depth cost 0.503 nats, and landed worse than two
+     replace-outright registers.  This is why --dff_every was deprecated.
+  2. The EMA window has a real optimum at 64-256 tokens (1 layer, fineweb).
+     Window 65536 is WORSE than window 1: as the blend rate goes to zero the
+     register stops tracking and a stale state is worse than no memory.
+  3. Two layers: 16,256 beats flat 256,256, and the gap WIDENS with training
+     (0.048 at 1K -> 0.084 at 5K on a disjoint fixed corpus).  L1 wants to be
+     short but not very short: 4,256 is 0.082 worse than 16,256.
+  4. --datarep 3 on fineweb was decisively WORSE than no replication: 6.299 vs
+     5.635 held-out at step 140k, gap not closing.  Confounded (1 layer vs 2),
+     but the deficit is 10x the layer-count differences measured elsewhere.
+  5. adamw needs beta2 <= 0.95 at lr 1e-3 (0.999 NaNs at step 5); beta2 0.90
+     keeps dff_max in the sgd band.  sgd lr 0.03-0.1 is stable at these widths.
+
+METHOD -- THE THING THAT CHANGED HOW ANYTHING CAN BE MEASURED
+  Hub corpora shuffle in a way no seed controls (streaming buffer, racing
+  builder threads), and the run-to-run sigma swamped everything below ~0.1 nats:
+  two IDENTICAL configs differed by 0.42 nats at step 200 and 0.10 at 1K, and
+  sweep rankings reshuffled by up to 3 places between step 1000 and 2000.
+  --dataset file fixes that: same seed -> BIT-IDENTICAL loss at every step
+  (verified at 2 and 12 workers).  Every conclusion above that rests on a
+  difference smaller than 0.1 nats was measured on a fixed corpus.
+    data/fineweb2k.jsonl   2000 docs, 6.3M chars   (the window/L1 sweeps)
+    data/fineweb5k.jsonl   5000 docs, 15.0M chars  (the 5K comparison, disjoint)
+  Sweep summaries live in log/sweeps/*.txt; log/sweeps/retable.sh rebuilds any
+  table from the per-run STEP logs in log/.
+
+OPEN
+  - 1 layer vs 2 is UNSETTLED.  2L starts ~0.27 nats behind and closes to ~0.04
+    by 1K while still descending 1.5-2x faster; no 1L run exists on fineweb5k.
+  - The 64-256 window optimum was tuned on fineweb and should not be assumed to
+    transfer: tinytb is symmetric (93% of tokens in 256-1024 token documents),
+    fwcrawl is heavy-tailed (57% of tokens in documents over 1024).
+  - fwcrawl uses the FIRST 18 of 250 shards, in file order.  If shards are
+    ordered by segment or host that is a biased slice, not a sample.
+  - No --datarep run was ever given a same-architecture --datarep 1 control.
+
+============================================================================
         TWO-LAYER LADDER: 16,256 BEATS FLAT 256,256 -- 2026-09-12
 ============================================================================
 Fixed corpus data/fineweb5k.jsonl (5000 documents, file order, no shuffle,

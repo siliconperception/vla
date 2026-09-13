@@ -1,0 +1,9 @@
+=== A_both_dff  (13:40:29)
+blend rate per register L1=0.125 (~8 tok window), L2=0.0625 (~16 tok window)
+  trainable 57,561,344
+  A_both_dff: @1000 6.9233  final500 6.7188
+=== B_L2_straight  (13:59:16)
+blend rate per register L1=0.125 (~8 tok window)
+  trainable 57,561,344
+  B_L2_straight: @1000 7.5139  final500 7.2219
+DFF_TEST_DONE
