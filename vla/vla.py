@@ -857,10 +857,12 @@ parser.add_argument('--clip',          default=0.0,   type=float,
 # learning rate: all --schedule modes are driven by this one set. lr_max is the peak
 # (and the optimizer base lr); lr_min is the floor; lr_warmup / lr_period are step counts.
 parser.add_argument('--schedule',      default='const',
-                    choices=['const', 'warmup', 'linear', 'triangle', 'cosine', 'plat'],
+                    choices=['const', 'warmup', 'step', 'linear', 'triangle', 'cosine', 'plat'],
                     help='lr schedule: "const" (fixed --lr_max), "warmup" (ramp '
                          '--lr_min->--lr_max over --lr_warmup steps, then hold; the ramp is '
                          'measured from the start of this run, so it restarts on --load), '
+                         '"step" (hold --lr_min for the first --lr_warmup GLOBAL steps, then '
+                         'jump to --lr_max: a short fixed low-lr settle instead of a ramp), '
                          '"linear" (ramp '
                          '--lr_min->--lr_max over --lr_period, then hold), "triangle" (ramp '
                          '--lr_min->--lr_max over --lr_warmup, then --lr_max->--lr_min over '
@@ -871,7 +873,7 @@ parser.add_argument('--schedule',      default='const',
                          'a decay clears the window, so the lr drops at most once per '
                          '--lr_period steps)')
 parser.add_argument('--lr_min',        default=1e-6,  type=float,
-                    help='minimum / floor learning rate (warmup|linear|triangle|cosine)')
+                    help='minimum / floor learning rate (warmup|step|linear|triangle|cosine)')
 parser.add_argument('--lr_max',        default=0.001, type=float,
                     help='peak learning rate; also the constant lr for --schedule const '
                          'and the optimizer base lr')
@@ -880,7 +882,7 @@ parser.add_argument('--lr_mult',       default=1.0,   type=float,
                          '--lr_mult**(k-1), so with --lr_mult 10 --n_layers 3 the three '
                          'layers use lr, 10*lr, 100*lr. Default 1.0 (all layers equal)')
 parser.add_argument('--lr_warmup',     default=1000,  type=int,
-                    help='ramp-up length in steps (warmup|triangle)')
+                    help='ramp-up length in steps (warmup|triangle); hold length for step')
 parser.add_argument('--lr_period',     default=10000, type=int,
                     help='schedule length in steps: linear ramp / triangle ramp-down / cosine cycle '
                          '/ plat slope window (steps of loss history the line is fit to, and '
@@ -4385,6 +4387,8 @@ def _lr_factor(step):
         # checkpoint with --schedule warmup means "ease this run back in", so the
         # ramp restarts on every --load instead of being fast-forwarded past.
         lr = _lo + (_hi - _lo) * min((step - _start_step) / _warm, 1.0)
+    elif args.schedule == 'step':                      # lr_min for lr_warmup steps, then lr_max
+        lr = _lo if step < _warm else _hi
     elif args.schedule == 'linear':                    # ramp lr_min -> lr_max over lr_period, then hold
         lr = _lo + (_hi - _lo) * min(step / _period, 1.0)
     elif args.schedule == 'triangle':                  # up over lr_warmup, down over lr_period, then hold lr_min
