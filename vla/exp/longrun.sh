@@ -50,19 +50,80 @@ except Exception:
 PY
 }
 
+# ── rolling LAST-GOOD copy (2026-09-15) ──────────────────────────────────────────────────
+# vla.py --save overwrites ONE file every --checkpoint steps, so a run that blows up has
+# nothing behind it: v111 (lr sqrt2) exploded between steps 244,900 and 245,000, wrote the
+# 245,000 checkpoint from the exploded state (loss 17.3 -- finite, so the HALT path never
+# fired -- dff_std 1.4e7), NaN'd seven steps later, and every one of the 20 resumes here
+# loaded that file and died in seconds.  245k steps, 7 hours, unrecoverable.
+#
+# This keeper runs beside the trainer and copies checkpoint/$M.pt to checkpoint/$M.good.pt
+# whenever it changes, but ONLY after exp/ckpt_health.py has looked at the STEP line the
+# trainer logged at that checkpoint's step and found it sane (finite; loss within 1.5x and
+# dff_std within 3x of the trailing 50 lines).  Readability alone is not the test -- the
+# v111 file loaded fine.  The copy is skipped while the file is under 30s old (torch.save is
+# not atomic) and is written via a temp file + mv so the good copy itself is never torn.
+# ckpt_step costs one CPU torch.load of ~120 MB per new checkpoint, i.e. per ~minute.
+keeper () {
+  local last="" mt st
+  while true; do
+    sleep 60
+    [ -f checkpoint/$M.pt ] || continue
+    mt=$(stat -c %Y checkpoint/$M.pt 2>/dev/null) || continue
+    [ "$mt" = "$last" ] && continue
+    [ $(( $(date +%s) - mt )) -lt 30 ] && continue
+    st=$(ckpt_step checkpoint/$M.pt)
+    [ "$st" = "-1" ] && continue
+    python3 exp/ckpt_health.py log/exp.$M "$st" > /tmp/longrun.$M.health 2>&1
+    case $? in
+      0) cp -f checkpoint/$M.pt checkpoint/$M.good.tmp && mv -f checkpoint/$M.good.tmp checkpoint/$M.good.pt
+         last=$mt ;;
+      1) echo "longrun: checkpoint at step $st FAILED health check -- NOT copied: $(cat /tmp/longrun.$M.health)" | tee -a $STATE
+         last=$mt ;;
+      *) ;;                               # no STEP line for it yet: look again next tick
+    esac
+  done
+}
+keeper &
+KEEPER=$!
+trap 'kill $KEEPER 2>/dev/null' EXIT
+
+# Replace checkpoint/$M.pt with the newest usable fallback: the rolling good copy first,
+# then any milestone stash.  Prints the step it landed on, or -1 if there was nothing.
+fallback () {
+  local why=$1 cand
+  for cand in checkpoint/$M.good.pt $(ls -1t checkpoint/$M.[0-9]*.pt 2>/dev/null); do
+    [ -f "$cand" ] || continue
+    local st=$(ckpt_step "$cand")
+    [ "$st" = "-1" ] && continue
+    echo "longrun: checkpoint/$M.pt is $why -- falling back to $cand (step $st)" | tee -a $STATE >&2
+    cp -f "$cand" checkpoint/$M.pt
+    echo "$st"; return
+  done
+  echo "longrun: checkpoint/$M.pt is $why and there is NO usable fallback" | tee -a $STATE >&2
+  echo "-1"
+}
+
 for (( attempt=0; attempt<=MAXR; attempt++ )); do
   DONE=0
   if [ -f checkpoint/$M.pt ]; then
     DONE=$(ckpt_step checkpoint/$M.pt)
     if [ "$DONE" = "-1" ]; then
       # torch.save is not atomic; a crash mid-write leaves a file that loads as garbage or
-      # not at all.  The milestone stashes exist precisely for this.
-      NEWEST=$(ls -1t checkpoint/$M.[0-9]*.pt 2>/dev/null | head -1)
-      echo "longrun: checkpoint/$M.pt is UNREADABLE -- falling back to ${NEWEST:-none}" | tee -a $STATE
-      [ -n "$NEWEST" ] || { echo "longrun: no usable checkpoint, ABORTING" | tee -a $STATE; exit 1; }
-      cp -f "$NEWEST" checkpoint/$M.pt
-      DONE=$(ckpt_step checkpoint/$M.pt)
-      [ "$DONE" = "-1" ] && { echo "longrun: stash unreadable too, ABORTING" | tee -a $STATE; exit 1; }
+      # not at all.
+      DONE=$(fallback UNREADABLE)
+      [ "$DONE" = "-1" ] && { echo "longrun: no usable checkpoint, ABORTING" | tee -a $STATE; exit 1; }
+    elif [ "$DONE" -gt 0 ]; then
+      python3 exp/ckpt_health.py log/exp.$M "$DONE" > /tmp/longrun.$M.health 2>&1
+      if [ $? = 1 ]; then
+        # Loads, but was written from a blown state (the v111 case).  Resuming it would
+        # replay the failure; the good copy is behind it and is the one to continue from.
+        # If there is no good copy, resume the bad one anyway rather than abort -- it might
+        # only be a transient, and the restart budget bounds the cost of being wrong.
+        echo "longrun: $(cat /tmp/longrun.$M.health)" | tee -a $STATE
+        GOOD=$(fallback "BLOWN at step $DONE")
+        [ "$GOOD" != "-1" ] && DONE=$GOOD
+      fi
     fi
   fi
 
