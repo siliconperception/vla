@@ -188,7 +188,10 @@ def _render(ids):
     string to _printable(); BPE mode decodes runs of ordinary tokens the same way and
     renders the document marker itself. Since START and END are one id in BPE mode, the
     marker shows as <STX> when it opens the sequence and <ETX> anywhere after -- which is
-    exactly the role it plays in the [START] text [END] framing."""
+    exactly the role it plays in the [START] text [END] framing. A marker with more
+    tokens after it is a document boundary -- generate() resets the state and re-feeds
+    the prompt there, and a corpus stream starts its next document there -- so it renders
+    as <ETX><STX>: without the <STX> the text after it reads as a continuation."""
     if _tokenizer.is_char:
         return _printable(bytes(ids).decode('utf-8', errors='replace'))
     out, run = [], []
@@ -197,7 +200,10 @@ def _render(ids):
             if run:
                 out.append(_printable(_tokenizer.decode(run)))
                 run = []
-            out.append(STX_TEXT if n == 0 else ETX_TEXT)
+            if n == 0:
+                out.append(STX_TEXT)
+            else:
+                out.append(ETX_TEXT + STX_TEXT if n < len(ids) - 1 else ETX_TEXT)
         else:
             run.append(t)
     if run:
@@ -633,6 +639,33 @@ parser.add_argument('--shuffle',       default=None,
                          'iterator -- so --no-shuffle is what makes two runs see the same '
                          'documents in the same order, and the only way to tell a 0.04-nat '
                          'config difference from a different draw.')
+parser.add_argument('--subsample',     default=0,     type=int, metavar='N',
+                    help='train on a FIXED sample of N examples per corpus instead of the '
+                         'whole stream. The sample is drawn once at startup -- the first N '
+                         'usable examples the (shuffled) corpus iterator yields, after the '
+                         'per-corpus filter and the held-out hash split, so every one of '
+                         'them is a document the model will actually see -- and is then '
+                         'treated as the corpus: one pass over it is one epoch, and each '
+                         'epoch is an independent reshuffle of the same N documents '
+                         '(random.Random(--seed + epoch)). Under --mix every corpus gets '
+                         'its own N-example sample. The epoch column and the EPOCH lines '
+                         'behave as for any finite corpus, so this is the tool for '
+                         'measuring how many passes a closed set of documents takes to '
+                         'memorize: 10000 fineweb docs is ~1 step per document at batch '
+                         '250, so --subsample 10000 cycles the same text every few hundred '
+                         'steps. 0 (default) = off, stream the corpus as before.')
+parser.add_argument('--epochs',        default=0,     type=int, metavar='E',
+                    help='--subsample turnover: how many epochs each sampled document lives '
+                         'before it is retired for a fresh one. 0 (default) = never, the '
+                         'sample is closed and every epoch is the same N documents. With E '
+                         'set the pool still holds N documents at all times, but after every '
+                         'epoch the N/E OLDEST are dropped and N/E fresh ones are drawn from '
+                         'the stream (the remainder spread so that exactly N turn over per E '
+                         'epochs), so the refresh is gradual rather than a wholesale swap: '
+                         'each document is seen E times, the pool composition drifts '
+                         'continuously, and at any moment it holds documents at every age '
+                         'from 1 to E epochs. E=1 replaces the whole pool every epoch. '
+                         'Requires --subsample.')
 parser.add_argument('--data_file',     default='data/fineweb2k.jsonl',
                     help='file backing --dataset file: a LOCAL JSONL corpus, one JSON object '
                          'per line with a "text" field. Unlike every hub corpus this one is '
@@ -1044,6 +1077,8 @@ parser.add_argument('--private',       default=False, action='store_true',
                     help='--push: create the hub repo private (default: the org/user default '
                          'visibility). Ignored if the repo already exists')
 args = parser.parse_args()
+if args.epochs and not args.subsample:
+    raise SystemExit('--epochs is the --subsample turnover rate and needs --subsample')
 
 
 def _cli_given(argv=None):
@@ -3143,6 +3178,76 @@ def worker(stop, q, datasets, args, mix=None):
         if _track_corpus_epochs:
             _epoch_set(n, 1)
 
+    # --subsample: replace each corpus iterator with a fixed list of N raw examples, drawn
+    # once here from the shuffled stream. Drawn AFTER the same filters _build_clip applies
+    # (_corpus_text and the held-out hash split), so the N examples are N usable documents
+    # rather than N raw rows of which some would be dropped every epoch. The list itself is
+    # the corpus from here on: exhaustion is an epoch, and the next epoch is a fresh
+    # permutation of the same list under --seed + epoch, the convention _make_iter already
+    # uses for its reshuffle seed.
+    def _subsample_epoch(pool, seed):
+        order = list(pool)
+        random.Random(seed).shuffle(order)
+        return order
+
+    _samples = {}
+    _stream  = {}     # the underlying corpus iterator, kept for --epochs refreshes
+    _spass   = {}     # how many times the stream has been re-made (its reshuffle seed)
+
+    _fresh_docs = collections.Counter()   # --subsample: distinct documents drawn so far
+    _fresh_toks = collections.Counter()   # ...and their token count, per corpus
+
+    def _sub_log(msg):
+        """subsample lines go to stdout AND log/exp.$M: the fresh-token tally is the x-axis
+        of a --epochs experiment and has to survive a resume, which rewrites .out."""
+        print(msg, flush=True)
+        with open(args.log, 'a') as f:
+            print(msg, file=f)
+
+    def _draw(n, k):
+        """k usable examples off the corpus stream (re-made, reseeded, on exhaustion)."""
+        drawn, seen, remade = [], 0, False
+        while len(drawn) < k:
+            try:
+                ex = next(_stream[n])
+            except StopIteration:
+                if remade:
+                    break                        # corpus smaller than k: take what there is
+                remade = True                    # one fresh pass per draw, then stop
+                _spass[n] += 1
+                _stream[n] = _make_iter(datasets[n], _split_for_name(n), args.streaming,
+                                        args.seed + 7919 * _spass[n])
+                continue
+            seen += 1
+            text = _corpus_text(n, ex)
+            if not text or (n in _HASH_HOLDOUT and _is_heldout(text)):
+                continue
+            drawn.append(ex)
+            _fresh_toks[n] += len(_tokenizer.encode(text))
+        _fresh_docs[n] += len(drawn)
+        return drawn, seen
+
+    def _fresh(n):
+        return f'fresh total {_fresh_docs[n]} docs / {_fresh_toks[n]:,} tokens'
+
+    def _refresh_count(epoch):
+        """Documents to turn over at the start of this epoch: N/E, remainder spread so that
+        exactly N have turned over after every E epochs."""
+        N, E = args.subsample, args.epochs
+        return (N * epoch) // E - (N * (epoch - 1)) // E
+
+    if args.subsample:
+        for n in set(names):
+            _stream[n] = _iters[n]
+            _spass[n]  = 0
+            drawn, seen = _draw(n, args.subsample)
+            _samples[n] = drawn
+            _sub_log(f'subsample: {n} {len(drawn)} examples drawn from {seen} '
+                     f'(requested {args.subsample}, seed {args.seed}'
+                     f'{f", {_refresh_count(2)}/epoch turnover over {args.epochs} epochs" if args.epochs else ", closed"}) '
+                     f'{_fresh(n)}')
+            _iters[n] = iter(_subsample_epoch(drawn, args.seed + 1))
+
     def _next_example(name):
         """Thread-safe pull of the next raw example for one dataset (loops on exhaustion)."""
         with _locks[name]:
@@ -3163,8 +3268,24 @@ def worker(stop, q, datasets, args, mix=None):
                 # which is where the reshuffle seed stays recoverable.
                 print(f'EPOCH {name} -> {_epochs[name][0]} '
                       f'(reshuffle seed {args.seed + _epochs[name][0]})', flush=True)
-                _iters[name] = _make_iter(datasets[name], _split_for_name(name),
-                                          args.streaming, args.seed + _epochs[name][0])
+                if name in _samples:
+                    if args.epochs:
+                        # --epochs: retire the oldest k, draw k fresh. The pool is kept in
+                        # insertion order so "oldest" is the head; a document therefore
+                        # lives exactly E epochs from the epoch it entered.
+                        k = _refresh_count(_epochs[name][0])
+                        fresh, seen = _draw(name, k)
+                        pool = _samples[name]
+                        del pool[:len(fresh)]
+                        pool.extend(fresh)
+                        _sub_log(f'subsample: {name} epoch {_epochs[name][0]}: retired '
+                                 f'{len(fresh)} oldest, drew {len(fresh)} fresh from {seen} '
+                                 f'(pool {len(pool)}) {_fresh(name)}')
+                    _iters[name] = iter(_subsample_epoch(_samples[name],
+                                                         args.seed + _epochs[name][0]))
+                else:
+                    _iters[name] = _make_iter(datasets[name], _split_for_name(name),
+                                              args.streaming, args.seed + _epochs[name][0])
                 return next(_iters[name])
 
     def _build_clip(name, example):
