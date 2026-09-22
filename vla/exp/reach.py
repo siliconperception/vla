@@ -57,25 +57,29 @@ def main():
     g = load_vla_defs(saved)
     VLAModel, clip_text = g['VLAModel'], g['clip_text']
     torch.manual_seed(a.seed)
+    # VLAModel's signature, as of the --ema_ladder rewrite: the --clock era kwargs
+    # (clock, accumulate, clock_base/max/ends) are GONE, and c_context is now separate from
+    # n_hidden, so a checkpoint with c_context != n_hidden rebuilds at the wrong interior
+    # width and load_state_dict fails. Keep this list in step with vla.py VLAModel.__init__.
     kw = dict(n_hidden=saved['n_hidden'], depth=saved['depth'], kernel=saved['kernel'],
               S=saved['context'], c_text=saved['c_text'], n_layers=saved['n_layers'],
-              clock=saved.get('clock', 'sync'), accumulate=saved.get('accumulate', False),
+              c_context=saved.get('c_context'),
               ema=saved.get('ema'), qproj=saved.get('qproj', 'none'),
               tap=saved.get('tap', False), tokenizer=saved['tokenizer'],
               head_norm=saved.get('head_norm', 'none'))
     # forward EVERY architecture key the checkpoint carries; omitting one rebuilds a
     # different model and the state_dict will not load (see score.py).
-    for k in ('clock_base', 'clock_max', 'clock_ends', 'clip_dff', 'norm',
-              'norm_groups', 'dff_norm', 'bn_track', 'bn_affine', 'bn_momentum',
-              'bn_eps'):
+    for k in ('clip_dff', 'norm', 'norm_groups', 'dff_norm', 'bn_track', 'bn_affine',
+              'bn_momentum', 'bn_eps'):
         if k in saved and saved[k] is not None: kw[k] = saved[k]
     model = VLAModel(**kw)
     model.load_state_dict(ck['state_dict'])
     model.init_mode = saved.get('init', 'relu')
     model = model.to(a.device).eval()
     g['_tokenizer'] = model.tok
-    print(f'{a.load}: step {ck.get("step")} n_layers {saved["n_layers"]} depth {saved["depth"]} '
-          f'clock {saved.get("clock")} base {saved.get("clock_base", 2.0)}', flush=True)
+    print(f'{a.load}: step {ck.get("step")} n_layers {saved["n_layers"]} '
+          f'depth {saved["depth"]} n_hidden {saved["n_hidden"]} c_context {saved.get("c_context")} '
+          f'ema {model.ema} (ema_ladder {saved.get("ema_ladder")})', flush=True)
 
     # shared selector (exp/memtest.heldout_docs), same as score.py / pythia_ref.py /
     # ngram.py, so a reach number and a loss number describe the same documents.

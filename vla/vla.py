@@ -654,6 +654,75 @@ parser.add_argument('--subsample',     default=0,     type=int, metavar='N',
                          'memorize: 10000 fineweb docs is ~1 step per document at batch '
                          '250, so --subsample 10000 cycles the same text every few hundred '
                          'steps. 0 (default) = off, stream the corpus as before.')
+parser.add_argument('--refresh',       default=0.0,   type=float, metavar='FRAC',
+                    help='--subsample turnover driven by a LEARNING-STALL DETECTOR instead of '
+                         'the fixed --epochs schedule: when the model has stopped learning '
+                         'from the current pool, replace FRAC of it (the oldest documents) '
+                         'with fresh ones, which should restart learning, and repeat. '
+                         '0 (default) = off. Mutually exclusive with --epochs.\n'
+                         'THE DETECTOR is arXiv:2403.02473 ("When do Convolutional Neural '
+                         'Networks Stop Learning?"), which stops training when the data '
+                         'variation across ALL layers goes still; here the same signal '
+                         'triggers a data refresh rather than a stop. Per conv layer i and '
+                         'epoch e: alpha = std of that layer\'s POST-CONVOLUTION activations, '
+                         'sampled every --refresh_sample steps; mu_i^e = mean(alpha) over the '
+                         'epoch; delta_i^e = round(mu_i^e, --refresh_r) - round(mu_i^(e-1), '
+                         '--refresh_r); the epoch is STILL when sum_i delta_i^e == 0, and the '
+                         'refresh fires after --refresh_hold consecutive still epochs.\n'
+                         'Post-CONVOLUTION and not post-norm on purpose: BatchNorm/GroupNorm '
+                         'with affine=False makes the post-norm std 1 by construction and the '
+                         'post-ReLU std a constant of it, so the only layer output that '
+                         'carries information about data variation is the conv output itself.')
+parser.add_argument('--refresh_r',     default=2,     type=int, metavar='R',
+                    help='--refresh: decimal places the per-layer mean is rounded to before '
+                         'differencing. The paper\'s r=2 is its one critical hyperparameter -- '
+                         'r=1 declares the stall too early, r>=3 never declares it.')
+parser.add_argument('--refresh_mode',  default='rel', choices=['rel', 'abs'],
+                    help='--refresh: how a stalled epoch is declared.\n'
+                         '"abs" is the paper verbatim: still when abs(sum delta) <= '
+                         '--refresh_eps, with EPS 0 the paper\'s exact ==0.\n'
+                         '"rel" (default) asks whether the drift is STILL FALLING rather '
+                         'than whether it has reached a floor: an epoch counts as progress '
+                         'only if abs(sum delta) sets a new minimum (by more than '
+                         '--refresh_tol, relatively), and --refresh_hold epochs with no new '
+                         'minimum declare the stall. It is the default because the absolute '
+                         'floor is not a property of the data -- it is set by this model\'s '
+                         'permanent activation-scale inflation, so "abs" with EPS 0 never '
+                         'fires here and an EPS chosen above the floor degenerates into a '
+                         'fixed schedule: measured at --subsample 100, EPS 0.5 fired every '
+                         '1+--refresh_hold epochs exactly, i.e. --epochs 4 with extra steps. '
+                         'A minimum-tracking test needs no scale constant and so transfers '
+                         'across depth, width and step count.')
+parser.add_argument('--refresh_tol',   default=0.0,   type=float, metavar='T',
+                    help='--refresh_mode rel: relative margin a new minimum must beat, '
+                         'best*(1-T). 0 (default) counts any new minimum as progress; raise '
+                         'it to ignore noise-sized improvements (T 0.05 = "at least 5%% '
+                         'better than the best epoch so far").')
+parser.add_argument('--refresh_eps',   default=0.0,   type=float, metavar='EPS',
+                    help='--refresh: declare the epoch STILL when abs(sum of per-layer '
+                         'deltas) <= EPS, instead of the paper\'s exact == 0. Default 0.0 IS '
+                         'the paper.\n'
+                         'Why it is needed here and not there: the paper\'s networks are '
+                         'feed-forward image classifiers whose activation statistics settle, '
+                         'so the rounded per-layer means eventually stop moving. This model is '
+                         'RECURRENT and its state scale drifts upward for the whole run '
+                         '(measured: the DFF std climbs from 0.7 to 1.65 over 3.6M steps), '
+                         'which drags the post-convolution activation std with it, so a few '
+                         'layers cross a rounding boundary every epoch and the exact criterion '
+                         'may never fire. Measured on --subsample 100: sum_delta decays '
+                         '2.43 -> 0.40 over 20 epochs and then flattens near 0.40-0.45 while '
+                         'the mean activation std is still climbing. With 32 layers and r=2, '
+                         'EPS 0.5 means "no more than ~50 rounding units of total drift", i.e. '
+                         'most layers unchanged; EPS 0 means every layer identical twice over.')
+parser.add_argument('--refresh_hold',  default=3,     type=int, metavar='K',
+                    help='--refresh: consecutive still epochs (sum delta == 0) required before '
+                         'the pool is refreshed. The paper uses 3.')
+parser.add_argument('--refresh_sample', default=10,   type=int, metavar='N',
+                    help='--refresh: sample the per-layer activation std every N training '
+                         'steps rather than every step. The epoch mean is over the samples, '
+                         'so this trades a little precision for the cost of one extra full '
+                         'reduction per conv layer: every step is ~8%% of step time at '
+                         'depth 32, N=10 is under 1%%.')
 parser.add_argument('--epochs',        default=0,     type=int, metavar='E',
                     help='--subsample turnover: how many epochs each sampled document lives '
                          'before it is retired for a fresh one. 0 (default) = never, the '
@@ -1079,6 +1148,13 @@ parser.add_argument('--private',       default=False, action='store_true',
 args = parser.parse_args()
 if args.epochs and not args.subsample:
     raise SystemExit('--epochs is the --subsample turnover rate and needs --subsample')
+if args.refresh and not args.subsample:
+    raise SystemExit('--refresh is the --subsample turnover rate and needs --subsample')
+if args.refresh and args.epochs:
+    raise SystemExit('--refresh and --epochs are two turnover schedules for the same pool: '
+                     '--epochs is a fixed rate, --refresh is stall-driven. Pick one.')
+if args.refresh and not (0.0 < args.refresh <= 1.0):
+    raise SystemExit(f'--refresh {args.refresh}: a fraction of the pool, in (0, 1]')
 
 
 def _cli_given(argv=None):
@@ -2159,6 +2235,86 @@ _epoch_mean_exclude = set()
 # line's epoch_vocab column needs the DENOMINATOR of the vocab channel's own consumption,
 # which otherwise lives only in worker()'s closure.
 _vocab_total = {}
+
+# ── learning-stall detector (--refresh, arXiv:2403.02473) ─────────────────────
+# "When do Convolutional Neural Networks Stop Learning?" measures DATA VARIATION across
+# every layer: per layer, the std of its post-convolution activations, averaged over the
+# epoch's iterations, rounded to r decimals; when the SUM of the per-layer epoch-over-epoch
+# differences is exactly 0 for three consecutive epochs, the network has reached its
+# near-optimal capacity on that data. The paper stops training there. Here the same signal
+# says "this pool is exhausted", and the response is to replace part of the pool.
+#
+# The trainer accumulates; the WORKER reads, because the worker is what owns the pool and
+# knows where an epoch ends. Everything here is a no-op unless --refresh is set: no hooks are
+# registered, so a run without it is byte-identical to one from before the flag.
+_stab_lock = threading.Lock()
+_stab_sum  = collections.defaultdict(float)   # layer -> sum of sampled activation stds
+_stab_cnt  = collections.defaultdict(int)     # layer -> number of samples
+_stab_prev = {}                               # layer -> previous epoch's ROUNDED mean
+_stab_hold = [0]                              # consecutive still epochs
+_stab_step = [0]                              # step counter for --refresh_sample
+_stab_last = [None]                           # last closed epoch's (delta, abs delta, layers)
+_stab_best = [None]                           # --refresh_mode rel: smallest abs(sum delta) yet
+
+
+def _stab_register(model):
+    """Forward hooks on every Conv2d in the recurrent stack. Post-convolution, pre-norm:
+    with affine=False the post-norm std is 1 by construction, so the conv output is the only
+    place the layer's data variation is still visible."""
+    n = 0
+    for name, m in model.named_modules():
+        if isinstance(m, nn.Conv2d) and ('context' in name or 'deep_context' in name):
+            def _hook(mod, inp, out, _k=name):
+                # sampled, and detached: this must not touch the graph or the step time.
+                # TRAIN MODE ONLY -- the loop runs a second forward after optimizer.step()
+                # to recompute the DFF, and generation/eval run more; counting those would
+                # mix distributions into one epoch mean.
+                if not mod.training or _stab_step[0] % max(1, args.refresh_sample):
+                    return
+                v = float(out.detach().float().std())
+                if math.isfinite(v):
+                    with _stab_lock:
+                        _stab_sum[_k] += v
+                        _stab_cnt[_k] += 1
+            m.register_forward_hook(_hook)
+            n += 1
+    print(f'--refresh: stall detector on {n} conv layers, sampled every '
+          f'{args.refresh_sample} steps, r={args.refresh_r}, hold={args.refresh_hold}',
+          flush=True)
+    return n
+
+
+def _stab_peek():
+    """Detector state for the periodic TRIGGER line: the epoch-SO-FAR mean activation std,
+    how many samples it rests on, and the last closed epoch's verdict. Does NOT drain the
+    accumulator -- only _stab_epoch() may, or an epoch mean would be taken over a partial
+    window and the deltas would compare unequal amounts of evidence."""
+    with _stab_lock:
+        mus = [_stab_sum[k] / _stab_cnt[k] for k in _stab_sum if _stab_cnt[k]]
+        nsamp = min([_stab_cnt[k] for k in _stab_cnt], default=0)
+    mu = sum(mus) / len(mus) if mus else float('nan')
+    return mu, nsamp, len(mus), _stab_last[0], _stab_hold[0]
+
+
+def _stab_epoch(r):
+    """Close the epoch: -> (sum of per-layer deltas, n layers, mean mu, n samples per layer).
+    Drains the accumulator, so each epoch's mean is over that epoch's samples only."""
+    with _stab_lock:
+        mus = {k: _stab_sum[k] / _stab_cnt[k] for k in _stab_sum if _stab_cnt[k]}
+        nsamp = min([_stab_cnt[k] for k in _stab_cnt], default=0)
+        _stab_sum.clear(); _stab_cnt.clear()
+    if not mus:
+        return None
+    cur = {k: round(v, r) for k, v in mus.items()}
+    if not _stab_prev:                      # first epoch: nothing to difference against
+        _stab_prev.update(cur)
+        return None
+    d = sum(cur[k] - _stab_prev.get(k, cur[k]) for k in cur)
+    dabs = sum(abs(cur[k] - _stab_prev.get(k, cur[k])) for k in cur)
+    _stab_prev.update(cur)
+    _stab_last[0] = (d, dabs, len(cur))
+    return d, dabs, len(cur), sum(mus.values()) / len(mus), nsamp
+
 
 def _epoch_set(name, n):
     with _epoch_lock:
@@ -3242,7 +3398,7 @@ def worker(stop, q, datasets, args, mix=None):
             _spass[n]  = 0
             drawn, seen = _draw(n, args.subsample)
             _samples[n] = drawn
-            _sub_log(f'subsample: {n} {len(drawn)} examples drawn from {seen} '
+            _sub_log(f'SUBSAMPLE {n} {len(drawn)} examples drawn from {seen} '
                      f'(requested {args.subsample}, seed {args.seed}'
                      f'{f", {_refresh_count(2)}/epoch turnover over {args.epochs} epochs" if args.epochs else ", closed"}) '
                      f'{_fresh(n)}')
@@ -3269,6 +3425,53 @@ def worker(stop, q, datasets, args, mix=None):
                 print(f'EPOCH {name} -> {_epochs[name][0]} '
                       f'(reshuffle seed {args.seed + _epochs[name][0]})', flush=True)
                 if name in _samples:
+                    if args.refresh:
+                        # --refresh: the pool turns over only when the detector says the
+                        # model has stopped learning from it. _stab_epoch is drained here,
+                        # at the epoch boundary, so 'epoch' means the same thing to the
+                        # detector as it does to the pool.
+                        _st = _stab_epoch(args.refresh_r)
+                        if _st is None:
+                            _sub_log(f'TRIGGER {name} epoch {_epochs[name][0]} detector '
+                                     f'warming up (no baseline yet)')
+                        else:
+                            _d, _da, _nl, _mu, _ns = _st
+                            # STILL? Either the drift is under an absolute floor (the
+                            # paper), or it has stopped setting new minima (relative).
+                            _ad = abs(_d)
+                            if args.refresh_mode == 'abs':
+                                _still = _ad <= args.refresh_eps
+                                _extra = f'eps {args.refresh_eps:g}'
+                            else:
+                                _b = _stab_best[0]
+                                _improved = _b is None or _ad < _b * (1.0 - args.refresh_tol)
+                                if _improved:
+                                    _stab_best[0] = _ad
+                                _still = not _improved
+                                _extra = f'best {_stab_best[0]:.{args.refresh_r}f}'
+                            _stab_hold[0] = _stab_hold[0] + 1 if _still else 0
+                            _sub_log(f'TRIGGER {name} epoch {_epochs[name][0]} '
+                                     f'sum_delta {_d:+.{args.refresh_r}f} '
+                                     f'sum_abs_delta {_da:.{args.refresh_r}f} '
+                                     f'mean_std {_mu:.4f} layers {_nl} samples {_ns} '
+                                     f'{args.refresh_mode} {_extra} '
+                                     f'still {_stab_hold[0]}/{args.refresh_hold}')
+                            if _stab_hold[0] >= args.refresh_hold:
+                                k = max(1, int(round(args.refresh * args.subsample)))
+                                fresh, seen = _draw(name, k)
+                                pool = _samples[name]
+                                del pool[:len(fresh)]
+                                pool.extend(fresh)
+                                _stab_hold[0] = 0
+                                # The baseline goes too: the next epoch runs on partly new
+                                # data, so differencing it against the stalled epoch would
+                                # compare two different datasets and fire spuriously.
+                                _stab_prev.clear()
+                                _stab_best[0] = None
+                                _sub_log(f'TRIGGER {name} STALLED at epoch '
+                                         f'{_epochs[name][0]} -- retired {len(fresh)} '
+                                         f'oldest, drew {len(fresh)} fresh from {seen} '
+                                         f'(pool {len(pool)}) {_fresh(name)}')
                     if args.epochs:
                         # --epochs: retire the oldest k, draw k fresh. The pool is kept in
                         # insertion order so "oldest" is the head; a document therefore
@@ -3278,7 +3481,7 @@ def worker(stop, q, datasets, args, mix=None):
                         pool = _samples[name]
                         del pool[:len(fresh)]
                         pool.extend(fresh)
-                        _sub_log(f'subsample: {name} epoch {_epochs[name][0]}: retired '
+                        _sub_log(f'SUBSAMPLE {name} epoch {_epochs[name][0]} retired '
                                  f'{len(fresh)} oldest, drew {len(fresh)} fresh from {seen} '
                                  f'(pool {len(pool)}) {_fresh(name)}')
                     _iters[name] = iter(_subsample_epoch(_samples[name],
@@ -3556,6 +3759,8 @@ else:
 # Bind the module-level tokenizer used by clip_text() and every display path. The worker
 # threads that call clip_text() are only started further down, so this is set in time.
 _tokenizer = model.tok
+if args.refresh:
+    _stab_register(model)
 # --tokenizer tiny* takes c_text from the pretrained embedding width, so sync it back:
 # saved_args must describe the model that was actually built or a --load would rebuild
 # a different one.
@@ -5144,6 +5349,25 @@ try:
             # counters it reports, so draining it on the (faster) generation interval would
             # silently rescale every TEXT line. exp/watch.sh also triggers off 'TEXT step',
             # i.e. off checkpoints, which is what it is meant to track.
+            # --refresh: the stall detector's state, on the checkpoint cadence. The verdict
+            # itself only exists at an epoch boundary, which can be tens of thousands of
+            # steps apart at --subsample 10000, so this reports the epoch-so-far mean and the
+            # last verdict in between -- enough to see the detector converging toward still
+            # rather than only learning about it when it fires.
+            if args.refresh:
+                _mu, _ns, _nl, _lastv, _hold = _stab_peek()
+                _lv = ('none yet' if _lastv is None else
+                       f'{_lastv[0]:+.{args.refresh_r}f} (abs {_lastv[1]:.{args.refresh_r}f})')
+                _ref = (f'eps {args.refresh_eps:g}' if args.refresh_mode == 'abs' else
+                        'best ' + ('none' if _stab_best[0] is None
+                                   else f'{_stab_best[0]:.{args.refresh_r}f}'))
+                _tl = (f'TRIGGER step {i:10} mean_std {_mu:.4f} samples {_ns} layers {_nl} '
+                       f'last_sum_delta {_lv} {args.refresh_mode} {_ref} '
+                       f'still {_hold}/{args.refresh_hold}')
+                print(_tl)
+                with open(args.log, 'a') as f:
+                    print(_tl, file=f)
+
             _te, _tt, _ = _text_drain()      # sample is read separately, see _text_peek
             if _te:
                 d = f'TEXT step {i:10} examples {_te} tokens {_tt}'
@@ -5209,6 +5433,8 @@ try:
         # ── train step ────────────────────────────────────────────────────────
         dff_prev = model.dff                                    # save pre-step DFF
         model.train()
+        if args.refresh:
+            _stab_step[0] += 1     # --refresh: sample cadence, counted in TRAINING steps
         logits, loss = model(x, targets=y, flag=flag)
 
         # ── instrumentation: the vocab channel's loss, separately from the corpus ──────

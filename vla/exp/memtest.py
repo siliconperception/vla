@@ -116,8 +116,9 @@ def load_vla_defs(saved):
     """Exec the head of vla.py (tokenizers, DFFClock, VLAModel, clip_text) with an argv
     that reproduces the checkpoint's architecture, and hand back its globals."""
     argv = ['vla.py', '--log', os.devnull, '--device', 'cpu']
-    for k in ('tokenizer', 'head_norm', 'context', 'n_hidden', 'c_text',
-              'n_layers', 'depth', 'kernel', 'qproj', 'clock', 'init', 'dataset'):
+    for k in ('tokenizer', 'head_norm', 'context', 'n_hidden', 'c_context', 'c_text',
+              'n_layers', 'depth', 'kernel', 'qproj', 'clock', 'init', 'dataset',
+              'linout_kernel'):
         if saved.get(k) is not None:
             argv += [f'--{k}', str(saved[k])]
     if saved.get('ema') is not None:
