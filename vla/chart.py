@@ -53,7 +53,7 @@ batch_size=0
 # Parse each numeric field by name so the layout is robust to the date/time tokens
 # and to optional mix-mode fields.
 _FIELDS = ['batch', 'loss', 'grad', 'lr', 'dff_mean', 'dff_std', 'dff_max', 'dff_zeros',
-           'a_std', 'i_std']
+           'a_std', 'i_std', 'epoch']
 _NUM    = r'(-?[\d.]+(?:[eE][-+]?\d+)?)'
 
 # GENSCORE lines carry the fluency of the periodic generation samples, scored by the frozen
@@ -65,6 +65,17 @@ _NUM    = r'(-?[\d.]+(?:[eE][-+]?\d+)?)'
 # --gen_prompts prompt per report, so several can share a step.
 gs_pat = re.compile(r'^GENSCORE\s+step\s+(\d+).*?\bnats\s+' + r'(-?[\d.]+(?:[eE][-+]?\d+)?)')
 
+# TRIGGER lines carry the --refresh stall detector (vla.py, arXiv:2403.02473). Two shapes:
+#   TRIGGER step   128000 mean_std 2.2778 ... last_sum_delta +1.20 (abs 1.20) rel best 1.20 still 0/3
+#   TRIGGER smolfwedu STALLED at epoch 20 -- retired 25 oldest, drew 25 fresh ...
+# The periodic one is the series (it is the only shape carrying a step number); the STALLED
+# one is an event, and its step is the last STEP line seen before it, which is exact to
+# within --monitor. The per-epoch verdict lines are not parsed: the periodic line already
+# reports the same numbers as last_sum_delta/best.
+tg_pat = re.compile(r'^TRIGGER\s+step\s+(\d+).*?\(abs\s+' + _NUM + r'\).*?'
+                    r'best\s+(?:none|' + _NUM + r').*?still\s+(\d+)/(\d+)')
+st_pat = re.compile(r'^TRIGGER\s+\S+\s+STALLED')
+
 
 def parselog(fn):
     global batch_size
@@ -74,8 +85,22 @@ def parselog(fn):
     data     = {k: [] for k in ['step'] + _FIELDS}
     data['wall'] = []
     gs_step, gs_nats = [], []
+    tg_step, tg_dabs, tg_best, tg_hold, tg_need = [], [], [], [], [0]
+    rf_step = []
+    last_step = [0.0]
     with open(fn, 'r') as f:
         for l in f:
+            if l.startswith('TRIGGER'):
+                mt = tg_pat.match(l)
+                if mt:
+                    tg_step.append(float(mt.group(1)))
+                    tg_dabs.append(float(mt.group(2)))
+                    tg_best.append(float(mt.group(3)) if mt.group(3) else np.nan)
+                    tg_hold.append(float(mt.group(4)))
+                    tg_need[0] = float(mt.group(5))
+                elif st_pat.match(l):
+                    rf_step.append(last_step[0])
+                continue
             mg = gs_pat.match(l)
             if mg:
                 gs_step.append(float(mg.group(1)))
@@ -84,6 +109,7 @@ def parselog(fn):
             ms = step_pat.match(l)
             if ms:
                 data['step'].append(float(ms.group(1)))
+                last_step[0] = float(ms.group(1))
                 mw = wall_pat.search(l)
                 data['wall'].append(mw.group(1) if mw else '')
                 for k in _FIELDS:
@@ -98,6 +124,12 @@ def parselog(fn):
     # number instead. They are filtered by step below, once the trim is known.
     out['gs_step'] = np.array(gs_step)
     out['gs_nats'] = np.array(gs_nats)
+    out['tg_step'] = np.array(tg_step)
+    out['tg_dabs'] = np.array(tg_dabs)
+    out['tg_best'] = np.array(tg_best)
+    out['tg_hold'] = np.array(tg_hold)
+    out['tg_need'] = tg_need[0]
+    out['rf_step'] = np.array(rf_step)
     return out
 
 print('loading log file')
@@ -109,6 +141,7 @@ step = d['step']
 loss = d['loss']
 grad = d['grad']
 lr   = d['lr']
+epoch = d['epoch']
 gs_step, gs_nats = d['gs_step'], d['gs_nats']
 mean = d['dff_mean']
 std  = d['dff_std']
@@ -220,9 +253,17 @@ if cut:
           f'body of the run fills the upper half of the loss/grad panels; --outliers keeps them')
     step, loss, grad, lr = step[cut:], loss[cut:], grad[cut:], lr[cut:]
     mean, std, dmax, zero, bs = mean[cut:], std[cut:], dmax[cut:], zero[cut:], bs[cut:]
+    epoch = epoch[cut:]
     if gs_step.size:                       # by STEP NUMBER: these are not per-sample rows
         _keep   = gs_step >= step[0]
         gs_step, gs_nats = gs_step[_keep], gs_nats[_keep]
+    for _k in ('tg_step', 'rf_step'):      # likewise, and the TRIGGER series travel together
+        if d[_k].size:
+            _keep = d[_k] >= step[0]
+            if _k == 'tg_step':
+                d['tg_dabs'], d['tg_best'] = d['tg_dabs'][_keep], d['tg_best'][_keep]
+                d['tg_hold'] = d['tg_hold'][_keep]
+            d[_k] = d[_k][_keep]
 
 window_size = 10
 weights = np.ones(window_size) / window_size
@@ -236,8 +277,8 @@ plt.style.use('dark_background')
 # quietly drifting toward a blow-up shows it here long before the loss moves. The lr is
 # fourth in both for the same reason: with cyclic and ramped schedules (v117-v119) the
 # loss and the state cannot be read without knowing where the schedule was at that step.
-nplots = 6 if args.verbose else 4
-fig = plt.figure(figsize=(12, 14 if args.verbose else 11))
+nplots = 7 if args.verbose else 4
+fig = plt.figure(figsize=(12, 16 if args.verbose else 11))
 if title:
     fig.suptitle(title)
 ax1 = fig.add_subplot(nplots,1,1)
@@ -322,9 +363,53 @@ ax4 = fig.add_subplot(nplots,1,4, sharex=ax1)
 # %g, not a fixed decimal count: the schedules span 1e-6 floors to lr 2.0 peaks, and seven
 # decimals reads as 2.0000000 at one end and 0.0000010 at the other.
 ax4.yaxis.set_major_formatter(ticker.FormatStrFormatter('%g'))
-ax4.plot(step, lr, '-c', linewidth=2.0,alpha=0.5)
-ax4.set_ylim(bottom=0, top=(float(lr.max()) * 1.05 if lr.size and lr.max() > 0 else 1.0))
-ax4.set_ylabel('lr', color='c')
+
+# PANEL 4 IS THE DATA CLOCK when the log has one: passes over the --subsample pool on the
+# left axis, the --refresh stall detector on the right, and a vertical line wherever the
+# pool actually turned over. Read together they answer the question --refresh exists to
+# ask -- did the drift flatten, did that fire a refresh, and did the refresh restart it --
+# which no other panel shows: loss and dff_std move so slowly at this scale that a refresh
+# is invisible in them. A log with no epoch column and no TRIGGER lines (every run before
+# --subsample) falls back to the lr trace this panel used to carry.
+ax4b = None
+# VARIES, not merely present: a streaming run logs epoch 1.000 for its whole life (the
+# corpus never wraps), and a flat line at 1 is worth less than the lr trace it replaced.
+# The panel takes over only for a run whose data actually cycles -- --subsample, --datarep,
+# or a corpus small enough to wrap -- or one carrying detector lines.
+_have_epoch = bool(epoch.size) and float(np.nanmax(epoch)) > float(np.nanmin(epoch))
+if _have_epoch or d['tg_step'].size:
+    if _have_epoch:
+        ax4.plot(step, epoch, '-c', linewidth=2.0, alpha=0.6, label='epoch')
+        ax4.set_ylim(bottom=0, top=float(np.nanmax(epoch)) * 1.05 + 1e-9)
+    ax4.set_ylabel('epoch' + ('' if _have_epoch else ' (none)'), color='c')
+    for _x in d['rf_step']:                # pool turnover: the event the detector caused
+        ax4.axvline(_x, color='r', linewidth=1.0, alpha=0.55, linestyle='--')
+    if d['tg_step'].size:
+        # LOG scale: the drift decays by more than a decade over a run (measured 6.3 -> 0.3
+        # at --subsample 100), so a linear twin pins the interesting flat tail to the axis.
+        ax4b = ax4.twinx()
+        ax4b.set_yscale('log')
+        ax4b.plot(d['tg_step'], d['tg_dabs'], '-', color='orange', linewidth=1.5, alpha=0.8,
+                  label='|sum delta|')
+        if np.isfinite(d['tg_best']).any():
+            # the running minimum IS the criterion under --refresh_mode rel: the detector
+            # fires after --refresh_hold epochs in which this line did not step down.
+            # DASHED, because while the run is still improving every epoch the running
+            # minimum IS the current value and a solid line would hide underneath it --
+            # the dashes are what say "no stall yet" at a glance.
+            ax4b.plot(d['tg_step'], d['tg_best'], '--', color='w', linewidth=1.2, alpha=0.7,
+                      label='best (running min)')
+        ax4b.set_ylabel('|sum delta| / best', color='orange')
+        ax4b.tick_params(axis='y', colors='orange')
+        _nr = len(d['rf_step'])
+        ax4b.legend(loc='upper right', fontsize=7, framealpha=0.2,
+                    title=(f'{_nr} refresh' + ('es' if _nr != 1 else '')
+                           + (f', hold {d["tg_need"]:.0f}' if d['tg_need'] else '')),
+                    title_fontsize=7)
+else:
+    ax4.plot(step, lr, '-c', linewidth=2.0,alpha=0.5)
+    ax4.set_ylim(bottom=0, top=(float(lr.max()) * 1.05 if lr.size and lr.max() > 0 else 1.0))
+    ax4.set_ylabel('lr', color='c')
 
 # y axis: minor ticks between the majors, and a hairline major gridline in the trace's own
 # colour, so the grid reads as part of its plot instead of competing with the samples
@@ -333,17 +418,24 @@ for ax, color in ((ax1, 'w'), (ax2, 'y'), (ax3, 'r'), (ax4, 'c')):
     ax.grid(axis='y', which='major', color=color, linewidth=1, alpha=0.2)
 
 axes = [ax1, ax2, ax3, ax4]
-twins = ([ax2b] if ax2b is not None else [])
+twins = ([ax2b] if ax2b is not None else []) + ([ax4b] if ax4b is not None else [])
 if args.verbose:
     ax5 = fig.add_subplot(nplots,1,5, sharex=ax1)
     ax6 = fig.add_subplot(nplots,1,6, sharex=ax1)
+    ax7 = fig.add_subplot(nplots,1,7, sharex=ax1)
     ax5.plot(step, dmax, '-m', linewidth=2.0,alpha=0.5)
     ax6.set_ylim(bottom=0, top=1)
     ax6.plot(step, zero, '-g', linewidth=2.0,alpha=0.5)
+    # lr kept here now that panel 4 is the data clock: with ramped and cyclic schedules the
+    # loss and the state still cannot be read without knowing where the schedule was.
+    ax7.yaxis.set_major_formatter(ticker.FormatStrFormatter('%g'))
+    ax7.plot(step, lr, '-c', linewidth=2.0, alpha=0.5)
+    ax7.set_ylim(bottom=0, top=(float(lr.max()) * 1.05 if lr.size and lr.max() > 0 else 1.0))
 
     ax5.set_ylabel('dff_max', color='m')
     ax6.set_ylabel('sparsity', color='g')
-    axes += [ax5, ax6]
+    ax7.set_ylabel('lr', color='c')
+    axes += [ax5, ax6, ax7]
 
 # only the bottom subplot carries the shared x-axis label and tick labels
 for ax in axes[:-1] + twins:
