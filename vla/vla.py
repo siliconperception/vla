@@ -3341,10 +3341,31 @@ def worker(stop, q, datasets, args, mix=None):
     # the corpus from here on: exhaustion is an epoch, and the next epoch is a fresh
     # permutation of the same list under --seed + epoch, the convention _make_iter already
     # uses for its reshuffle seed.
-    def _subsample_epoch(pool, seed):
-        order = list(pool)
-        random.Random(seed).shuffle(order)
-        return order
+    # HOW MANY DOCUMENTS CAN BE IN FLIGHT AT ONCE: one per batch slot, plus the built-clip
+    # queue (maxsize 2*workers), plus one in each builder's hand. Conservative under
+    # --mix_slots, where the batch is split across corpora and each has its own queue.
+    _INFLIGHT = args.batch + 3 * max(1, args.workers)
+    _recent = collections.defaultdict(lambda: collections.deque(maxlen=_INFLIGHT))
+
+    def _subsample_epoch(pool, seed, hold=()):
+        """Permute the pool for one epoch, with the documents still IN FLIGHT deferred to
+        the end of it.
+
+        Without this a reshuffle is independent of what the slots are holding, so a document
+        drawn near the end of one epoch can be handed to a second slot at the start of the
+        next while the first is still running it -- the same text twice in one batch, at two
+        offsets, correlating the gradient and the BatchNorm statistics. Deferring the
+        in-flight set turns an unbounded collision rate into a bounded one: a document cannot
+        be redrawn until the other N - |hold| have been, which buys it
+        (N - |hold|) * mean_len / batch steps to finish. Only documents LONGER than that can
+        still double, so the bound is printed at startup rather than left implicit."""
+        held, rest = [], []
+        for d in pool:
+            (held if id(d) in hold else rest).append(d)
+        rng = random.Random(seed)
+        rng.shuffle(rest)
+        rng.shuffle(held)
+        return rest + held
 
     _samples = {}
     _stream  = {}     # the underlying corpus iterator, kept for --epochs refreshes
@@ -3402,13 +3423,30 @@ def worker(stop, q, datasets, args, mix=None):
                      f'(requested {args.subsample}, seed {args.seed}'
                      f'{f", {_refresh_count(2)}/epoch turnover over {args.epochs} epochs" if args.epochs else ", closed"}) '
                      f'{_fresh(n)}')
-            _iters[n] = iter(_subsample_epoch(drawn, args.seed + 1))
+            _iters[n] = iter(_subsample_epoch(drawn, args.seed + 1, set(_recent[n])))
+            # The bound the holdback buys, in the corpus's own units. A document longer than
+            # this can still be redrawn while a slot is running it; shorter ones cannot.
+            _mlen = _fresh_toks[n] / max(_fresh_docs[n], 1)
+            _gap  = max(len(drawn) - _INFLIGHT, 0) * _mlen / max(args.batch, 1)
+            if len(drawn) <= _INFLIGHT:
+                print(f'WARNING: --subsample {args.subsample} is not larger than the '
+                      f'{_INFLIGHT} documents that can be in flight ({args.batch} slots + '
+                      f'{3 * max(1, args.workers)} queued/building), so every batch holds '
+                      f'duplicates and no holdback can prevent it', flush=True)
+            else:
+                print(f'subsample holdback: {n} defers up to {_INFLIGHT} in-flight docs to '
+                      f'the end of each reshuffle; a redrawn document has had >= {_gap:,.0f} '
+                      f'steps to finish, so only documents longer than {_gap:,.0f} tokens '
+                      f'(mean is {_mlen:,.0f}) can appear twice in one batch', flush=True)
 
     def _next_example(name):
         """Thread-safe pull of the next raw example for one dataset (loops on exhaustion)."""
         with _locks[name]:
             try:
-                return next(_iters[name])
+                _ex = next(_iters[name])
+                if args.subsample:
+                    _recent[name].append(id(_ex))   # identity, for the reshuffle holdback
+                return _ex
             except StopIteration:
                 _epochs[name][0] += 1
                 # For a finite corpus that is deliberately repeated (wdef) the epoch boundary
@@ -3485,7 +3523,8 @@ def worker(stop, q, datasets, args, mix=None):
                                  f'{len(fresh)} oldest, drew {len(fresh)} fresh from {seen} '
                                  f'(pool {len(pool)}) {_fresh(name)}')
                     _iters[name] = iter(_subsample_epoch(_samples[name],
-                                                         args.seed + _epochs[name][0]))
+                                                         args.seed + _epochs[name][0],
+                                                         set(_recent[name])))
                 else:
                     _iters[name] = _make_iter(datasets[name], _split_for_name(name),
                                               args.streaming, args.seed + _epochs[name][0])
