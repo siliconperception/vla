@@ -68,13 +68,14 @@ gs_pat = re.compile(r'^GENSCORE\s+step\s+(\d+).*?\bnats\s+' + r'(-?[\d.]+(?:[eE]
 # TRIGGER lines carry the --refresh stall detector (vla.py, arXiv:2403.02473). Two shapes:
 #   TRIGGER step   128000 mean_std 2.2778 ... last_sum_delta +1.20 (abs 1.20) rel best 1.20 still 0/3
 #   TRIGGER smolfwedu STALLED at epoch 20 -- retired 25 oldest, drew 25 fresh ...
+#   TRIGGER smolfwedu SCHEDULED at epoch 8 -- ...        (--refresh_every, detector off)
 # The periodic one is the series (it is the only shape carrying a step number); the STALLED
 # one is an event, and its step is the last STEP line seen before it, which is exact to
 # within --monitor. The per-epoch verdict lines are not parsed: the periodic line already
 # reports the same numbers as last_sum_delta/best.
 tg_pat = re.compile(r'^TRIGGER\s+step\s+(\d+).*?\(abs\s+' + _NUM + r'\).*?'
                     r'best\s+(?:none|' + _NUM + r').*?still\s+(\d+)/(\d+)')
-st_pat = re.compile(r'^TRIGGER\s+\S+\s+STALLED')
+st_pat = re.compile(r'^TRIGGER\s+\S+\s+(?:STALLED|SCHEDULED)')
 
 
 def parselog(fn):

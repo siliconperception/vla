@@ -677,6 +677,20 @@ parser.add_argument('--refresh_r',     default=2,     type=int, metavar='R',
                     help='--refresh: decimal places the per-layer mean is rounded to before '
                          'differencing. The paper\'s r=2 is its one critical hyperparameter -- '
                          'r=1 declares the stall too early, r>=3 never declares it.')
+parser.add_argument('--refresh_every', default=0,     type=int, metavar='K',
+                    help='--refresh on a FIXED SCHEDULE instead of on the stall detector: '
+                         'turn the pool over every K epochs regardless of what the detector '
+                         'says. 0 (default) = the detector decides.\n'
+                         'The refresh itself is identical -- the same --refresh fraction, the '
+                         'oldest first -- so this is the controlled comparison for a '
+                         'stall-driven run: same action, same pool, only the timing rule '
+                         'differs. It is NOT --epochs, which retires N/E documents EVERY '
+                         'epoch so the pool drifts continuously; this swaps a block at once, '
+                         'the way a triggered refresh does.\n'
+                         'The detector is DISABLED in this mode -- no activation hooks are '
+                         'registered and nothing is measured -- because a fixed schedule does '
+                         'not consult it, and leaving it on would pay one extra reduction per '
+                         'conv layer for a number nothing reads.')
 parser.add_argument('--refresh_mode',  default='rel', choices=['rel', 'abs'],
                     help='--refresh: how a stalled epoch is declared.\n'
                          '"abs" is the paper verbatim: still when abs(sum delta) <= '
@@ -1150,6 +1164,8 @@ if args.epochs and not args.subsample:
     raise SystemExit('--epochs is the --subsample turnover rate and needs --subsample')
 if args.refresh and not args.subsample:
     raise SystemExit('--refresh is the --subsample turnover rate and needs --subsample')
+if args.refresh_every and not args.refresh:
+    raise SystemExit('--refresh_every is the --refresh schedule and needs --refresh')
 if args.refresh and args.epochs:
     raise SystemExit('--refresh and --epochs are two turnover schedules for the same pool: '
                      '--epochs is a fixed rate, --refresh is stall-driven. Pick one.')
@@ -3464,52 +3480,63 @@ def worker(stop, q, datasets, args, mix=None):
                       f'(reshuffle seed {args.seed + _epochs[name][0]})', flush=True)
                 if name in _samples:
                     if args.refresh:
-                        # --refresh: the pool turns over only when the detector says the
-                        # model has stopped learning from it. _stab_epoch is drained here,
-                        # at the epoch boundary, so 'epoch' means the same thing to the
-                        # detector as it does to the pool.
-                        _st = _stab_epoch(args.refresh_r)
-                        if _st is None:
-                            _sub_log(f'TRIGGER {name} epoch {_epochs[name][0]} detector '
-                                     f'warming up (no baseline yet)')
+                        if args.refresh_every:
+                            # FIXED SCHEDULE. The stall detector is not consulted and is not
+                            # even running -- no hooks are registered (see _stab_register),
+                            # nothing is measured, nothing is logged -- because a schedule
+                            # does not read it, and the measurement costs one extra full
+                            # reduction per conv layer. The epoch counter alone decides.
+                            _fire = _epochs[name][0] % args.refresh_every == 0
                         else:
-                            _d, _da, _nl, _mu, _ns = _st
-                            # STILL? Either the drift is under an absolute floor (the
-                            # paper), or it has stopped setting new minima (relative).
-                            _ad = abs(_d)
-                            if args.refresh_mode == 'abs':
-                                _still = _ad <= args.refresh_eps
-                                _extra = f'eps {args.refresh_eps:g}'
+                            # STALL-DRIVEN. _stab_epoch is drained here, at the epoch
+                            # boundary, so 'epoch' means the same thing to the detector as
+                            # it does to the pool.
+                            _fire = False
+                            _st = _stab_epoch(args.refresh_r)
+                            if _st is None:
+                                _sub_log(f'TRIGGER {name} epoch {_epochs[name][0]} detector '
+                                         f'warming up (no baseline yet)')
                             else:
-                                _b = _stab_best[0]
-                                _improved = _b is None or _ad < _b * (1.0 - args.refresh_tol)
-                                if _improved:
-                                    _stab_best[0] = _ad
-                                _still = not _improved
-                                _extra = f'best {_stab_best[0]:.{args.refresh_r}f}'
-                            _stab_hold[0] = _stab_hold[0] + 1 if _still else 0
-                            _sub_log(f'TRIGGER {name} epoch {_epochs[name][0]} '
-                                     f'sum_delta {_d:+.{args.refresh_r}f} '
-                                     f'sum_abs_delta {_da:.{args.refresh_r}f} '
-                                     f'mean_std {_mu:.4f} layers {_nl} samples {_ns} '
-                                     f'{args.refresh_mode} {_extra} '
-                                     f'still {_stab_hold[0]}/{args.refresh_hold}')
-                            if _stab_hold[0] >= args.refresh_hold:
-                                k = max(1, int(round(args.refresh * args.subsample)))
-                                fresh, seen = _draw(name, k)
-                                pool = _samples[name]
-                                del pool[:len(fresh)]
-                                pool.extend(fresh)
-                                _stab_hold[0] = 0
-                                # The baseline goes too: the next epoch runs on partly new
-                                # data, so differencing it against the stalled epoch would
-                                # compare two different datasets and fire spuriously.
-                                _stab_prev.clear()
-                                _stab_best[0] = None
-                                _sub_log(f'TRIGGER {name} STALLED at epoch '
-                                         f'{_epochs[name][0]} -- retired {len(fresh)} '
-                                         f'oldest, drew {len(fresh)} fresh from {seen} '
-                                         f'(pool {len(pool)}) {_fresh(name)}')
+                                _d, _da, _nl, _mu, _ns = _st
+                                # STILL? Either the drift is under an absolute floor (the
+                                # paper), or it has stopped setting new minima (relative).
+                                _ad = abs(_d)
+                                if args.refresh_mode == 'abs':
+                                    _still = _ad <= args.refresh_eps
+                                    _extra = f'eps {args.refresh_eps:g}'
+                                else:
+                                    _b = _stab_best[0]
+                                    _improved = _b is None or _ad < _b * (1.0 - args.refresh_tol)
+                                    if _improved:
+                                        _stab_best[0] = _ad
+                                    _still = not _improved
+                                    _extra = f'best {_stab_best[0]:.{args.refresh_r}f}'
+                                _stab_hold[0] = _stab_hold[0] + 1 if _still else 0
+                                _sub_log(f'TRIGGER {name} epoch {_epochs[name][0]} '
+                                         f'sum_delta {_d:+.{args.refresh_r}f} '
+                                         f'sum_abs_delta {_da:.{args.refresh_r}f} '
+                                         f'mean_std {_mu:.4f} layers {_nl} samples {_ns} '
+                                         f'{args.refresh_mode} {_extra} '
+                                         f'still {_stab_hold[0]}/{args.refresh_hold}')
+                                _fire = _stab_hold[0] >= args.refresh_hold
+                        if _fire:
+                            k = max(1, int(round(args.refresh * args.subsample)))
+                            fresh, seen = _draw(name, k)
+                            pool = _samples[name]
+                            del pool[:len(fresh)]
+                            pool.extend(fresh)
+                            # The detector's baseline goes too -- a no-op on the scheduled
+                            # path, where it was never built: the next epoch runs on partly
+                            # new data, so differencing it against the stalled epoch would
+                            # compare two different datasets and fire spuriously.
+                            _stab_hold[0] = 0
+                            _stab_prev.clear()
+                            _stab_best[0] = None
+                            _sub_log(f'TRIGGER {name} '
+                                     f'{"SCHEDULED" if args.refresh_every else "STALLED"} '
+                                     f'at epoch {_epochs[name][0]} -- retired {len(fresh)} '
+                                     f'oldest, drew {len(fresh)} fresh from {seen} '
+                                     f'(pool {len(pool)}) {_fresh(name)}')
                     if args.epochs:
                         # --epochs: retire the oldest k, draw k fresh. The pool is kept in
                         # insertion order so "oldest" is the head; a document therefore
@@ -3798,7 +3825,7 @@ else:
 # Bind the module-level tokenizer used by clip_text() and every display path. The worker
 # threads that call clip_text() are only started further down, so this is set in time.
 _tokenizer = model.tok
-if args.refresh:
+if args.refresh and not args.refresh_every:
     _stab_register(model)
 # --tokenizer tiny* takes c_text from the pretrained embedding width, so sync it back:
 # saved_args must describe the model that was actually built or a --load would rebuild
@@ -5393,7 +5420,7 @@ try:
             # steps apart at --subsample 10000, so this reports the epoch-so-far mean and the
             # last verdict in between -- enough to see the detector converging toward still
             # rather than only learning about it when it fires.
-            if args.refresh:
+            if args.refresh and not args.refresh_every:
                 _mu, _ns, _nl, _lastv, _hold = _stab_peek()
                 _lv = ('none yet' if _lastv is None else
                        f'{_lastv[0]:+.{args.refresh_r}f} (abs {_lastv[1]:.{args.refresh_r}f})')
@@ -5472,7 +5499,7 @@ try:
         # ── train step ────────────────────────────────────────────────────────
         dff_prev = model.dff                                    # save pre-step DFF
         model.train()
-        if args.refresh:
+        if args.refresh and not args.refresh_every:
             _stab_step[0] += 1     # --refresh: sample cadence, counted in TRAINING steps
         logits, loss = model(x, targets=y, flag=flag)
 
