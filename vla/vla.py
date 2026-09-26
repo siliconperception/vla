@@ -911,7 +911,11 @@ parser.add_argument('--gen_score',     default=None,  nargs='?', metavar='MODEL'
                          'DELIGHTED by degenerate output -- "the the the" scores near-zero '
                          'nats -- which is exactly the failure mode a recurrent model falls '
                          'into (see exp/gencheck.py). GENSCORE therefore also reports rep1, '
-                         'the fraction of the sample made of its single most common token; '
+                         'the larger of the fraction of the sample made of its most common '
+                         'WORD and the fraction of its non-whitespace CHARACTERS made of the '
+                         'most common one -- a wall of one punctuation character broken by '
+                         'spaces defeats the word rate alone (0.08, while the reference LM '
+                         'scores it 98%% fluent) and the character rate catches it (0.75); '
                          'a high fluency score next to a high rep1 is a collapsed model, not '
                          'a fluent one.\n'
                          'Runs on the CPU and only every --gen_interval steps, so it costs '
@@ -3939,7 +3943,11 @@ class _GenScorer:
 
     rep1 is reported alongside, and exists because THIS METRIC IS BACKWARDS ON DEGENERATE
     TEXT: a model emitting one token forever is maximally predictable and scores as maximally
-    fluent. rep1 is the fraction of the sample made of its most common word; read together, a
+    fluent. rep1 is the larger of two rates -- the fraction of the sample made of its most
+    common WORD and the fraction of its non-whitespace CHARACTERS made of the most common one
+    -- because a word-only rate has a hole: a wall of one punctuation character broken by
+    spaces splits into many distinct "words" and reads 0.08, while the reference LM scores
+    that sample 98% fluent (v196 step 10000); the character rate calls it 0.75. Read together, a
     high score with a high rep1 is collapse, not fluency.
     """
     def __init__(self, repo):
