@@ -433,6 +433,26 @@ parser.add_argument('--dff_penalty',   default=0.0,   type=float, metavar='W',
                          'a no-op: it is detached (gradient horizon = 1 token) and carries '
                          'no graph. Complements --clip_dff, which bounds the state after the '
                          'fact without any gradient signal to avoid the bound.')
+parser.add_argument('--dff_bias',      default=0.0,   type=float, metavar='W',
+                    help='add W * (mean of the DFF state) to the training loss -- the '
+                         'TWO-SIDED form of --dff_penalty: a positive mean costs and a '
+                         'negative one is rewarded, without limit (0 = off).\n'
+                         'Where it differs: --dff_penalty relu()s the mean, so it is a '
+                         'restoring force that goes silent once the mean is negative and '
+                         'therefore contributes nothing in steady state (measured: W=10 parks '
+                         'the mean at -0.0022 and the loss stays pure cross-entropy). This one '
+                         'never goes silent -- it is a constant downward pull on the mean, and '
+                         'the loss it reports is CE + W*mean, which is BELOW the true CE '
+                         'whenever the mean is negative. Read the loss column accordingly: '
+                         'with --dff_bias the logged loss is the objective, not the '
+                         'cross-entropy, and is not comparable with a run trained without it.\n'
+                         'The pull is bounded only by whatever the CE term is willing to pay, '
+                         'so a large W can drive the state arbitrarily negative; the DFF '
+                         'columns (dff_mean, dff_std) are what say whether the state is still '
+                         'carrying information or has simply been pushed down.\n'
+                         'Applied to the PRE-DETACH layer outputs, like --dff_penalty, so the '
+                         'gradient reaches the projector. May be combined with it, though the '
+                         'combination is two forces on the same quantity.')
 parser.add_argument('--clip_dff',      default=0.0,   type=float, metavar='MAX',
                     help='bound the magnitude of the DFF state after every write (0 = off). '
                          'Rescales rather than clamping element-wise -- if a layer\'s state '
@@ -1623,6 +1643,7 @@ class VLAModel(nn.Module, _HubMixin):
         # checkpoint rebuilt by exp/score.py or exp/reach.py does not need a new kwarg --
         # it changes the LOSS, not the architecture, and no state_dict entry depends on it.
         self.dff_penalty = float(getattr(args, 'dff_penalty', 0.0) or 0.0)
+        self.dff_bias    = float(getattr(args, 'dff_bias', 0.0) or 0.0)
         self.tap_norm_kind = tap_norm or 'none'
         self.norm_kind     = norm or 'batch'
         self.norm_groups   = int(norm_groups)
@@ -2132,13 +2153,16 @@ class VLAModel(nn.Module, _HubMixin):
 
         logits = self.readout(self.decoder(new_ctx))
         loss   = F.cross_entropy(logits, targets.long()) if targets is not None else None
-        if loss is not None and self.dff_penalty:
-            # relu(mean state), element-weighted across layers so a wide layer counts for
-            # what it is rather than one layer one vote. On `stack`, which still carries the
-            # graph -- self.dff above is detached and would contribute nothing.
+        if loss is not None and (self.dff_penalty or self.dff_bias):
+            # Mean state, element-weighted across layers so a wide layer counts for what it
+            # is rather than one layer one vote. On `stack`, which still carries the graph --
+            # self.dff above is detached and would contribute nothing.
             _n = sum(d.numel() for d in stack)
             _m = sum(d.sum() for d in stack) / _n
-            loss = loss + self.dff_penalty * F.relu(_m)
+            if self.dff_penalty:
+                loss = loss + self.dff_penalty * F.relu(_m)   # one-sided: restoring force
+            if self.dff_bias:
+                loss = loss + self.dff_bias * _m              # two-sided: constant pull
         return logits, loss
 
     @torch.no_grad()
