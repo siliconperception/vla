@@ -414,6 +414,25 @@ parser.add_argument('--tap_norm',      default='none', choices=['none', 'batch',
                          'train/eval mismatch on that path. It adds no parameters and no '
                          'state_dict entries, so unlike "batch" it can be toggled on an '
                          'existing checkpoint. Requires --tap')
+parser.add_argument('--dff_penalty',   default=0.0,   type=float, metavar='W',
+                    help='add W * relu(mean of the DFF state) to the training loss, so a '
+                         'POSITIVE mean state is penalized and a negative one is free '
+                         '(0 = off).\n'
+                         'What it is for: the state\'s scale inflates monotonically for a '
+                         'whole run -- the logged dff_std climbs 0.7 -> 1.65 over 3.6M steps '
+                         'and never settles -- and the mean rides with it, because the '
+                         'register accumulates the ReLU outputs of the stack, which are '
+                         'non-negative before the linear projection. relu() and not abs() '
+                         'because only the positive direction is the runaway one: pushing '
+                         'the mean below zero is not an improvement worth paying gradient '
+                         'for, and abs() would make 0 an attractor the state has no reason '
+                         'to sit at.\n'
+                         'Applied to the PRE-DETACH layer outputs, i.e. the tensors that are '
+                         'about to become the register, so the gradient reaches the '
+                         'projector that produced them. Penalizing self.dff instead would be '
+                         'a no-op: it is detached (gradient horizon = 1 token) and carries '
+                         'no graph. Complements --clip_dff, which bounds the state after the '
+                         'fact without any gradient signal to avoid the bound.')
 parser.add_argument('--clip_dff',      default=0.0,   type=float, metavar='MAX',
                     help='bound the magnitude of the DFF state after every write (0 = off). '
                          'Rescales rather than clamping element-wise -- if a layer\'s state '
@@ -1600,6 +1619,10 @@ class VLAModel(nn.Module, _HubMixin):
         # register is written every step (see DFFEma); the convs run every step regardless.
         self.ema = None                                  # derived in set_ema
         self.clip_dff   = float(clip_dff or 0.0)
+        # --dff_penalty: read off the module-level args, the same way --linout is, so a
+        # checkpoint rebuilt by exp/score.py or exp/reach.py does not need a new kwarg --
+        # it changes the LOSS, not the architecture, and no state_dict entry depends on it.
+        self.dff_penalty = float(getattr(args, 'dff_penalty', 0.0) or 0.0)
         self.tap_norm_kind = tap_norm or 'none'
         self.norm_kind     = norm or 'batch'
         self.norm_groups   = int(norm_groups)
@@ -2109,6 +2132,13 @@ class VLAModel(nn.Module, _HubMixin):
 
         logits = self.readout(self.decoder(new_ctx))
         loss   = F.cross_entropy(logits, targets.long()) if targets is not None else None
+        if loss is not None and self.dff_penalty:
+            # relu(mean state), element-weighted across layers so a wide layer counts for
+            # what it is rather than one layer one vote. On `stack`, which still carries the
+            # graph -- self.dff above is detached and would contribute nothing.
+            _n = sum(d.numel() for d in stack)
+            _m = sum(d.sum() for d in stack) / _n
+            loss = loss + self.dff_penalty * F.relu(_m)
         return logits, loss
 
     @torch.no_grad()
