@@ -3999,14 +3999,24 @@ class _GenScorer:
             return ''
         # Gate on CHARACTERS, not words. A collapsed sample is often one unbroken run
         # ('okinetics*******...'), i.e. a single "word" -- and that is exactly the case this
-        # metric exists to flag, so it must not be the case that gets skipped. rep1 falls
-        # back to characters when there are too few words to be meaningful.
+        # metric exists to flag, so it must not be the case that gets skipped.
         text = text.strip()
         if len(text) < 16:
             return ''
         words = text.split()
-        units = words if len(words) >= 8 else list(text)
-        rep1  = max(collections.Counter(units).values()) / len(units)
+        # rep1 is the MAX of the word-level and character-level rates, not a fallback from
+        # one to the other. A word-only rep1 has a hole this metric cannot afford: a wall of
+        # one punctuation character broken by spaces ('||| H|| |||||||| ...') splits into
+        # many DISTINCT 'words' of different run lengths, so no single word dominates and
+        # rep1 reads a healthy 0.12 -- while the reference LM, delighted by the most
+        # predictable text imaginable, scored that sample 3.53 nats and 98% fluency
+        # (v196 step 10000). Measured at the character level the same sample is ~0.7.
+        # Whitespace is excluded from the character count so ordinary spacing cannot itself
+        # become the dominant 'character' in a short sample.
+        _chars = [c for c in text if not c.isspace()]
+        rep1w  = max(collections.Counter(words).values()) / len(words) if words else 0.0
+        rep1c  = max(collections.Counter(_chars).values()) / len(_chars) if _chars else 0.0
+        rep1   = max(rep1w, rep1c)
         n = self._nll(' '.join(words[:256]) if words else text[:1024])
         if n is None:
             return ''
