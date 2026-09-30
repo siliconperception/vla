@@ -3976,7 +3976,14 @@ def worker(stop, q, datasets, args, mix=None):
                         ids = [x for x in ids for _ in range(_DATAREP)]
                     if not ids:
                         break          # nothing left to read this sweep; retry on the next
-                    _text_tally(len(ids), sample=text[:400])
+                    # The WHOLE chunk as the sample, not its opening 400 characters.
+                    # _sample_window draws a random window from the stored sample precisely
+                    # so a long-lived load does not show its first lines forever (see the
+                    # sebooks note there) -- and a 400-char store defeats that: every window
+                    # overlaps, so report after report reads as the same text. A slot holds
+                    # this chunk for ~16k steps, so the chunk IS what the run is training on
+                    # for that whole stretch, and a window of it is the honest sample.
+                    _text_tally(len(ids), sample=text)
                     slot.load(ids, text[:400])
                     continue
                 try:
