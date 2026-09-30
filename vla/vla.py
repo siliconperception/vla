@@ -2600,6 +2600,11 @@ _TEXT_DATASETS = {
     'dolma3':  ('allenai/dolma3_mix-150B-1025', None, 'train', 'text'),
     's1k':     ('simplescaling/s1K',      None, 'train', None),
     'pile':    ('EleutherAI/the_pile_deduplicated', None, 'train', 'text'),
+    # LittleCurriculum: 2546 parquet shards of (id, text), ~74k rows each -- far too large to
+    # fetch whole, and it needs no subset file list because it STREAMS: 250 slots at one token
+    # per step is ~24 KB/s, so the network is never the bottleneck. Ordinary framed corpus,
+    # so <STX>/<ETX> and the usual prompting apply.
+    'littlec': ('littlelearner/LittleCurriculum', None, 'train', 'text'),
     'pile_nc': ('monology/pile-uncopyrighted', None, 'train', 'text'),
     # synth has no repo: examples are generated on the fly by --teacher. The tuple exists so
     # _build_clip finds the 'text' column and _split_for_name resolves, exactly as for a
@@ -2793,7 +2798,8 @@ def _fmt_finephrase(ex):
 # Corpora with a real held-out split (tiny/c4/pile/web) are NOT hashed: they keep the exact
 # sets every earlier number in PLAN.txt was measured on.
 _HASH_HOLDOUT = {'swiki', 'fwedu', 'fineweb', 'fwcrawl', 'cosmo', 'cosmoweb', 'fpfaq', 'fpmath', 'fptut',
-                 'smolcosmo', 'smolfwedu', 'strangetb', 'sebooks', 'dclmedu', 'babylm'}
+                 'smolcosmo', 'smolfwedu', 'strangetb', 'sebooks', 'dclmedu', 'babylm',
+                 'littlec'}
 _HOLDOUT_MOD = 32                       # ~3.1% held out. Sized by the SCAN COST of building
                                         # the eval set, not by statistics: the filters
                                         # compound. cosmo keeps 26.5% (audience) x 1/MOD
