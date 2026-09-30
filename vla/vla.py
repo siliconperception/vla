@@ -3335,13 +3335,26 @@ class _BlockReader:
                     _epoch_set(self.name, min(self.epoch))
                 self.pos[k] = self.ranges[self.fi[k]][k][0]
                 continue
+            at_start = self.pos[k] == start        # first read of this range?
             with open(f, 'rb') as fh:
                 fh.seek(self.pos[k])
                 buf = fh.read(min(self.CHUNK, end - self.pos[k]))
                 if self.pos[k] + len(buf) < end:
                     buf += fh.readline()           # never split a line
                 self.pos[k] += len(buf)
-            return buf.decode('utf-8', errors='replace')
+            # NEWLINES OUT. The line breaks are the corpus FILE's format, not the text: a
+            # BabyLM transcript puts one utterance per line, so a raw read stitches the block
+            # together with a '\n' every ~13 tokens and the model spends its capacity
+            # learning to emit them. --blocks exists to present the corpus as one continuous
+            # document, so the separator becomes a space -- a space and not nothing, or the
+            # last word of one line would fuse with the first of the next -- and runs of
+            # whitespace collapse, since a blank line would otherwise leave a double space.
+            # A chunk that CONTINUES a range keeps its leading space, because each chunk is
+            # tokenized on its own: without it the first word would encode as a
+            # start-of-text token instead of the ' word' form it has mid-document, once per
+            # refill. One boundary in ~16k tokens either way, but it costs one space.
+            txt = ' '.join(buf.decode('utf-8', errors='replace').split())
+            return txt if at_start else ' ' + txt
         return ''
 
 
