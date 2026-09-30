@@ -921,6 +921,25 @@ parser.add_argument('--gen_score',     default=None,  nargs='?', metavar='MODEL'
                          'Runs on the CPU and only every --gen_interval steps, so it costs '
                          'no GPU memory and no measurable training time. Off by default: a '
                          'run without it is byte-identical to one from before the flag.')
+parser.add_argument('--blocks',        default=False, action=argparse.BooleanOptionalAction,
+                    help='read the corpus as ONE CONTIGUOUS STREAM PER SLOT instead of a bag '
+                         'of documents: each file is cut into --batch byte ranges and slot k '
+                         'reads range k of every file, head to tail, in file order.\n'
+                         'For a line-oriented corpus this is the difference between a slot '
+                         'seeing ~13 tokens of continuity and then jumping somewhere else in '
+                         'the corpus, and a slot reading hundreds of thousands of contiguous '
+                         'tokens. The ordinary path hands documents out from a shared queue, '
+                         'so a slot gets roughly every --batch-th line; on an --unframed slot, '
+                         'whose state is never reset, that asks the recurrence to carry '
+                         'context across boundaries with nothing behind them.\n'
+                         'PER FILE, so the batch moves through the files together and an '
+                         'unshuffled curriculum survives; cutting the concatenated corpus '
+                         'would put slot 0 in the first file and the last slot in the last, '
+                         'with every file present in every batch. One pass over every range '
+                         'of every file is one epoch, and the epoch length in steps is '
+                         'unchanged: corpus_tokens / batch.\n'
+                         'Local text corpora only (--dataset babylm), single dataset, and it '
+                         'is inherently ordered -- implies --no-shuffle.')
 parser.add_argument('--gen_null',      default=False, action=argparse.BooleanOptionalAction,
                     help='sample from the SEEDED STATE ALONE: the prompt is empty, not even '
                          '<STX>. Applies everywhere a sample is drawn -- the periodic GEN '
@@ -1222,6 +1241,20 @@ if args.epochs and not args.subsample:
     raise SystemExit('--epochs is the --subsample turnover rate and needs --subsample')
 if args.refresh and not args.subsample:
     raise SystemExit('--refresh is the --subsample turnover rate and needs --subsample')
+if args.blocks:
+    if args.dataset != 'babylm' or args.mix:
+        raise SystemExit('--blocks needs a local text corpus and a single dataset '
+                         '(--dataset babylm, no --mix)')
+    if args.subsample:
+        raise SystemExit('--blocks and --subsample are two different ways to choose what a '
+                         'slot reads; pick one')
+    if args.shuffle:
+        raise SystemExit('--blocks is a contiguous read and cannot be shuffled')
+    args.shuffle = False
+    if args.dataset not in {n.strip() for n in (args.unframed or '').split(',')}:
+        raise SystemExit(f'--blocks needs --unframed {args.dataset}: a contiguous stream has '
+                         'no document boundaries to frame, and a framed slot resets the DFF '
+                         'at every refill -- the opposite of what blocks are for')
 if args.refresh_every and not args.refresh:
     raise SystemExit('--refresh_every is the --refresh schedule and needs --refresh')
 if args.refresh and args.epochs:
@@ -2711,6 +2744,21 @@ _HUB_SUBSET = {
 }
 
 
+def _babylm_files():
+    """The BabyLM-2026-Strict .txt files in the hub cache, SORTED -- the order is the
+    curriculum under --no-shuffle, and the block partition under --blocks."""
+    home = os.environ.get('HF_HOME') or os.path.expanduser('~/.cache/huggingface')
+    root = os.path.join(home, 'hub',
+                        'datasets--BabyLM-community--BabyLM-2026-Strict', 'snapshots')
+    files = sorted(glob.glob(os.path.join(root, '*', '*.txt')))
+    if not files:
+        raise SystemExit('babylm: no .txt files under HF_HOME for '
+                         'BabyLM-community/BabyLM-2026-Strict -- fetch it first with '
+                         "snapshot_download('BabyLM-community/BabyLM-2026-Strict', "
+                         "repo_type='dataset')")
+    return files
+
+
 def _hub_subset_files(name):
     repo, cfg = _HUB_SUBSET[name]
     home = os.environ.get('HF_HOME') or os.path.expanduser('~/.cache/huggingface')
@@ -3100,15 +3148,7 @@ def _init_one_dataset(name, streaming, shards=None):
         # so the run sees bnc_spoken, then childes, then gutenberg ... -- a curriculum by
         # corpus rather than an interleaving. That is only meaningful unshuffled; with the
         # default per-corpus shuffle it is an ordinary mixed stream.
-        home = os.environ.get('HF_HOME') or os.path.expanduser('~/.cache/huggingface')
-        root = os.path.join(home, 'hub',
-                            'datasets--BabyLM-community--BabyLM-2026-Strict', 'snapshots')
-        files = sorted(glob.glob(os.path.join(root, '*', '*.txt')))
-        if not files:
-            raise SystemExit('babylm: no .txt files under HF_HOME for '
-                             'BabyLM-community/BabyLM-2026-Strict -- fetch it first with '
-                             "snapshot_download('BabyLM-community/BabyLM-2026-Strict', "
-                             "repo_type='dataset')")
+        files = _babylm_files()
         _how = 'file order, NOT shuffled' if args.shuffle is False else 'shuffled'
         print(f'babylm: {len(files)} text file(s), {_how}: '
               f'{", ".join(os.path.basename(f) for f in files)}', flush=True)
@@ -3233,6 +3273,76 @@ def _make_iter(ds, split, streaming, seed, buffer_size=10000, shuffle=True):
     # same approximate shuffle the streaming path uses, at disk-friendly access patterns.
     it = split_ds.to_iterable_dataset(num_shards=64)
     return iter(it.shuffle(buffer_size=buffer_size, seed=seed))
+
+
+class _BlockReader:
+    """--blocks: the corpus as ONE CONTIGUOUS STREAM per slot, not a bag of documents.
+
+    Why it exists. A line-oriented corpus (babylm) loaded the ordinary way becomes one
+    "document" per line -- ~13 tokens for transcripts and subtitles -- and every slot draws
+    from a shared queue, so a slot gets roughly every Bth line: thirteen tokens of real
+    continuity, then a jump to a distant part of the corpus. For an --unframed slot, whose
+    state is never reset, that asks the recurrence to carry context across boundaries with no
+    continuity behind them. Contiguity is the whole point of a long-reach model, so it has to
+    come from the reader.
+
+    PER FILE, not per corpus. Each file is cut into B byte ranges at newline boundaries and
+    slot k reads range k of file 0, then range k of file 1, and so on. Cutting the CONCATENATED
+    corpus instead would be simpler and would destroy the curriculum: slot 0 would sit in
+    bnc_spoken while slot 200 sits in simple_wiki, so every batch would hold all six corpora
+    at once. This way the whole batch moves through the files together -- childes while the
+    model is learning child-directed speech -- and each slot still reads its own range of that
+    file head to tail.
+
+    One pass over every range of every file is one EPOCH, and the token count is the corpus
+    token count, so the epoch length in steps is unchanged: corpus_tokens / batch.
+    """
+    CHUNK = 1 << 16          # bytes per refill; ~16k tokens, so a slot refills rarely
+
+    def __init__(self, files, nslots, name):
+        self.files, self.n, self.name = files, nslots, name
+        # byte ranges per file, aligned FORWARD to the next newline so no line is split
+        # across two slots and none is dropped.
+        self.ranges = []
+        for f in files:
+            size = os.path.getsize(f)
+            cuts = [0]
+            with open(f, 'rb') as fh:
+                for i in range(1, nslots):
+                    fh.seek(size * i // nslots)
+                    fh.readline()                  # advance past the partial line
+                    cuts.append(min(fh.tell(), size))
+            cuts.append(size)
+            self.ranges.append([(cuts[i], cuts[i + 1]) for i in range(nslots)])
+        self.fi   = [0] * nslots                   # current file index, per slot
+        self.pos  = [self.ranges[0][k][0] for k in range(nslots)]
+        self.epoch = [1] * nslots
+        tot = sum(os.path.getsize(f) for f in files)
+        print(f'blocks: {name} {len(files)} file(s) cut into {nslots} contiguous ranges each, '
+              f'{tot / nslots / 1e6:.1f} MB per slot per pass', flush=True)
+
+    def next_text(self, k):
+        """The next chunk of slot k's stream, as text. Advances to the next file at the end
+        of a range and wraps to file 0 (a new epoch) at the end of the last."""
+        for _ in range(len(self.files) + 1):
+            f          = self.files[self.fi[k]]
+            start, end = self.ranges[self.fi[k]][k]
+            if self.pos[k] >= end:
+                self.fi[k] += 1
+                if self.fi[k] >= len(self.files):
+                    self.fi[k] = 0
+                    self.epoch[k] += 1
+                    _epoch_set(self.name, min(self.epoch))
+                self.pos[k] = self.ranges[self.fi[k]][k][0]
+                continue
+            with open(f, 'rb') as fh:
+                fh.seek(self.pos[k])
+                buf = fh.read(min(self.CHUNK, end - self.pos[k]))
+                if self.pos[k] + len(buf) < end:
+                    buf += fh.readline()           # never split a line
+                self.pos[k] += len(buf)
+            return buf.decode('utf-8', errors='replace')
+        return ''
 
 
 # ── worker ─────────────────────────────────────────────────────────────────────
@@ -3827,13 +3937,35 @@ def worker(stop, q, datasets, args, mix=None):
                 except queue.Full:
                     pass
 
-    builders = [threading.Thread(target=builder, args=(f,), daemon=True) for f in _pinned]
+    # --blocks: each slot reads its own contiguous byte range, so the shared clip queue and
+    # its builder threads are bypassed for corpus slots entirely. Refills happen inline in
+    # the loop below: a 64 KB chunk is ~16k tokens and a slot consumes one token per step, so
+    # a slot refills about every 16k steps and the tokenizer cost is a fraction of a percent.
+    _blocks = _BlockReader(_babylm_files(), n_corpus, names[0]) if args.blocks else None
+
+    builders = [] if _blocks else [threading.Thread(target=builder, args=(f,), daemon=True)
+                                   for f in _pinned]
     for b in builders:
         b.start()
 
     while not stop.is_set():
-        for slot in slots:
+        for _si, slot in enumerate(slots):
             while slot.done():
+                if _blocks is not None and _si >= n_vocab:
+                    # RAW IDS, not (x, y) pairs: a _StreamSlot appends to a running buffer
+                    # and forms the pair itself, so the pair straddling a refill is the last
+                    # token of one chunk -> the first of the next and the stream is unbroken
+                    # across the 64 KB boundary. Passing pairs here made load() extend the
+                    # buffer with tuples and the slot never became ready.
+                    text = _blocks.next_text(_si - n_vocab)
+                    ids  = _tokenizer.encode(text) if text else []
+                    if _DATAREP > 1:
+                        ids = [x for x in ids for _ in range(_DATAREP)]
+                    if not ids:
+                        break          # nothing left to read this sweep; retry on the next
+                    _text_tally(len(ids), sample=text[:400])
+                    slot.load(ids, text[:400])
+                    continue
                 try:
                     steps, caption = clip_qs[slot.name].get(timeout=0.5)
                 except queue.Empty:
