@@ -921,6 +921,21 @@ parser.add_argument('--gen_score',     default=None,  nargs='?', metavar='MODEL'
                          'Runs on the CPU and only every --gen_interval steps, so it costs '
                          'no GPU memory and no measurable training time. Off by default: a '
                          'run without it is byte-identical to one from before the flag.')
+parser.add_argument('--gen_null',      default=False, action=argparse.BooleanOptionalAction,
+                    help='sample from the SEEDED STATE ALONE: the prompt is empty, not even '
+                         '<STX>. Applies everywhere a sample is drawn -- the periodic GEN '
+                         'lines, --generate and --vis.\n'
+                         'Default off, where a prompt of "" still means the single token '
+                         '<STX> (see _prompt_ids), so generation always opens at a document '
+                         'boundary the way every training clip does. That is the right '
+                         'default for a FRAMED corpus and the wrong one for an UNDELIMITED '
+                         'stream (--unframed), which never sees <STX> in training: feeding '
+                         'one at sample time puts the model in a state it was never trained '
+                         'on. With --gen_null the DFF is seeded by --init (gaussian noise, '
+                         'say) and the first token is read straight off that state through '
+                         'the decoder, with no token injection at all -- which is what the '
+                         'recurrence does mid-stream, and the only honest way to sample a '
+                         'model trained without document markers.')
 parser.add_argument('--gen_prompts',   default=None,
                     help='EXTRA prompts for the periodic GEN sample, comma-separated, e.g. '
                          '"aardvark,telescope,zorbulate". The NULL prompt (bare <STX>, i.e. '
@@ -2235,7 +2250,18 @@ class VLAModel(nn.Module, _HubMixin):
                 if logits is None:
                     return out
             if logits is None:
-                return out
+                # EMPTY PROMPT (--gen_null): there is no token to inject, so the first
+                # distribution is read straight off the freshly seeded state -- decode the
+                # top register exactly as _step does with the layer output. Everything after
+                # this is the ordinary loop: the sampled token is fed back normally.
+                if not prompt_ids:
+                    with torch.no_grad():
+                        logits = self.readout(self.decoder(dff[-1]))
+                    if not logits.isfinite().all():
+                        print('generate: logits NaN/Inf from seed')
+                        return out
+                else:
+                    return out
             while len(out) < n_tokens:
                 prob = F.softmax(logits[0] / max(temperature, 1e-6), dim=-1)
                 bval = torch.multinomial(prob, 1).item()
@@ -2653,6 +2679,11 @@ _TEXT_DATASETS = {
     # intercepts the name before the repo is read. Split and column still have to be here so
     # _corpus_text and _split_for_name resolve exactly as for a hub corpus.
     'file':    (None, None, 'train', 'text'),
+    # BabyLM 2026 Strict: six plain-text files (bnc_spoken, childes, gutenberg,
+    # open_subtitles, simple_wiki, switchboard), ~543 MB, fetched from the hub as TEXT rather
+    # than parquet. repo None for the same reason 'file' and 'bdict' are: _init_one_dataset
+    # builds it locally and nothing downstream needs to know the difference.
+    'babylm':  (None, None, 'train', 'text'),
 }
 
 # Repos where only a SUBSET of the files is on disk, loaded from the hub cache directly.
@@ -2714,7 +2745,7 @@ def _fmt_finephrase(ex):
 # Corpora with a real held-out split (tiny/c4/pile/web) are NOT hashed: they keep the exact
 # sets every earlier number in PLAN.txt was measured on.
 _HASH_HOLDOUT = {'swiki', 'fwedu', 'fineweb', 'fwcrawl', 'cosmo', 'cosmoweb', 'fpfaq', 'fpmath', 'fptut',
-                 'smolcosmo', 'smolfwedu', 'strangetb', 'sebooks', 'dclmedu'}
+                 'smolcosmo', 'smolfwedu', 'strangetb', 'sebooks', 'dclmedu', 'babylm'}
 _HOLDOUT_MOD = 32                       # ~3.1% held out. Sized by the SCAN COST of building
                                         # the eval set, not by statistics: the filters
                                         # compound. cosmo keeps 26.5% (audience) x 1/MOD
@@ -3062,6 +3093,26 @@ def _init_one_dataset(name, streaming, shards=None):
         _how = 'SHUFFLED (--shuffle)' if args.shuffle else 'file order, NOT shuffled'
         print(f'file: {path} ({n} documents, {_how})', flush=True)
         return load_dataset('json', data_files={'train': path}, streaming=streaming)
+    if name == 'babylm':
+        # One document per LINE, like bdict: the transcripts and subtitles are line-oriented
+        # and a whole 152 MB file is not a "document" in any sense the slot machinery means.
+        # Files are concatenated in SORTED ORDER and, with --no-shuffle, read in that order,
+        # so the run sees bnc_spoken, then childes, then gutenberg ... -- a curriculum by
+        # corpus rather than an interleaving. That is only meaningful unshuffled; with the
+        # default per-corpus shuffle it is an ordinary mixed stream.
+        home = os.environ.get('HF_HOME') or os.path.expanduser('~/.cache/huggingface')
+        root = os.path.join(home, 'hub',
+                            'datasets--BabyLM-community--BabyLM-2026-Strict', 'snapshots')
+        files = sorted(glob.glob(os.path.join(root, '*', '*.txt')))
+        if not files:
+            raise SystemExit('babylm: no .txt files under HF_HOME for '
+                             'BabyLM-community/BabyLM-2026-Strict -- fetch it first with '
+                             "snapshot_download('BabyLM-community/BabyLM-2026-Strict', "
+                             "repo_type='dataset')")
+        _how = 'file order, NOT shuffled' if args.shuffle is False else 'shuffled'
+        print(f'babylm: {len(files)} text file(s), {_how}: '
+              f'{", ".join(os.path.basename(f) for f in files)}', flush=True)
+        return load_dataset('text', data_files={'train': files}, streaming=streaming)
     if name == 'bdict':
         # one document per LINE. datasets' 'text' builder with the default sample_by='line'
         # is exactly that, so the rest of the pipeline (shuffle, epoch wrap, _corpus_text)
@@ -3924,6 +3975,8 @@ def _prompt_ids(text=None):
     text=None means --prompt (the original behaviour, unchanged for every existing caller);
     the periodic GEN block passes each entry of _gen_prompt_list() explicitly."""
     t = args.prompt if text is None else text
+    if args.gen_null and not t:
+        return []                      # --gen_null: no <STX>, no tokens; see generate()
     return [_tokenizer.start_id] + (_tokenizer.encode(t) if t else [])
 
 
@@ -5542,7 +5595,7 @@ try:
             for _p in _gen_prompt_list():
                 prompt = _prompt_ids(_p)
                 out    = model.generate(prompt, _GEN_SAMPLE, temperature=args.temperature)
-                lines.append(f'GEN step {i:10} [{_p or "<STX>"}]: {_render(prompt + out)}')
+                lines.append(f'GEN step {i:10} [{_p or ("<NULL>" if args.gen_null else "<STX>")}]: {_render(prompt + out)}')
                 if _gen_scorer is not None:
                     # score the DECODED generation, not the rendered line: _render escapes
                     # whitespace and inserts <STX>/<ETX>, none of which is text the model
@@ -5550,7 +5603,7 @@ try:
                     _txt = _decode_plain(out)
                     _sc  = _gen_scorer.score(_txt)
                     if _sc:
-                        lines.append(f'GENSCORE step {i:10} [{_p or "<STX>"}]: {_sc}')
+                        lines.append(f'GENSCORE step {i:10} [{_p or ("<NULL>" if args.gen_null else "<STX>")}]: {_sc}')
             _tsample, _vsample = _text_peek()  # recent corpus / per-pool vocab training text
             _vw = max([len(k) for k in _vsample] + [6])
             for _k in sorted(_vsample):            # every curriculum file, every report
