@@ -3444,6 +3444,7 @@ def worker(stop, q, datasets, args, mix=None):
     _iters  = {}
     _locks  = {}
     _epochs = {}
+    _shufs  = {}          # per-corpus shuffle decision, reused by every iterator re-make
     # When the batchwise vocab stream is active the epoch column must report passes over the
     # VOCAB FILES only: the corpus is effectively infinite and would pin the reported epoch
     # at 1 forever, since _epoch_num() takes the minimum across datasets.
@@ -3451,7 +3452,13 @@ def worker(stop, q, datasets, args, mix=None):
     for n in set(names):
         # --shuffle unset: file order for --dataset file, shuffled for everything else.
         # Set either way, it applies to every corpus in the mix.
+        # Remembered per corpus, because EVERY later _make_iter must reproduce it: an epoch
+        # wrap and a --subsample stream re-make both rebuild the iterator, and _make_iter
+        # defaults to shuffle=True. Without this, --no-shuffle held only for epoch 1 and the
+        # corpus was silently shuffled from epoch 2 on -- which for an unshuffled curriculum
+        # run is the whole experiment.
         _shuf      = (n != 'file') if args.shuffle is None else bool(args.shuffle)
+        _shufs[n]  = _shuf
         _iters[n]  = _make_iter(datasets[n], _split_for_name(n), args.streaming, args.seed,
                                 shuffle=_shuf)
         _locks[n]  = threading.Lock()   # HF streaming iterator is not thread-safe
@@ -3518,7 +3525,7 @@ def worker(stop, q, datasets, args, mix=None):
                 remade = True                    # one fresh pass per draw, then stop
                 _spass[n] += 1
                 _stream[n] = _make_iter(datasets[n], _split_for_name(n), args.streaming,
-                                        args.seed + 7919 * _spass[n])
+                                        args.seed + 7919 * _spass[n], shuffle=_shufs[n])
                 continue
             seen += 1
             text = _corpus_text(n, ex)
@@ -3663,7 +3670,8 @@ def worker(stop, q, datasets, args, mix=None):
                                                          set(_recent[name])))
                 else:
                     _iters[name] = _make_iter(datasets[name], _split_for_name(name),
-                                              args.streaming, args.seed + _epochs[name][0])
+                                              args.streaming, args.seed + _epochs[name][0],
+                                              shuffle=_shufs[name])
                 return next(_iters[name])
 
     def _build_clip(name, example):
