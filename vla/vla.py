@@ -2669,6 +2669,9 @@ _TEXT_DATASETS = {
     # 'textbook' is the generated textbook prose the dataset exists to provide (mean 622
     # tokens, median 605). Short-form, so preroll and held-out eval both apply normally.
     'tinytb':    ('nampdn-ai/tiny-textbooks', None, 'train', 'textbook'),
+    # Same repo as tinytb; the column is None because _fmt_tinytb_pair builds the text from
+    # two columns, the way s1k and wdef do.
+    'tinytbpair': ('nampdn-ai/tiny-textbooks', None, 'train', None),
     # Nelathan/standardebooks: 1233 public-domain books, whole book per row. 0.43 GB,
     # ~175M tokens. UNLIKE EVERY OTHER CORPUS HERE THE DOCUMENTS ARE ENORMOUS -- mean
     # 126k tokens, median 107k, max 659k -- so a slot holds one book for ~126k steps and
@@ -2824,6 +2827,7 @@ def _is_heldout(text):
 _EVAL_SPLITS = {
     # ships a genuine test split (21k rows), so there is nothing to hash out of training
     'tinytb':  'test',
+    'tinytbpair': 'test',
     'tiny':    'validation',
     'c4':      'validation',
     # openwebtext ships no validation split. train[-3000:] is the tail exp/score.py,
@@ -2912,7 +2916,27 @@ def _fmt_wdef(ex):
 
 # cosmo has NO entry here any more: _fmt_cosmo (the audience == 'young_children' filter)
 # was removed 2026-08-29, so cosmo now reads its 'text' column like any other corpus.
-_TEXT_FORMAT = {'s1k': _fmt_s1k, 'wdef': _fmt_wdef,
+def _fmt_tinytb_pair(ex):
+    """tiny-textbooks SOURCE then LESSON in one example: text + '\n\n' + textbook.
+
+    The corpus is a rewrite pair -- `text` is the raw web snippet an entry was built from
+    (~600 chars, scraped and fragmentary) and `textbook` is the synthetic lesson generated
+    FROM it (~3000 chars, titled and sectioned). vla.py's 'tinytb' reads the lesson alone, so
+    the model never sees what the lesson was written about. Concatenated, one framed example
+    is <STX> raw source, then the lesson derived from it <ETX>, and the transition from messy
+    source to structured exposition falls inside a single document -- which, for a model whose
+    state carries across the whole example, is the part worth having.
+
+    A blank line between them, not a marker: the boundary is a paragraph break in ordinary
+    text, which is what the tokenizer and the model already know how to read. Entries missing
+    either half are dropped -- half a pair is just 'tinytb' or raw web text under a name that
+    claims otherwise."""
+    raw  = (ex.get('text') or '').strip()
+    book = (ex.get('textbook') or '').strip()
+    return f'{raw}\n\n{book}' if raw and book else ''
+
+
+_TEXT_FORMAT = {'s1k': _fmt_s1k, 'wdef': _fmt_wdef, 'tinytbpair': _fmt_tinytb_pair,
                 'fpfaq': _fmt_finephrase, 'fpmath': _fmt_finephrase,
                 'fptut': _fmt_finephrase}
 
