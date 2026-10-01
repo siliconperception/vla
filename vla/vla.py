@@ -5301,11 +5301,22 @@ def _build_eval_docs(corpus=None):
             # must NOT go through load_dataset(repo, cfg): finephrase has 27k files and
             # resolving them takes longer than the eval itself. Use the same local subset
             # the trainer reads, so the hold-out is the complement of what training sees.
+            # --shards applies HERE TOO, for the same reason: with 15 fineweb shards passed
+            # to a non-streaming load_dataset, the scan read all 30.6 GB and built a full
+            # arrow cache before yielding row 0 -- minutes of stalled training at every
+            # --eval_interval, to find 100 documents. It also made the hold-out a superset
+            # of the training shard rather than its complement.
             _f = _hub_subset_files(corpus)
+            if args.shards:
+                _f = _f[:args.shards]
             rows = load_dataset('parquet', data_files={'train': _f}, split='train',
-                                streaming=args.streaming)
+                                streaming=True)
         else:
-            rows = load_dataset(hf, cfg, split=split, streaming=args.streaming)
+            # streamed regardless of --streaming (see above): this scan wants the first few
+            # thousand rows, so an arrow build over the whole corpus is pure latency. A
+            # SLICED split cannot be streamed, so those keep the non-streaming path.
+            rows = load_dataset(hf, cfg, split=split,
+                                streaming='[' not in split)
         docs, seen = [], 0
         for ex in rows:
             seen += 1
