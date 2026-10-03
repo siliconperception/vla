@@ -608,7 +608,109 @@ parser.add_argument('--linout_kernel', default=1,     type=int, metavar='K',
                          'against 1.0M. Identity init still holds -- dirac_ puts the identity '
                          'on the CENTRE tap and zeros the rest, so K=3 starts as exactly K=1 '
                          'and grows its neighbourhood as the off-centre taps move.')
-parser.add_argument('--tap',           default=False, action='store_true',
+parser.add_argument('--ctx_mix',       default='conv',
+                    choices=['conv', 'none', 'sign', 'signperm', 'hadamard'],
+                    help='how each --ctx_ema register gets its OWN view of the layer output. '
+                         'conv (default): K separate --linout copies, summed on the way up -- '
+                         'the v219/v224 topology. none: ONE ordinary linout conv whose output '
+                         'goes up the stack AND to every register unchanged (see '
+                         '--dff_write_scale). The others use ONE shared linout and give '
+                         'register k a FIXED, multiplier-free transform T_k of its output '
+                         '(T_1 = identity, so register 1 holds the output itself): '
+                         'sign = random +-1 per channel (where signs agree the feedback sum is '
+                         'EMA_fast + EMA_slow, where they differ it is a band-pass difference); '
+                         'signperm = random channel permutation then +-1 (the cheapest exact '
+                         'orthogonal map, pure wiring in hardware); hadamard = random +-1 then '
+                         'the fast Walsh-Hadamard transform, a dense orthogonal rotation in '
+                         'log2(n_hidden) add/sub stages (n_hidden must be a power of 2). '
+                         'The transforms are seeded independently of --seed and saved in the '
+                         'checkpoint. Changes the linout shape, so it is restored from a '
+                         'checkpoint and cannot be toggled on one.')
+parser.add_argument('--linout_init',   default='orth', choices=['orth', 'tied', 'scaled'],
+                    help='init of the --ctx_ema --linout copies (--ctx_mix conv). orth (default): '
+                         'each copy its own independent semi-orthogonal draw, so the upward sum '
+                         'starts at ~sqrt(K) scale. tied: every copy starts as the SAME draw -- '
+                         'and since the copies get identical updates through the upward sum, '
+                         'they stay identical, i.e. one shared linout with K x upward gain and '
+                         'K x effective lr, every register holding the same projection. '
+                         'scaled: independent draws, each x 1/sqrt(K), so the upward sum starts '
+                         'at unit scale. All three make the SAME random draws, so every other '
+                         'module initializes identically. Init only: no shapes change.')
+parser.add_argument('--linout_gain',   default=1.0,   type=float, metavar='G',
+                    help='multiply the --linout init weights by G (init only; no shapes change). '
+                         'With --ctx_mix none, G=2 reproduces the upward gain of two tied '
+                         'copies (v231).')
+parser.add_argument('--linout_lr_mult', default=1.0,  type=float, metavar='M',
+                    help='--linout gets its own optimizer parameter group at M x the learning '
+                         'rate (the schedule scales it like every other group). With --ctx_mix '
+                         'none, M=2 reproduces how fast the summed map of two tied copies moves.')
+parser.add_argument('--decoder_lr_mult', default=1.0, type=float, metavar='M',
+                    help='the decoder (decoder.proj and its norm) gets its own optimizer parameter '
+                         'group at M x the learning rate. The decoder is linear up to its pool, so '
+                         'a gain g on its input (--linout_gain) mainly rescales its updates by '
+                         '~g^2; this is the direct way to get the same effect without inflating '
+                         'the linout init.')
+parser.add_argument('--dff_write_scale', default=1.0, type=float, metavar='S',
+                    help='registers store S x the layer output instead of the output itself '
+                         '(the value going up the stack is unscaled). Linear all the way to '
+                         'linin, so at inference it folds into the weights: text_proj x 1/S and '
+                         'linin x S compute the same function with no extra op. --ctx_mix none '
+                         '--linout_gain 2 --dff_write_scale 0.5 --linout_lr_mult 2 is exactly '
+                         'two tied linout copies (--linout_init tied) as one conv.')
+parser.add_argument('--ctx_read_gain', default='none', choices=['none', 'scalar', 'channel'],
+                    help='a TRAINABLE gain on each --ctx_ema register as the feedback reads it, '
+                         'before the K registers are summed: feedback = sum_k g_k * DFF_k. '
+                         'scalar = one per register per layer, channel = one per register per '
+                         'channel per layer (K*n_hidden). On the read side, so it gets gradient '
+                         '(a write-side gain would not -- the registers are detached). It can '
+                         'weight the timescales differently, or take their difference. Replaces '
+                         'the fixed --dff_write_scale: by linearity, write 1 and read-gain init '
+                         '0.5 start exactly where write 0.5 does. Adds parameters, so it is '
+                         'restored from a checkpoint.')
+parser.add_argument('--ctx_read_gain_init', default=1.0, type=float, metavar='G',
+                    help='starting value of every --ctx_read_gain entry (init only)')
+parser.add_argument('--freeze_linout', default=False, action='store_true',
+                    help='keep every --linout conv (all --ctx_ema copies) at its random init: '
+                         'requires_grad off, so the optimizer never sees it. The control for '
+                         'the question "do the linout copies help because they TRAIN, or '
+                         'because their fixed random inits put the K registers in different '
+                         'subspaces?" -- under --ctx_ema the copies get identical updates '
+                         'through the upward sum, so their difference never trains anyway. '
+                         'Not an architecture arg: re-applied from the command line on every '
+                         'run, like --unfreeze.')
+parser.add_argument('--linin',         default=False, action='store_true',
+                    help='ONE pointwise 1x1 linear conv2d IN FRONT of each layer\'s ContextCNN, '
+                         'mapping the feedback sum (DFF + token / layer below, n_hidden '
+                         'channels) down to --c_context. The first 3x3 of the chain then runs '
+                         'c_context -> c_context instead of n_hidden -> c_context, so the '
+                         'only thing that touches the full register width on the way in is '
+                         'linear -- the mirror of --linout on the way out. Weights: '
+                         'n_hidden*c_context per layer at 1x1, against 9*n_hidden*c_context '
+                         'for the 3x3 it narrows. Semi-orthogonal init (norm-preserving rows). '
+
+                         'Adds parameters, so it is restored from a checkpoint and cannot be '
+                         'toggled on one.')
+parser.add_argument('--ctx_ema',       default=None,  type=str, metavar='W1,W2,...',
+                    help='give EVERY LAYER SEVERAL CONTEXTS instead of one: K = the number of '
+                         'comma-separated WINDOWS IN TOKENS, and each context is a DFF '
+                         'register of the usual [n_hidden, S, S] shape, blended at its own rate '
+                         '1/W (W=1 replaces outright). With --linout each register is written '
+                         'by its OWN COPY of the linout projection and the K copies are SUMMED '
+                         'on the way up; the copies all get the same update through that sum, '
+                         'so they differ by their independent random inits, which keeps the '
+                         'K registers in separate subspaces. Without --linout every register '
+                         'blends the same layer output. '
+                         '--ctx_ema 1,10,100 gives every layer a 1-, a 10- and a 100-token '
+                         'memory of what it computed.\n'
+                         'The K registers are SUMMED into the feedback add.\n'
+                         'The registers are held concatenated, [K*n_hidden, S, S] per layer: '
+                         'K times the state memory and (with --linout) K times its weights. '
+                         'What travels up the stack and into the decoder is the sum of the '
+                         'linout copies (the layer output itself without --linout). Replaces --ema/--ema_ladder (the per-'
+                         'context windows ARE the blend rates), so it cannot be combined with '
+                         'them. Restored from a checkpoint, since it changes the state shape. '
+                         'A single window is exactly --ema 1/W, apart from the linout init.')
+parser.add_argument('--tap',          default=False, action='store_true',
                     help='put two pointwise 1x1 linear conv2d projections in series after '
                          'each layer\'s last conv2d-BN-ReLU -- the tensor that normally feeds '
                          'the DFF -- and tap the DFF from between them. This flag adds the '
@@ -1210,8 +1312,11 @@ parser.add_argument('--altvis',        default=False, action='store_true',
                          'variation rather than how much of it there is overall. Like --vis '
                          'this is read-only: it generates from --prompt and trains nothing.')
 parser.add_argument('--vis',           default=False, action='store_true',
-                    help='live text-generation viz (DFF std + P(next token)) from the '
-                         'prompt token; no training. Read-only. Press x to exit')
+                    help='live text-generation viz from the prompt token; no training. One '
+                         'column per layer, left to right: the layer OUTPUT on top and its DFF '
+                         'register(s) stacked below it (one row per --ctx_ema context), each '
+                         'drawn as the std across channels at every SxS position; P(next '
+                         'token) in a column on the right. Read-only. Press x to exit')
 parser.add_argument('--delay',         default=0.1,   type=float,
                     help='seconds to pause per vis frame')
 parser.add_argument('--cmap',          default='viridis',
@@ -1384,7 +1489,8 @@ if _N_VOCAB:
 
 _ARCH_ARGS = ('context', 'n_hidden', 'c_context', 'c_text', 'n_layers', 'depth', 'kernel',
               'tokenizer', 'head_norm', 'ema', 'ema_ladder', 'qproj',
-              'tap', 'linout', 'linout_kernel', 'dff_every',
+              'tap', 'linout', 'linout_kernel', 'dff_every', 'ctx_ema', 'linin', 'ctx_mix',
+              'dff_write_scale', 'ctx_read_gain',
               'init', 'clock_base', 'clock_max', 'clock_ends', 'clip_dff', 'tap_norm', 'norm', 'norm_groups', 'dff_norm', 'bn_track', 'bn_affine',
                   'bn_momentum', 'bn_eps')
 
@@ -1521,7 +1627,7 @@ class ContextCNN(nn.Module):
     """
     def __init__(self, n_hidden, depth, kernel, norm='batch', groups=32,
                  bn_track=True, bn_affine=False, bn_momentum=0.1, bn_eps=1e-5,
-                 c_context=None, c_out=None):
+                 c_context=None, c_out=None, c_in=None):
         super().__init__()
         pad = kernel // 2
         self.norm_kind = norm
@@ -1539,6 +1645,9 @@ class ContextCNN(nn.Module):
         # --linout the caller passes c_out=c_context instead and lets the 1x1 do the widening,
         # so the chain never runs a wide conv and the final ReLU sits at the interior width.
         self.c_out = int(c_out) if c_out else n_hidden
+        # c_in: what the FIRST conv reads. n_hidden by default (the feedback sum itself);
+        # under --linin a 1x1 has already narrowed it to c_context.
+        self.c_in = int(c_in) if c_in else n_hidden
         def block(cin, cout):
             conv = nn.Conv2d(cin, cout, kernel, padding=pad)
             if norm == 'group':
@@ -1571,7 +1680,7 @@ class ContextCNN(nn.Module):
                                                 momentum=bn_momentum, eps=bn_eps),
                                  nn.ReLU())
         self.layers = nn.ModuleList(
-            block(n_hidden if i == 0 else w, self.c_out if i == depth - 1 else w)
+            block(self.c_in if i == 0 else w, self.c_out if i == depth - 1 else w)
             for i in range(depth))
 
     def forward(self, x):
@@ -1603,6 +1712,21 @@ class DecoderCNN(nn.Module):
         return self.pool(self.norm(self.proj(x))).squeeze(-1).squeeze(-1)
 
 
+def _fwht(x):
+    """Orthonormal fast Walsh-Hadamard transform over dim 1 of [B, C, S, S], C a power of 2:
+    log2(C) stages of pairwise add/subtract, then one 1/sqrt(C) scale. No multiplies in the
+    butterflies, which is the point for hardware."""
+    B, C = x.shape[0], x.shape[1]
+    rest = x.shape[2:]
+    y, h = x.reshape(B, C, -1), 1
+    while h < C:
+        y = y.view(B, C // (2 * h), 2, h, -1)
+        a, b = y[:, :, 0], y[:, :, 1]
+        y = torch.stack((a + b, a - b), dim=2).view(B, C, -1)
+        h *= 2
+    return (y * C ** -0.5).view(B, C, *rest)
+
+
 class DFFEma:
     """How a register commits the value its layer just computed.
 
@@ -1618,11 +1742,24 @@ class DFFEma:
     generate() and --vis keep theirs, so a sample drawn mid-training cannot disturb the
     training state."""
 
-    def __init__(self, ema, B, device):
+    def __init__(self, ema, B, device, ctx_rates=None):
         self.ema = ema                       # float, or one per register (--ema_ladder)
         self.t   = torch.zeros(B, dtype=torch.long, device=device)
+        # --ctx_ema: K registers per layer held concatenated on channels, each with its own
+        # rate. Stored as a [1, K*C, 1, 1] tensor so one blend writes all K at once.
+        self.K   = 0
+        if ctx_rates is not None:
+            self.K   = len(ctx_rates[0])
+            self.rate = torch.tensor(ctx_rates[1], dtype=torch.float32,
+                                     device=device).view(1, -1, 1, 1)
 
     def write(self, li, o, prev):
+        if self.K:
+            # under --linout o is already [B, K*C, S, S] (block k = copy k for register k);
+            # without it the one layer output is proposed to every context
+            if o.shape[1] != prev.shape[1]:
+                o = o.repeat(1, self.K, 1, 1)
+            return torch.where((self.t == 0).view(-1, 1, 1, 1), o, prev + self.rate * (o - prev))
         if self.ema is None:
             return o
         e = self.ema[li] if isinstance(self.ema, (list, tuple)) else self.ema
@@ -1761,12 +1898,15 @@ class VLAModel(nn.Module, _HubMixin):
         # Decided here because it sets ContextCNN's output width. When c_context == n_hidden
         # (the default) both paths build exactly the same convs as before either flag existed.
         self.ctx_out   = self.c_context if getattr(args, 'linout', False) else n_hidden
+        # --linin: the mirror image on the way IN -- a 1x1 narrows the feedback sum to
+        # c_context, so the chain's first conv reads c_context rather than n_hidden.
+        self.ctx_in    = self.c_context if getattr(args, 'linin', False) else n_hidden
         self.context   = ContextCNN(n_hidden, depth, kernel, norm=self.norm_kind,
                                     groups=self.norm_groups, bn_track=self.bn_track,
                                     bn_affine=self.bn_affine,
                                     bn_momentum=(self.bn_momentum or None),
                                     bn_eps=self.bn_eps, c_context=self.c_context,
-                                    c_out=self.ctx_out)
+                                    c_out=self.ctx_out, c_in=self.ctx_in)
         self.decoder   = DecoderCNN(n_hidden, S, self.c_text if tokenizer != 'char' else 256,
                                     norm2d=self.head_norm_kind == 'batch2d')
         # token grid (c_text) → n_hidden, summed into the DFF state
@@ -1802,7 +1942,7 @@ class VLAModel(nn.Module, _HubMixin):
                                     bn_affine=self.bn_affine,
                                     bn_momentum=(self.bn_momentum or None),
                                     bn_eps=self.bn_eps, c_context=self.c_context,
-                                    c_out=self.ctx_out)
+                                    c_out=self.ctx_out, c_in=self.ctx_in)
                 for _ in range(self.n_layers - 1))
             self.deep_proj = nn.ModuleList(
                 nn.Conv2d(n_hidden, n_hidden, 1) for _ in range(self.n_layers - 1))
@@ -1817,6 +1957,56 @@ class VLAModel(nn.Module, _HubMixin):
         # checkpoint's value defines the weights and a command-line value must not win).
         # getattr keeps checkpoints that predate the flag loadable -- they simply have no
         # 'linout' key and fall back to False.
+        # --ctx_ema: K contexts per layer, same shape, each written by its own linout copy (the
+        # same layer output without --linout) and blended at its own rate, the K summed into
+        # the feedback add. The K registers live concatenated on channels, [B, K*n_hidden, S,
+        # S], so every list-of-per-layer-tensors consumer (reset, clip, stats, vis) is
+        # unchanged -- and so do the K linout copies: one conv with K*n_hidden outputs.
+        self.ctx_windows = None
+        _spec = getattr(args, 'ctx_ema', None)
+        if _spec:
+            try:
+                _w = [float(x) for x in str(_spec).split(',') if x.strip()]
+            except ValueError:
+                raise SystemExit(f'--ctx_ema {_spec!r}: expected comma-separated windows in tokens')
+            if not _w or any(x < 1.0 for x in _w):
+                raise SystemExit(f'--ctx_ema {_spec!r}: windows must be >= 1 token')
+            self.ctx_windows = _w
+            if self.ema is not None:
+                raise SystemExit('--ctx_ema replaces --ema/--ema_ladder (each context window IS '
+                                 'its blend rate); drop one of them')
+        # --ctx_mix: fixed per-register transforms of ONE shared linout output (see _ctx_fan).
+        # Buffers, so they are saved with the weights; their own generator, so they are the
+        # same in every run regardless of --seed and of what else the model draws.
+        self.ctx_mix = getattr(args, 'ctx_mix', 'conv') or 'conv'
+        # not `or 1.0`: 0 is a legal value (no feedback at all) and must not become 1
+        _ws = getattr(args, 'dff_write_scale', None)
+        self.dff_write_scale = 1.0 if _ws is None else float(_ws)
+        # --ctx_read_gain: trainable per-register gains, applied in _fb before the sum. A
+        # ParameterList (a Module) so the summaries can name it. Created with the RNG forked:
+        # torch.full draws nothing anyway, but this keeps every other init identical by design.
+        self.ctx_read_gain_kind = getattr(args, 'ctx_read_gain', 'none') or 'none'
+        self.ctx_rgain = None
+        if self.ctx_read_gain_kind != 'none':
+            if not self.ctx_windows or len(self.ctx_windows) < 2:
+                raise SystemExit('--ctx_read_gain needs --ctx_ema with K >= 2')
+            _shape = ((len(self.ctx_windows), n_hidden) if self.ctx_read_gain_kind == 'channel'
+                      else (len(self.ctx_windows),))
+            _g0 = float(getattr(args, 'ctx_read_gain_init', 1.0))
+            self.ctx_rgain = nn.ParameterList(nn.Parameter(torch.full(_shape, _g0))
+                                              for _ in range(self.n_layers))
+        if self.ctx_mix not in ('conv', 'none'):
+            if not self.ctx_windows or len(self.ctx_windows) < 2:
+                raise SystemExit(f'--ctx_mix {self.ctx_mix} needs --ctx_ema with K >= 2')
+            if self.ctx_mix == 'hadamard' and (n_hidden & (n_hidden - 1)):
+                raise SystemExit(f'--ctx_mix hadamard needs a power-of-2 --n_hidden, got {n_hidden}')
+            _g = torch.Generator().manual_seed(20261002)
+            _Km = len(self.ctx_windows)
+            self.register_buffer('ctx_sign', (torch.randint(0, 2, (_Km, n_hidden), generator=_g)
+                                              * 2 - 1).float())
+            self.register_buffer('ctx_perm', torch.stack([torch.randperm(n_hidden, generator=_g)
+                                                          for _ in range(_Km)]))
+
         self.linout = None
         if getattr(args, 'linout', False):
             if getattr(args, 'tap', False):
@@ -1835,10 +2025,23 @@ class VLAModel(nn.Module, _HubMixin):
             # register, the feedback add and the decoder all keep the shapes they had.
             # one per LAYER, recurrent or not: every chain ends at c_context and every
             # layer widens back to n_hidden with its own 1x1/3x3 (see --dff_every).
-            self.linout = nn.ModuleList(nn.Conv2d(self.ctx_out, n_hidden, _lk, padding=_lk // 2)
+            # --ctx_ema: K copies per layer, held as one conv with K*n_hidden outputs; output
+            # block k is copy k and writes register k, and their SUM goes up (see _layers)
+            _K = self.n_ctx if self.ctx_mix == 'conv' else 1   # --ctx_mix: one shared linout
+            # --ctx_mix none: construct at the K-copy width first. Conv2d draws its default init
+            # at construction, so this consumes exactly the random numbers --ctx_mix conv does,
+            # and every module built after it initializes identically. The real one-copy convs
+            # are then built with the RNG forked, so they draw nothing.
+            _Kc = self.n_ctx if self.ctx_mix == 'none' else _K
+            self.linout = nn.ModuleList(nn.Conv2d(self.ctx_out, _Kc * n_hidden, _lk, padding=_lk // 2)
                                         for _ in range(self.n_layers))
+            if _Kc != _K:
+                with torch.random.fork_rng(devices=[]):
+                    self.linout = nn.ModuleList(
+                        nn.Conv2d(self.ctx_out, _K * n_hidden, _lk, padding=_lk // 2)
+                        for _ in range(self.n_layers))
             for _c in self.linout:
-                if self.ctx_out == n_hidden:
+                if self.ctx_out == n_hidden and _K == 1:
                     # square: dirac_ is the identity on the CENTRE tap (and zeros elsewhere
                     # when K>1), so K=3 starts out computing exactly what K=1 does
                     nn.init.dirac_(_c.weight)
@@ -1851,8 +2054,23 @@ class VLAModel(nn.Module, _HubMixin):
                     # the first c_context channels and leave the other n_hidden-c_context at
                     # zero, i.e. a sparse non-negative register: the thing the flag exists to
                     # avoid, and 75% of the state dead at init when c_context is n_hidden/4.
-                    _w = torch.empty(n_hidden, self.ctx_out)
-                    nn.init.orthogonal_(_w)
+                    # Under --ctx_ema each copy gets its own draw: the copies all receive the
+                    # same gradient (through the upward sum), so their difference stays at
+                    # this init -- which is what keeps the K registers in separate subspaces.
+                    _w = torch.cat([nn.init.orthogonal_(torch.empty(n_hidden, self.ctx_out))
+                                    for _ in range(_K)])
+                    # --linout_init: same draws either way (other modules' inits unchanged)
+                    _li = getattr(args, 'linout_init', 'orth')
+                    if _li == 'tied' and _K > 1:
+                        _w = _w[:n_hidden].repeat(_K, 1)
+                    elif _li == 'scaled' and _K > 1:
+                        _w = _w * _K ** -0.5
+                    if self.ctx_mix == 'none' and self.n_ctx > 1:
+                        # one conv, but make the SAME K draws --ctx_mix conv makes, so every
+                        # module built after this initializes identically (v233 == v231)
+                        for _ in range(self.n_ctx - 1):
+                            nn.init.orthogonal_(torch.empty(n_hidden, self.ctx_out))
+                    _w = _w * float(getattr(args, 'linout_gain', 1.0) or 1.0)
                     with torch.no_grad():
                         _c.weight.zero_()
                         # centre tap carries the whole projection; the off-centre taps start
@@ -1860,6 +2078,20 @@ class VLAModel(nn.Module, _HubMixin):
                         _c.weight[:, :, _lk // 2, _lk // 2] = _w
                 nn.init.zeros_(_c.bias)
             self.deep_proj = None          # its job is done by linout now
+
+        # --linin: one 1x1 per layer between the feedback sum and ContextCNN. Semi-orthogonal
+        # (orthonormal rows when narrowing): no rescaling inside a loop prone to blowing up,
+        # and dense from step 0. Square (c_context == n_hidden) it is a plain rotation.
+        self.linin = None
+        if getattr(args, 'linin', False):
+            self.linin = nn.ModuleList(nn.Conv2d(n_hidden, self.ctx_in, 1)
+                                       for _ in range(self.n_layers))
+            for _c in self.linin:
+                with torch.no_grad():
+                    _w = torch.empty(self.ctx_in, n_hidden)
+                    nn.init.orthogonal_(_w)
+                    _c.weight.copy_(_w.view(self.ctx_in, n_hidden, 1, 1))
+                nn.init.zeros_(_c.bias)
 
         # --qproj: a 1x1 linear conv per layer on the DFF path, at that layer's own width
         # since it has to land on a tensor of the register's shape. Two placements,
@@ -1892,6 +2124,7 @@ class VLAModel(nn.Module, _HubMixin):
             for _c in self.qproj:
                 nn.init.dirac_(_c.weight)
                 nn.init.zeros_(_c.bias)
+
 
         # --tap: a 1x1 linear conv after each layer's last conv-BN-ReLU, with the DFF
         # register fed from its output (see _tap). It is the first of the two convs in
@@ -1974,7 +2207,7 @@ class VLAModel(nn.Module, _HubMixin):
         init is forgotten fast -- relative divergence between a zero and a gaussian start
         falls to 3% by 20 bytes and to float32 noise by 50 -- so --init only changes what
         the model sees for the first few dozen bytes of a context."""
-        shapes = [(B, self.n_hidden, self.S, self.S)] * self.n_dff
+        shapes = [(B, self.n_hidden * self.n_ctx, self.S, self.S)] * self.n_dff
         if self.init_mode == 'gaussian':
             return [torch.randn(s, device=device) for s in shapes]
         if self.init_mode == 'relu':
@@ -2019,11 +2252,24 @@ class VLAModel(nn.Module, _HubMixin):
                     raise SystemExit(f'--ema_ladder {_spec!r}: a bare BASE must be > 1 '
                                      f'(use a comma-separated window list for anything else)')
                 self.ema = [min(1.0, 1.0 / (_b ** i)) for i in range(_nreg)]
+        if getattr(self, 'ctx_windows', None) and self.ema is not None:
+            raise SystemExit('--ctx_ema replaces --ema/--ema_ladder (each context window IS '
+                             'its blend rate); drop one of them')
         self.clk = None
+
+    @property
+    def n_ctx(self):
+        """Contexts per layer (--ctx_ema); 1 without it."""
+        return len(self.ctx_windows) if getattr(self, 'ctx_windows', None) else 1
 
     def _new_writer(self, B, device):
         """The blend state for one context. None when there is nothing to blend -- no --ema
-        and no --ema_ladder -- where a write is a plain replace and needs no state."""
+        and no --ema_ladder -- where a write is a plain replace and needs no state. Always
+        built under --ctx_ema: it is what fans the layer output out to the K registers."""
+        if getattr(self, 'ctx_windows', None):
+            _r = [min(1.0, 1.0 / w) for w in self.ctx_windows]
+            return DFFEma(None, B, device,
+                          ctx_rates=(_r, [r for r in _r for _ in range(self.n_hidden)]))
         return DFFEma(self.ema, B, device) if self.ema is not None else None
 
     def _init_dff(self, B, device):
@@ -2057,6 +2303,56 @@ class VLAModel(nn.Module, _HubMixin):
         what it remembers differently from what it is being told. Applied to the whole output
         instead, it would just be a reparameterization of the following 1x1 (deep_proj,
         decoder.proj) or 3x3 (ContextCNN) conv."""
+        if self.ctx_windows:
+            # --ctx_ema: condition each of the K registers exactly as a lone one would be,
+            # then sum them into the one feedback tensor
+            regs = [self._fb_one(li, c) for c in d.chunk(self.n_ctx, dim=1)]
+            if self.ctx_rgain is not None:
+                g = self.ctx_rgain[li]
+                g = g.view(len(regs), -1, 1, 1) if g.dim() == 2 else g.view(len(regs), 1, 1, 1)
+                regs = [r * g[k] for k, r in enumerate(regs)]
+            return sum(regs)
+        return self._fb_one(li, d)
+
+    def _feed(self, li, d, inp):
+        """Layer li's ContextCNN input before --linin: the DFF feedback plus what arrives
+        from below (the token grid on layer 0)."""
+        return self._fb(li, d) + inp
+
+    def _to_regs(self, z):
+        """What linout's output writes to the layer's registers: the copies themselves
+        (--ctx_mix conv), the output as-is for every register (none; DFFEma.write fans it out),
+        or the fixed per-register transforms -- then x --dff_write_scale."""
+        w = z if self.ctx_mix in ('conv', 'none') else self._ctx_fan(z)
+        return w if self.dff_write_scale == 1.0 else w * self.dff_write_scale
+
+    def _ctx_fan(self, o):
+        """--ctx_mix: [B, C, S, S] -> [B, K*C, S, S], register k's view T_k(o). T_1 is the
+        identity; the others are fixed, multiplier-free transforms."""
+        views = [o]
+        for k in range(1, self.n_ctx):
+            s = self.ctx_sign[k].view(1, -1, 1, 1)
+            if self.ctx_mix == 'sign':
+                v = o * s
+            elif self.ctx_mix == 'signperm':
+                v = o[:, self.ctx_perm[k]] * s
+            else:                                   # hadamard: H(D o) / sqrt(C)
+                v = _fwht(o * s)
+            views.append(v)
+        return torch.cat(views, dim=1)
+
+    def _ctx_sum(self, z):
+        """[B, K*n_hidden, S, S] -> [B, n_hidden, S, S]: the K linout copies summed (identity
+        at K=1, and when z is already n_hidden wide)."""
+        K = z.shape[1] // self.n_hidden
+        return z if K == 1 else sum(z.chunk(K, dim=1))
+
+    def _lin_in(self, li, x):
+        """--linin: layer li's feedback sum narrowed to c_context (identity when off)."""
+        return x if self.linin is None else self.linin[li](x)
+
+    def _fb_one(self, li, d):
+        """_fb for one [B, n_hidden, S, S] register: --dff_norm, then --qproj read."""
         # --dff_norm conditions the state ON THE WAY OUT, so the REGISTER keeps the raw
         # ReLU output -- sparse, ~50% exact zeros, which is what a hardware state memory
         # wants -- while what is fed back into the layer is bounded.  Normalizing on the
@@ -2151,26 +2447,31 @@ class VLAModel(nn.Module, _HubMixin):
             # both stored in the register and handed straight to the layer above -- there is
             # no second projection on the way up, which is the whole difference from --tap.
             # Layer 0 always owns a register (--dff_every counts from it).
-            x0   = self._fb(0, dff[0]) + tok
-            o    = self.linout[0](self.context(x0))
-            outs = [o]
+            # --ctx_ema: the conv emits all K copies concatenated; each block goes to its own
+            # register, and the layer above (and the decoder) gets their SUM -- the only path
+            # by which the copies train, since the registers are detached.
+            x0   = self._feed(0, dff[0], tok)
+            z    = self.linout[0](self.context(self._lin_in(0, x0)))
+            o    = self._ctx_sum(z)
+            outs = [self._to_regs(z)]
             if record is not None:
                 record.append({'in': x0, 'out': o})
             for li in range(self.n_layers - 1):
-                x = self._fb(li + 1, dff[li + 1]) + o
-                o = self.linout[li + 1](self.deep_context[li](x))
-                outs.append(o)
+                x = self._feed(li + 1, dff[li + 1], o)
+                z = self.linout[li + 1](self.deep_context[li](self._lin_in(li + 1, x)))
+                o = self._ctx_sum(z)
+                outs.append(self._to_regs(z))
                 if record is not None:
                     record.append({'in': x, 'out': o})
         else:
-            x0   = self._fb(0, dff[0]) + tok
-            o    = self._tap(0, self.context(x0))
+            x0   = self._feed(0, dff[0], tok)
+            o    = self._tap(0, self.context(self._lin_in(0, x0)))
             outs = [o]
             if record is not None:
                 record.append({'in': x0, 'out': o})
             for li in range(self.n_layers - 1):
-                x = self._fb(li + 1, dff[li + 1]) + self.deep_proj[li](o)
-                o = self._tap(li + 1, self.deep_context[li](x))
+                x = self._feed(li + 1, dff[li + 1], self.deep_proj[li](o))
+                o = self._tap(li + 1, self.deep_context[li](self._lin_in(li + 1, x)))
                 outs.append(o)
                 if record is not None:
                     record.append({'in': x, 'out': o})
@@ -2289,7 +2590,7 @@ class VLAModel(nn.Module, _HubMixin):
                 # this is the ordinary loop: the sampled token is fed back normally.
                 if not prompt_ids:
                     with torch.no_grad():
-                        logits = self.readout(self.decoder(dff[-1]))
+                        logits = self.readout(self.decoder(self._ctx_sum(dff[-1])))
                     if not logits.isfinite().all():
                         print('generate: logits NaN/Inf from seed')
                         return out
@@ -2824,6 +3125,10 @@ def _is_heldout(text):
 # pile re-release carries one, so both score the Pile's own official validation set.
 # Anything missing here falls back to the training split in _TEXT_DATASETS, with a warning
 # -- that number is a training loss, not a validation loss.
+# Eval corpora always streamed whatever --streaming says (see _eval_docs): preparing their
+# config non-streaming means building every split of a multi-hundred-GB repo.
+_STREAM_EVAL = {'c4'}
+
 _EVAL_SPLITS = {
     # ships a genuine test split (21k rows), so there is nothing to hash out of training
     'tinytb':  'test',
@@ -2957,7 +3262,7 @@ def _split_for_name(name):
     return _TEXT_DATASETS[name][2] if name in _TEXT_DATASETS else 'train'
 
 
-_SHARD_EXTS = ('.parquet', '.jsonl.zst', '.json.zst', '.jsonl.gz', '.jsonl')
+_SHARD_EXTS = ('.parquet', '.jsonl.zst', '.json.zst', '.jsonl.gz', '.json.gz', '.jsonl')  # .json.gz: allenai/c4
 
 
 def _shard_files(hf, cfg, n):
@@ -4156,6 +4461,13 @@ args.tap        = model.tap is not None
 # flag rather than inherited from the checkpoint.
 if args.unfreeze:
     model.set_pretrained_trainable(True)
+# --freeze_linout: same deal -- requires_grad is not in the state_dict, so it comes from the
+# flag every run, and a resume without it would quietly start training the copies.
+if args.freeze_linout:
+    if model.linout is None:
+        raise SystemExit('--freeze_linout needs --linout')
+    for _p in model.linout.parameters():
+        _p.requires_grad_(False)
 
 
 def _prompt_ids(text=None):
@@ -4313,32 +4625,176 @@ def _summ(title, mod, **kw):
         for line in block.splitlines():
             print(f'INFO {line}', file=f)
 
-# Summaries follow the data flow: tok_embed → text_proj (token grid → n_hidden,
-# summed into the DFF) → context (recurrent state update) → decoder → head_norm → lmhead
-# → logits.
-_borrowed = ('' if args.tokenizer == 'char' else
-             f', frozen{"" if not args.unfreeze else " -> TRAINABLE (--unfreeze)"}')
-_summ('tok_embed' + ('' if args.tokenizer == 'char' else
-                     f' ({_TOKENIZERS[args.tokenizer]} input embedding{_borrowed})'),
-      model.tok_embed, input_data=torch.zeros(1, dtype=torch.long))
-_summ('text_proj', model.text_proj, input_size=(1, model.c_text, args.context, args.context))
-if model.tap is not None:
-    _summ(f'tap x{model.n_layers} (layer output -> DFF register and on to deep_proj, '
-          f'trainable, identity-initialized)', model.tap[0], input_size=_dff_shape)
-if model.qproj is not None:
-    _summ(f'qproj x{model.n_layers} ('
-          + ('DFF state -> feedback add, trainable, identity-initialized'
-             if model.qproj_mode == 'read' else
-             'layer output -> DFF register, FROZEN random orthogonal')
-          + ')', model.qproj[0], input_size=_dff_shape)
-_ctx_label = 'context (layer 1)' if model.n_layers > 1 else 'context'
-if model.context.c_context != model.n_hidden:
-    _ctx_label += (f' -- interior {model.context.c_context} channels (--c_context), '
-                   f'ends pinned to n_hidden {model.n_hidden} by the DFF')
-_summ(_ctx_label, model.context, input_size=_dff_shape)
+def _model_graph(model):
+    """The whole model as ONE table, every layer in the order a token step executes it.
+
+    One real step is traced with a forward hook on every leaf module (eval mode, no_grad,
+    a fresh local DFF and writer -- nothing on the model is touched). A conv and the
+    norm/ReLU that follow it inside the same block collapse to one row, so a depth-16
+    ContextCNN is 16 rows, not 48. Marker rows (no parameters) show where the recurrence
+    enters and leaves each layer, since the feedback add and the DFF write are tensor ops,
+    not modules, and would otherwise be invisible. Shapes are per sample: [C, S, S]."""
+    rows, mods = [], {m: n for n, m in model.named_modules()}
+
+    def _shape(t):
+        t = t[0] if isinstance(t, (tuple, list)) else t
+        if not torch.is_tensor(t):
+            return '?'
+        return 'x'.join(str(d) for d in t.shape[1:]) if t.dim() > 1 else 'token'
+
+    def _desc(m):
+        if isinstance(m, nn.Conv2d):
+            k = m.kernel_size
+            return f'Conv2d {k[0]}x{k[1]}'
+        if isinstance(m, nn.Embedding):
+            return 'Embedding'
+        if isinstance(m, nn.Linear):
+            return 'Linear'
+        return type(m).__name__
+
+    def _hook(m, inp, out):
+        n = mods.get(m, '?')
+        tr = sum(q.numel() for q in m.parameters(recurse=False) if q.requires_grad)
+        fr = sum(q.numel() for q in m.parameters(recurse=False) if not q.requires_grad)
+        parent = n.rsplit('.', 1)[0] if '.' in n else n
+        # fold norm/activation into the conv row of the same block (e.g. context.layers.3.*)
+        if (rows and not isinstance(m, (nn.Conv2d, nn.Linear, nn.Embedding))
+                and rows[-1]['parent'] == parent and rows[-1]['kind'] == 'conv'):
+            r = rows[-1]
+            r['op'] += '+' + _desc(m).replace('BatchNorm2d', 'BN').replace('GroupNorm', 'GN')
+            r['out'] = _shape(out); r['tr'] += tr; r['fr'] += fr
+            return
+        _op = _desc(m)
+        if n.startswith('linout.') and model.n_ctx > 1 and model.ctx_mix == 'conv':
+            _op += f' x{model.n_ctx} copies'          # one per DFF register, summed upward
+        rows.append({'name': n, 'parent': parent, 'op': _op, 'in': _shape(inp),
+                     'out': _shape(out), 'tr': tr, 'fr': fr,
+                     'kind': 'conv' if isinstance(m, nn.Conv2d) else 'other'})
+
+    hooks = [m.register_forward_hook(_hook) for m in model.modules()
+             if not list(m.children()) and not isinstance(m, nn.Identity)]
+    was_training = model.training
+    model.eval()
+    try:
+        with torch.no_grad():
+            dev = next(model.parameters()).device
+            bi  = torch.zeros(1, dtype=torch.long, device=dev)
+            dff = model._new_dff(1, dev)
+            stack, ctx = model._layers(dff, model._tok_grid(bi), model._new_writer(1, dev))
+            model.readout(model.decoder(ctx))
+    finally:
+        for h in hooks:
+            h.remove()
+        model.train(was_training)
+
+    # The tensor ops between modules are first-class rows too: the token REPLICATION onto the
+    # S x S grid, each layer's feedback ADD, the per-register WRITE (EMA blend), and the ADD
+    # of the --ctx_ema linout copies on the way up. A --ctx_ema linout is one conv holding K
+    # copies; it is shown as K rows, one per register, with its parameters split evenly.
+    K, S = model.n_ctx, model.S
+    H = f'{model.n_hidden}x{S}x{S}'
+    regs = ([f'DFF_{k + 1}' for k in range(K)] if K > 1 else ['DFF'])
+    def _rate(k, li):
+        if model.ctx_windows:
+            w = model.ctx_windows[k]
+            return 'replace' if w <= 1 else f'EMA w={w:g}'
+        e = (model.ema[li] if isinstance(model.ema, (list, tuple)) else model.ema)
+        return 'replace' if (e is None or e >= 1.0) else f'EMA a={e:.4g}'
+    def _op(name, op, i, o):
+        return {'name': name, 'op': op, 'in': i, 'out': o, 'tr': 0, 'fr': 0}
+    def _layer_of(name):
+        if name.startswith('deep_context.'):
+            return int(name.split('.')[1]) + 1
+        if name.startswith(('linin.', 'linout.', 'tap.')):
+            return int(name.split('.')[1])
+        return 0 if name.startswith('context.') else None
+    def _is_last(r, li):
+        if model.linout is not None:
+            return r['name'].startswith('linout.')
+        if model.tap is not None:
+            return r['name'].startswith('tap.')
+        return (li is not None and r['name'].startswith(('context.', 'deep_context.'))
+                and r['name'].split('.')[-2] == str(len(model.context.layers) - 1))
+    out, seen_in, up = [], set(), 'text_proj'
+    for r in rows:
+        li = _layer_of(r['name'])
+        if li is not None and li not in seen_in:
+            seen_in.add(li)
+            if li > 0:
+                up = f'deep_proj.{li - 1}' if model.deep_proj is not None else f'layer {li} out'
+            if getattr(model, 'ctx_rgain', None) is not None:
+                _gp = model.ctx_rgain[li]
+                for k, g in enumerate(regs):
+                    _row = _op(f'g_{k + 1} x {g}[t-1]', f'Mul (trainable read gain, '
+                               f'{model.ctx_read_gain_kind})', H, H)
+                    _row['tr'] = _gp[k].numel()
+                    out.append(_row)
+            out.append(_op(f'{up} + ' + ' + '.join(f'{g}[t-1]' for g in regs), 'Add (feedback)',
+                           f'{len(regs) + 1} x {H}', H))
+        if r['name'].startswith('linout.') and K > 1 and model.ctx_mix == 'conv':
+            # one conv, K copies: a row per copy, each writing its own register
+            for k in range(K):
+                out.append(dict(r, name=f'{r["name"]}[{k + 1}]',
+                                op=r['op'].replace(f' x{K} copies', '') + f' -> {regs[k]}',
+                                out=H, tr=r['tr'] // K, fr=r['fr'] // K))
+        else:
+            out.append(r)
+        if r['name'] == 'tok_embed':
+            out.append(_op('(token grid)', f'Replicate 1x1 -> {S}x{S}', r['out'],
+                           f'{r["out"]}x{S}x{S}'))
+        if _is_last(r, li) and K > 1 and getattr(model, 'ctx_mix', 'conv') not in ('conv', 'none'):
+            _mx = {'sign': 'Sign flip (fixed +-1)', 'signperm': 'Permute + sign (fixed)',
+                   'hadamard': 'Sign + Hadamard (FWHT)'}[model.ctx_mix]
+            for k in range(1, K):
+                out.append(_op(f'T_{k + 1}({r["name"]})', _mx, H, H))
+        if _is_last(r, li):
+            _mix = K > 1 and getattr(model, 'ctx_mix', 'conv') not in ('conv', 'none')
+            srcs = ([f'{r["name"]}[{k + 1}]' for k in range(K)]
+                    if (K > 1 and model.linout is not None and not _mix
+                        and model.ctx_mix == 'conv') else
+                    [r['name']] + [f'T_{k + 1}({r["name"]})' for k in range(1, K)] if _mix
+                    else [r['name']] * len(regs))
+            _ws = getattr(model, 'dff_write_scale', 1.0)
+            for k in range(len(regs)):
+                out.append(_op(f'{regs[k]}[t] <- {"" if _ws == 1.0 else f"{_ws:g} x "}{srcs[k]}',
+                               f'Write ({_rate(k, li)})', H, H))
+            if K > 1 and model.linout is not None and not _mix and model.ctx_mix == 'conv':
+                out.append(_op(' + '.join(srcs), 'Add (up the stack)', f'{K} x {H}', H))
+
+    w = max(len(r.get('name', '')) for r in out)
+    wo = max(len(r.get('op', '')) for r in out)
+    ws = max([len(r.get('in', '')) for r in out] + [len(r.get('out', '')) for r in out])
+    lines = [f'{"#":>3}  {"module":<{w}}  {"op":<{wo}}  {"in":>{ws}}    {"out":<{ws}}  '
+             f'{"params":>12}']
+    n = 0
+    for r in out:
+        n += 1
+        p = r['tr'] + r['fr']
+        ps = '' if not p else f'{p:,}' + (' frozen' if r['fr'] and not r['tr'] else '')
+        lines.append(f'{n:>3}  {r["name"]:<{w}}  {r["op"]:<{wo}}  {r["in"]:>{ws}} -> '
+                     f'{r["out"]:<{ws}}  {ps:>12}')
+    return lines
+
+
+if not ((args.generate or args.vis or args.altvis or args.push or args.eval)
+        and not args.verbose):
+    _g = (['── model graph (one token step, execution order; params per row, '
+           'totals in PARAMS below) ──'] + _model_graph(model))
+    print('\n'.join(_g))
+    with open(args.log, 'a') as f:
+        for line in _g:
+            print(f'INFO {line}', file=f)
 # The blend rate is invisible in the layer summaries (it adds no parameters and no shapes),
 # so state it explicitly: it is the only thing deciding how long the state remembers.
-if model.ema is not None and (not (args.generate or args.vis or args.altvis or args.push
+if model.ctx_windows and not (args.generate or args.vis or args.altvis or args.push
+                              or args.eval):
+    _line = (f'--ctx_ema {args.ctx_ema}: {model.n_ctx} contexts per layer, windows '
+             + ', '.join(f'{w:g} (ema {min(1.0, 1.0 / w):.4g})' for w in model.ctx_windows)
+             + '; summed into the feedback add')
+    print(_line)
+    with open(args.log, 'a') as f:
+        print(f'INFO {_line}', file=f)
+elif model.ema is not None and (not (args.generate or args.vis or args.altvis or args.push
                                    or args.eval) or args.verbose):
     _lbl = getattr(model, 'dff_layers', list(range(model.n_layers)))
     if isinstance(model.ema, (list, tuple)):
@@ -4358,9 +4814,6 @@ elif model.ema is None and not (args.generate or args.vis or args.altvis or args
                                 or args.eval):
     print('no --ema/--ema_ladder: every register REPLACES its contents every step')
 
-if model.deep_context is not None:
-    _summ(f'deep_context x{model.n_layers - 1} (layers 2..{model.n_layers})',
-          model.deep_context[0], input_size=_dff_shape)
 if model.tap is not None and (not (args.generate or args.vis or args.altvis or args.push or args.eval)
                               or args.verbose):
     _tap_txt = (
@@ -4378,22 +4831,6 @@ if model.tap is not None and (not (args.generate or args.vis or args.altvis or a
     with open(args.log, 'a') as f:
         for line in _tap_txt.splitlines():
             print(f'INFO {line}', file=f)
-_summ('decoder', model.decoder, input_size=_dff_shape)
-if model.head_norm_kind not in ('none', 'batch2d'):
-    _src = (f'{_TOKENIZERS[args.tokenizer]} {model.norm_path}{_borrowed}'
-            if model.head_norm_kind == 'ln_f' else 'fresh, trained with the CNN')
-    # batch 2, not 1: BatchNorm1d refuses a single sample per channel in train mode
-    _summ(f'head_norm ({model.head_norm_kind}: {_src})',
-          model.head_norm, input_size=(2, model.c_text))
-if args.tokenizer != 'char':
-    # GPT-Neo ties the head to the embedding, GPT-NeoX does not: say which, since it
-    # decides whether --unfreeze trains one matrix or two.
-    _tied = (next(model.lmhead.parameters()).data_ptr()
-             == next(model.tok_embed.parameters()).data_ptr())
-    _summ(f'lmhead ({_TOKENIZERS[args.tokenizer]} output embedding, '
-          f'{"tied to tok_embed" if _tied else "untied"}{_borrowed})',
-          model.lmhead, input_size=(1, model.c_text))
-
 model = model.to(args.device)
 model.init_mode = args.init   # applies to both construction paths (--pretrained and local)
 print(f'tokenizer {args.tokenizer}: vocab {model.vocab}, embedding width {model.c_text}')
@@ -4422,6 +4859,8 @@ def _param_summary(model):
              ('context',      model.context),
              ('deep_context', model.deep_context),
              ('deep_proj',    model.deep_proj),
+             ('linin',        getattr(model, 'linin', None)),
+             ('ctx_read_gain', getattr(model, 'ctx_rgain', None)),
              ('linout',       model.linout),
              ('tap',          model.tap),
              ('decoder',      model.decoder),
@@ -4692,7 +5131,11 @@ if args.altvis:
     # --n_layers 1 the panel rule alone gives 4 inches and the tape is cut off at ~15% of
     # its length.
     _av_w = max(4 * _NL, _ticker_width_in(_AV_WIN + 8))
-    _av_fig, _av_axes = plt.subplots(3, _NL, figsize=(_av_w, 10), squeeze=False)
+    # rows: the layer's input, its output, then one row per DFF register (--ctx_ema K)
+    _AVK    = model.n_ctx
+    _AVROWS = 2 + _AVK
+    _av_fig, _av_axes = plt.subplots(_AVROWS, _NL, figsize=(_av_w, 2.8 * _AVROWS + 1.6),
+                                     squeeze=False)
     _av_fig.subplots_adjust(top=0.85, bottom=0.05, left=0.05, right=0.98,
                             hspace=0.25, wspace=0.12)
     # Row 3 is the REGISTER. Every register is written every step (there is no clock any
@@ -4701,25 +5144,27 @@ if args.altvis:
     # its panel says so rather than showing another layer's state.
     _sl_of = getattr(model, 'dff_slot', {c: c for c in range(_NL)})
     _emas  = model.ema if isinstance(model.ema, (list, tuple)) else None
-    for _r, _lbl in enumerate(('input', 'output', 'state')):
+    for _r in range(_AVROWS):
         for _c in range(_NL):
             _ax = _av_axes[_r][_c]
-            if _lbl == 'state':
-                if _c in _sl_of:
-                    _e = (_emas[_sl_of[_c]] if _emas else
-                          (model.ema if model.ema is not None else 1.0))
-                    _t = (f'layer {_c + 1} DFF state std  (ema {_e:.4g}, '
-                          f'~{1.0 / _e:.0f} tok window)')
-                else:
-                    _t = f'layer {_c + 1}: no register (--dff_every)'
+            # one plain name per panel; the layer is named once, over its column
+            if _r < 2:
+                _t = (f'layer {_c + 1}\n' if (_r == 0 and _NL > 1) else '') + \
+                     ('input' if _r == 0 else 'output')
+            elif _c not in _sl_of:
+                _t = 'no DFF'
+            elif model.ctx_windows:
+                _t = f'DFF {_r - 1}: {model.ctx_windows[_r - 2]:g}-token window'
             else:
-                _t = f'layer {_c + 1} DFF {_lbl} std / {model.n_hidden} ch'
-            _ax.set_title(_t, fontsize=8, pad=3)
-            _ax.set_xlabel(str(model.S), fontsize=7)
-            _ax.set_ylabel(str(model.S), fontsize=7)
+                _e = (_emas[_sl_of[_c]] if _emas else
+                      (model.ema if model.ema is not None else 1.0))
+                _t = f'DFF: {1.0 / _e:.3g}-token window'
+            _ax.set_title(_t, fontsize=9, pad=3)
             _ax.set_xticks([]); _ax.set_yticks([])
-    _av_imgs   = [[None] * _NL for _ in range(3)]
-    _av_vmax   = [[None] * _NL for _ in range(3)]   # slow-tracking scale, as --vis does
+    _av_fig.text(0.05, 0.008, f'maps: std across the {model.n_hidden} channels at each of the '
+                 f'{model.S}x{model.S} positions', fontsize=8, color='0.7', va='bottom')
+    _av_imgs   = [[None] * _NL for _ in range(_AVROWS)]
+    _av_vmax   = [[None] * _NL for _ in range(_AVROWS)]   # slow-tracking scale, as --vis does
     _av_header = _av_fig.text(0.01, 0.99, '', family='monospace', fontsize=7,
                               va='top', ha='left')
 
@@ -4755,12 +5200,12 @@ if args.altvis:
         _nstep += 1
         prob = F.softmax(logits[0] / max(args.temperature, 1e-6), dim=-1)
 
-        for _r in range(3):
+        for _r in range(_AVROWS):
             for _c in range(_NL):
-                if _r == 2:
-                    # the register itself, after this step's blend. A straight-through layer
+                if _r >= 2:
+                    # register _r-2 itself, after this step's blend. A straight-through layer
                     # has none, so its panel stays blank rather than borrowing a neighbour's.
-                    m = (_std_map(dff[_sl_of[_c]]) if _c in _sl_of
+                    m = (_std_map(dff[_sl_of[_c]].chunk(_AVK, dim=1)[_r - 2]) if _c in _sl_of
                          else np.zeros_like(_std_map(rec[_c]['out'])))
                 else:
                     m = _std_map(rec[_c]['in' if _r == 0 else 'out'])
@@ -4780,7 +5225,9 @@ if args.altvis:
         _av_header.set_text(
             f'step {_nstep}   ' + '   '.join(
                 f'L{c+1} in {rec[c]["in"].std().item():6.3f} out {rec[c]["out"].std().item():6.3f} '
-                + (f'state {dff[_sl_of[c]].std().item():6.3f}' if c in _sl_of else 'no reg')
+                + (' '.join(f'DFF{k + 1} {r.std().item():6.3f}' for k, r in
+                            enumerate(dff[_sl_of[c]].chunk(_AVK, dim=1)))
+                   if c in _sl_of else 'no reg')
                 for c in range(_NL))
             + '\n' + _ticker[-_AV_WIN:])
 
@@ -4822,24 +5269,43 @@ if args.vis:
 
     plt.style.use('dark_background')
     plt.ion()
-    # 12in fits the three panels comfortably; the max() guarantees the tape fits too, so
-    # raising _VIS_WIN later cannot silently start clipping it.
-    _vis_fig, _vis_axes_grid = plt.subplots(
-        1, 3, figsize=(max(12, _ticker_width_in(_VIS_WIN + 5)), 4))
-    _vis_fig.subplots_adjust(top=0.78, bottom=0.10, left=0.04, right=0.98,
-                              hspace=0.1, wspace=0.08)
-    _vis_ax_dff, _vis_ax_zero, _vis_ax_prob = _vis_axes_grid
-    _vis_ax_dff.set_title('DFF std / {:d} ch'.format(model.n_hidden), fontsize=8, pad=2)
-    _vis_ax_zero.set_title('DFF zeros / {:d} ch'.format(model.n_hidden), fontsize=8, pad=2)
-    _vis_ax_prob.set_title('P(next token)', fontsize=8, pad=2)
-    # row/column dimension labels (e.g. "7"): DFF state is S×S, prob is the vocabulary grid.
-    _vis_ax_dff.set_xlabel(str(model.S),  fontsize=7); _vis_ax_dff.set_ylabel(str(model.S),  fontsize=7)
-    _vis_ax_zero.set_xlabel(str(model.S), fontsize=7); _vis_ax_zero.set_ylabel(str(model.S), fontsize=7)
-    _vis_ax_prob.set_xlabel(str(_PROB_C), fontsize=7); _vis_ax_prob.set_ylabel(str(_PROB_R), fontsize=7)
-    _vis_img_dff  = None
-    _vis_img_zero = None
+    # Layers run LEFT TO RIGHT, one column each. Within a column the layer OUTPUT (what goes
+    # up the stack / into the decoder) is on top and its DFF register(s) are stacked under
+    # it -- one row per --ctx_ema context, a single row otherwise. P(next token) takes a
+    # column of its own on the right, spanning every row. Each map is the std ACROSS
+    # CHANNELS at each of the S x S positions.
+    _VNL   = model.n_layers
+    _VNC   = model.n_ctx
+    _VROWS = 1 + _VNC
+    _vis_fig = plt.figure(figsize=(max(3.0 * (_VNL + 1.5), _ticker_width_in(_VIS_WIN + 5)),
+                                   2.6 * _VROWS + 1.2))
+    _vis_gs  = _vis_fig.add_gridspec(_VROWS, _VNL + 1, width_ratios=[1] * _VNL + [1.5],
+                                     top=0.84, bottom=0.04, left=0.03, right=0.98,
+                                     hspace=0.25, wspace=0.10)
+    _vis_ax_grid = [[_vis_fig.add_subplot(_vis_gs[_r, _c]) for _c in range(_VNL)]
+                    for _r in range(_VROWS)]
+    _vis_ax_prob = _vis_fig.add_subplot(_vis_gs[:, _VNL])
+    _vemas = model.ema if isinstance(model.ema, (list, tuple)) else None
+    for _c in range(_VNL):
+        for _r in range(_VROWS):
+            _ax = _vis_ax_grid[_r][_c]
+            # one plain name per panel; the layer is named once, over its column
+            if _r == 0:
+                _t = (f'layer {_c + 1}\n' if _VNL > 1 else '') + 'output'
+            elif model.ctx_windows:
+                _t = f'DFF {_r}: {model.ctx_windows[_r - 1]:g}-token window'
+            else:
+                _e = (_vemas[_c] if _vemas else (model.ema if model.ema is not None else 1.0))
+                _t = f'DFF: {1.0 / _e:.3g}-token window'
+            _ax.set_title(_t, fontsize=9, pad=3)
+            _ax.set_xticks([]); _ax.set_yticks([])
+    _vis_ax_prob.set_title('P(next token)', fontsize=9, pad=3)
+    _vis_ax_prob.set_xticks([]); _vis_ax_prob.set_yticks([])
+    _vis_fig.text(0.03, 0.008, f'maps: std across the {model.n_hidden} channels at each of the '
+                  f'{model.S}x{model.S} positions', fontsize=8, color='0.7', va='bottom')
+    _vis_img_grid  = [[None] * _VNL for _ in range(_VROWS)]
+    _vis_vmax_grid = [[None] * _VNL for _ in range(_VROWS)]   # slow-tracking colour scales
     _vis_img_prob = None
-    _vis_dff_vmax = None   # slow-tracking color scale for the DFF-std panel (see set_clim below)
     _vis_header   = _vis_fig.text(0.01, 0.99, _vis_stats_line,
                                    family='monospace', fontsize=7,
                                    va='top', ha='left')
@@ -4885,7 +5351,8 @@ if args.vis:
             # this display exists to show -- the state settling within a token -- so they
             # are drawn, not collapsed. The token only ADVANCES on the last replica, so the
             # ticker still gains one character per token while the panels update N times.
-            stack, new_ctx = model._layers(dff, tok, clk)          # last-layer output
+            _vrec  = []
+            stack, new_ctx = model._layers(dff, tok, clk, record=_vrec)  # last-layer output
             dff    = [d.detach().clone() for d in stack]
             logits = model.readout(model.decoder(new_ctx))
             if args.gen_pool == 'mean':                            # see --gen_pool
@@ -4926,10 +5393,6 @@ if args.vis:
             _rep, _acc = 0, None
 
         # ── render ──────────────────────────────────────────────────────────
-        # DFF-std panel shows the last layer's state (the one feeding the decoder).
-        dff_std_map = new_ctx[0].cpu().std(dim=0).numpy()           # [S, S]
-        # per-location sparsity: how many of the n_hidden channels are exactly 0 here
-        zero_map    = (new_ctx[0] == 0).sum(dim=0).cpu().numpy()     # [S, S], 0..n_hidden
         prob_img    = _prob_grid(prob)                               # vocabulary → R×C grid
         _dff_mean, _dff_std, _dff_max, _ = _dff_stats(dff)
         _vis_header.set_text(
@@ -4939,22 +5402,22 @@ if args.vis:
             + '\n' + 'gen: ' + _ticker
         )
 
-        if _vis_img_dff is None:
-            _vis_img_dff = _vis_ax_dff.matshow(dff_std_map, cmap=args.cmap)
-            _vis_ax_dff.set_xticks([]); _vis_ax_dff.set_yticks([])
-        else:
-            _vis_img_dff.set_data(dff_std_map)
-        _fmax = float(dff_std_map.max())
-        _vis_dff_vmax = _fmax if _vis_dff_vmax is None else max(_fmax, 0.98 * _vis_dff_vmax)
-        _vis_img_dff.set_clim(0.0, _vis_dff_vmax or 1e-9)
-
-        # fixed 0..n_hidden scale: absolute zero-count is more readable than an autoscale.
-        if _vis_img_zero is None:
-            _vis_img_zero = _vis_ax_zero.matshow(zero_map, cmap=args.cmap,
-                                                 vmin=0, vmax=model.n_hidden)
-            _vis_ax_zero.set_xticks([]); _vis_ax_zero.set_yticks([])
-        else:
-            _vis_img_zero.set_data(zero_map)
+        for _c in range(_VNL):
+            _regs = dff[_c].chunk(_VNC, dim=1)                       # K registers, [1, C, S, S]
+            for _r in range(_VROWS):
+                _t = _vrec[_c]['out'] if _r == 0 else _regs[_r - 1]
+                m  = _t[0].std(dim=0).detach().float().cpu().numpy()  # [S, S]
+                # ease the ceiling upward, let it decay: one spike cannot wash a panel out
+                _hi = float(m.max())
+                _vm = _vis_vmax_grid[_r][_c]
+                _vm = _hi if _vm is None else max(_hi, 0.98 * _vm)
+                _vis_vmax_grid[_r][_c] = _vm
+                if _vis_img_grid[_r][_c] is None:
+                    _vis_img_grid[_r][_c] = _vis_ax_grid[_r][_c].matshow(m, cmap=args.cmap)
+                    _vis_ax_grid[_r][_c].set_xticks([]); _vis_ax_grid[_r][_c].set_yticks([])
+                else:
+                    _vis_img_grid[_r][_c].set_data(m)
+                _vis_img_grid[_r][_c].set_clim(0.0, _vm or 1e-9)
 
         if _vis_img_prob is None:
             _vis_img_prob = _vis_ax_prob.matshow(prob_img, cmap=args.cmap, vmin=0, vmax=1)
@@ -5031,6 +5494,28 @@ def _lr_scaled_groups(model, base_lr, mult):
 # Only build per-layer optimizer groups when lr_mult scaling is active; otherwise pass the
 # flat param list so the optimizer/checkpoint layout is byte-identical to before.
 _params = _lr_scaled_groups(model, args.lr_max, args.lr_mult) if args.lr_mult != 1.0 else _trainable
+# --linout_lr_mult / --decoder_lr_mult: pull a module out into its own group at M x lr (works
+# on top of either layout)
+def _split_group(params, mod, mult, name):
+    ids = {id(p) for p in mod.parameters()}
+    if isinstance(params[0], dict):
+        for _g in params:
+            _g['params'] = [p for p in _g['params'] if id(p) not in ids]
+        params = [g for g in params if g['params']]
+    else:
+        params = [{'params': [p for p in params if id(p) not in ids], 'lr': args.lr_max}]
+    params.append({'params': [p for p in mod.parameters() if p.requires_grad],
+                   'lr': args.lr_max * mult})
+    print(f'--{name}_lr_mult {mult}: {name} {sum(p.numel() for p in params[-1]["params"]):,} '
+          f'params at lr {args.lr_max * mult:g}', flush=True)
+    return params
+
+if args.linout_lr_mult != 1.0:
+    if model.linout is None:
+        raise SystemExit('--linout_lr_mult needs --linout')
+    _params = _split_group(_params, model.linout, args.linout_lr_mult, 'linout')
+if args.decoder_lr_mult != 1.0:
+    _params = _split_group(_params, model.decoder, args.decoder_lr_mult, 'decoder')
 
 # Per-layer summary: trainable params and lr, shown when --lr_mult scales the layers. Param
 # counts come from the same grouping as the lr scaling (layer 1 includes tok_embed/text_proj;
@@ -5341,7 +5826,10 @@ def _build_eval_docs(corpus=None):
     # "Bad split". web has no validation split and its held-out IS that slice, so streaming
     # is forced off for it regardless of --streaming. It is a download, but it is the same
     # tail exp/score.py uses and therefore the only web number comparable to PLAN.txt.
-    _stream = args.streaming and '[' not in split
+    # a corpus whose repo is too big to prepare in full is ALWAYS streamed here: a
+    # non-streaming load_dataset(allenai/c4, en, split='validation') builds the whole 'en'
+    # config -- 365M train documents -- to return 100 validation docs.
+    _stream = (args.streaming or corpus in _STREAM_EVAL) and '[' not in split
     print(f'eval set: loading {hf}' + (f' [{cfg}]' if cfg else '') + f' split {split}'
           + ('' if _stream else ' (non-streaming)') + ' ...', flush=True)
     rows = load_dataset(hf, cfg, split=split, streaming=_stream)
