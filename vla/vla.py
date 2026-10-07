@@ -789,6 +789,51 @@ parser.add_argument('--ctx_cat_in',    default=False, action='store_true',
                          'the feedback add altogether. Starts as [I, I, ..., I] (the plain sum), '
                          'so every source -- input and each timescale -- gets its own trained '
                          'read. Implies --ctx_cat. Restored from a checkpoint.')
+parser.add_argument('--ctx_cat_kernel', default=1, type=int, metavar='K',
+                    help='kernel size of the --ctx_cat/--ctx_cat_in conv (odd; default 1). '
+                         'K=3 reads each source over a 3x3 neighbourhood; the identity init '
+                         'sits on the centre tap, so step 0 still equals the plain sum. '
+                         'Restored from a checkpoint.')
+parser.add_argument('--dec_depth',     default=0,     type=int, metavar='N',
+                    help='N extra (conv 3x3 + norm + ReLU) blocks at n_hidden, applied to the '
+                         'layer output AFTER the DFF tap (linout) and BEFORE decoder.proj. The '
+                         'registers still store linout\'s output; these blocks sit only on the '
+                         'path to the prediction, so the recurrent context representation is '
+                         'decoupled from the one the frozen lmhead reads. 0 (default) = none. '
+                         'Restored from a checkpoint.')
+parser.add_argument('--dec_width',     default=0,     type=int, metavar='W',
+                    help='channel width of the --dec_depth blocks (default 0 = n_hidden). The '
+                         'first block narrows n_hidden -> W, the rest stay at W, and decoder.proj '
+                         'reads W channels (W -> embedding width). The DFF tap is unaffected. '
+                         'Restored from a checkpoint.')
+parser.add_argument('--dec_kernel',    default=1,     type=int, metavar='K',
+                    help='kernel of decoder.proj, the linear conv before the global average pool '
+                         '(odd, padded to keep SxS; default 1 = 1x1). Restored from a checkpoint.')
+parser.add_argument('--dec_tree',      action='store_true',
+                    help='replace the decoder\'s spatial reduction (decoder.proj + global average '
+                         'pool) with a tree of unpadded (conv + norm + ReLU) blocks that shrinks '
+                         'the SxS grid to 1x1: 3x3 kernels while the side is >= 3 (8->6->4->2), '
+                         'then a 2x2 for the last step. Its ReLU output feeds decoder.proj as a '
+                         'plain 1x1 linear at 1x1 (no pool) and then the lmhead. Width from '
+                         '--dec_width (default n_hidden). Applied after --dec_depth if both are '
+                         'set; --dec_kernel must stay 1. Restored from a checkpoint.')
+parser.add_argument('--dec_tree_linear', action='store_true',
+                    help='--dec_tree blocks are bare convs (no norm, no ReLU), so the tree plus '
+                         'decoder.proj is one LINEAR map of the whole SxSxn_hidden layer output, '
+                         'factorized into stages. Convs get a variance-preserving init (fan_in, '
+                         'linear gain, zero bias). Restored from a checkpoint.')
+parser.add_argument('--dec_tree_kernels', default=None, type=str, metavar='K1,K2,...',
+                    help='--dec_tree with explicit unpadded kernels, which must take the SxS grid '
+                         'to 1x1 (sum of (k-1) = S-1; e.g. 5,4 or 3,3,4 for S=8). Every kernel but '
+                         'the last is a tree block; the LAST is decoder.proj itself, a KxK conv '
+                         'straight to the embedding width -- no separate 1x1, no pool. Default '
+                         '(unset): 3x3 blocks down to 2x2, a 2x2 block, then a 1x1 decoder.proj. '
+                         'Restored from a checkpoint.')
+parser.add_argument('--dec_tree_pool', action='store_true',
+                    help='with --dec_tree_kernels: the kernels may stop short of 1x1 (sum of '
+                         '(k-1) < S-1); decoder.proj (the last kernel) is followed by a global '
+                         'average pool over the grid it leaves, e.g. 3,3,3 on 8x8: 8->6->4->2, '
+                         'pool 2x2. Restored from a checkpoint.')
 parser.add_argument('--ctx_first',     default='replace', choices=['replace', 'blend'],
                     help='a DFF register\'s FIRST write of a document. replace (default): the '
                          'register is overwritten with the layer output, so no --init value '
@@ -1554,7 +1599,7 @@ _ARCH_ARGS = ('context', 'n_hidden', 'c_context', 'c_text', 'n_layers', 'depth',
               'tokenizer', 'head_norm', 'ema', 'ema_ladder', 'qproj',
               'tap', 'linout', 'linout_kernel', 'dff_every', 'ctx_ema', 'linin', 'ctx_mix',
               'dff_write_scale', 'ctx_read_gain', 'ctx_first', 'ctx_cat', 'ctx_cat_in',
-              'no_text_proj',
+              'no_text_proj', 'ctx_cat_kernel', 'dec_depth', 'dec_width', 'dec_kernel', 'dec_tree', 'dec_tree_linear', 'dec_tree_kernels', 'dec_tree_pool',
               'init', 'clock_base', 'clock_max', 'clock_ends', 'clip_dff', 'tap_norm', 'norm', 'norm_groups', 'dff_norm', 'bn_track', 'bn_affine',
                   'bn_momentum', 'bn_eps')
 
@@ -1753,6 +1798,46 @@ class ContextCNN(nn.Module):
         return x
 
 
+class DecoderTree(nn.Module):
+    """--dec_tree: unpadded (conv + norm + ReLU) blocks that reduce [B, c_in, S, S] to
+    [B, width, 1, 1] -- a 3x3 kernel while the side is >= 3 (each removes 2), then a 2x2 to
+    finish an even side. S=8 is 8 -> 6 -> 4 -> 2 -> 1. Norm follows ContextCNN's (BatchNorm,
+    or GroupNorm / none); at the last 1x1 stages BatchNorm normalizes over the batch alone."""
+    def __init__(self, c_in, S, width, norm='batch', groups=32, bn_track=True,
+                 bn_affine=False, bn_momentum=0.1, bn_eps=1e-5, linear=False, kernels=None):
+        super().__init__()
+        layers, s, c = [], S, c_in
+        _ks = list(kernels) if kernels is not None else None
+        while (s > 1) if _ks is None else _ks:
+            k = (3 if s >= 3 else 2) if _ks is None else _ks.pop(0)
+            conv = nn.Conv2d(c, width, k, padding=0)
+            if linear:
+                # --dec_tree_linear: nothing rescales between the convs, so the init keeps
+                # Var(out) ~ Var(in) per stage (PyTorch's default would lose ~3x per conv)
+                nn.init.kaiming_normal_(conv.weight, mode='fan_in', nonlinearity='linear')
+                nn.init.zeros_(conv.bias)
+                layers.append(nn.Sequential(conv))
+                s, c = s - k + 1, width
+                continue
+            if norm == 'group':
+                nrm = nn.GroupNorm(max(1, min(groups, width)), width, affine=False)
+            elif norm == 'none':
+                nn.init.kaiming_normal_(conv.weight, mode='fan_in', nonlinearity='relu')
+                nn.init.zeros_(conv.bias)
+                nrm = nn.Identity()
+            else:
+                nrm = nn.BatchNorm2d(width, affine=bn_affine, track_running_stats=bn_track,
+                                     momentum=bn_momentum, eps=bn_eps)
+            layers.append(nn.Sequential(conv, nrm, nn.ReLU()))
+            s, c = s - k + 1, width
+        self.layers = nn.ModuleList(layers)
+
+    def forward(self, x):
+        for layer in self.layers:
+            x = layer(x)
+        return x
+
+
 class DecoderCNN(nn.Module):
     """1×1 conv n_hidden→n_out, then global average pool.
     Input:  [B, n_hidden, S, S]
@@ -1766,11 +1851,17 @@ class DecoderCNN(nn.Module):
     same Conv->BatchNorm2d shape ContextCNN uses. It normalizes per channel over batch and
     space, before the pool averages, and is a plain affine per channel at inference, so it
     folds into proj's weights."""
-    def __init__(self, n_hidden, S, n_out=256, norm2d=False):
+    def __init__(self, n_hidden, S, n_out=256, norm2d=False, kernel=1, padded=True,
+                 linear_init=False):
         super().__init__()
-        self.proj = nn.Conv2d(n_hidden, n_out, 1)
+        self.proj = nn.Conv2d(n_hidden, n_out, kernel, padding=kernel // 2 if padded else 0)
+        if linear_init:   # same variance-preserving init as the --dec_tree_linear stages
+            nn.init.kaiming_normal_(self.proj.weight, mode='fan_in', nonlinearity='linear')
+            nn.init.zeros_(self.proj.bias)
         self.norm = nn.BatchNorm2d(n_out) if norm2d else nn.Identity()
-        self.pool = nn.AvgPool2d(S)
+        # no pool when proj's output is already 1x1 (--dec_tree): proj is then the whole decoder
+        S_out = S if padded else S - kernel + 1
+        self.pool = nn.AvgPool2d(S_out) if S_out > 1 else nn.Identity()
 
     def forward(self, x):
         return self.pool(self.norm(self.proj(x))).squeeze(-1).squeeze(-1)
@@ -1981,8 +2072,68 @@ class VLAModel(nn.Module, _HubMixin):
                                     bn_momentum=(self.bn_momentum or None),
                                     bn_eps=self.bn_eps, c_context=self.c_context,
                                     c_out=self.ctx_out, c_in=self.ctx_in)
-        self.decoder   = DecoderCNN(n_hidden, S, self.c_text if tokenizer != 'char' else 256,
-                                    norm2d=self.head_norm_kind == 'batch2d')
+        # --dec_width: the --dec_depth blocks run at this width and decoder.proj reads it
+        _dd = int(getattr(args, 'dec_depth', 0) or 0)
+        _dt = bool(getattr(args, 'dec_tree', False))
+        self.dec_width = (int(getattr(args, 'dec_width', 0) or 0) or n_hidden) if (_dd > 0 or _dt) else n_hidden
+        if getattr(args, 'dec_tree_linear', False) and not _dt:
+            raise SystemExit('--dec_tree_linear needs --dec_tree')
+        if _dt and int(getattr(args, 'dec_kernel', 1) or 1) != 1:
+            raise SystemExit('--dec_tree feeds decoder.proj a 1x1 grid; leave --dec_kernel at 1')
+        _dtk = getattr(args, 'dec_tree_kernels', None)
+        _dtk = [int(k) for k in str(_dtk).split(',') if k.strip()] if _dtk else None
+        if _dtk is not None:
+            if not _dt:
+                raise SystemExit('--dec_tree_kernels needs --dec_tree')
+            _red = sum(k - 1 for k in _dtk)
+            if getattr(args, 'dec_tree_pool', False):
+                if _red > S - 1 or min(_dtk) < 1:
+                    raise SystemExit(f'--dec_tree_kernels {_dtk}: sum of (k-1) must be <= S-1 = '
+                                     f'{S - 1} with --dec_tree_pool')
+            elif _red != S - 1 or min(_dtk) < 1:
+                raise SystemExit(f'--dec_tree_kernels {_dtk}: sum of (k-1) must be S-1 = {S - 1} '
+                                 f'to reach 1x1 from {S}x{S} (or add --dec_tree_pool)')
+        elif getattr(args, 'dec_tree_pool', False):
+            raise SystemExit('--dec_tree_pool needs --dec_tree_kernels')
+        self.dec_tree_kernels = _dtk
+        if _dtk is not None:
+            # the last kernel IS decoder.proj: unpadded, on the grid the tree leaves (k x k, or
+            # larger under --dec_tree_pool, where DecoderCNN then pools what proj leaves)
+            self.decoder = DecoderCNN(self.dec_width, S - sum(k - 1 for k in _dtk[:-1]),
+                                      self.c_text if tokenizer != 'char' else 256,
+                                      norm2d=self.head_norm_kind == 'batch2d',
+                                      kernel=_dtk[-1], padded=False,
+                                      linear_init=bool(getattr(args, 'dec_tree_linear', False)))
+        else:
+            self.decoder = DecoderCNN(self.dec_width, 1 if _dt else S,
+                                      self.c_text if tokenizer != 'char' else 256,
+                                      norm2d=self.head_norm_kind == 'batch2d',
+                                      kernel=int(getattr(args, 'dec_kernel', 1) or 1))
+        # --dec_depth: nonlinear blocks between the DFF tap and decoder.proj (see _decode).
+        # Built with the RNG forked so every other module initializes as without it.
+        self.dec_stack = None
+        _dd = int(getattr(args, 'dec_depth', 0) or 0)
+        if _dd > 0:
+            with torch.random.fork_rng(devices=[]):
+                self.dec_stack = ContextCNN(n_hidden, _dd, kernel, norm=self.norm_kind,
+                                            groups=self.norm_groups, bn_track=self.bn_track,
+                                            bn_affine=self.bn_affine,
+                                            bn_momentum=(self.bn_momentum or None),
+                                            bn_eps=self.bn_eps, c_context=self.dec_width,
+                                            c_out=self.dec_width, c_in=n_hidden)
+        # --dec_tree: the SxS -> 1x1 reduction in front of decoder.proj (see _decode)
+        self.dec_tree = None
+        if _dt:
+            with torch.random.fork_rng(devices=[]):
+                self.dec_tree = DecoderTree(self.dec_width if _dd > 0 else n_hidden, S,
+                                            self.dec_width, norm=self.norm_kind,
+                                            groups=self.norm_groups, bn_track=self.bn_track,
+                                            bn_affine=self.bn_affine,
+                                            bn_momentum=(self.bn_momentum or 0.1),
+                                            bn_eps=self.bn_eps,
+                                            linear=bool(getattr(args, 'dec_tree_linear', False)),
+                                            kernels=(self.dec_tree_kernels[:-1]
+                                                     if self.dec_tree_kernels is not None else None))
         # token grid (c_text) → n_hidden, summed into the DFF state
         if getattr(args, 'no_text_proj', False):
             if self.c_text != n_hidden:
@@ -2076,13 +2227,17 @@ class VLAModel(nn.Module, _HubMixin):
                 raise SystemExit('--ctx_cat needs --ctx_ema with K >= 2')
             _Kc = len(self.ctx_windows) + (1 if self.ctx_cat_in else 0)   # + the input block
             with torch.random.fork_rng(devices=[]):
-                self.ctx_cat = nn.ModuleList(nn.Conv2d(_Kc * n_hidden, n_hidden, 1)
+                _ck = int(getattr(args, 'ctx_cat_kernel', 1) or 1)
+                if _ck < 1 or _ck % 2 == 0:
+                    raise SystemExit(f'--ctx_cat_kernel {_ck}: must be a positive ODD integer')
+                self.ctx_cat = nn.ModuleList(nn.Conv2d(_Kc * n_hidden, n_hidden, _ck, padding=_ck // 2)
                                              for _ in range(self.n_layers))
             with torch.no_grad():
                 for _c in self.ctx_cat:
                     _c.weight.zero_()
+                    _m = _c.weight.shape[-1] // 2  # centre tap (0 for a 1x1)
                     for _k in range(_Kc):        # [I, I, ..., I]: the plain sum at step 0
-                        _c.weight[:, _k * n_hidden:(_k + 1) * n_hidden, 0, 0] = torch.eye(n_hidden)
+                        _c.weight[:, _k * n_hidden:(_k + 1) * n_hidden, _m, _m] = torch.eye(n_hidden)
                     _c.bias.zero_()
         if self.ctx_read_gain_kind != 'none':
             if not self.ctx_windows or len(self.ctx_windows) < 2:
@@ -2276,6 +2431,14 @@ class VLAModel(nn.Module, _HubMixin):
                     seen.add(id(p))
                     out.append(p)
         return out
+
+    def _decode(self, ctx):
+        """Layer output -> [B, c_text]: the --dec_depth blocks (if any), then the decoder."""
+        if self.dec_stack is not None:
+            ctx = self.dec_stack(ctx)
+        if self.dec_tree is not None:
+            ctx = self.dec_tree(ctx)
+        return self.decoder(ctx)
 
     def readout(self, dec):
         """Decoder output [B, c_text] → logits [B, vocab]: --head_norm, then the borrowed
@@ -2610,7 +2773,7 @@ class VLAModel(nn.Module, _HubMixin):
         stack, new_ctx = self._layers(self.dff, self._tok_grid(byte_idx), self.clk)
         self.dff = [d.detach().clone() for d in stack]   # store for next step (gradient horizon = 1)
 
-        logits = self.readout(self.decoder(new_ctx))
+        logits = self.readout(self._decode(new_ctx))
         loss   = F.cross_entropy(logits, targets.long()) if targets is not None else None
         if loss is not None and (self.dff_penalty or self.dff_bias):
             # Mean state, element-weighted across layers so a wide layer counts for what it
@@ -2636,7 +2799,7 @@ class VLAModel(nn.Module, _HubMixin):
         for _ in range(n_tokens):
             stack, ctx = self._layers(dff, self._tok_grid(torch.tensor([b], device=dev)), clk)
             dff = [d.detach() for d in stack]
-            logits = self.readout(self.decoder(ctx))
+            logits = self.readout(self._decode(ctx))
             if not logits.isfinite().all():
                 break
             prob = F.softmax(logits[0] / max(temperature, 1e-6), dim=-1)
@@ -2669,7 +2832,7 @@ class VLAModel(nn.Module, _HubMixin):
             if not all(d.isfinite().all() for d in dff):
                 print('generate: dff NaN/Inf')
                 return None
-            logits = self.readout(self.decoder(new_ctx))
+            logits = self.readout(self._decode(new_ctx))
             if not logits.isfinite().all():
                 print('generate: logits NaN/Inf')
                 return None
@@ -2716,7 +2879,7 @@ class VLAModel(nn.Module, _HubMixin):
                 # this is the ordinary loop: the sampled token is fed back normally.
                 if not prompt_ids:
                     with torch.no_grad():
-                        logits = self.readout(self.decoder(self._ctx_sum(dff[-1])))
+                        logits = self.readout(self._decode(self._ctx_sum(dff[-1])))
                     if not logits.isfinite().all():
                         print('generate: logits NaN/Inf from seed')
                         return out
@@ -4807,7 +4970,7 @@ def _model_graph(model):
             bi  = torch.zeros(1, dtype=torch.long, device=dev)
             dff = model._new_dff(1, dev)
             stack, ctx = model._layers(dff, model._tok_grid(bi), model._new_writer(1, dev))
-            model.readout(model.decoder(ctx))
+            model.readout(model._decode(ctx))
     finally:
         for h in hooks:
             h.remove()
@@ -5008,6 +5171,8 @@ def _param_summary(model):
              ('ctx_cat',      getattr(model, 'ctx_cat', None)),
              ('linout',       model.linout),
              ('tap',          model.tap),
+             ('dec_stack',    getattr(model, 'dec_stack', None)),
+             ('dec_tree',     getattr(model, 'dec_tree', None)),
              ('decoder',      model.decoder),
              ('head_norm',    getattr(model, 'head_norm', None)),
              ('lmhead',       model.lmhead)]
@@ -5341,7 +5506,7 @@ if args.altvis:
             tok  = model.tok_embed(bi).view(1, model.c_text, 1, 1).expand(-1, -1, model.S, model.S)
             stack, new_ctx = model._layers(dff, tok, clk, record=rec)
             dff    = [d.detach().clone() for d in stack]
-            logits = model.readout(model.decoder(new_ctx))
+            logits = model.readout(model._decode(new_ctx))
         _nstep += 1
         prob = F.softmax(logits[0] / max(args.temperature, 1e-6), dim=-1)
 
@@ -5499,7 +5664,7 @@ if args.vis:
             _vrec  = []
             stack, new_ctx = model._layers(dff, tok, clk, record=_vrec)  # last-layer output
             dff    = [d.detach().clone() for d in stack]
-            logits = model.readout(model.decoder(new_ctx))
+            logits = model.readout(model._decode(new_ctx))
             if args.gen_pool == 'mean':                            # see --gen_pool
                 _p   = F.softmax(logits, dim=-1)
                 _acc = _p if _acc is None else _acc + _p
