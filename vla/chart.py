@@ -77,6 +77,13 @@ tg_pat = re.compile(r'^TRIGGER\s+step\s+(\d+).*?\(abs\s+' + _NUM + r'\).*?'
                     r'best\s+(?:none|' + _NUM + r').*?still\s+(\d+)/(\d+)')
 st_pat = re.compile(r'^TRIGGER\s+\S+\s+(?:STALLED|SCHEDULED)')
 
+# EVAL lines carry the held-out loss, one per --eval_corpora corpus per report:
+#   EVAL step      60000 corpus smolfwedu clean    6.074443 ppl 434.6 median 6.03 runaway 1.00% ...
+# "clean" is the mean over the documents that did not run away -- the number the runs are
+# compared on. Same units as the training loss, so it goes on the loss panel. EVALW (the
+# --eval_warm variant) does not match: \s+ after EVAL excludes it.
+ev_pat = re.compile(r'^EVAL\s+step\s+(\d+)\s+corpus\s+(\S+)\s+clean\s+' + _NUM)
+
 
 def parselog(fn):
     global batch_size
@@ -85,9 +92,12 @@ def parselog(fn):
     pats     = {k: re.compile(r'\b' + k + r'\s+' + _NUM) for k in _FIELDS}
     data     = {k: [] for k in ['step'] + _FIELDS}
     data['wall'] = []
+    win_pat = re.compile(r'\bwin(\d+)\s+' + _NUM)     # win1 <v> win2 <v> ... (--ctx_ema windows)
+    wins = {}                                  # register index -> [window per STEP row]
     gs_step, gs_nats = [], []
     tg_step, tg_dabs, tg_best, tg_hold, tg_need = [], [], [], [], [0]
     rf_step = []
+    ev = {}                                    # corpus -> ([step], [clean])
     last_step = [0.0]
     with open(fn, 'r') as f:
         for l in f:
@@ -101,6 +111,12 @@ def parselog(fn):
                     tg_need[0] = float(mt.group(5))
                 elif st_pat.match(l):
                     rf_step.append(last_step[0])
+                continue
+            me = ev_pat.match(l)
+            if me:
+                _s, _c = ev.setdefault(me.group(2), ([], []))
+                _s.append(float(me.group(1)))
+                _c.append(float(me.group(3)))
                 continue
             mg = gs_pat.match(l)
             if mg:
@@ -116,6 +132,11 @@ def parselog(fn):
                 for k in _FIELDS:
                     m = pats[k].search(l)
                     data[k].append(float(m.group(1)) if m else 0.0)
+                _row = len(data['step']) - 1
+                for mw_ in win_pat.finditer(l):
+                    _w = wins.setdefault(int(mw_.group(1)), [])
+                    _w.extend([np.nan] * (_row - len(_w)))     # a register that appeared late
+                    _w.append(float(mw_.group(2)))
             elif l[0:4] == 'ARGS':
                 match = re.search(r"batch=(\d+)", l)
                 if match:
@@ -131,6 +152,10 @@ def parselog(fn):
     out['tg_hold'] = np.array(tg_hold)
     out['tg_need'] = tg_need[0]
     out['rf_step'] = np.array(rf_step)
+    out['ev'] = {k: (np.array(a), np.array(b)) for k, (a, b) in ev.items()}
+    _n = len(data['step'])
+    out['wins'] = {k: np.array(v + [np.nan] * (_n - len(v)))[args.head:]
+                   for k, v in sorted(wins.items())}
     return out
 
 print('loading log file')
@@ -144,6 +169,9 @@ grad = d['grad']
 lr   = d['lr']
 epoch = d['epoch']
 gs_step, gs_nats = d['gs_step'], d['gs_nats']
+ev = d['ev']
+if ev:
+    print('EVAL', ', '.join(f'{k} {v[0].size}' for k, v in ev.items()))
 mean = d['dff_mean']
 std  = d['dff_std']
 dmax = d['dff_max']
@@ -255,9 +283,11 @@ if cut:
     step, loss, grad, lr = step[cut:], loss[cut:], grad[cut:], lr[cut:]
     mean, std, dmax, zero, bs = mean[cut:], std[cut:], dmax[cut:], zero[cut:], bs[cut:]
     epoch = epoch[cut:]
+    d['wins'] = {k: v[cut:] for k, v in d['wins'].items()}
     if gs_step.size:                       # by STEP NUMBER: these are not per-sample rows
         _keep   = gs_step >= step[0]
         gs_step, gs_nats = gs_step[_keep], gs_nats[_keep]
+    ev = {k: (s_[s_ >= step[0]], c_[s_ >= step[0]]) for k, (s_, c_) in ev.items()}
     for _k in ('tg_step', 'rf_step'):      # likewise, and the TRIGGER series travel together
         if d[_k].size:
             _keep = d[_k] >= step[0]
@@ -278,8 +308,10 @@ plt.style.use('dark_background')
 # quietly drifting toward a blow-up shows it here long before the loss moves. The lr is
 # fourth in both for the same reason: with cyclic and ramped schedules (v117-v119) the
 # loss and the state cannot be read without knowing where the schedule was at that step.
-nplots = 7 if args.verbose else 4
-fig = plt.figure(figsize=(12, 16 if args.verbose else 11))
+# one more panel, last, when the log carries learned/adapted register windows (win1, win2, ...)
+_have_wins = bool(d['wins'])
+nplots = (7 if args.verbose else 4) + (1 if _have_wins else 0)
+fig = plt.figure(figsize=(12, (16 if args.verbose else 11) + (2.5 if _have_wins else 0)))
 if title:
     fig.suptitle(title)
 ax1 = fig.add_subplot(nplots,1,1)
@@ -292,7 +324,7 @@ ax2b = ax2.twinx() if args.batch else None
 # of word salad against a loss of 8) and settles toward it, so scaling to the loss alone
 # would put every early point off-panel. ylim_top's cap still applies, so a run whose
 # samples stay bad does not flatten the loss trace to read them.
-_l_top = ylim_top(np.concatenate([loss, gs_nats]) if gs_nats.size else loss, 'loss')
+_l_top = ylim_top(np.concatenate([loss, gs_nats] + [c_ for _, c_ in ev.values()]), 'loss')
 ax1.set_ylim(bottom=0, top=_l_top)
 ax1.plot(step, loss, '.w', linewidth=0.1,alpha=1.0, markersize=1)
 if gs_nats.size:
@@ -311,10 +343,18 @@ if gs_nats.size:
         _half = (_w - 1) // 2
         ax1.plot(gs_step[_half:_half + _roll.size], _roll, '-', color='#ffd699',
                  linewidth=1.5, alpha=0.9, label=f'GENSCORE mean ({_w})')
-    ax1.legend(loc='upper right', fontsize=8, framealpha=0.3)
     _off = int((gs_nats > _l_top).sum()) if _l_top else 0
     if _off:
         print(f'GENSCORE: {_off}/{gs_nats.size} points above the loss axis top {_l_top:.4g}')
+# held-out EVAL, one series per corpus: markers at the eval steps joined by a thin line, so
+# the trend reads even where the evals are sparse against the dense training scatter
+_EV_COLORS = ['#4fc3f7', '#81c784', '#f06292', '#ba68c8', '#ffd54f']
+for _i, (_k, (_s, _c)) in enumerate(sorted(ev.items())):
+    if _s.size:
+        ax1.plot(_s, _c, 'o-', color=_EV_COLORS[_i % len(_EV_COLORS)], markersize=3,
+                 linewidth=0.8, alpha=0.9, label=f'EVAL {_k}')
+if gs_nats.size or any(_s.size for _s, _ in ev.values()):
+    ax1.legend(loc='upper right', fontsize=8, framealpha=0.3)
 #ax1.plot(step, loss_mean, '-w', linewidth=1,alpha=0.8)
 ax1.axhline(y=np.min(loss), color='g', linestyle='-',linewidth=1,label='min')
 #ax2.plot(step, grad, '-y', linewidth=2.0,alpha=0.5)
@@ -437,6 +477,19 @@ if args.verbose:
     ax6.set_ylabel('sparsity', color='g')
     ax7.set_ylabel('lr', color='c')
     axes += [ax5, ax6, ax7]
+
+if _have_wins:
+    # LOG scale: windows span 0.5 (an extrapolating rate) to thousands of tokens
+    axw = fig.add_subplot(nplots, 1, nplots, sharex=ax1)
+    _cols = ['#ff7043', '#66bb6a', '#42a5f5', '#ab47bc', '#ffee58', '#26c6da']
+    for i, (k, v) in enumerate(d['wins'].items()):
+        axw.plot(step, v, '-', color=_cols[i % len(_cols)], linewidth=2.0, alpha=0.8,
+                 label=f'win{k}')
+    axw.set_yscale('log')
+    axw.set_ylabel('register window (tokens)', color='w')
+    axw.grid(axis='y', which='major', color='w', linewidth=1, alpha=0.2)
+    axw.legend(loc='upper left', fontsize=8, framealpha=0.2)
+    axes.append(axw)
 
 # only the bottom subplot carries the shared x-axis label and tick labels
 for ax in axes[:-1] + twins:

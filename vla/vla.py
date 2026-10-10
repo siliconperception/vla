@@ -48,6 +48,11 @@ _GEN_SAMPLE = 200
 # silently makes the EVAL line incomparable to that table and to the pythia references,
 # which is the whole reason the eval exists -- so they are pinned here rather than exposed.
 _EVAL_MINLEN = 512
+# Short-document corpora (stories, chats) rarely reach 512 tokens, so their eval sets take
+# documents from 128 tokens up; every other corpus keeps the protocol's 512.
+_EVAL_MINLEN_SHORT = {'simplestories': 128, 'smolchat': 128}
+def _eval_minlen(corpus):
+    return _EVAL_MINLEN_SHORT.get(corpus, _EVAL_MINLEN)
 _EVAL_MAXLEN = 1024
 _EVAL_BATCH  = 400    # rows per forward chunk. Cost here is dominated by SEQUENTIAL steps
                       # (51 conv launches each), not by batch width, so one wide chunk beats
@@ -98,6 +103,9 @@ _TOKENIZERS = {
     'pythia31m':  'EleutherAI/pythia-31m',       # GPT-NeoX, hidden 256, vocab 50304
     'pythia70m':  'EleutherAI/pythia-70m',       # GPT-NeoX, hidden 512, vocab 50304
     'pythia160m': 'EleutherAI/pythia-160m',      # GPT-NeoX, hidden 768, vocab 50304
+    # simplified vocabulary: SimpleStories-V2-5M (llama), 4019-token lowercase WordPiece
+    # trained on simple-English stories, hidden 256, embedding TIED to lm_head
+    'ss4k':       'SimpleStories/SimpleStories-V2-5M',
 }
 
 # The TinyStories models are trained on a deliberately simple corpus, so most of their
@@ -167,7 +175,9 @@ class HFTokenizer:
         # the model's embedding rows, not len(tokenizer): the logits are that wide
         self.vocab_size = vocab_size
 
-    def encode(self, text): return self.tok.encode(text)
+    # add_special_tokens=False: some tokenizers (SimpleStories' WordPiece) append [EOS] to
+    # every encode(), which would plant end markers mid-document. A no-op for GPT-NeoX/Neo.
+    def encode(self, text): return self.tok.encode(text, add_special_tokens=False)
     def decode(self, ids):  return self.tok.decode(ids)
 
 
@@ -643,6 +653,9 @@ parser.add_argument('--linout_gain',   default=1.0,   type=float, metavar='G',
                     help='multiply the --linout init weights by G (init only; no shapes change). '
                          'With --ctx_mix none, G=2 reproduces the upward gain of two tied '
                          'copies (v231).')
+parser.add_argument('--gate_lr_mult',  default=1.0,  type=float, metavar='M',
+                    help='--ctx_read_gate: train the gate conv at M x lr (its gradient carries '
+                         'the register values, ~0.02-0.15, so at 1x the gates barely leave 0.5)')
 parser.add_argument('--linout_lr_mult', default=1.0,  type=float, metavar='M',
                     help='--linout gets its own optimizer parameter group at M x the learning '
                          'rate (the schedule scales it like every other group). With --ctx_mix '
@@ -834,6 +847,97 @@ parser.add_argument('--dec_tree_pool', action='store_true',
                          '(k-1) < S-1); decoder.proj (the last kernel) is followed by a global '
                          'average pool over the grid it leaves, e.g. 3,3,3 on 8x8: 8->6->4->2, '
                          'pool 2x2. Restored from a checkpoint.')
+parser.add_argument('--ctx_cat_narrow', action='store_true',
+                    help='with --ctx_cat_in: the ctx_cat 1x1 outputs --c_context channels (not '
+                         'n_hidden), so it reads the concat straight down to the ContextCNN width '
+                         'and the first 3x3 runs c_context -> c_context. Restored from a checkpoint.')
+parser.add_argument('--dff_dropout',   default=0.0,   type=float, metavar='P',
+                    help='--ctx_ema: inverted dropout with probability P on each register as it is '
+                         'READ into the feedback/concat, in training mode only. The registers '
+                         'themselves (and so their EMA) are untouched; eval/generation read them '
+                         'whole. 0 (default) = off.')
+parser.add_argument('--tok_dropout',   default=0.0,   type=float, metavar='P',
+                    help='inverted dropout with probability P on the SxSxC token grid (after '
+                         'replication and text_proj, elementwise -- each grid cell keeps its own '
+                         'subset of the embedding), training mode only. 0 (default) = off.')
+parser.add_argument('--ctx_read_norm', default=0.0, type=float, metavar='S',
+                    help='--ctx_ema: read each register RMS-normalized to S (per row, over its '
+                         'channels and grid), so the K registers enter ctx_cat at equal size '
+                         'whatever their own scale -- what v350\'s learned gates converged to '
+                         '(each register read at ~0.015). No parameters. 0 = off.')
+parser.add_argument('--ctx_learn_win', action='store_true',
+                    help='--ctx_ema windows as trainable parameters (one log-window per register, '
+                         'starting at the --ctx_ema values). The registers are detached, so the '
+                         'rate gets its gradient by one-step lookahead: register r_t = r_t-1 + '
+                         'a*e_t is read at t+1 as r_t + (a - a.detach())*e_t -- same value, exact '
+                         'd loss_t+1 / d a. Rates are fixed numbers at inference. See --win_lr_mult.')
+parser.add_argument('--ctx_win_param', default='clamp', choices=['clamp', 'exp1', 'rate2'],
+                    help='--ctx_learn_win parameterization. clamp: W = exp(theta) clamped to '
+                         '[1, 4096] -- a window that touches 1 can get stuck there (the clamp '
+                         'zeroes its gradient; v359). exp1: W = 1 + exp(theta), always above 1 '
+                         'with a live gradient (a --ctx_ema window of 1 starts at 1.001). '
+                         'rate2: the RATE a = 1/W learned as a = 2*sigmoid(phi), free in (0, 2): '
+                         'a < 1 smooths, a = 1 copies, 1 < a < 2 extrapolates (old state enters '
+                         'with a negative weight, emphasizing token-to-token change). The bounds '
+                         'are the EMA\'s stability limits, so W floats in (0.5, inf).')
+parser.add_argument('--win_lr_mult', default=1.0, type=float, metavar='M',
+                    help='--ctx_learn_win: train the log-windows at M x lr')
+parser.add_argument('--ctx_every',     default=None, metavar='N1,N2,...',
+                    help='--ctx_ema subsampled registers: register k updates once every N_k '
+                         'tokens (counted from <STX>), writing the MEAN of its input over those '
+                         'N_k tokens (box decimation), at rate 1-(1-1/W_k)^N_k so its window '
+                         'in tokens stays W_k. 1 = every token (default for all).')
+parser.add_argument('--ctx_read_gate', action='store_true',
+                    help='--ctx_ema learned read gates: every register channel is read through '
+                         'a sigmoid gate g = sigmoid(1x1 conv of the whole ctx_cat input -- token '
+                         'grid and all K registers), so the mix of the K timescales the layer '
+                         'sees is chosen per step, channel and grid cell: a learned, input-'
+                         'dependent effective window. On the READ side because the registers '
+                         'are detached: a write-side rate never reaches the loss under the '
+                         '1-step gradient. Starts at g = 0.5 everywhere (weights and bias 0), where the '
+                         'sigmoid is steepest and the gates learn fastest. '
+                         'Needs --ctx_cat_in.')
+parser.add_argument('--ctx_adapt',     action='store_true',
+                    help='--ctx_ema closed-form adaptive rates: each register, per document '
+                         'row, sets its rate to the steady-state Kalman gain of a local-level '
+                         'model fitted to its own innovations e = input - register: with V = '
+                         'E[e^2] and C1 = E[e_t e_t-1] (pooled over channels and grid, smoothed '
+                         'over --ctx_adapt_win tokens), R = (1-a)V - C1, Q = a(2-a)V - 2aR, '
+                         'lambda = Q/R, rate = 2/(1 + sqrt(1 + 4/lambda)), clamped to the '
+                         'register\'s --ctx_adapt_range. Rates are detached (a control law, not '
+                         'trained) and run identically at inference. Needs --ctx_first blend.')
+parser.add_argument('--ctx_adapt_range', default=None, metavar='LO:HI,...',
+                    help='--ctx_adapt window clamp per register, in tokens. Default: bands '
+                         'split at the geometric midpoints of the --ctx_ema windows, outer edges '
+                         'at /4 and x4 (16,64,256 -> 4:32,32:128,128:1024).')
+parser.add_argument('--ctx_adapt_win', default=None, metavar='W1,W2,...',
+                    help='--ctx_adapt statistics window per register, tokens (default: the '
+                         '--ctx_ema windows). Bias-corrected, so short documents still get an '
+                         'estimate.')
+parser.add_argument('--ctx_warm',      action='store_true',
+                    help='--ctx_ema warm-up correction: register k blends at rate '
+                         'a_k / (1 - (1 - a_k)^n), n = writes since <STX> (the Adam bias '
+                         'correction). Each register is a normalized (weights summing to 1) '
+                         'average of the document so far -- about the running mean while n is '
+                         'well under its window, the usual EMA after -- instead of a '
+                         'zero-started average that is shrunk toward 0 for its first ~window '
+                         'tokens. Needs --ctx_first blend. The effective window 1/rate is logged '
+                         '(win on STEP, EVALI).')
+parser.add_argument('--ctx_resid',     action='store_true',
+                    help='--ctx_ema registers written with what the FASTER register missed: '
+                         'register 1 blends toward the layer output x as usual, register k '
+                         'toward x - register k-1 (its value just written this step). A '
+                         'residual cascade meant to cut the overlap between the K windows: '
+                         'register k no longer holds a smoothed copy of what k-1 already '
+                         'holds. Needs --ctx_mix none (one shared output). See --eval_info.')
+parser.add_argument('--ctx_chain',     action='store_true',
+                    help='--ctx_ema registers in SERIES (a clocked shift-register chain): '
+                         'register 1 blends toward the layer output, register k toward register '
+                         'k-1\'s value from the previous step. All update at once, so each stage '
+                         'adds one step of delay plus its EMA smoothing; the K registers become '
+                         'a smoothed delay line (impulse responses peaked progressively further '
+                         'in the past) instead of K windows all peaked at the present. Read '
+                         'exactly as before. Restored from a checkpoint.')
 parser.add_argument('--ctx_first',     default='replace', choices=['replace', 'blend'],
                     help='a DFF register\'s FIRST write of a document. replace (default): the '
                          'register is overwritten with the layer output, so no --init value '
@@ -1336,7 +1440,8 @@ parser.add_argument('--eval_corpora',  default=None,
                          'once each and reused')
 parser.add_argument('--reason_eval',   default=None,
                     help='comma-separated zero-shot multiple-choice benchmarks scored every '
-                         '--eval_interval steps: arc_easy | arc_chal | obqa | winogrande. '
+                         '--eval_interval steps: arc_easy | arc_chal | obqa | winogrande | '
+                         'piqa | hellaswag | copa. '
                          'Held-out LOSS cannot measure reasoning -- on a factual corpus it '
                          'rewards memorisation, which is the opposite of the goal -- so this '
                          'is the metric that tracks whether the model REASONS. winogrande is '
@@ -1373,6 +1478,83 @@ parser.add_argument('--gen_warm',      default=False, action='store_true',
 parser.add_argument('--gen_cold',      default=True, action=argparse.BooleanOptionalAction,
                     help='print the usual cold GEN samples (fresh state from <STX>) at every '
                          'GEN interval. --no-gen_cold leaves only GENW (needs --gen_warm).')
+parser.add_argument('--eval_bands',    default='1024,8192', metavar='R1,R2,...',
+                    help='frequency-banded held-out loss: with every cold EVAL, also print an '
+                         'EVALB line splitting the clean documents\' loss by the FREQUENCY RANK '
+                         'of the target token, ranks counted over all --eval_corpora held-out '
+                         'text. Edges 1024,8192 give three bands: the ~1K most frequent tokens '
+                         '(function words, syntax -- "language"), the next 7K (common content), '
+                         'and the long tail (names, numbers, rare terms -- "facts"). "" = off.')
+parser.add_argument('--eval_recall',   default=0,     type=int, metavar='N',
+                    help='in-context recall eval at every cold EVAL, on N held-out documents per '
+                         'corpus (0 = off): each sequence is <STX> A filler A, A = the first '
+                         '--eval_recall_len tokens of a document, filler = text from other '
+                         'documents. Prints an EVALR line: loss on the FIRST copy of A (no help '
+                         'from context) and on the SECOND copy at each --eval_recall_gaps, plus '
+                         'the drop between them -- how much the model can reuse text it has '
+                         'read, which retrieval (feeding it search results) depends on.')
+parser.add_argument('--eval_recall_len', default=32,  type=int, metavar='L')
+parser.add_argument('--eval_info',     default=0,     type=int, metavar='N',
+                    help='register-overlap eval at every cold EVAL, on N held-out documents of '
+                         'the FIRST --eval_corpora corpus (0 = off; needs --ctx_ema). Prints an '
+                         'EVALI line: each register\'s rms and effective rank (participation '
+                         'ratio of its channel covariance, positions as samples, within-position), '
+                         'the rank of the concatenation, Gaussian mutual information between '
+                         'each register pair (CCA) and the total correlation of all K, and the '
+                         'held-out loss rise when each register / pair / all are read as their '
+                         'mean instead (unique vs shared predictive information).')
+parser.add_argument('--eval_recall_gaps', default='0,64,256', metavar='G1,G2,...')
+parser.add_argument('--eval_facts',    default=0,     type=int, metavar='N',
+                    help='human-style reading-comprehension recall at every cold EVAL (0 = off): '
+                         'N fixed items. Each item is a short passage of simple facts about TWO '
+                         'people ("Maria lives in Denver. Tom works as a baker. ..."), then '
+                         '--eval_facts_gaps tokens of unrelated held-out text, then a cue '
+                         '("Maria lives in") that the model must complete. Scored as 4-way '
+                         'multiple choice by total log-probability: the right value, the OTHER '
+                         'person\'s value for the same attribute (a binding distractor) and two '
+                         'random ones -- chance 25%%. A no-passage control asks the same cues '
+                         'with nothing read. Prints an EVALF line.')
+parser.add_argument('--eval_facts_gaps', default='0,64,256', metavar='G1,G2,...')
+parser.add_argument('--eval_chatqa',   default=0,     type=int, metavar='N',
+                    help='chat-format Q&A at every cold EVAL (0 = off), in the "User: ...\\n\\n'
+                         'Assistant: ..." harness format the smolchat corpus teaches. Three '
+                         'parts, each multiple choice by log-probability of the assistant\'s '
+                         'answer: (1) the --eval_facts reading-comprehension items as a chat -- '
+                         'the user states the facts and asks ("Where does Robert live?"), the '
+                         'assistant answers "Robert lives in ___" (4-way, chance 25%%, plus a '
+                         'no-passage control); (2) PIQA goals as user questions, the solutions '
+                         'as answers (2-way); (3) COPA premises with "What happened as a '
+                         'result?" / "What was the cause?" (2-way). N caps the PIQA/COPA items. '
+                         'Prints an EVALQ line.')
+parser.add_argument('--gen_vocab',     default=0,     type=int, metavar='K',
+                    help='--generate: sample only from the K most frequent tokens (ranked as for '
+                         '--eval_bands, over the --eval_corpora held-out text; <STX>/<ETX> always '
+                         'allowed). The model\'s distribution is renormalized over that '
+                         'vocabulary. 0 = off.')
+parser.add_argument('--gen_vocab_words', default=False, action='store_true',
+                    help='with --gen_vocab: rank only WHOLE-WORD tokens -- alphabetic, with a '
+                         'leading space (or capitalized, for sentence starts), at least two '
+                         'letters except a/A/I -- so the K kept are the K most frequent words, '
+                         'not single letters, digits or word fragments. Basic punctuation '
+                         '(. , ? ! \' " : ; and newlines) is always allowed.')
+parser.add_argument('--char_onehot',   default=False, action='store_true',
+                    help='--tokenizer char: the token embedding is a FIXED one-hot (256x256 '
+                         'identity, frozen) instead of a learned 256 x --c_text table, so the '
+                         'token grid is 256 channels with exactly one lit. The readout is already '
+                         'degenerate under char (lm_head = Identity; decoder.proj emits the 256 '
+                         'byte logits and is trained). Restored from a checkpoint.')
+parser.add_argument('--eval_gen',      default=0,     type=int, metavar='N',
+                    help='prompted fluency eval at every cold EVAL, on N held-out documents per '
+                         'corpus (0 = off): the model continues each document\'s first '
+                         '--eval_gen_prompt tokens for --eval_gen_len tokens, and a frozen judge '
+                         'LM (--eval_gen_judge) scores the continuation GIVEN the prompt. The '
+                         'same judge scores the document\'s real continuation (floor) and that '
+                         'continuation with its words shuffled (ceiling), per prompt, so '
+                         'fluency%% is anchored on matched text. Prints an EVALG line with '
+                         'nats, fluency%%, rep1 and distinct-2 (blandness / repetition guard).')
+parser.add_argument('--eval_gen_judge', default='EleutherAI/pythia-410m', metavar='MODEL')
+parser.add_argument('--eval_gen_prompt', default=32, type=int, metavar='P')
+parser.add_argument('--eval_gen_len',  default=96,    type=int, metavar='C')
 parser.add_argument('--eval_warm',     default=0,     type=int, metavar='N',
                     help='ALSO score every held-out set WARM: each document is preceded by N '
                          'tokens of OTHER held-out documents (framed <STX>...<ETX> exactly as in '
@@ -1599,7 +1781,7 @@ _ARCH_ARGS = ('context', 'n_hidden', 'c_context', 'c_text', 'n_layers', 'depth',
               'tokenizer', 'head_norm', 'ema', 'ema_ladder', 'qproj',
               'tap', 'linout', 'linout_kernel', 'dff_every', 'ctx_ema', 'linin', 'ctx_mix',
               'dff_write_scale', 'ctx_read_gain', 'ctx_first', 'ctx_cat', 'ctx_cat_in',
-              'no_text_proj', 'ctx_cat_kernel', 'dec_depth', 'dec_width', 'dec_kernel', 'dec_tree', 'dec_tree_linear', 'dec_tree_kernels', 'dec_tree_pool',
+              'no_text_proj', 'ctx_cat_kernel', 'dec_depth', 'dec_width', 'dec_kernel', 'dec_tree', 'dec_tree_linear', 'dec_tree_kernels', 'dec_tree_pool', 'ctx_cat_narrow', 'ctx_chain', 'ctx_resid', 'ctx_warm', 'ctx_adapt', 'ctx_adapt_range', 'ctx_adapt_win', 'ctx_read_gate', 'ctx_read_norm', 'ctx_learn_win', 'ctx_win_param', 'ctx_every', 'char_onehot',
               'init', 'clock_base', 'clock_max', 'clock_ends', 'clip_dff', 'tap_norm', 'norm', 'norm_groups', 'dff_norm', 'bn_track', 'bn_affine',
                   'bn_momentum', 'bn_eps')
 
@@ -1897,8 +2079,31 @@ class DFFEma:
     generate() and --vis keep theirs, so a sample drawn mid-training cannot disturb the
     training state."""
 
-    def __init__(self, ema, B, device, ctx_rates=None, first='replace'):
+    def __init__(self, ema, B, device, ctx_rates=None, first='replace', chain=False, resid=False,
+                 warm=False, adapt=None, every=None, learn=False):
         self.ema = ema                       # float, or one per register (--ema_ladder)
+        self.chain = chain                   # --ctx_chain: register k is fed by register k-1
+        self.resid = resid                   # --ctx_resid: register k fed x - register k-1
+        self.warm = warm                     # --ctx_warm: bias-corrected rate per row
+        self.last_win = None                 # [B or 1, K] effective window 1/rate, last write
+        self.every = every                   # --ctx_every: [N_k] or None
+        self.learn = learn                   # --ctx_learn_win: rate set by the model per step
+        self.acc = None                      # --ctx_every: running input sum per register
+        self.e_last = None                   # last write's innovation (--ctx_learn_win read)
+        # --ctx_adapt: (nominal windows, [(lo, hi)] window clamps, stat windows) or None
+        self.adapt = adapt
+        if adapt is not None:
+            wins, rng, swin = adapt
+            Kc = len(wins)
+            f = lambda v: torch.tensor(v, dtype=torch.float32, device=device).view(1, Kc)
+            self.a_nom = f([1.0 / w for w in wins])
+            self.a_lo  = f([1.0 / hi for lo, hi in rng])     # slowest allowed rate
+            self.a_hi  = f([1.0 / lo for lo, hi in rng])     # fastest allowed rate
+            self.beta  = f([1.0 / w for w in swin])
+            z = lambda: torch.zeros(B, Kc, device=device)
+            self.sV, self.nV, self.sC, self.nC = z(), z(), z(), z()
+            self.a = self.a_nom.expand(B, Kc).clone()
+            self.e_prev = None
         self.t   = torch.zeros(B, dtype=torch.long, device=device)
         # --ctx_ema: K registers per layer held concatenated on channels, each with its own
         # rate. Stored as a [1, K*C, 1, 1] tensor so one blend writes all K at once.
@@ -1914,12 +2119,45 @@ class DFFEma:
                                      device=device).view(1, -1, 1, 1)
 
     def write(self, li, o, prev):
+        if self.K and self.adapt is not None:
+            return self._write_adapt(o, prev)
         if self.K:
+            rate = self.rate
+            if self.warm:
+                # n-th write since <STX> (n = t+1): rate a/(1-(1-a)^n), 1 at n=1
+                n = (self.t + 1).view(-1, 1, 1, 1).to(rate.dtype)
+                rate = rate / (1.0 - (1.0 - rate) ** n)
+            self.last_win = (1.0 / rate).view(rate.shape[0], self.K, -1)[..., 0].detach()
+            if self.every is not None or self.learn:
+                return self._write_loop(o, prev, rate)
             # under --linout o is already [B, K*C, S, S] (block k = copy k for register k);
             # without it the one layer output is proposed to every context
-            if o.shape[1] != prev.shape[1]:
+            if self.resid:
+                # residual cascade: register k blends toward what register k-1 (as written
+                # THIS step) did not capture of the layer output
+                C = prev.shape[1] // self.K
+                if o.shape[1] != C:
+                    raise ValueError('--ctx_resid needs one layer output per step (--ctx_mix none)')
+                pk, rk = prev.split(C, dim=1), rate.split(C, dim=1)
+                new, inp = [], o
+                for k in range(self.K):
+                    if k:
+                        inp = o - new[-1]
+                    n = pk[k] + rk[k] * (inp - pk[k])
+                    if self.first_replace:
+                        n = torch.where((self.t == 0).view(-1, 1, 1, 1), inp, n)
+                    new.append(n)
+                return torch.cat(new, dim=1)
+            if self.chain:
+                # shift register: register 1 sees the layer output, register k the PREVIOUS
+                # value of register k-1 (all clocked at once)
+                C = prev.shape[1] // self.K
+                if o.shape[1] != C:
+                    raise ValueError('--ctx_chain needs one layer output per step (--ctx_mix none)')
+                o = torch.cat([o, prev[:, :-C]], dim=1)
+            elif o.shape[1] != prev.shape[1]:
                 o = o.repeat(1, self.K, 1, 1)
-            blend = prev + self.rate * (o - prev)
+            blend = prev + rate * (o - prev)
             if not self.first_replace:
                 return blend
             return torch.where((self.t == 0).view(-1, 1, 1, 1), o, blend)
@@ -1933,13 +2171,118 @@ class DFFEma:
             return prev + e * (o - prev)
         return torch.where((self.t == 0).view(-1, 1, 1, 1), o, prev + e * (o - prev))
 
+    def _write_loop(self, o, prev, rate):
+        """Register-by-register write: parallel or --ctx_resid cascade, each register every
+        token or every N_k tokens (--ctx_every, box-averaged input), and the innovation of
+        each actual update kept in e_last for --ctx_learn_win's lookahead read."""
+        K = self.K
+        C = prev.shape[1] // K
+        if self.resid and o.shape[1] != C:
+            raise ValueError('--ctx_resid needs one layer output per step (--ctx_mix none)')
+        ok = o.split(C, dim=1) if o.shape[1] == prev.shape[1] else [o] * K
+        pk, rk = prev.split(C, dim=1), rate.split(C, dim=1)
+        ev = self.every or [1] * K
+        if any(n > 1 for n in ev) and (self.acc is None or self.acc.shape != prev.shape):
+            self.acc = torch.zeros_like(prev)
+        acc = self.acc.split(C, dim=1) if self.acc is not None else [None] * K
+        new, es, accs = [], [], []
+        for k in range(K):
+            u = ok[k] if (k == 0 or not self.resid) else ok[k] - new[-1]
+            if ev[k] > 1:
+                N = ev[k]
+                a_sum = acc[k] + u.detach()
+                fire = ((self.t + 1) % N == 0).view(-1, 1, 1, 1)
+                m = a_sum / N
+                a = 1.0 - (1.0 - rk[k]) ** N                  # per-update rate, window W_k
+                e = torch.where(fire, m - pk[k], torch.zeros_like(m))
+                n = pk[k] + a * e
+                accs.append(torch.where(fire, torch.zeros_like(a_sum), a_sum))
+            else:
+                e = u - pk[k]
+                n = pk[k] + rk[k] * e
+                if self.first_replace:
+                    n = torch.where((self.t == 0).view(-1, 1, 1, 1), u, n)
+                if acc[k] is not None:
+                    accs.append(acc[k])
+            new.append(n); es.append(e.detach())
+        if accs and self.acc is not None:
+            self.acc = torch.cat(accs, dim=1).detach()
+        self.e_last = torch.cat(es, dim=1)
+        return torch.cat(new, dim=1)
+
     def advance(self):
         """One step of the token stream has been consumed."""
         self.t = self.t + 1
 
+    def _write_adapt(self, o, prev):
+        """--ctx_adapt: the K registers (parallel, or --ctx_resid cascade), each blending at
+        its own per-row rate from the closed-form Kalman gain of its innovation statistics.
+
+        Local-level model: input u_t = m_t + v_t (noise variance R), m_t = m_t-1 + w_t
+        (drift variance Q). An EMA at rate a has innovations e_t = u_t - r_t-1 with
+            V  = E[e^2]       = Q/(a(2-a)) + 2R/(2-a)
+            C1 = E[e_t e_t-1] = (1-a)Q/(a(2-a)) - aR/(2-a)
+        so R = (1-a)V - C1 and Q = a(2-a)V - 2aR, and the optimal (Kalman) rate is the root
+        of a^2/(1-a) = lambda = Q/R: a* = 2/(1 + sqrt(1 + 4/lambda)). At a* the innovations are
+        white (C1 = 0), so this is a fixed point of the update. Statistics are pooled over
+        channels and grid (one rate per register per row), smoothed with a bias-corrected EMA,
+        and detached: a control law, not a trained parameter."""
+        K = self.K
+        C = prev.shape[1] // K
+        ok = o.split(C, dim=1) if o.shape[1] == prev.shape[1] else [o] * K
+        if self.resid and o.shape[1] != C:
+            raise ValueError('--ctx_resid needs one layer output per step (--ctx_mix none)')
+        pk = prev.split(C, dim=1)
+        if self.e_prev is None or self.e_prev.shape != prev.shape:
+            self.e_prev = torch.zeros_like(prev).detach()
+        ep = self.e_prev.split(C, dim=1)
+        B = prev.shape[0]
+        started = (self.t >= 1).float().view(-1)[:B]      # e_t-1 exists in this document
+        ready = (self.t >= 2).view(-1)[:B]
+        new, es, a_all = [], [], []
+        for k in range(K):
+            u = ok[k] if (k == 0 or not self.resid) else ok[k] - new[-1]
+            e = (u - pk[k]).detach()
+            v = e.pow(2).mean(dim=(1, 2, 3))
+            c = (e * ep[k]).mean(dim=(1, 2, 3))
+            b = self.beta[0, k]
+            self.sV[:, k] += b * (v - self.sV[:, k]); self.nV[:, k] += b * (1 - self.nV[:, k])
+            bc = b * started
+            self.sC[:, k] += bc * (c - self.sC[:, k]); self.nC[:, k] += bc * (1 - self.nC[:, k])
+            V = self.sV[:, k] / self.nV[:, k].clamp_min(1e-12)
+            C1 = self.sC[:, k] / self.nC[:, k].clamp_min(1e-12)
+            a0 = self.a[:, k].clone()
+            R = (1 - a0) * V - C1
+            Q = a0 * (2 - a0) * V - 2 * a0 * R
+            lam = torch.where(R > 0, Q.clamp_min(0) / R.clamp_min(1e-30),
+                              torch.full_like(R, 1e12))
+            a = 2.0 / (1.0 + torch.sqrt(1.0 + 4.0 / lam.clamp_min(1e-12)))
+            a = torch.minimum(torch.maximum(a, self.a_lo[0, k]), self.a_hi[0, k])
+            a = torch.where(ready, a, self.a_nom[0, k].expand_as(a))
+            self.a[:, k] = a
+            n = pk[k] + a.view(-1, 1, 1, 1) * (u - pk[k])
+            new.append(n); es.append(e)
+        self.e_prev = torch.cat(es, dim=1)
+        self.last_win = (1.0 / self.a).detach().clone()
+        return torch.cat(new, dim=1)
+
     def reset(self, flag):
         """Rows starting a new document are back at their first write."""
         self.t = torch.where(flag, torch.zeros_like(self.t), self.t)
+        f4 = flag.view(-1, 1, 1, 1)
+        if self.acc is not None and self.acc.shape[0] == flag.shape[0]:
+            self.acc = torch.where(f4, torch.zeros_like(self.acc), self.acc)
+        if self.e_last is not None and self.e_last.shape[0] == flag.shape[0]:
+            self.e_last = torch.where(f4, torch.zeros_like(self.e_last), self.e_last)
+        if self.adapt is not None:
+            f = flag.view(-1, 1)
+            for name in ('sV', 'nV', 'sC', 'nC'):
+                t = getattr(self, name)
+                setattr(self, name, torch.where(f, torch.zeros_like(t), t))
+            self.a = torch.where(f, self.a_nom.expand_as(self.a), self.a)
+            if self.e_prev is not None:
+                self.e_prev = torch.where(flag.view(-1, 1, 1, 1), torch.zeros_like(self.e_prev),
+                                          self.e_prev)
 
 
 # PyTorchModelHubMixin gives VLAModel save_pretrained()/push_to_hub()/from_pretrained()
@@ -2026,6 +2369,15 @@ class VLAModel(nn.Module, _HubMixin):
             self.tok      = ByteTokenizer()
             self.vocab    = self.tok.vocab_size
             self.tok_embed = nn.Embedding(self.vocab, self.c_text)   # token → c_text channels
+            if getattr(args, 'char_onehot', False):
+                # --char_onehot: a FIXED one-hot input -- byte b lights channel b of a
+                # 256-wide token vector, nothing learned before the CNN. Built as a frozen
+                # identity Embedding so every embed path (training, generate, --vis) is unchanged.
+                self.c_text = self.vocab
+                self.tok_embed = nn.Embedding(self.vocab, self.vocab)
+                with torch.no_grad():
+                    self.tok_embed.weight.copy_(torch.eye(self.vocab))
+                self.tok_embed.weight.requires_grad_(False)
             self.lmhead   = nn.Identity()     # the decoder already emits the 256 byte logits
         else:
             # Pull the vocabulary-facing layers out of the pretrained causal LM and drop the
@@ -2065,7 +2417,13 @@ class VLAModel(nn.Module, _HubMixin):
         self.ctx_out   = self.c_context if getattr(args, 'linout', False) else n_hidden
         # --linin: the mirror image on the way IN -- a 1x1 narrows the feedback sum to
         # c_context, so the chain's first conv reads c_context rather than n_hidden.
-        self.ctx_in    = self.c_context if getattr(args, 'linin', False) else n_hidden
+        # --ctx_cat_narrow does the same narrowing inside the ctx_cat read
+        if getattr(args, 'ctx_cat_narrow', False) and (getattr(args, 'linin', False)
+                                                       or not getattr(args, 'ctx_cat_in', False)):
+            raise SystemExit('--ctx_cat_narrow needs --ctx_cat_in and excludes --linin')
+        self.ctx_in    = (self.c_context if (getattr(args, 'linin', False)
+                                             or getattr(args, 'ctx_cat_narrow', False))
+                          else n_hidden)
         self.context   = ContextCNN(n_hidden, depth, kernel, norm=self.norm_kind,
                                     groups=self.norm_groups, bn_track=self.bn_track,
                                     bn_affine=self.bn_affine,
@@ -2136,9 +2494,13 @@ class VLAModel(nn.Module, _HubMixin):
                                                      if self.dec_tree_kernels is not None else None))
         # token grid (c_text) → n_hidden, summed into the DFF state
         if getattr(args, 'no_text_proj', False):
-            if self.c_text != n_hidden:
+            # a narrower token grid is fine when nothing adds it to n_hidden-wide state: under
+            # --ctx_cat_in (one layer) it is just another block of the concat ctx_cat reads
+            if self.c_text != n_hidden and not (getattr(args, 'ctx_cat_in', False)
+                                                and self.n_layers == 1):
                 raise SystemExit(f'--no_text_proj needs the embedding width ({self.c_text}) to '
-                                 f'equal --n_hidden ({n_hidden})')
+                                 f'equal --n_hidden ({n_hidden}), or --ctx_cat_in with '
+                                 f'--n_layers 1')
             self.text_proj = nn.Identity()       # no parameters; the grid feeds the add/concat
         else:
             self.text_proj = nn.Conv2d(self.c_text, n_hidden, 1)
@@ -2203,6 +2565,11 @@ class VLAModel(nn.Module, _HubMixin):
             if not _w or any(x < 1.0 for x in _w):
                 raise SystemExit(f'--ctx_ema {_spec!r}: windows must be >= 1 token')
             self.ctx_windows = _w
+            self.ctx_every = None
+            if getattr(args, 'ctx_every', None):
+                self.ctx_every = [int(v) for v in str(args.ctx_every).split(',') if v.strip()]
+                if len(self.ctx_every) != len(_w) or min(self.ctx_every) < 1:
+                    raise SystemExit('--ctx_every: one positive integer per --ctx_ema window')
             if self.ema is not None:
                 raise SystemExit('--ctx_ema replaces --ema/--ema_ladder (each context window IS '
                                  'its blend rate); drop one of them')
@@ -2223,21 +2590,57 @@ class VLAModel(nn.Module, _HubMixin):
         self.ctx_cat = None
         self.ctx_cat_in = bool(getattr(args, 'ctx_cat_in', False))
         if getattr(args, 'ctx_cat', False) or self.ctx_cat_in:
-            if not self.ctx_windows or len(self.ctx_windows) < 2:
-                raise SystemExit('--ctx_cat needs --ctx_ema with K >= 2')
+            # --ctx_cat_in reads [input, registers] through one conv, so ONE register is a
+            # meaningful case there; plain --ctx_cat only mixes registers and needs two
+            if not self.ctx_windows or len(self.ctx_windows) < (1 if self.ctx_cat_in else 2):
+                raise SystemExit('--ctx_cat needs --ctx_ema with K >= 2 (K >= 1 with --ctx_cat_in)')
             _Kc = len(self.ctx_windows) + (1 if self.ctx_cat_in else 0)   # + the input block
             with torch.random.fork_rng(devices=[]):
                 _ck = int(getattr(args, 'ctx_cat_kernel', 1) or 1)
                 if _ck < 1 or _ck % 2 == 0:
                     raise SystemExit(f'--ctx_cat_kernel {_ck}: must be a positive ODD integer')
-                self.ctx_cat = nn.ModuleList(nn.Conv2d(_Kc * n_hidden, n_hidden, _ck, padding=_ck // 2)
+                # block widths in concat order: the input (the raw c_text grid under
+                # --no_text_proj, else n_hidden), then the K registers
+                _bw = (([self.c_text if getattr(args, 'no_text_proj', False) else n_hidden]
+                        if self.ctx_cat_in else []) + [n_hidden] * len(self.ctx_windows))
+                _co = self.ctx_in if self.ctx_cat_in else n_hidden   # --ctx_cat_narrow: c_context
+                self.ctx_cat = nn.ModuleList(nn.Conv2d(sum(_bw), _co, _ck, padding=_ck // 2)
                                              for _ in range(self.n_layers))
+                # --ctx_learn_win: one trainable log-window per register per layer
+                self.ctx_logw = None
+                if getattr(args, 'ctx_learn_win', False):
+                    if self.n_layers != 1:
+                        raise SystemExit('--ctx_learn_win supports --n_layers 1')
+                    _w0 = torch.tensor(self.ctx_windows, dtype=torch.float32)
+                    if getattr(args, 'ctx_win_param', 'clamp') == 'exp1':   # theta = log(W - 1)
+                        _w0 = torch.log((_w0 - 1.0).clamp_min(1e-3))
+                    elif getattr(args, 'ctx_win_param', 'clamp') == 'rate2':  # phi = logit(a/2)
+                        _a = (1.0 / _w0 / 2.0).clamp(1e-6, 1 - 1e-6)
+                        _w0 = torch.log(_a / (1.0 - _a))
+                    else:                                                   # theta = log W
+                        _w0 = torch.log(_w0)
+                    self.ctx_logw = nn.ParameterList(nn.Parameter(_w0.clone())
+                                                     for _ in range(self.n_layers))
+                # --ctx_read_gate: sigmoid gates on the K register reads, from the same input
+                self.ctx_rgate = None
+                if getattr(args, 'ctx_read_gate', False):
+                    if not self.ctx_cat_in:
+                        raise SystemExit('--ctx_read_gate needs --ctx_cat_in')
+                    self.ctx_rgate = nn.ModuleList(
+                        nn.Conv2d(sum(_bw), n_hidden * len(self.ctx_windows), 1)
+                        for _ in range(self.n_layers))
+                    with torch.no_grad():
+                        for _g in self.ctx_rgate:
+                            _g.weight.zero_(); _g.bias.zero_()
             with torch.no_grad():
                 for _c in self.ctx_cat:
                     _c.weight.zero_()
                     _m = _c.weight.shape[-1] // 2  # centre tap (0 for a 1x1)
-                    for _k in range(_Kc):        # [I, I, ..., I]: the plain sum at step 0
-                        _c.weight[:, _k * n_hidden:(_k + 1) * n_hidden, _m, _m] = torch.eye(n_hidden)
+                    _o = 0
+                    for _w in _bw:               # [I, I, ..., I]: the plain sum at step 0
+                        _n = min(_w, _c.out_channels)   # onto the first outputs that fit
+                        _c.weight[:_n, _o:_o + _n, _m, _m] = torch.eye(_n)
+                        _o += _w
                     _c.bias.zero_()
         if self.ctx_read_gain_kind != 'none':
             if not self.ctx_windows or len(self.ctx_windows) < 2:
@@ -2530,9 +2933,55 @@ class VLAModel(nn.Module, _HubMixin):
         if getattr(self, 'ctx_windows', None):
             _r = [min(1.0, 1.0 / w) for w in self.ctx_windows]
             return DFFEma(None, B, device, first=getattr(args, 'ctx_first', 'replace'),
-                          ctx_rates=(_r, [r for r in _r for _ in range(self.n_hidden)]))
+                          ctx_rates=(_r, [r for r in _r for _ in range(self.n_hidden)]),
+                          chain=bool(getattr(args, 'ctx_chain', False)),
+                          resid=bool(getattr(args, 'ctx_resid', False)),
+                          warm=bool(getattr(args, 'ctx_warm', False)),
+                          adapt=self._adapt_spec(),
+                          every=getattr(self, 'ctx_every', None),
+                          learn=getattr(self, 'ctx_logw', None) is not None)
         return (DFFEma(self.ema, B, device, first=getattr(args, 'ctx_first', 'replace'))
                 if self.ema is not None else None)
+
+    def _ctx_alpha(self, li):
+        """--ctx_learn_win: per-token rate 1/W of each register, [1, K*n_hidden, 1, 1]."""
+        if getattr(args, 'ctx_win_param', 'clamp') == 'rate2':
+            a = 2.0 * torch.sigmoid(self.ctx_logw[li])
+            return a.repeat_interleave(self.n_hidden).view(1, -1, 1, 1)
+        if getattr(args, 'ctx_win_param', 'clamp') == 'exp1':
+            w = (1.0 + self.ctx_logw[li].exp()).clamp(max=4096.0)
+        else:
+            w = self.ctx_logw[li].exp().clamp(1.0, 4096.0)
+        return (1.0 / w).repeat_interleave(self.n_hidden).view(1, -1, 1, 1)
+
+    def _ctx_aeff(self, li):
+        """The rate each register actually applies per update (1-(1-a)^N under --ctx_every)."""
+        a = self._ctx_alpha(li)
+        if getattr(self, 'ctx_every', None) and any(n > 1 for n in self.ctx_every):
+            N = torch.tensor(self.ctx_every, dtype=a.dtype, device=a.device)
+            N = N.repeat_interleave(self.n_hidden).view(1, -1, 1, 1)
+            a = 1.0 - (1.0 - a) ** N
+        return a
+
+    def _adapt_spec(self):
+        """--ctx_adapt: (nominal windows, [(lo, hi)] clamps, stat windows), or None."""
+        if not getattr(args, 'ctx_adapt', False):
+            return None
+        if getattr(args, 'ctx_first', 'replace') != 'blend':
+            raise SystemExit('--ctx_adapt needs --ctx_first blend')
+        if getattr(args, 'ctx_warm', False):
+            raise SystemExit('--ctx_adapt replaces --ctx_warm; drop one')
+        w = list(self.ctx_windows)
+        if getattr(args, 'ctx_adapt_range', None):
+            rng = [tuple(float(v) for v in p.split(':')) for p in args.ctx_adapt_range.split(',')]
+        else:
+            edges = [w[0] / 4] + [math.sqrt(a * b) for a, b in zip(w, w[1:])] + [w[-1] * 4]
+            rng = list(zip(edges, edges[1:]))
+        sw = ([float(v) for v in args.ctx_adapt_win.split(',')]
+              if getattr(args, 'ctx_adapt_win', None) else w)
+        if len(rng) != len(w) or len(sw) != len(w):
+            raise SystemExit('--ctx_adapt_range/--ctx_adapt_win: one entry per --ctx_ema window')
+        return (w, rng, sw)
 
     def _init_dff(self, B, device):
         dev = torch.device(device)
@@ -2568,7 +3017,27 @@ class VLAModel(nn.Module, _HubMixin):
         if self.ctx_windows:
             # --ctx_ema: condition each of the K registers exactly as a lone one would be,
             # then sum them into the one feedback tensor
+            _clk = getattr(self, '_cur_clk', None)
+            if (getattr(self, 'ctx_logw', None) is not None and _clk is not None
+                    and getattr(_clk, 'e_last', None) is not None and _clk.e_last.shape == d.shape):
+                # --ctx_learn_win lookahead: same value, d read / d a = last write's innovation
+                a = self._ctx_aeff(li)
+                d = d + (a - a.detach()) * _clk.e_last
             regs = [self._fb_one(li, c) for c in d.chunk(self.n_ctx, dim=1)]
+            _pd = float(getattr(args, 'dff_dropout', 0.0) or 0.0)
+            if _pd > 0 and self.training:
+                regs = [F.dropout(r, _pd, training=True) for r in regs]
+            _abl = getattr(self, '_read_ablate', None)   # --eval_info: read as the mean
+            if _abl:
+                _mu = self._read_mean.chunk(self.n_ctx, dim=1)
+                regs = [_mu[k].expand_as(r) if k in _abl else r for k, r in enumerate(regs)]
+            _rn = float(getattr(args, 'ctx_read_norm', 0.0) or 0.0)
+            if _rn > 0:                                  # --ctx_read_norm: equal-size reads
+                # eps INSIDE the sqrt: a register reset to 0 at <STX> has rms 0, where sqrt
+                # has an infinite slope -- harmless while registers carry no gradient, NaN
+                # once --ctx_learn_win puts its lookahead gradient through the read
+                regs = [r * (_rn * torch.rsqrt(r.pow(2).mean(dim=(1, 2, 3), keepdim=True) + 1e-12))
+                        for r in regs]
             if self.ctx_rgain is not None:
                 g = self.ctx_rgain[li]
                 g = g.view(len(regs), -1, 1, 1) if g.dim() == 2 else g.view(len(regs), 1, 1, 1)
@@ -2585,7 +3054,14 @@ class VLAModel(nn.Module, _HubMixin):
         from below (the token grid on layer 0). --ctx_cat_in: the input and the K registers
         concatenated and read by one 1x1 conv instead of added."""
         if self.ctx_cat is not None and self.ctx_cat_in:
-            return self.ctx_cat[li](torch.cat([inp, self._fb(li, d)], dim=1))
+            x = torch.cat([inp, self._fb(li, d)], dim=1)
+            if getattr(self, 'ctx_rgate', None) is not None:
+                # --ctx_read_gate: gate only the register block, from the whole input
+                w0 = inp.shape[1]
+                g = torch.sigmoid(self.ctx_rgate[li](x))
+                self._last_gate = g.detach().view(g.shape[0], self.n_ctx, -1).mean(-1)
+                x = torch.cat([inp, x[:, w0:] * g], dim=1)
+            return self.ctx_cat[li](x)
         return self._fb(li, d) + inp
 
     def _to_regs(self, z):
@@ -2710,7 +3186,13 @@ class VLAModel(nn.Module, _HubMixin):
         plus what arrives from below) and its OUTPUT (what the register will store and the
         layer above receives). --altvis draws these; nothing else uses them, and passing None
         leaves the forward pass byte-identical."""
+        self._cur_clk = clk                    # --ctx_learn_win reads the writer's e_last
+        if clk is not None and getattr(self, 'ctx_logw', None) is not None:
+            clk.rate = self._ctx_alpha(0).detach()
         tok  = self.text_proj(tok_grid)        # [B, n_hidden, S, S], computed once
+        _pt = float(getattr(args, 'tok_dropout', 0.0) or 0.0)
+        if _pt > 0 and self.training:             # --tok_dropout
+            tok = F.dropout(tok, _pt, training=True)
         if self.linout is not None:
             # ONE 1x1 per layer. `o` leaves the projection already dense and signed, and is
             # both stored in the register and handed straight to the layer above -- there is
@@ -2886,6 +3368,9 @@ class VLAModel(nn.Module, _HubMixin):
                 else:
                     return out
             while len(out) < n_tokens:
+                _vm = getattr(self, 'vocab_mask', None)    # --gen_vocab: restricted sampling
+                if _vm is not None:
+                    logits = logits.masked_fill(~_vm, float('-inf'))
                 prob = F.softmax(logits[0] / max(temperature, 1e-6), dim=-1)
                 bval = torch.multinomial(prob, 1).item()
                 if bval == self.end_id:
@@ -3196,6 +3681,12 @@ _TEXT_DATASETS = {
     # so <STX>/<ETX> and the usual prompting apply.
     'littlec': ('littlelearner/LittleCurriculum', None, 'train', 'text'),
     'pile_nc': ('monology/pile-uncopyrighted', None, 'train', 'text'),
+    # conversational / Q&A: HuggingFaceTB/smol-smoltalk, SmolTalk cut down for small models
+    # (~460K multi-turn chats). No text column -- _fmt_smolchat renders the turns.
+    'smolchat': ('HuggingFaceTB/smol-smoltalk', None, 'train', None),
+    # SimpleStories/SimpleStories: ~2M short simple-English stories (gpt-4o-mini, ~6th-grade
+    # reading level, tagged by topic/theme/style) -- the corpus the ss4k vocabulary is from.
+    'simplestories': ('SimpleStories/SimpleStories', None, 'train', 'story'),
     # synth has no repo: examples are generated on the fly by --teacher. The tuple exists so
     # _build_clip finds the 'text' column and _split_for_name resolves, exactly as for a
     # real corpus -- everything downstream of the worker is unchanged.
@@ -3392,7 +3883,7 @@ def _fmt_finephrase(ex):
 # sets every earlier number in PLAN.txt was measured on.
 _HASH_HOLDOUT = {'swiki', 'fwedu', 'fineweb', 'fwcrawl', 'cosmo', 'cosmoweb', 'fpfaq', 'fpmath', 'fptut',
                  'smolcosmo', 'smolfwedu', 'strangetb', 'sebooks', 'dclmedu', 'babylm',
-                 'littlec'}
+                 'littlec', 'simplestories', 'smolchat'}
 _HOLDOUT_MOD = 32                       # ~3.1% held out. Sized by the SCAN COST of building
                                         # the eval set, not by statistics: the filters
                                         # compound. cosmo keeps 26.5% (audience) x 1/MOD
@@ -3530,7 +4021,21 @@ def _fmt_tinytb_pair(ex):
     return f'{raw}\n\n{book}' if raw and book else ''
 
 
-_TEXT_FORMAT = {'s1k': _fmt_s1k, 'wdef': _fmt_wdef, 'tinytbpair': _fmt_tinytb_pair,
+def _fmt_smolchat(ex):
+    """A chat as plain text, one turn per paragraph: 'User: ...' / 'Assistant: ...'
+    (a system prompt, when present, as 'System: ...'). Role labels in ordinary words rather
+    than special tokens, so the harness format is text the frozen embedding already knows.
+    Chats with no assistant turn are skipped."""
+    msgs = ex.get('messages') or []
+    lbl = {'user': 'User', 'assistant': 'Assistant', 'system': 'System'}
+    turns = [f"{lbl.get(m.get('role'), 'User')}: {(m.get('content') or '').strip()}"
+             for m in msgs if (m.get('content') or '').strip()]
+    if not any(m.get('role') == 'assistant' for m in msgs):
+        return ''
+    return '\n\n'.join(turns)
+
+
+_TEXT_FORMAT = {'s1k': _fmt_s1k, 'smolchat': _fmt_smolchat, 'wdef': _fmt_wdef, 'tinytbpair': _fmt_tinytb_pair,
                 'fpfaq': _fmt_finephrase, 'fpmath': _fmt_finephrase,
                 'fptut': _fmt_finephrase}
 
@@ -4986,7 +5491,9 @@ def _model_graph(model):
     def _rate(k, li):
         if model.ctx_windows:
             w = model.ctx_windows[k]
-            return 'replace' if w <= 1 else f'EMA w={w:g}'
+            return 'replace' if w <= 1 else (f'EMA w={w:g}'
+                                             + (' warm' if getattr(args, 'ctx_warm', False) else '')
+                                             + (' adapt' if getattr(args, 'ctx_adapt', False) else ''))
         e = (model.ema[li] if isinstance(model.ema, (list, tuple)) else model.ema)
         return 'replace' if (e is None or e >= 1.0) else f'EMA a={e:.4g}'
     def _op(name, op, i, o):
@@ -5022,8 +5529,11 @@ def _model_graph(model):
                     out.append(_row)
             if getattr(model, 'ctx_cat', None) is not None and getattr(model, 'ctx_cat_in', False):
                 _srcs = [up] + [f'{g}[t-1]' for g in regs]
-                out.append(_op(', '.join(_srcs), 'Concat (channels)',
-                               f'{len(_srcs)} x {H}', f'{len(_srcs) * model.n_hidden}x{S}x{S}'))
+                _cin = model.ctx_cat[li].in_channels
+                _w0 = _cin - len(regs) * model.n_hidden      # the input block's width
+                _ins = (f'{len(_srcs)} x {H}' if _w0 == model.n_hidden
+                        else f'{_w0}+{len(regs)}x{model.n_hidden} x{S}x{S}')
+                out.append(_op(', '.join(_srcs), 'Concat (channels)', _ins, f'{_cin}x{S}x{S}'))
                 out.extend(_cat_pending)
                 _cat_pending.clear()
             elif getattr(model, 'ctx_cat', None) is not None:
@@ -5061,6 +5571,10 @@ def _model_graph(model):
                         and model.ctx_mix == 'conv') else
                     [r['name']] + [f'T_{k + 1}({r["name"]})' for k in range(1, K)] if _mix
                     else [r['name']] * len(regs))
+            if getattr(args, 'ctx_chain', False):      # shift register: k-1 feeds k
+                srcs = [srcs[0]] + [f'{regs[k - 1]}[t-1]' for k in range(1, len(regs))]
+            if getattr(args, 'ctx_resid', False):      # residual cascade: x - register k-1
+                srcs = [srcs[0]] + [f'{srcs[0]} - {regs[k - 1]}[t]' for k in range(1, len(regs))]
             _ws = getattr(model, 'dff_write_scale', 1.0)
             for k in range(len(regs)):
                 out.append(_op(f'{regs[k]}[t] <- {"" if _ws == 1.0 else f"{_ws:g} x "}{srcs[k]}',
@@ -5169,6 +5683,8 @@ def _param_summary(model):
              ('linin',        getattr(model, 'linin', None)),
              ('ctx_read_gain', getattr(model, 'ctx_rgain', None)),
              ('ctx_cat',      getattr(model, 'ctx_cat', None)),
+             ('ctx_read_gate', getattr(model, 'ctx_rgate', None)),
+             ('ctx_logw',     getattr(model, 'ctx_logw', None)),
              ('linout',       model.linout),
              ('tap',          model.tap),
              ('dec_stack',    getattr(model, 'dec_stack', None)),
@@ -5389,6 +5905,44 @@ if args.generate:
     if args.load is None and args.pretrained is None:
         print('WARNING: --generate without --load/--pretrained is running an untrained model')
     prompt = _prompt_ids()
+    if args.gen_vocab:
+        # frequencies from ~2000 streamed documents of each corpus (rank only needs counts;
+        # the eval-set builder is defined further down the file than this block)
+        from datasets import load_dataset as _ld
+        _cnt = collections.Counter()
+        for _c in ([c.strip() for c in args.eval_corpora.split(',') if c.strip()]
+                   if args.eval_corpora else [args.dataset]):
+            _repo, _cfg, _spl, _col = _TEXT_DATASETS[_c]
+            for _k, _ex in enumerate(_ld(_repo, _cfg, split=_spl, streaming=True)):
+                if _k >= 2000:
+                    break
+                _cnt.update(_tokenizer.encode(_corpus_text(_c, _ex) if _col is None
+                                              else (_ex.get(_col) or '')))
+        _V = int(model.lmhead.out_features)
+        _m = torch.zeros(_V, dtype=torch.bool)
+        def _is_word(t):
+            s_ = _tokenizer.decode([t])
+            w_ = s_[1:] if s_.startswith(' ') else s_
+            return (w_.isalpha() and w_.isascii() and (s_.startswith(' ') or w_[0].isupper())
+                    and (len(w_) >= 2 or w_ in ('a', 'A', 'I')))
+        _ranked = [t for t, _ in _cnt.most_common()]
+        if args.gen_vocab_words:
+            _ranked = [t for t in _ranked if _is_word(t)]
+        _keep = _ranked[:args.gen_vocab]
+        if args.gen_vocab_words:
+            for _p in ('.', ',', '?', '!', "'", '"', ':', ';', '\n', '\n\n'):
+                _ids = _tokenizer.encode(_p)
+                if len(_ids) == 1:
+                    _keep.append(_ids[0])
+        _m[_keep] = True
+        _m[[_tokenizer.start_id, _tokenizer.end_id]] = True
+        model.vocab_mask = _m.to(next(model.parameters()).device)
+        print(f'--gen_vocab {args.gen_vocab}: sampling restricted to the most frequent '
+              f'{len(_keep)} {"whole words + punctuation" if args.gen_vocab_words else "tokens"} '
+              f'of {sum(_cnt.values())} counted tokens', flush=True)
+        if args.gen_vocab_words:
+            print('  least frequent kept: ' + ' '.join(repr(_tokenizer.decode([t]))
+                                                     for t in _keep[args.gen_vocab - 12:args.gen_vocab]))
     out    = model.generate(prompt, args.n, temperature=args.temperature)
     print(_render(prompt + out))
     raise SystemExit(0)
@@ -5424,6 +5978,40 @@ def _vc(t):
         c = chr(t) if 32 <= t < 127 else DOT_TEXT
         return DOT_TEXT if c in '$\\' else c
     return ''.join(DOT_TEXT if c in '$\\' else c for c in _render([t]))
+
+
+class _Ticker:
+    """The --vis/--altvis text ticker. It used to append _vc(token) one token at a time,
+    which is right for byte mode and for GPT-style BPE (every token carries its own leading
+    space) but wrong for WordPiece (--tokenizer ss4k): there a token decoded ALONE has no
+    space and continuation pieces keep their '##', so the ticker read 'marialivesinde##n##ver'
+    where the log says 'maria lives in denver'. Now the current episode's ids are decoded
+    TOGETHER with _render -- the same path the GEN lines use -- and finished episodes are kept
+    as text. Byte mode keeps the per-byte rendering (the ticker is fed one byte at a time)."""
+    def __init__(self, prompt):
+        self.prompt = list(prompt)
+        self.hist, self.cur, self.chars = '', list(prompt), ''
+
+    def add(self, t):
+        if t == model.null_id:
+            return
+        if _tokenizer.is_char:
+            self.chars += _vc(t)
+        else:
+            self.cur.append(t)
+
+    def end(self):
+        self.hist = (self.hist + self._cur_text() + ETX_TEXT)[-4096:]
+        self.cur, self.chars = list(self.prompt), ''
+
+    def _cur_text(self):
+        if _tokenizer.is_char:
+            return _render(self.prompt) + self.chars
+        return _render(self.cur)
+
+    def text(self, n):
+        t = self.hist + self._cur_text()
+        return ''.join(DOT_TEXT if c in '$\\' else c for c in t)[-n:]
 
 
 if args.altvis:
@@ -5495,6 +6083,7 @@ if args.altvis:
     _queue  = list(_prompt)
     _b      = _queue.pop(0)
     _ticker = _ptext
+    _tk     = _Ticker(_prompt)
     _nstep  = 0
     dff     = model._new_dff(1, _dev)
     clk     = model._new_writer(1, _dev)
@@ -5546,17 +6135,15 @@ if args.altvis:
         else:
             nxt = int(torch.multinomial(prob, 1).item())
             if nxt == model.end_id:
-                _ticker += ETX_TEXT
+                _tk.end()
                 dff    = model._new_dff(1, _dev)
                 clk    = model._new_writer(1, _dev)
                 _queue = list(_prompt)
                 _b     = _queue.pop(0)
-                _ticker += _ptext
             else:
-                if nxt != model.null_id:
-                    _ticker += _vc(nxt)
+                _tk.add(nxt)
                 _b = nxt
-            _ticker = _ticker[-_VIS_WIN:]
+            _ticker = _tk.text(_VIS_WIN)
 
         plt.pause(max(args.delay, 1e-3))
         if not plt.fignum_exists(_av_fig.number):
@@ -5647,6 +6234,7 @@ if args.vis:
     _queue  = list(_prompt)   # remaining prompt tokens to inject
     _b      = _queue.pop(0)   # current token being injected
     _ticker = _ptext          # ticker-tape display buffer (trailing _VIS_WIN chars)
+    _tk     = _Ticker(_prompt)
     _nstep  = 0
     _rep    = 0               # --datarep: replicas of the current token drawn so far
     _acc    = None            # --gen_pool mean: probabilities pooled across them
@@ -5687,17 +6275,15 @@ if args.vis:
             # --n does not apply here: --vis streams forever, so an episode runs until the
             # model emits END on its own and the next one starts from the prompt again.
             if nxt == model.end_id:
-                _ticker += ETX_TEXT        # mark the episode break in the ticker
+                _tk.end()                  # episode break: <ETX>, then the prompt again
                 dff    = model._new_dff(1, _dev)
                 clk    = model._new_writer(1, _dev)
                 _queue = list(_prompt)     # episode over: reset state, restart prompt
                 _b     = _queue.pop(0)
-                _ticker += _ptext          # new episode opens with <STX> again
             else:
-                if nxt != model.null_id:   # null_id is None outside byte mode
-                    _ticker += _vc(nxt)
+                _tk.add(nxt)
                 _b = nxt
-            _ticker = _ticker[-_VIS_WIN:]  # slide + bound the visible window (ticker tape)
+            _ticker = _tk.text(_VIS_WIN)   # slide + bound the visible window (ticker tape)
 
         if _last:                          # token consumed: start the next one's replicas
             _rep, _acc = 0, None
@@ -5826,6 +6412,16 @@ if args.linout_lr_mult != 1.0:
     _params = _split_group(_params, model.linout, args.linout_lr_mult, 'linout')
 if args.decoder_lr_mult != 1.0:
     _params = _split_group(_params, model.decoder, args.decoder_lr_mult, 'decoder')
+if args.gate_lr_mult != 1.0:
+    # the sigmoid gates, or the plain read gains (--ctx_read_gain) when there are no gates
+    _gm = getattr(model, 'ctx_rgate', None) or getattr(model, 'ctx_rgain', None)
+    if _gm is None:
+        raise SystemExit('--gate_lr_mult needs --ctx_read_gate or --ctx_read_gain')
+    _params = _split_group(_params, _gm, args.gate_lr_mult, 'gate')
+if args.win_lr_mult != 1.0:
+    if getattr(model, 'ctx_logw', None) is None:
+        raise SystemExit('--win_lr_mult needs --ctx_learn_win')
+    _params = _split_group(_params, model.ctx_logw, args.win_lr_mult, 'win')
 
 # Per-layer summary: trainable params and lr, shown when --lr_mult scales the layers. Param
 # counts come from the same grouping as the lr scaling (layer 1 includes tok_embed/text_proj;
@@ -6119,7 +6715,7 @@ def _build_eval_docs(corpus=None):
             if not t.strip() or not _is_heldout(t):
                 continue
             steps, _ = clip_text(t)
-            if len(steps) >= _EVAL_MINLEN:
+            if len(steps) >= _eval_minlen(corpus):
                 docs.append(steps[:_EVAL_MAXLEN])
             if len(docs) >= args.eval_docs:
                 break
@@ -6156,7 +6752,7 @@ def _build_eval_docs(corpus=None):
         if not text.strip():
             continue
         steps, _ = clip_text(text)
-        if len(steps) >= _EVAL_MINLEN:
+        if len(steps) >= _eval_minlen(corpus):
             docs.append(steps[:_EVAL_MAXLEN])
         if len(docs) >= args.eval_docs:
             break
@@ -6173,6 +6769,12 @@ def _heldout_eval(step):
     an eval failure must not take down a training run that is otherwise healthy."""
     for corpus in _eval_corpus_names():
         _heldout_eval_one(step, corpus)
+    for _fn, _on in ((_facts_eval, args.eval_facts), (_chatqa_eval, args.eval_chatqa)):
+        if _on:
+            try:
+                _fn(step)
+            except Exception as e:
+                print(f'WARNING: {_fn.__name__} failed at step {step}: {e!r}', flush=True)
 
 
 def _heldout_eval_one(step, corpus):
@@ -6193,6 +6795,15 @@ def _heldout_eval_one(step, corpus):
 
         for _warm in ((0, args.eval_warm) if args.eval_warm else (0,)):
             _score_and_report(step, corpus, docs, _warm)
+        # the quality evals: each guarded on its own, so one failing cannot cost the others
+        for _fn, _on in ((_recall_eval, args.eval_recall), (_gen_eval, args.eval_gen),
+                         (_info_eval, args.eval_info)):
+            if _on:
+                try:
+                    _fn(step, corpus, docs)
+                except Exception as e:
+                    print(f'WARNING: {_fn.__name__} failed at step {step} on "{corpus}": '
+                          f'{e!r}', flush=True)
     except Exception as e:
         print(f'WARNING: --eval_interval failed at step {step} on "{corpus}": {e!r}; '
               f'disabling THAT CORPUS, others continue', flush=True)
@@ -6232,6 +6843,9 @@ def _score_and_report(step, corpus, docs, warm):
     t0 = time.time()
     per_doc = []                    # mean nats/token for each document, kept separate
     bad_doc = []                    # per document: did ANY token exceed _EVAL_THRESH
+    _band_of = _token_bands(_dev) if (args.eval_bands and not warm) else None
+    _nb = int(_band_of.max()) + 1 if _band_of is not None else 0
+    band_sum, band_cnt = [], []     # per document x band, token-weighted (--eval_bands)
     try:
       with torch.no_grad():
         for c in range(0, len(docs), _EVAL_BATCH):
@@ -6256,9 +6870,18 @@ def _score_and_report(step, corpus, docs, warm):
                     model(P[:, t])
             rs = torch.zeros(B, device=_dev)
             bad = torch.zeros(B, dtype=torch.bool, device=_dev)
+            if _nb:
+                bsum = torch.zeros(B, _nb, device=_dev)
+                bcnt = torch.zeros(B, _nb, device=_dev)
             for t in range(T):
                 logits, _ = model(X[:, t])
                 ce = F.cross_entropy(logits, Y[:, t], reduction='none')
+                if _nb:
+                    _oh = F.one_hot(_band_of[Y[:, t].clamp(max=_band_of.numel() - 1)],
+                                    _nb).float() * M[:, t, None]
+                    bsum += _oh * torch.where(torch.isfinite(ce), ce,
+                                              torch.full_like(ce, 1e30))[:, None]
+                    bcnt += _oh
                 # a diverged row produces inf/nan; map it to a large finite value so it
                 # is counted as runaway instead of poisoning every other row's sum
                 ce = torch.where(torch.isfinite(ce), ce, torch.full_like(ce, 1e30))
@@ -6275,6 +6898,8 @@ def _score_and_report(step, corpus, docs, warm):
             n = M.sum(dim=1).clamp(min=1)
             per_doc.append((rs / n).cpu().numpy())
             bad_doc.append(bad.cpu().numpy())
+            if _nb:
+                band_sum.append(bsum.cpu().numpy()); band_cnt.append(bcnt.cpu().numpy())
     finally:
         model.dff, model.clk = _saved_dff, _saved_clk
         if _was_training:
@@ -6283,6 +6908,12 @@ def _score_and_report(step, corpus, docs, warm):
     per = np.concatenate(per_doc)
     bad = np.concatenate(bad_doc)
     clean = float(per[~bad].mean()) if (~bad).any() else float('nan')
+    # nats per CHARACTER over the clean documents: tokenizer-independent, so runs on
+    # different vocabularies (--tokenizer) can be compared. Each document's total nats
+    # (mean x tokens) over the characters of its decoded text.
+    _nt = np.array([len(d) for d in docs], dtype=np.float64)
+    _nc = np.array([max(1, len(_decode_plain(_doc_tokens(d)))) for d in docs], dtype=np.float64)
+    npc = (float((per * _nt)[~bad].sum() / _nc[~bad].sum()) if (~bad).any() else float('nan'))
     _key = corpus if not warm else f'{corpus}~warm'
     _eval_results[_key] = dict(
         corpus=corpus, step=int(step), clean=clean, median=float(np.median(per)),
@@ -6299,11 +6930,542 @@ def _score_and_report(step, corpus, docs, warm):
                   math.exp(min(clean, 700)) if clean == clean else float('nan'),
                   float(np.median(per)), 100.0 * float(bad.mean()), int(bad.sum()),
                   len(per), time.time() - t0)
+    d += f' nats/char {npc:.4f}'
     if warm:
         d += f' warm {warm}'
     print(d, flush=True)
     with open(args.log, 'a') as f:
         print(d, file=f)
+    if _nb and (~bad).any():
+        # token-weighted over the CLEAN documents, the same set 'clean' averages
+        bs = np.concatenate(band_sum)[~bad].sum(0)
+        bc = np.concatenate(band_cnt)[~bad].sum(0)
+        _edges = [0] + [int(e) for e in args.eval_bands.split(',') if e.strip()]
+        _lbl = [f'r{a}-{b}' for a, b in zip(_edges, _edges[1:])] + [f'r{_edges[-1]}+']
+        parts = ' '.join(f'{l} {bs[k] / bc[k]:.4f} ({100.0 * bc[k] / bc.sum():.0f}%)'
+                         if bc[k] else f'{l} n/a' for k, l in enumerate(_lbl))
+        _eval_results[f'{corpus}~bands'] = dict(zip(_lbl, (bs / np.maximum(bc, 1)).tolist()))
+        _emit(f'EVALB step {step:10} corpus {corpus:8} {parts}')
+
+
+def _emit(line):
+    print(line, flush=True)
+    with open(args.log, 'a') as f:
+        print(line, file=f)
+
+
+_band_cache = {}
+def _token_bands(dev):
+    """[V] long: each token id's --eval_bands band, from its frequency RANK over the
+    held-out text of every --eval_corpora corpus (targets only). Built once. Ids never seen
+    in that text fall in the last (rarest) band. Ranks come from held-out text rather than
+    the training stream because it is already in memory and covers every corpus scored;
+    with ~10^5-10^6 tokens the top few thousand ranks are stable."""
+    if 'b' not in _band_cache:
+        cnt = collections.Counter()
+        for c in _eval_corpus_names():
+            if c not in _eval_docs_cache:
+                _eval_docs_cache[c] = _build_eval_docs(c)
+            for d in _eval_docs_cache[c] or []:
+                cnt.update(y for _, y in d)
+        V = int(model.lmhead.out_features) if hasattr(model.lmhead, 'out_features') else 256
+        V = max(V, max(cnt) + 1 if cnt else 1)
+        edges = [int(e) for e in args.eval_bands.split(',') if e.strip()]
+        band = torch.full((V,), len(edges), dtype=torch.long)
+        for r, (tid, _) in enumerate(cnt.most_common()):
+            band[tid] = sum(r >= e for e in edges)
+        _band_cache['b'] = band
+        print(f'--eval_bands: ranks from {sum(cnt.values())} held-out tokens, '
+              f'{len(cnt)} distinct; edges {edges}', flush=True)
+    return _band_cache['b'].to(dev)
+
+
+def _ce_seqs(seqs):
+    """Teacher-forced per-position loss for a list of token sequences, each from a fresh
+    context (like a document): returns one numpy array per sequence, entry p = loss of
+    predicting seq[p+1] after reading seq[:p+1]. The training context is saved and
+    restored exactly as in _score_and_report."""
+    _dev = next(model.parameters()).device
+    _was_training = model.training
+    _saved_dff, _saved_clk = model.dff, model.clk
+    model.eval()
+    out = []
+    try:
+      with torch.no_grad():
+        for c in range(0, len(seqs), _EVAL_BATCH):
+            chunk = seqs[c:c + _EVAL_BATCH]
+            B = len(chunk); T = max(len(q) for q in chunk) - 1
+            X = torch.zeros((B, T), dtype=torch.long)
+            Y = torch.zeros((B, T), dtype=torch.long)
+            for r, q in enumerate(chunk):
+                X[r, :len(q) - 1] = torch.tensor(q[:-1]); Y[r, :len(q) - 1] = torch.tensor(q[1:])
+            X, Y = X.to(_dev), Y.to(_dev)
+            model.dff = None
+            ce = torch.zeros(B, T, device=_dev)
+            for t in range(T):
+                logits, _ = model(X[:, t])
+                v = F.cross_entropy(logits, Y[:, t], reduction='none')
+                ce[:, t] = torch.where(torch.isfinite(v), v, torch.full_like(v, 30.0)).clamp(max=30.0)
+            ce = ce.cpu().numpy()
+            out += [ce[r, :len(q) - 1] for r, q in enumerate(chunk)]
+    finally:
+        model.dff, model.clk = _saved_dff, _saved_clk
+        if _was_training:
+            model.train()
+    return out
+
+
+def _info_eval(step, corpus, docs):
+    """--eval_info: how much the K --ctx_ema registers overlap, and what each one is worth.
+
+    Pass 1 runs N held-out documents teacher-forced and accumulates, over every valid token
+    and every grid position, the covariance of the K*C register channels (position means
+    removed, so a fixed spatial pattern does not count as shared information). From it:
+      rms      sqrt(mean channel variance) per register -- the slow ones are smaller
+      rank     participation ratio (sum l)^2 / sum l^2 of each register's eigenvalues,
+               1..C: how many dimensions it really uses; 'cat' is the same for the K
+               concatenated after scaling each to equal total variance, against the sum
+      MI ij    Gaussian mutual information, nats, from the canonical correlations of
+               registers i and j: -1/2 sum log(1 - rho^2) (a lower bound on the true MI)
+      rho1     largest canonical correlation, n>.9 how many exceed 0.9
+      TC       total correlation, sum_k logdet S_kk - logdet S
+    Small ridge (1e-4 x mean eigenvalue) on each block keeps the log-dets finite.
+    Then 2^K - 1 more passes read registers as their (per channel and position) mean
+    instead of their value -- the state still evolves -- and report the loss rise d<set>
+    (nats/token, token-weighted) over the unablated base. red ij = d ij - d i - d j: positive
+    when i and j carry the same useful information (each covers for the other)."""
+    if corpus != _eval_corpus_names()[0]:
+        return
+    K = getattr(model, 'n_ctx', 1)
+    if not getattr(model, 'ctx_windows', None) or K < 1 or model.n_dff != 1:
+        return
+    _dev = next(model.parameters()).device
+    t0 = time.time()
+    sel = docs[:args.eval_info]
+    C, S = model.n_hidden, model.S
+    D = K * C
+    _was_training = model.training
+    _saved_dff, _saved_clk = model.dff, model.clk
+    model.eval()
+
+    def _run(stats):
+        tot = torch.zeros((), dtype=torch.float64, device=_dev); ntok = 0
+        if stats:
+            s2 = torch.zeros(D, D, dtype=torch.float64, device=_dev)
+            ps = torch.zeros(S * S, D, dtype=torch.float64, device=_dev)
+            wsum = torch.zeros(K, dtype=torch.float64, device=_dev)
+            gsum = torch.zeros(K, dtype=torch.float64, device=_dev)
+        for c in range(0, len(sel), _EVAL_BATCH):
+            chunk = sel[c:c + _EVAL_BATCH]
+            B = len(chunk); T = max(len(d) for d in chunk)
+            X = torch.zeros((B, T), dtype=torch.long); Y = torch.zeros((B, T), dtype=torch.long)
+            M = torch.zeros((B, T), dtype=torch.bool)
+            for r, st in enumerate(chunk):
+                X[r, :len(st)] = torch.tensor([x for x, _ in st]); M[r, :len(st)] = True
+                Y[r, :len(st)] = torch.tensor([y for _, y in st])
+            X, Y, M = X.to(_dev), Y.to(_dev), M.to(_dev)
+            model.dff = None
+            for t in range(T):
+                logits, _ = model(X[:, t])
+                m = M[:, t]
+                ce = F.cross_entropy(logits, Y[:, t], reduction='none')
+                ce = torch.where(torch.isfinite(ce), ce, torch.full_like(ce, 30.0)).clamp(max=30.0)
+                tot += (ce * m).sum().double(); ntok += int(m.sum())
+                _lw = getattr(model.clk, 'last_win', None)
+                if stats and _lw is not None:
+                    wsum += (_lw.expand(B, -1) * m[:, None]).sum(0).double()
+                _lg = getattr(model, '_last_gate', None)
+                if stats and _lg is not None:
+                    gsum += (_lg * m[:, None]).sum(0).double()
+                if stats and m.any():
+                    z = model.dff[0][m].permute(0, 2, 3, 1).float()      # [b, S, S, D]
+                    ps += z.sum(0).reshape(S * S, D).double()
+                    z = z.reshape(-1, D)
+                    s2 += (z.T @ z).double()
+        out = {'loss': float(tot) / max(ntok, 1), 'ntok': ntok}
+        if stats:
+            mu = ps / max(ntok, 1)                                    # [P, D] position means
+            out['cov'] = s2 / max(ntok * S * S, 1) - mu.T @ mu / (S * S)
+            out['mean'] = mu.float().T.reshape(1, D, S, S)
+            out['win'] = (wsum / max(ntok, 1)).tolist()
+            out['gate'] = (gsum / max(ntok, 1)).tolist()
+        return out
+
+    try:
+      with torch.no_grad():
+        base = _run(True)
+        cov = base['cov']; cov = (cov + cov.T) / 2
+        blk = [cov[i * C:(i + 1) * C, i * C:(i + 1) * C] for i in range(K)]
+        ridge = [1e-4 * float(torch.trace(b)) / C + 1e-30 for b in blk]
+        rms = [math.sqrt(max(float(torch.trace(b)) / C, 0.0)) for b in blk]
+        def _pr(m):
+            l = torch.linalg.eigvalsh(m).clamp(min=0)
+            return float(l.sum() ** 2 / (l.pow(2).sum() + 1e-300))
+        rank = [_pr(b) for b in blk]
+        sc = torch.cat([torch.full((C,), 1.0 / math.sqrt(max(float(torch.trace(b)), 1e-300)),
+                                   dtype=torch.float64, device=_dev) for b in blk])
+        rank_cat = _pr(cov * sc[:, None] * sc[None, :])
+        def _isqrt(m, r):
+            l, v = torch.linalg.eigh(m + r * torch.eye(C, dtype=m.dtype, device=m.device))
+            return (v * l.clamp(min=r).rsqrt()) @ v.T
+        W = [_isqrt(b, r) for b, r in zip(blk, ridge)]
+        mi, rho1, n9 = {}, {}, {}
+        for i in range(K):
+            for j in range(i + 1, K):
+                rho = torch.linalg.svdvals(W[i] @ cov[i * C:(i + 1) * C, j * C:(j + 1) * C] @ W[j])
+                rho = rho.clamp(max=1 - 1e-9)
+                mi[(i, j)] = float(-0.5 * torch.log1p(-rho.pow(2)).sum())
+                rho1[(i, j)] = float(rho[0]); n9[(i, j)] = int((rho > 0.9).sum())
+        rI = torch.cat([torch.full((C,), r, dtype=torch.float64, device=_dev) for r in ridge])
+        ld = lambda m: float(torch.linalg.slogdet(m)[1])
+        # Gaussian total correlation is HALF the log-det gap (as MI is -1/2 sum log(1-rho^2));
+        # before 2026-10-10 15:00 this omitted the 1/2, so older EVALI lines read 2x
+        tc = 0.5 * (sum(ld(b + r * torch.eye(C, dtype=b.dtype, device=_dev)) for b, r in zip(blk, ridge))
+                    - ld(cov + torch.diag(rI)))
+        # ablation passes: every non-empty subset of the K registers read as its mean
+        model._read_mean = base['mean'].to(_dev)
+        dl = {}
+        for r in range(1, K + 1):
+            if K > 3 and 1 < r < K:          # 2^K passes is too many: singles and all only
+                continue
+            for sub in itertools.combinations(range(K), r):
+                model._read_ablate = set(sub)
+                dl[sub] = _run(False)['loss'] - base['loss']
+    finally:
+        model._read_ablate = None; model._read_mean = None
+        model.dff, model.clk = _saved_dff, _saved_clk
+        if _was_training:
+            model.train()
+
+    n = lambda sub: ''.join(str(k + 1) for k in sub)
+    pairs = [(i, j) for i in range(K) for j in range(i + 1, K)]
+    line = (f'EVALI step {step:10} corpus {corpus:8} docs {len(sel)} tokens {base["ntok"]} | '
+            f'win ' + '/'.join(f'{v:.1f}' for v in base['win']) + ' | '
+            + (('gate ' + '/'.join(f'{v:.3f}' for v in base['gate']) + ' | ')
+               if getattr(model, 'ctx_rgate', None) is not None else '') +
+            f'rms ' + '/'.join(f'{v:.4f}' for v in rms) +
+            ' | rank ' + '/'.join(f'{v:.1f}' for v in rank) +
+            (f' cat {rank_cat:.1f} (sum {sum(rank):.1f}) | MI ' +
+             ' '.join(f'{n(p)} {mi[p]:.1f}' for p in pairs) + f' TC {tc:.1f} | rho1 ' +
+             ' '.join(f'{n(p)} {rho1[p]:.3f}' for p in pairs) + ' n>.9 ' +
+             ' '.join(f'{n(p)} {n9[p]}' for p in pairs) if pairs else '') +
+            f' | base {base["loss"]:.4f} d ' +
+            ' '.join(f'{n(sub)} {v:+.4f}' for sub, v in dl.items()) +
+            (' | red ' + ' '.join(f'{n(p)} {dl[p] - dl[(p[0],)] - dl[(p[1],)]:+.4f}'
+                                  for p in pairs if p in dl) if pairs else '') +
+            f' | wall {time.time() - t0:.1f}s')
+    _eval_results[f'{corpus}~info'] = dict(rms=rms, rank=rank, rank_cat=rank_cat,
+                                           mi={n(p): v for p, v in mi.items()}, tc=tc,
+                                           base=base['loss'], d={n(k): v for k, v in dl.items()})
+    _emit(line)
+
+
+def _doc_tokens(d):
+    """A framed eval document as its full token list: <STX> ... <ETX>."""
+    return [x for x, _ in d] + [d[-1][1]]
+
+
+def _recall_eval(step, corpus, docs):
+    """--eval_recall: does reading a span once make it easier to predict when it repeats?
+
+    test     <STX> A filler A      -- the second A follows its own first copy
+    control  <STX> B filler A      -- same length and layout, B a span of another document
+    gain at each gap = loss(second A | control) - loss(second A | test). The control matters:
+    the second copy sits mid-stream after unrelated filler, a harder spot than a document
+    start, so comparing it with the FIRST copy (loss right after <STX>) understates recall
+    and can even read negative. 'first' (A at the start) is still reported for scale.
+    The first token of each A is never scored (nothing could predict it)."""
+    L = args.eval_recall_len
+    gaps = [int(g) for g in args.eval_recall_gaps.split(',') if g.strip()]
+    marks = (_tokenizer.start_id, _tokenizer.end_id)
+    pool = [[t for t in _doc_tokens(d) if t not in marks] for d in docs]
+    idx = [i for i, q in enumerate(pool) if len(q) >= L][:args.eval_recall]
+    if len(idx) < 2:
+        return
+    seqs, meta = [], []
+    for g in gaps:
+        for n_, i in enumerate(idx):
+            A = pool[i][:L]
+            B = pool[idx[(n_ + len(idx) // 2) % len(idx)]][:L]     # another document's span
+            fill, j = [], i
+            while len(fill) < g:                 # filler from the following documents
+                j = (j + 1) % len(pool)
+                if j != i:
+                    fill += pool[j]
+            fill = fill[:g]
+            seqs.append([_tokenizer.start_id] + A + fill + A); meta.append((g, 'test'))
+            seqs.append([_tokenizer.start_id] + B + fill + A); meta.append((g, 'ctrl'))
+    ce = _ce_seqs(seqs)
+    first, second = [], {}
+    for (g, kind), c in zip(meta, ce):
+        s0 = L + g + 1                                    # loss index of the second A[1]
+        second.setdefault((g, kind), []).append(c[s0:s0 + L - 1].mean())
+        if kind == 'test' and g == gaps[0]:
+            first.append(c[1:L].mean())                   # A[1:] at the document start
+    f = float(np.mean(first))
+    res, parts = dict(first=f), []
+    for g in gaps:
+        t_, c_ = float(np.mean(second[(g, 'test')])), float(np.mean(second[(g, 'ctrl')]))
+        res[f'gap{g}'], res[f'gap{g}_ctrl'] = t_, c_
+        parts.append(f'gap{g} {t_:.4f} ctrl {c_:.4f} gain {c_ - t_:+.3f}')
+    _eval_results[f'{corpus}~recall'] = res
+    _emit(f'EVALR step {step:10} corpus {corpus:8} len {L} docs {len(idx)} first {f:.4f} | '
+          + ' | '.join(parts))
+
+
+# ── --eval_facts: reading-comprehension recall ────────────────────────────────
+_FACT_NAMES = ['Maria', 'Tom', 'Anna', 'James', 'Sarah', 'David', 'Laura', 'Peter', 'Emma',
+               'Daniel', 'Lucy', 'Michael', 'Julia', 'Robert', 'Grace', 'Henry', 'Alice',
+               'Frank', 'Helen', 'George', 'Rachel', 'Paul', 'Kate', 'Steven']
+_FACT_QUESTION = {'city': 'Where does {n} live?', 'job': 'What does {n} do for work?',
+                  'color': "What is {n}'s favorite color?", 'animal': 'What pet does {n} have?'}
+_FACT_ATTRS = {
+    'city':   ('{n} lives in {v}.', '{n} lives in',
+               ['Denver', 'Boston', 'Paris', 'London', 'Chicago', 'Seattle', 'Dallas', 'Berlin',
+                'Madrid', 'Tokyo', 'Toronto', 'Sydney', 'Rome', 'Dublin']),
+    'job':    ('{n} works as a {v}.', '{n} works as a',
+               ['nurse', 'baker', 'teacher', 'farmer', 'pilot', 'lawyer', 'doctor', 'driver',
+                'painter', 'chef', 'writer', 'plumber']),
+    'color':  ("{n}'s favorite color is {v}.", "{n}'s favorite color is",
+               ['red', 'blue', 'green', 'yellow', 'purple', 'orange', 'pink', 'brown', 'black',
+                'white']),
+    'animal': ('{n} has a pet {v}.', '{n} has a pet',
+               ['dog', 'cat', 'rabbit', 'horse', 'parrot', 'turtle', 'goat', 'hamster',
+                'snake', 'fish']),
+}
+_facts_items = None
+
+
+def _facts_build(n_items):
+    """Fixed items (seeded): two people, the SAME two attribute types each, all four facts
+    in a shuffled order; the question asks one person about one of the two attributes."""
+    rng = random.Random(4321)
+    items = []
+    for _ in range(n_items):
+        a, b = rng.sample(_FACT_NAMES, 2)
+        kinds = rng.sample(sorted(_FACT_ATTRS), 2)
+        val = {}
+        for k in kinds:
+            va, vb = rng.sample(_FACT_ATTRS[k][2], 2)
+            val[(a, k)], val[(b, k)] = va, vb
+        facts = [_FACT_ATTRS[k][0].format(n=n, v=val[(n, k)]) for n in (a, b) for k in kinds]
+        rng.shuffle(facts)
+        who, k = rng.choice((a, b)), rng.choice(kinds)
+        other = b if who == a else a
+        right, binder = val[(who, k)], val[(other, k)]
+        rest = [v for v in _FACT_ATTRS[k][2] if v not in (right, binder)]
+        cands = [right, binder] + rng.sample(rest, 2)
+        items.append(dict(passage=' '.join(facts), cue=_FACT_ATTRS[k][1].format(n=who),
+                          cands=cands, who=who, kind=k))      # cands[0] is the answer
+    return items
+
+
+def _facts_eval(step):
+    """--eval_facts: accuracy at each gap, plus the no-passage control."""
+    global _facts_items
+    if _facts_items is None:
+        _facts_items = _facts_build(args.eval_facts)
+    gaps = [int(g) for g in args.eval_facts_gaps.split(',') if g.strip()]
+    c0 = _eval_corpus_names()[0]
+    if c0 not in _eval_docs_cache:
+        _eval_docs_cache[c0] = _build_eval_docs(c0)
+    marks = (_tokenizer.start_id, _tokenizer.end_id)
+    pool = [[t for t in _doc_tokens(d) if t not in marks] for d in _eval_docs_cache[c0]]
+    enc = _tokenizer.encode
+    seqs, meta = [], []                  # meta: (condition, item index, candidate index, n)
+    for i, it in enumerate(_facts_items):
+        cue = enc('\n' + it['cue'])
+        cand = [enc(' ' + v) for v in it['cands']]
+        fill_all, j = [], i
+        while len(fill_all) < max(gaps):
+            j = (j + 1) % len(pool)
+            fill_all += pool[j]
+        conds = [(f'gap{g}', [_tokenizer.start_id] + enc(it['passage']) + fill_all[:g])
+                 for g in gaps] + [('nopassage', [_tokenizer.start_id])]
+        for name, pre in conds:
+            for ci, cv in enumerate(cand):
+                seqs.append(pre + cue + cv)
+                meta.append((name, i, ci, len(cv)))
+    ce = _ce_seqs(seqs)
+    score = {}
+    for (name, i, ci, n), c, q in zip(meta, ce, seqs):
+        score.setdefault((name, i), {})[ci] = -float(c[len(q) - 1 - n:len(q) - 1].sum())
+    names = [f'gap{g}' for g in gaps] + ['nopassage']
+    res, parts = {}, []
+    for name in names:
+        acc = bind = 0
+        for i in range(len(_facts_items)):
+            sc = score[(name, i)]
+            best = max(sc, key=sc.get)
+            acc += best == 0
+            bind += best == 1
+        n_ = len(_facts_items)
+        res[name] = 100.0 * acc / n_
+        parts.append(f'{name} {100.0 * acc / n_:.1f}% (binder {100.0 * bind / n_:.0f}%)')
+    _eval_results['facts'] = res
+    _emit(f'EVALF step {step:10} items {len(_facts_items)} chance 25% | ' + ' | '.join(parts))
+
+
+_chatqa_items = None
+
+
+def _chatqa_build(limit):
+    """-> {part: [(prompt_text, [answer_text, ...], gold, norm)]}, built once.
+    prompt_text ends with 'Assistant:'; answers start with a space. norm: score by mean
+    per-token log-probability (PIQA/COPA answers differ in length) instead of the sum."""
+    from datasets import load_dataset
+    global _facts_items
+    if _facts_items is None:
+        _facts_items = _facts_build(args.eval_facts or 200)
+    out = {'facts': [], 'facts_nop': [], 'piqa': [], 'copa': []}
+    for it in _facts_items:
+        q = _FACT_QUESTION[it['kind']].format(n=it['who'])
+        ans = [f" {it['cue']} {v}." for v in it['cands']]
+        out['facts'].append((f"User: {it['passage']} {q}\n\nAssistant:", ans, 0, False))
+        out['facts_nop'].append((f"User: {q}\n\nAssistant:", ans, 0, False))
+    for ex in load_dataset('baber/piqa', split='validation'):
+        out['piqa'].append((f"User: {ex['goal']}\n\nAssistant:",
+                            [' ' + ex['sol1'], ' ' + ex['sol2']], int(ex['label']), True))
+        if limit and len(out['piqa']) >= limit:
+            break
+    for ex in load_dataset('pkavumba/balanced-copa', split='test'):
+        q = {'cause': 'What was the cause?', 'effect': 'What happened as a result?'}[ex['question']]
+        out['copa'].append((f"User: {ex['premise']} {q}\n\nAssistant:",
+                            [' ' + ex['choice1'], ' ' + ex['choice2']], int(ex['label']), True))
+        if limit and len(out['copa']) >= limit:
+            break
+    return out
+
+
+def _chatqa_eval(step):
+    """--eval_chatqa: chat-format multiple choice, one EVALQ line."""
+    global _chatqa_items
+    if _chatqa_items is None:
+        _chatqa_items = _chatqa_build(args.eval_chatqa)
+    enc = _tokenizer.encode
+    seqs, meta = [], []
+    for part, items in _chatqa_items.items():
+        for i, (ptxt, ans, gold, norm) in enumerate(items):
+            pre = [_tokenizer.start_id] + enc(ptxt)
+            for ci, a in enumerate(ans):
+                av = enc(a)
+                seqs.append(pre + av)
+                meta.append((part, i, ci, len(av)))
+    ce = _ce_seqs(seqs)
+    score = {}
+    for (part, i, ci, n), c, q in zip(meta, ce, seqs):
+        lp = -float(c[len(q) - 1 - n:len(q) - 1].sum())
+        score.setdefault((part, i), {})[ci] = (lp, lp / max(n, 1))
+    res, parts = {}, []
+    for part, items in _chatqa_items.items():
+        acc = acc_n = bind = 0
+        for i, (_, ans, gold, norm) in enumerate(items):
+            sc = score[(part, i)]
+            b_sum = max(sc, key=lambda k: sc[k][0])
+            b_avg = max(sc, key=lambda k: sc[k][1])
+            acc += b_sum == gold
+            acc_n += b_avg == gold
+            bind += b_sum == 1
+        n_ = max(len(items), 1)
+        if part.startswith('facts'):
+            res[part] = 100.0 * acc / n_
+            parts.append(f'{part} {100.0 * acc / n_:.1f}% (binder {100.0 * bind / n_:.0f}%)')
+        else:
+            res[part] = 100.0 * acc_n / n_
+            parts.append(f'{part} acc {100.0 * acc / n_:.1f}% norm {100.0 * acc_n / n_:.1f}% n {n_}')
+    _eval_results['chatqa'] = res
+    _emit(f'EVALQ step {step:10} chance facts 25% piqa/copa 50% | ' + ' | '.join(parts))
+
+
+class _Judge:
+    """--eval_gen: a frozen judge LM on the CPU scoring a continuation GIVEN its prompt."""
+    def __init__(self, repo):
+        from transformers import AutoTokenizer, AutoModelForCausalLM
+        self.tok = AutoTokenizer.from_pretrained(repo)
+        self.lm = AutoModelForCausalLM.from_pretrained(repo).to('cpu').eval()
+        print(f'--eval_gen: judge {repo} loaded on cpu', flush=True)
+
+    @torch.no_grad()
+    def cond_nll(self, prompt, cont):
+        """Mean nats/token of `cont` after `prompt` (prompt tokens not scored)."""
+        p = self.tok(prompt).input_ids
+        full = self.tok(prompt + cont, truncation=True, max_length=1024).input_ids
+        if len(full) - len(p) < 2:
+            return None
+        lab = torch.tensor([full])
+        lab[0, :len(p)] = -100
+        v = float(self.lm(torch.tensor([full]), labels=lab).loss)
+        return v if math.isfinite(v) else None
+
+
+_judge = None
+_gen_anchor = {}         # corpus -> (prompts, real nats, shuffled nats), computed once
+
+
+def _rep_stats(text):
+    """rep1 (as GENSCORE: max of word- and char-level top-share) and distinct-2."""
+    w = text.split()
+    ch = [c for c in text if not c.isspace()]
+    rep1 = max(max(collections.Counter(w).values()) / len(w) if w else 0.0,
+               max(collections.Counter(ch).values()) / len(ch) if ch else 0.0)
+    bg = list(zip(w, w[1:]))
+    d2 = len(set(bg)) / len(bg) if bg else 0.0
+    return rep1, d2
+
+
+def _gen_eval(step, corpus, docs):
+    """--eval_gen: prompted continuations scored by the judge against matched anchors."""
+    global _judge
+    if _judge is None:
+        _judge = _Judge(args.eval_gen_judge)
+    P, C = args.eval_gen_prompt, args.eval_gen_len
+    if corpus not in _gen_anchor:
+        rng = random.Random(1234)
+        items = []
+        for d in docs:
+            q = _doc_tokens(d)
+            if len(q) < 1 + P + C:
+                continue
+            prompt = q[:1 + P]
+            ptxt = _decode_plain(prompt)
+            real = _decode_plain(q[1 + P:1 + P + C])
+            sw = real.split(); rng.shuffle(sw)
+            a, b = _judge.cond_nll(ptxt, real), _judge.cond_nll(ptxt, ' ' + ' '.join(sw))
+            if a is not None and b is not None:
+                items.append((prompt, ptxt, a, b))
+            if len(items) >= args.eval_gen:
+                break
+        _gen_anchor[corpus] = items
+    items = _gen_anchor[corpus]
+    if not items:
+        return
+    _was_training = model.training
+    g_n, r_n, s_n, reps, d2s = [], [], [], [], []
+    try:
+        with torch.random.fork_rng(devices=[next(model.parameters()).device]
+                                   if next(model.parameters()).is_cuda else []):
+            for prompt, ptxt, a, b in items:
+                out = model.generate(prompt, C, temperature=args.temperature)
+                if _tokenizer.end_id in out:              # one continuation, not a new doc
+                    out = out[:out.index(_tokenizer.end_id)]
+                ctxt = _decode_plain(out)
+                n = _judge.cond_nll(ptxt, ctxt) if ctxt.strip() else None
+                if n is None:
+                    continue
+                r1, d2 = _rep_stats(ctxt)
+                g_n.append(n); r_n.append(a); s_n.append(b); reps.append(r1); d2s.append(d2)
+    finally:
+        if _was_training:
+            model.train()
+    if not g_n:
+        return
+    g, r, s_ = float(np.mean(g_n)), float(np.mean(r_n)), float(np.mean(s_n))
+    flu = 100.0 * (s_ - g) / (s_ - r) if s_ > r else float('nan')
+    _eval_results[f'{corpus}~gen'] = dict(nats=g, real=r, shuf=s_, fluency=flu,
+                                          rep1=float(np.mean(reps)), distinct2=float(np.mean(d2s)))
+    _emit(f'EVALG step {step:10} corpus {corpus:8} prompts {len(g_n)} nats {g:.4f} '
+          f'real {r:.4f} shuf {s_:.4f} fluency {flu:.1f}% rep1 {np.mean(reps):.3f} '
+          f'distinct2 {np.mean(d2s):.3f}')
 
 
 # ── zero-shot multiple-choice reasoning eval (--reason_eval) ──────────────────
@@ -6327,7 +7489,18 @@ _REASON_BENCH = {
     'arc_chal':   ('allenai/ai2_arc', 'ARC-Challenge', 'validation'),
     'obqa':       ('allenai/openbookqa', 'main', 'validation'),
     'winogrande': ('allenai/winogrande', 'winogrande_xs', 'validation'),
+    # everyday common sense, with headroom for small models (lm-eval-harness formats):
+    'piqa':       ('baber/piqa', None, 'validation'),           # physical, 2-way, 1838 items
+    'hellaswag':  ('Rowan/hellaswag', None, 'validation'),      # scene continuation, 4-way
+    'copa':       ('pkavumba/balanced-copa', None, 'test'),     # cause/effect, 2-way, 500
 }
+
+
+def _hs_clean(t):
+    """HellaSwag's WikiHow text carries [title]/[step] markup; strip it as lm-eval does."""
+    t = t.strip().replace(' [title]', '. ')
+    t = re.sub(r'\[.*?\]', '', t)
+    return t.replace('  ', ' ')
 
 
 def _mc_items(bench, limit=0):
@@ -6349,6 +7522,19 @@ def _mc_items(bench, limit=0):
             cands = [pre + ex['option1'], pre + ex['option2']]
             # context differs per candidate here, so carry the pair and score `post`
             out.append((cands, [post, post], int(ex['answer']) - 1))
+        elif bench == 'piqa':
+            out.append((f"Question: {ex['goal']}\nAnswer:",
+                        [' ' + ex['sol1'], ' ' + ex['sol2']], int(ex['label'])))
+        elif bench == 'hellaswag':
+            ctx = ex['ctx_a'] + ' ' + ex['ctx_b'].capitalize()
+            out.append((_hs_clean(ex['activity_label'] + ': ' + ctx),
+                        [' ' + _hs_clean(e) for e in ex['endings']], int(ex['label'])))
+        elif bench == 'copa':
+            # "The man turned on the faucet therefore water flowed from the spout."
+            conn = {'cause': 'because', 'effect': 'therefore'}[ex['question']]
+            low = lambda c: c[0].lower() + c[1:]
+            out.append((ex['premise'].rstrip('.') + ' ' + conn,
+                        [' ' + low(ex['choice1']), ' ' + low(ex['choice2'])], int(ex['label'])))
         else:
             q = ex.get('question') or ex.get('question_stem') or ''
             ch = ex['choices']
@@ -6753,13 +7939,33 @@ try:
                                  else ('epoch', _epoch_num()))
             s = ('STEP {:10} wall {} loss {:12.9f} grad {:12.6f} '
                  'lr {:10.9f} dff_mean {:12.5f} dff_std {:12.5f} dff_max {:11.3f} '
-                 'dff_zeros {:8.5f} batch {:6d} examples {:12d} {} {:10.3f}').format(
+                 'batch {:6d} examples {:12d} {} {:10.3f}').format(
                 i, datetime.datetime.now(),
                 np.mean(larr[-args.monitor:]),
                 np.mean(garr[-args.monitor:]),
                 optimizer.param_groups[0]['lr'],
-                _dmean, _dstd, _dmax, _dzero, args.batch, n_examples, _ep_name, _ep_val,
+                _dmean, _dstd, _dmax, args.batch, n_examples, _ep_name, _ep_val,
             )
+            # --ctx_ema: effective window (1/rate) of each register at this step's write,
+            # mean and spread over the batch rows (rows sit at different document positions)
+            _lg = getattr(model, '_last_gate', None)
+            if _lg is not None:   # compact: '.489' -- a gate is in (0, 1)
+                _f = lambda v: f'{v:.3f}'.lstrip('0') or '0'
+                s += ' gate ' + '/'.join(_f(v) for v in _lg.float().mean(0).tolist())
+                s += ' sd ' + '/'.join(_f(v) for v in _lg.float().std(0).tolist())
+            # win only when the rates actually move (--ctx_warm/--ctx_adapt); fixed rates
+            # would print the --ctx_ema windows every line
+            _lw = (getattr(model.clk, 'last_win', None)
+                   if model.clk is not None and (getattr(args, 'ctx_warm', False)
+                                                 or getattr(args, 'ctx_adapt', False)
+                                                 or getattr(args, 'ctx_learn_win', False)) else None)
+            if _lw is not None:
+                _lw = _lw.float().expand(-1, _lw.shape[1])
+                # one named column per register (win1, win2, ...) so chart.py can plot them;
+                # fixed width (windows run 0.5..4096) so the columns do not jitter as they move
+                s += ''.join(f' win{k + 1} {v:6.1f}' for k, v in enumerate(_lw.mean(0).tolist()))
+                if _lw.shape[0] > 1:      # per-row rates only (--ctx_warm/--ctx_adapt)
+                    s += ''.join(f' sd{k + 1} {v:.1f}' for k, v in enumerate(_lw.std(0).tolist()))
             # appended only when clipping is on, so logs from non-clip runs stay byte-identical
             # (chart.py looks fields up by name and defaults a missing one to 0.0)
             if args.clip > 0:

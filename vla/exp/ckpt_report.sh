@@ -3,7 +3,7 @@
 M=$1; L=log/exp.$M
 echo "=== $M @ $(grep -a '^TEXT step' $L | tail -1 | awk '{print $3}') steps  ($(date +%H:%M))"
 echo "-- loss / gradient / state (every 1000 steps):"
-grep '^STEP' $L | awk '$2%1000==0 {printf "   step %6d  loss %7.4f  grad %7.3f  dff_std %6.3f  dff_max %9.1f  dff_zeros %6.4f\n",$2,$7,$9,$15,$17,$19}'
+grep '^STEP' $L | awk '$2%1000==0 {printf "   step %6d  loss %7.4f  grad %7.3f  dff_std %6.3f  dff_max %9.1f\n",$2,$7,$9,$15,$17}'
 echo "-- last 10 monitor lines: mean loss / slope"
 grep '^STEP' $L | tail -10 | awk '{s+=$7; n++} END {printf "   mean(last10) %.4f  (openwebtext unigram floor 7.549)\n", s/n}'
 echo "-- free-running generation health (3 fresh samples; cycle>0.6 = degenerate):"

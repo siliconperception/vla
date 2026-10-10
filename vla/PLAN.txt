@@ -1,5 +1,99 @@
 ============================================================================
-              SESSION HANDOFF -- 2026-09-12, read this first
+              SESSION HANDOFF -- 2026-10-10, read this first
+============================================================================
+
+STATE AT HANDOFF
+  v364 was running (3 registers, step ~12K) when the session ended for an OS /
+  NVIDIA driver upgrade; the reboot kills it.  NEXT: a LONG RUN of either
+    v363  2 registers   (best fineweb-edu held-out so far, see table)
+    v364  3 registers   (only reached 12K; windows 3.1 / 1.1 / 2.3 at 12K)
+  Exact command lines are in ./doit (search the mnemonic).  To resume a run from
+  its checkpoint, relaunch the SAME longrun line: exp/longrun.sh resumes from
+  checkpoint/<mnemonic>.pt.  For a fresh start under the same name, move the
+  old log/exp.<m>, log/longrun.<m>.*, checkpoint/<m>.pt aside first.
+  Launch pattern:  setsid nohup ./exp/launch.sh exp/longrun.sh <m> 40000000 40
+                   -- <flags> >> log/longrun.<m>.nohup 2>&1 < /dev/null &
+  Stop pattern: kill the driver's PROCESS GROUP (kill -- -<pgid> of
+  exp/.run/longrun.*.sh), never pkill -f with a pattern your own shell matches.
+
+CURRENT ARCHITECTURE (v363 = v364 minus one register)
+  token (pythia-31m, frozen 50304x256 embed/lmhead) -> replicate 8x8 ->
+  concat [token grid, DFF_1..K reads] -> ctx_cat 1x1 -> 384 ->
+  ContextCNN 8 x (conv3x3+BN+ReLU, 384) -> linout 1x1 -> 512 = x ->
+    decoder: linear unpadded 3x3 tree 8->6->4->2 + avgpool -> lmhead
+    registers (each 512x8x8, reset to 0 at <STX>, blend from 0):
+      DFF_1 <- EMA(x, rate a1);  DFF_k <- EMA(x - DFF_{k-1}[t], rate ak)  (--ctx_resid)
+      rates LEARNED: a = 2*sigmoid(phi), free in (0, 2), init a=1 (--ctx_win_param rate2)
+      read side: each register RMS-normalized to 0.015 per row (--ctx_read_norm 0.015)
+  13.7-13.9M trainable, ~28-31 steps/s.  Data: --dataset smolfwedu --shards 1.
+  Key flags: --ctx_ema 1,1[,1] --ctx_resid --ctx_read_norm 0.015 --ctx_learn_win
+             --ctx_win_param rate2 --ctx_cat_in --ctx_cat_narrow --no_text_proj
+             --n_hidden 512 --c_context 384 --depth 8 --eval_info 100
+
+WHAT WAS MEASURED (v340-v364, 2026-10-09/10)
+  Tokenizer (stories+15% chat): ss4k (4K WordPiece) best story fluency; char-level
+  one-hot (v342) 0.17 nats/char behind ss4k at matched text; pythia kept.
+  Benchmarks (PIQA/HellaSwag/COPA/EVALF/EVALQ) at chance for EVERY design: they
+  were dropped from the default eval set (only EVAL/EVALB/EVALI/GEN remain).
+
+  Register experiments on SimpleStories (held-out nats/token at 20K / 40K):
+    v346 resid cascade 16/64/256 ............. 3.600 / 3.330   baseline
+    v347 + warm-up (bias-corrected) rates ..... 3.809 / 3.449   worse
+    v348 + closed-form Kalman rates ........... 4.083           pinned at clamps
+                                                                in train, moved in eval
+    v350 + learned sigmoid read gates (x100) .. 3.478           gates = fixed scales
+    v351 + RMS read norm (no params) .......... 3.497 / 3.323   = v350 at full speed
+    v353 + learned windows from 2,2,2 (x100) .. 3.360 / 3.151   BEST; windows went to
+                                                                ~260 / ~20 / 1 (slow-first)
+  Why read norm works: registers differ ~6x in rms, and SGD trains each ctx_cat
+  block in proportion to its input size; equal-size reads rebalance it.  Removing
+  it (v362) cost +0.22 held-out at 20K.
+
+  Register count on fineweb-edu (held-out at 20K / 40K, train 15-20K):
+    v356 3 regs, windows lr 1x ........ 5.700 /       5.481   windows 5.6/1.3/3.5 (1&3 duplicate)
+    v357 2 regs, windows lr 1x ........ 5.782 /       5.495   8.9/1.2
+    v358 1 reg,  window from 2 ........ 5.743 / 5.566 5.543   1.3
+    v359 1 reg,  window from 1 (clamp). 5.806 /       5.620   STUCK at 1 (clamp kills grad)
+    v361 1 reg,  rate2 from 1 ......... 5.744 /       5.569   1.3-1.4
+    v363 2 regs, rate2 from 1 ......... 5.702 / 5.537 5.543   6.3->7.5 / 1.1-1.2   BEST
+  - One register settles at window ~1.3 (a recurrent state with slight smoothing)
+    from either side; a pure copy (1.0) is 0.06-0.09 worse.
+  - A second, slower register helps a little; a third added nothing at 1x.
+  - W1 ~250 on stories did NOT track document length (fineweb-edu docs ~940
+    tokens gave the same ~250 at x100): likely an artifact of the one-step
+    lookahead gradient / lr noise, not the data.  UNTESTED: whether a genuinely
+    long window pays off on web text (x1 windows never got past ~9).
+
+NEW THIS SESSION (all in _ARCH_ARGS where they change the model)
+  --ctx_resid            register k fed x - register k-1 (residual cascade)
+  --ctx_read_norm S      RMS-normalize each register read to S
+  --ctx_learn_win        trainable windows via one-step lookahead gradient
+                         (read r + (a - a.detach())*e_last: exact d loss_t+1/da)
+  --ctx_win_param clamp|exp1|rate2   window parameterization; USE rate2
+  --win_lr_mult M        lr multiplier for the window parameters
+  --ctx_warm / --ctx_adapt[_range/_win] / --ctx_every N,..   tried, not adopted
+  --ctx_read_gate, --gate_lr_mult    sigmoid read gates (slow, superseded by norm)
+  --eval_info N          EVALI line: per-register rms, effective rank, CCA MI,
+                         total correlation, loss rise when each register / pair /
+                         all are read as their mean.  K>3: singles + all only.
+                         (TC was 2x too large before 2026-10-10 15:00.)
+  STEP line: win1 win2 ... (learned windows), gate ...; dff_zeros column removed.
+  chart.py: plots EVAL clean loss on panel 1 and a log-scale window panel when
+  the log has win1.. columns.
+  Diagrams: vla_v330/v334/v344/v346/v353.svg (generators were in the session
+  scratchpad, not kept).
+
+OPEN QUESTIONS / NEXT
+  1. Long run: v363 or v364 (user's choice).
+  2. Does a long slow window help on web text?  Try 2 regs with W1 fixed 256
+     (or rate2 init 1/256 at x100) + W2 learned.
+  3. Window-override eval curve (loss vs W1 on a trained checkpoint) to tell a
+     plateau from a real optimum -- proposed, never run.
+  4. Binding/recall evals stayed at chance; an explicit item memory is the
+     untried architectural lever.
+
+============================================================================
+          SESSION HANDOFF -- 2026-09-12 (superseded by 2026-10-10 above)
 ============================================================================
 
 RUNNING NOW

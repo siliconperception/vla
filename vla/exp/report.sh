@@ -13,7 +13,7 @@ echo "--------------------------------------------------------------------------
 # Read from the log's ARGS line, which vla.py writes AFTER resolving a None seed to a real one.
 echo "  seed $(grep -ao 'seed=[0-9]*' $L | head -1 | cut -d= -f2)   dataset $(grep -ao "dataset='[a-z0-9_]*'" $L | head -1 | cut -d\' -f2)"
 echo "loss/grad/state:"
-grep '^STEP' $L | awk -v s=$S '$2%5000==0 {printf "  step %6d  loss %7.4f  grad %6.3f  dff_std %6.3f  dff_max %8.1f  dff_zeros %6.4f\n",$2,$7,$9,$15,$17,$19}'
+grep '^STEP' $L | awk -v s=$S '$2%5000==0 {printf "  step %6d  loss %7.4f  grad %6.3f  dff_std %6.3f  dff_max %8.1f\n",$2,$7,$9,$15,$17}'
 grep '^STEP' $L | tail -10 | awk '{t+=$7;n++} END {printf "  mean(last10) %.4f   tokens %.2f M   (unigram floor 7.549)\n",t/n,'"$S"'*250/1e6}'
 # in-training held-out eval (--eval_interval), which vla.py now writes into the log at the
 # checkpoint cadence. Printed here so a PLAN.txt row carries its own held-out number instead
