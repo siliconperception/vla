@@ -34,7 +34,7 @@ print(f'{"tok":>4} {"dff_max":>11} {"dff_std":>8}  emitted')
 with torch.no_grad():
     for t in range(n):
         bi = torch.tensor([b], dtype=torch.long, device='cuda')
-        tg = m.tok_embed(bi).view(1, m.c_text, 1, 1).expand(-1, -1, m.S, m.S)
+        tg = m._tok_grid(bi)
         stack, ctx = m._layers(dff, tg, clk)
         dff = [d.detach().clone() for d in stack]
         logits = m.readout(m.decoder(ctx))

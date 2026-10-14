@@ -802,6 +802,14 @@ parser.add_argument('--ctx_cat_in',    default=False, action='store_true',
                          'the feedback add altogether. Starts as [I, I, ..., I] (the plain sum), '
                          'so every source -- input and each timescale -- gets its own trained '
                          'read. Implies --ctx_cat. Restored from a checkpoint.')
+parser.add_argument('--ctx_cat_spatial', default=False, action='store_true',
+                    help='with --ctx_cat_in: concatenate [input, DFF1, DFF2, DFF3] SPATIALLY '
+                         'instead of along channels. Every grid cell becomes a 2x2 group '
+                         '[input, DFF1; DFF2, DFF3] at n_hidden depth, so SxS -> 2Sx2S, read by '
+                         'S/2 unpadded (3x3 conv + BN + ReLU) blocks that take 2S back to S '
+                         '(8: 16 -> 14 -> 12 -> 10 -> 8) and end at the ctx_cat width. Needs '
+                         'exactly 3 --ctx_ema registers and an n_hidden-wide input (text_proj '
+                         'on, i.e. no --no_text_proj). Restored from a checkpoint.')
 parser.add_argument('--ctx_cat_kernel', default=1, type=int, metavar='K',
                     help='kernel size of the --ctx_cat/--ctx_cat_in conv (odd; default 1). '
                          'K=3 reads each source over a 3x3 neighbourhood; the identity init '
@@ -865,6 +873,25 @@ parser.add_argument('--ctx_read_norm', default=0.0, type=float, metavar='S',
                          'channels and grid), so the K registers enter ctx_cat at equal size '
                          'whatever their own scale -- what v350\'s learned gates converged to '
                          '(each register read at ~0.015). No parameters. 0 = off.')
+parser.add_argument('--ctx_read_norm_mode', default='row', choices=['row', 'running'],
+                    help='how --ctx_read_norm measures each register\'s RMS. row (default): per '
+                         'batch row, every step. running: one scale per register, a running '
+                         'average (momentum 0.01) of the batch RMS kept in a buffer and updated '
+                         'in training only, BatchNorm-style -- a fixed constant at inference '
+                         'that folds into ctx_cat\'s weights (no reduction, no rsqrt). '
+                         'Restored from a checkpoint.')
+parser.add_argument('--tok_norm', default=False, action='store_true',
+                    help='RMS-normalize each token embedding to 1 (over its c_text channels) '
+                         'before it is replicated to the grid. With --ctx_read_norm 1 the token '
+                         'and every register read enter ctx_cat at unit RMS. The embedding is '
+                         'frozen, so this is a fixed per-token rescale (pythia31m rows: rms '
+                         '0.030-0.032) that folds into the embedding ROM.')
+parser.add_argument('--tok_gain', default=1.0, type=float, metavar='G',
+                    help='fixed multiplier on the token grid (after text_proj, before the '
+                         'feedback add/concat). The frozen pythia31m embedding has rms ~0.031 '
+                         'while unnormalized registers sit at ~0.15-0.4, so with '
+                         '--ctx_read_norm off a gain ~10 puts the token at the registers\' '
+                         'level. A constant: folds into the embedding ROM. 1 (default) = off.')
 parser.add_argument('--ctx_learn_win', action='store_true',
                     help='--ctx_ema windows as trainable parameters (one log-window per register, '
                          'starting at the --ctx_ema values). The registers are detached, so the '
@@ -930,6 +957,14 @@ parser.add_argument('--ctx_resid',     action='store_true',
                          'residual cascade meant to cut the overlap between the K windows: '
                          'register k no longer holds a smoothed copy of what k-1 already '
                          'holds. Needs --ctx_mix none (one shared output). See --eval_info.')
+parser.add_argument('--ctx_resid_mode', default='prev', choices=['prev', 'sum'],
+                    help='--ctx_resid input to register k (k > 1): "prev" (default, every run '
+                         'before this flag) = x - register k-1; "sum" = x - (registers 1..k-1), '
+                         'a true residual decomposition (Laplacian-pyramid style): each register '
+                         'holds only what ALL slower registers missed, and with a W=1 last '
+                         'register the K registers sum exactly to x. "prev" flips sign every '
+                         'stage, so register k+2 sees roughly what k saw (v392/v393 EVALI: '
+                         'canonical correlation ~0.99 between registers 1-3, 3-5, ...).')
 parser.add_argument('--ctx_chain',     action='store_true',
                     help='--ctx_ema registers in SERIES (a clocked shift-register chain): '
                          'register 1 blends toward the layer output, register k toward register '
@@ -1305,6 +1340,18 @@ parser.add_argument('--momentum',      default=0.0,   type=float,
                     help='momentum (--opt sgd/rmsprop; the fallback for adamw beta2 when '
                          '--beta2 is unset, kept for compatibility with runs and '
                          'checkpoints that predate --beta2; ignored by rprop/adagrad)')
+parser.add_argument('--rms_alpha',     default=0.99,  type=float, metavar='DECAY',
+                    help='--opt rmsprop squared-gradient EMA decay (torch default 0.99): the '
+                         'per-weight step-size normalizer averages ~1/(1-alpha) steps, so 0.99 '
+                         'is ~100 steps and 0.999 ~1000')
+parser.add_argument('--rms_eps',       default=1e-8,  type=float, metavar='EPS',
+                    help='--opt rmsprop denominator epsilon (torch default 1e-8). Per-weight '
+                         'gradient rms is ~3e-3 here, so 1e-8 is inert; a value near that rms '
+                         'damps steps for weights with tiny gradients (SGD-like below it)')
+parser.add_argument('--rms_centered',  default=True,  action=argparse.BooleanOptionalAction,
+                    help='--opt rmsprop centered (default, as every rmsprop run so far): '
+                         'normalize by the gradient VARIANCE (second moment minus squared mean) '
+                         'rather than the raw second moment. --no-rms_centered is plain RMSprop')
 parser.add_argument('--beta1',         default=None,  type=float, metavar='DECAY',
                     help='--opt adamw first-moment (gradient EMA) decay. Default 0.9. The '
                          'averaging window is ~1/(1-beta1) steps, so 0.9 averages ~10 '
@@ -1504,6 +1551,18 @@ parser.add_argument('--eval_info',     default=0,     type=int, metavar='N',
                          'held-out loss rise when each register / pair / all are read as their '
                          'mean instead (unique vs shared predictive information).')
 parser.add_argument('--eval_recall_gaps', default='0,64,256', metavar='G1,G2,...')
+parser.add_argument('--eval_reach',    default=0,     type=int, metavar='N',
+                    help='context-reach eval at every cold EVAL, on N spliced rows per corpus '
+                         '(0 = off); exp/reach.py\'s splice probe, in the trainer. Each row is '
+                         '4 chunks of --eval_reach_period tokens cut from random held-out '
+                         'documents, with ONE state reset at the row start, so at offset c into '
+                         'chunks 2-4 the state is warm but only c of the tokens read belong to '
+                         'the current document. excess(c) = loss there minus the loss of the '
+                         'SAME token with its full document history. excess > 0 at offset c '
+                         'means the model uses history older than c tokens; where it falls to '
+                         '~0 is the reach. Prints an EVALX line: excess per log-spaced offset '
+                         'bucket, its mean, and tail64 (mean over c >= 64).')
+parser.add_argument('--eval_reach_period', default=256, type=int, metavar='P')
 parser.add_argument('--eval_facts',    default=0,     type=int, metavar='N',
                     help='human-style reading-comprehension recall at every cold EVAL (0 = off): '
                          'N fixed items. Each item is a short passage of simple facts about TWO '
@@ -1676,6 +1735,22 @@ def _cli_given(argv=None):
 
 _CLI_GIVEN = _cli_given()
 
+# The DEFAULT EVAL SUITE for fineweb-edu runs (2026-10-11): held-out loss on fineweb-edu
+# alone (SimpleStories dropped), the register-overlap EVALI, a deep prompted-fluency EVALG
+# (50 held-out prompts of 128 tokens, 128-token continuations, judged by Qwen2.5-1.5B), and
+# the context-reach EVALX. Applied to single-corpus --dataset smolfwedu runs, each entry
+# only where the flag was not typed, so any of them can still be overridden or turned off.
+_FWEDU_SUITE = dict(eval_corpora='smolfwedu', eval_docs=100, eval_info=100,
+                    eval_gen=50, eval_gen_prompt=128, eval_gen_len=128,
+                    eval_gen_judge='Qwen/Qwen2.5-1.5B', eval_reach=100)
+if args.dataset == 'smolfwedu' and not args.mix:
+    _suite = {k: v for k, v in _FWEDU_SUITE.items() if k not in _CLI_GIVEN}
+    for k, v in _suite.items():
+        setattr(args, k, v)
+    if _suite:
+        print('fwedu eval suite: ' + ' '.join(f'--{k} {v}' for k, v in _suite.items()),
+              flush=True)
+
 # ── multi-dataset mix ─────────────────────────────────────────────────────────
 
 def _parse_mix(spec):
@@ -1780,8 +1855,8 @@ if _N_VOCAB:
 _ARCH_ARGS = ('context', 'n_hidden', 'c_context', 'c_text', 'n_layers', 'depth', 'kernel',
               'tokenizer', 'head_norm', 'ema', 'ema_ladder', 'qproj',
               'tap', 'linout', 'linout_kernel', 'dff_every', 'ctx_ema', 'linin', 'ctx_mix',
-              'dff_write_scale', 'ctx_read_gain', 'ctx_first', 'ctx_cat', 'ctx_cat_in',
-              'no_text_proj', 'ctx_cat_kernel', 'dec_depth', 'dec_width', 'dec_kernel', 'dec_tree', 'dec_tree_linear', 'dec_tree_kernels', 'dec_tree_pool', 'ctx_cat_narrow', 'ctx_chain', 'ctx_resid', 'ctx_warm', 'ctx_adapt', 'ctx_adapt_range', 'ctx_adapt_win', 'ctx_read_gate', 'ctx_read_norm', 'ctx_learn_win', 'ctx_win_param', 'ctx_every', 'char_onehot',
+              'dff_write_scale', 'ctx_read_gain', 'ctx_first', 'ctx_cat', 'ctx_cat_in', 'ctx_cat_spatial',
+              'no_text_proj', 'ctx_cat_kernel', 'dec_depth', 'dec_width', 'dec_kernel', 'dec_tree', 'dec_tree_linear', 'dec_tree_kernels', 'dec_tree_pool', 'ctx_cat_narrow', 'ctx_chain', 'ctx_resid', 'ctx_resid_mode', 'ctx_warm', 'ctx_adapt', 'ctx_adapt_range', 'ctx_adapt_win', 'ctx_read_gate', 'ctx_read_norm', 'ctx_read_norm_mode', 'tok_gain', 'tok_norm', 'ctx_learn_win', 'ctx_win_param', 'ctx_every', 'char_onehot',
               'init', 'clock_base', 'clock_max', 'clock_ends', 'clip_dff', 'tap_norm', 'norm', 'norm_groups', 'dff_norm', 'bn_track', 'bn_affine',
                   'bn_momentum', 'bn_eps')
 
@@ -1818,6 +1893,7 @@ _start_step  = 0                 # resumed global step count (0 for a fresh run)
 _start_exs   = 0                 # resumed cumulative training-example count
 _start_lr    = None              # lr the checkpoint was saved at (--schedule plat resume)
 _start_plat  = None              # binned loss window carried across a --schedule plat resume
+_start_opt   = (None, None)      # (optimizer state_dict, its --opt) carried across a --load
 if args.pretrained and args.load is not None:
     # --pretrained overrides --load: the hub repo carries both weights and config.json,
     # so a local checkpoint would only be half-used (its saved_args then foreign weights).
@@ -1832,6 +1908,9 @@ if args.load is not None:
     # read here: the ckpt is freed before the scheduler is built
     _start_lr   = _loaded_ckpt.get('lr')
     _start_plat = _loaded_ckpt.get('plat')
+    # per-parameter optimizer state (RMSprop/AdamW moments), restored after the optimizer
+    # is built -- only when the checkpoint was trained with the SAME --opt
+    _start_opt  = (_loaded_ckpt.get('optimizer'), _loaded_ckpt['saved_args'].get('opt'))
 
 if args.c_text is None:          # default token embedding width to n_hidden
     args.c_text = args.n_hidden
@@ -1980,6 +2059,36 @@ class ContextCNN(nn.Module):
         return x
 
 
+class SpatialCat(nn.Module):
+    """--ctx_cat_spatial: the ctx_cat read with its sources tiled in space, not stacked in
+    depth. Input [B, 4C, S, S] (the channel concat _feed already builds: input, DFF1..3)
+    -> [B, C, 2S, 2S] with cell (i, j) expanded to the 2x2 group
+         [ input  DFF1 ]
+         [ DFF2   DFF3 ]
+    then S/2 unpadded 3x3 (conv + BN + ReLU) blocks, each removing 2 from the side, so
+    2S -> S. A 3x3 tap is shared by whichever source lands under it, so the first conv
+    mixes all four sources inside every window."""
+
+    def __init__(self, c, c_out, S, bn_track=True, bn_affine=False, bn_momentum=0.1,
+                 bn_eps=1e-5):
+        super().__init__()
+        self.in_channels = 4 * c          # what the op summary reads, as for an nn.Conv2d
+        self.c = c
+        self.layers = nn.ModuleList(
+            nn.Sequential(nn.Conv2d(c if i == 0 else c_out, c_out, 3, padding=0),
+                          nn.BatchNorm2d(c_out, affine=bn_affine, track_running_stats=bn_track,
+                                         momentum=bn_momentum, eps=bn_eps),
+                          nn.ReLU())
+            for i in range(S // 2))
+
+    def forward(self, x):
+        B, _, S, _ = x.shape
+        x = x.view(B, 2, 2, self.c, S, S).permute(0, 3, 4, 1, 5, 2).reshape(B, self.c, 2 * S, 2 * S)
+        for layer in self.layers:
+            x = layer(x)
+        return x
+
+
 class DecoderTree(nn.Module):
     """--dec_tree: unpadded (conv + norm + ReLU) blocks that reduce [B, c_in, S, S] to
     [B, width, 1, 1] -- a 3x3 kernel while the side is >= 3 (each removes 2), then a 2x2 to
@@ -2080,10 +2189,11 @@ class DFFEma:
     training state."""
 
     def __init__(self, ema, B, device, ctx_rates=None, first='replace', chain=False, resid=False,
-                 warm=False, adapt=None, every=None, learn=False):
+                 warm=False, adapt=None, every=None, learn=False, resid_sum=False):
         self.ema = ema                       # float, or one per register (--ema_ladder)
         self.chain = chain                   # --ctx_chain: register k is fed by register k-1
         self.resid = resid                   # --ctx_resid: register k fed x - register k-1
+        self.resid_sum = resid_sum           # --ctx_resid_mode sum: x - (registers 1..k-1)
         self.warm = warm                     # --ctx_warm: bias-corrected rate per row
         self.last_win = None                 # [B or 1, K] effective window 1/rate, last write
         self.every = every                   # --ctx_every: [N_k] or None
@@ -2142,7 +2252,7 @@ class DFFEma:
                 new, inp = [], o
                 for k in range(self.K):
                     if k:
-                        inp = o - new[-1]
+                        inp = o - (sum(new) if self.resid_sum else new[-1])
                     n = pk[k] + rk[k] * (inp - pk[k])
                     if self.first_replace:
                         n = torch.where((self.t == 0).view(-1, 1, 1, 1), inp, n)
@@ -2187,7 +2297,8 @@ class DFFEma:
         acc = self.acc.split(C, dim=1) if self.acc is not None else [None] * K
         new, es, accs = [], [], []
         for k in range(K):
-            u = ok[k] if (k == 0 or not self.resid) else ok[k] - new[-1]
+            u = (ok[k] if (k == 0 or not self.resid) else
+                 ok[k] - (sum(new) if self.resid_sum else new[-1]))
             if ev[k] > 1:
                 N = ev[k]
                 a_sum = acc[k] + u.detach()
@@ -2241,7 +2352,8 @@ class DFFEma:
         ready = (self.t >= 2).view(-1)[:B]
         new, es, a_all = [], [], []
         for k in range(K):
-            u = ok[k] if (k == 0 or not self.resid) else ok[k] - new[-1]
+            u = (ok[k] if (k == 0 or not self.resid) else
+                 ok[k] - (sum(new) if self.resid_sum else new[-1]))
             e = (u - pk[k]).detach()
             v = e.pow(2).mean(dim=(1, 2, 3))
             c = (e * ep[k]).mean(dim=(1, 2, 3))
@@ -2570,6 +2682,8 @@ class VLAModel(nn.Module, _HubMixin):
                 self.ctx_every = [int(v) for v in str(args.ctx_every).split(',') if v.strip()]
                 if len(self.ctx_every) != len(_w) or min(self.ctx_every) < 1:
                     raise SystemExit('--ctx_every: one positive integer per --ctx_ema window')
+            if getattr(args, 'ctx_resid_mode', 'prev') == 'sum' and not getattr(args, 'ctx_resid', False):
+                raise SystemExit('--ctx_resid_mode sum needs --ctx_resid')
             if self.ema is not None:
                 raise SystemExit('--ctx_ema replaces --ema/--ema_ladder (each context window IS '
                                  'its blend rate); drop one of them')
@@ -2588,6 +2702,7 @@ class VLAModel(nn.Module, _HubMixin):
         # --ctx_cat: the K registers concatenated and read through one 1x1 conv; built with
         # the RNG forked so every other module still initializes as it did without it
         self.ctx_cat = None
+        self.ctx_cat_spatial = False
         self.ctx_cat_in = bool(getattr(args, 'ctx_cat_in', False))
         if getattr(args, 'ctx_cat', False) or self.ctx_cat_in:
             # --ctx_cat_in reads [input, registers] through one conv, so ONE register is a
@@ -2604,8 +2719,23 @@ class VLAModel(nn.Module, _HubMixin):
                 _bw = (([self.c_text if getattr(args, 'no_text_proj', False) else n_hidden]
                         if self.ctx_cat_in else []) + [n_hidden] * len(self.ctx_windows))
                 _co = self.ctx_in if self.ctx_cat_in else n_hidden   # --ctx_cat_narrow: c_context
-                self.ctx_cat = nn.ModuleList(nn.Conv2d(sum(_bw), _co, _ck, padding=_ck // 2)
-                                             for _ in range(self.n_layers))
+                self.ctx_cat_spatial = bool(getattr(args, 'ctx_cat_spatial', False))
+                if self.ctx_cat_spatial:
+                    if not self.ctx_cat_in or len(self.ctx_windows) != 3 or set(_bw) != {n_hidden}:
+                        raise SystemExit('--ctx_cat_spatial needs --ctx_cat_in, exactly 3 '
+                                         '--ctx_ema registers and an n_hidden-wide input '
+                                         '(drop --no_text_proj)')
+                    if self.S % 2 or getattr(args, 'ctx_read_gate', False):
+                        raise SystemExit('--ctx_cat_spatial needs an even --context and no '
+                                         '--ctx_read_gate')
+                    self.ctx_cat = nn.ModuleList(
+                        SpatialCat(n_hidden, _co, self.S, bn_track=self.bn_track,
+                                   bn_affine=self.bn_affine, bn_momentum=self.bn_momentum,
+                                   bn_eps=self.bn_eps)
+                        for _ in range(self.n_layers))
+                else:
+                    self.ctx_cat = nn.ModuleList(nn.Conv2d(sum(_bw), _co, _ck, padding=_ck // 2)
+                                                 for _ in range(self.n_layers))
                 # --ctx_learn_win: one trainable log-window per register per layer
                 self.ctx_logw = None
                 if getattr(args, 'ctx_learn_win', False):
@@ -2633,7 +2763,7 @@ class VLAModel(nn.Module, _HubMixin):
                         for _g in self.ctx_rgate:
                             _g.weight.zero_(); _g.bias.zero_()
             with torch.no_grad():
-                for _c in self.ctx_cat:
+                for _c in (self.ctx_cat if not self.ctx_cat_spatial else []):
                     _c.weight.zero_()
                     _m = _c.weight.shape[-1] // 2  # centre tap (0 for a 1x1)
                     _o = 0
@@ -2650,6 +2780,9 @@ class VLAModel(nn.Module, _HubMixin):
             _g0 = float(getattr(args, 'ctx_read_gain_init', 1.0))
             self.ctx_rgain = nn.ParameterList(nn.Parameter(torch.full(_shape, _g0))
                                               for _ in range(self.n_layers))
+        # --ctx_read_norm_mode running: each register's running RMS (0 = not measured yet)
+        if getattr(args, 'ctx_read_norm_mode', 'row') == 'running' and self.ctx_windows:
+            self.register_buffer('ctx_read_rms', torch.zeros(self.n_layers, len(self.ctx_windows)))
         if self.ctx_mix not in ('conv', 'none'):
             if not self.ctx_windows or len(self.ctx_windows) < 2:
                 raise SystemExit(f'--ctx_mix {self.ctx_mix} needs --ctx_ema with K >= 2')
@@ -2936,6 +3069,7 @@ class VLAModel(nn.Module, _HubMixin):
                           ctx_rates=(_r, [r for r in _r for _ in range(self.n_hidden)]),
                           chain=bool(getattr(args, 'ctx_chain', False)),
                           resid=bool(getattr(args, 'ctx_resid', False)),
+                          resid_sum=getattr(args, 'ctx_resid_mode', 'prev') == 'sum',
                           warm=bool(getattr(args, 'ctx_warm', False)),
                           adapt=self._adapt_spec(),
                           every=getattr(self, 'ctx_every', None),
@@ -3036,8 +3170,20 @@ class VLAModel(nn.Module, _HubMixin):
                 # eps INSIDE the sqrt: a register reset to 0 at <STX> has rms 0, where sqrt
                 # has an infinite slope -- harmless while registers carry no gradient, NaN
                 # once --ctx_learn_win puts its lookahead gradient through the read
-                regs = [r * (_rn * torch.rsqrt(r.pow(2).mean(dim=(1, 2, 3), keepdim=True) + 1e-12))
-                        for r in regs]
+                if getattr(self, 'ctx_read_rms', None) is not None:   # running mode
+                    _run = self.ctx_read_rms[li]
+                    if self.training or bool((_run == 0).any()):
+                        with torch.no_grad():
+                            _b = torch.stack([r.float().pow(2).mean() for r in regs]).sqrt()
+                            if self.training:
+                                _run.copy_(torch.where(_run == 0, _b, 0.99 * _run + 0.01 * _b))
+                            _sc = torch.where(_run == 0, _b, _run)
+                    else:
+                        _sc = _run
+                    regs = [r * (_rn / (_sc[k] + 1e-12)) for k, r in enumerate(regs)]
+                else:
+                    regs = [r * (_rn * torch.rsqrt(r.pow(2).mean(dim=(1, 2, 3), keepdim=True) + 1e-12))
+                            for r in regs]
             if self.ctx_rgain is not None:
                 g = self.ctx_rgain[li]
                 g = g.view(len(regs), -1, 1, 1) if g.dim() == 2 else g.view(len(regs), 1, 1, 1)
@@ -3166,6 +3312,8 @@ class VLAModel(nn.Module, _HubMixin):
     def _tok_grid(self, byte_idx):
         B   = byte_idx.shape[0]
         tok = self.tok_embed(byte_idx)                             # [B, c_text]
+        if getattr(args, 'tok_norm', False):                         # --tok_norm
+            tok = tok * torch.rsqrt(tok.pow(2).mean(dim=1, keepdim=True) + 1e-12)
         return tok.view(B, self.c_text, 1, 1).expand(-1, -1, self.S, self.S)
 
     def _layers(self, dff, tok_grid, clk=None, record=None):
@@ -3190,6 +3338,9 @@ class VLAModel(nn.Module, _HubMixin):
         if clk is not None and getattr(self, 'ctx_logw', None) is not None:
             clk.rate = self._ctx_alpha(0).detach()
         tok  = self.text_proj(tok_grid)        # [B, n_hidden, S, S], computed once
+        _tg = float(getattr(args, 'tok_gain', 1.0) or 1.0)
+        if _tg != 1.0:                            # --tok_gain
+            tok = tok * _tg
         _pt = float(getattr(args, 'tok_dropout', 0.0) or 0.0)
         if _pt > 0 and self.training:             # --tok_dropout
             tok = F.dropout(tok, _pt, training=True)
@@ -3308,7 +3459,7 @@ class VLAModel(nn.Module, _HubMixin):
         def _step(b):
             nonlocal dff
             bi   = torch.tensor([b], dtype=torch.long, device=dev)
-            tok  = self.tok_embed(bi).view(1, self.c_text, 1, 1).expand(-1, -1, self.S, self.S)
+            tok  = self._tok_grid(bi)
             stack, new_ctx = self._layers(dff, tok, clk)
             dff     = [d.detach().clone() for d in stack]
             if not all(d.isfinite().all() for d in dff):
@@ -5533,7 +5684,11 @@ def _model_graph(model):
                 _w0 = _cin - len(regs) * model.n_hidden      # the input block's width
                 _ins = (f'{len(_srcs)} x {H}' if _w0 == model.n_hidden
                         else f'{_w0}+{len(regs)}x{model.n_hidden} x{S}x{S}')
-                out.append(_op(', '.join(_srcs), 'Concat (channels)', _ins, f'{_cin}x{S}x{S}'))
+                if getattr(model, 'ctx_cat_spatial', False):
+                    out.append(_op(', '.join(_srcs), 'Concat (spatial 2x2)', _ins,
+                                   f'{model.n_hidden}x{2 * S}x{2 * S}'))
+                else:
+                    out.append(_op(', '.join(_srcs), 'Concat (channels)', _ins, f'{_cin}x{S}x{S}'))
                 out.extend(_cat_pending)
                 _cat_pending.clear()
             elif getattr(model, 'ctx_cat', None) is not None:
@@ -5574,7 +5729,11 @@ def _model_graph(model):
             if getattr(args, 'ctx_chain', False):      # shift register: k-1 feeds k
                 srcs = [srcs[0]] + [f'{regs[k - 1]}[t-1]' for k in range(1, len(regs))]
             if getattr(args, 'ctx_resid', False):      # residual cascade: x - register k-1
-                srcs = [srcs[0]] + [f'{srcs[0]} - {regs[k - 1]}[t]' for k in range(1, len(regs))]
+                if getattr(args, 'ctx_resid_mode', 'prev') == 'sum':   # x - (registers 1..k-1)
+                    srcs = [srcs[0]] + [f'{srcs[0]} - ({" + ".join(f"{regs[j]}[t]" for j in range(k))})'
+                                        for k in range(1, len(regs))]
+                else:
+                    srcs = [srcs[0]] + [f'{srcs[0]} - {regs[k - 1]}[t]' for k in range(1, len(regs))]
             _ws = getattr(model, 'dff_write_scale', 1.0)
             for k in range(len(regs)):
                 out.append(_op(f'{regs[k]}[t] <- {"" if _ws == 1.0 else f"{_ws:g} x "}{srcs[k]}',
@@ -6092,7 +6251,7 @@ if args.altvis:
         rec = []
         with torch.no_grad():
             bi   = torch.tensor([_b], dtype=torch.long, device=_dev)
-            tok  = model.tok_embed(bi).view(1, model.c_text, 1, 1).expand(-1, -1, model.S, model.S)
+            tok  = model._tok_grid(bi)
             stack, new_ctx = model._layers(dff, tok, clk, record=rec)
             dff    = [d.detach().clone() for d in stack]
             logits = model.readout(model._decode(new_ctx))
@@ -6244,7 +6403,7 @@ if args.vis:
     while not _vis_exit:
         with torch.no_grad():
             bi   = torch.tensor([_b], dtype=torch.long, device=_dev)
-            tok  = model.tok_embed(bi).view(1, model.c_text, 1, 1).expand(-1, -1, model.S, model.S)
+            tok  = model._tok_grid(bi)
             # ONE model step per FRAME, at every --datarep: the replicas are exactly what
             # this display exists to show -- the state settling within a token -- so they
             # are drawn, not collapsed. The token only ADVANCES on the last replica, so the
@@ -6457,8 +6616,11 @@ if args.opt == 'sgd':
     optimizer = torch.optim.SGD(_params, lr=args.lr_max, momentum=args.momentum,
                                 weight_decay=args.weight_decay, nesterov=_nesterov)
 elif args.opt == 'rmsprop':
-    optimizer = torch.optim.RMSprop(_params, lr=args.lr_max,
-                                    momentum=args.momentum, weight_decay=args.weight_decay, centered=True)
+    optimizer = torch.optim.RMSprop(_params, lr=args.lr_max, alpha=args.rms_alpha,
+                                    eps=args.rms_eps, momentum=args.momentum,
+                                    weight_decay=args.weight_decay, centered=args.rms_centered)
+    print(f'rmsprop alpha {args.rms_alpha} eps {args.rms_eps} centered {args.rms_centered} '
+          f'momentum {args.momentum}', flush=True)
 elif args.opt == 'rprop':
     optimizer = torch.optim.Rprop(_params, lr=args.lr_max)
 elif args.opt == 'adagrad':
@@ -6472,6 +6634,40 @@ elif args.opt == 'adamw':
                                   weight_decay=args.weight_decay)
     print(f'adamw betas ({_beta1}, {_beta2})'
           + ('' if args.beta2 is not None else '  [beta2 from --momentum]'))
+
+# Resume the optimizer's per-parameter state. Checkpoints did not carry it until
+# 2026-10-11, which cost nothing under plain SGD (stateless) but under RMSprop restarted
+# every running average at zero: the first steps after a --load were ~10x oversized and
+# moved held-out loss 4.99 -> 5.64 in ONE step (v369 at 536K). Only 'state' is restored;
+# param_groups keep this run's hyperparameters, and the lr is the scheduler's business.
+if args.load is not None and _start_opt[0] is not None:
+    if _start_opt[1] != args.opt:
+        print(f'optimizer state NOT restored: checkpoint trained with --opt {_start_opt[1]}, '
+              f'this run uses --opt {args.opt}', flush=True)
+    else:
+        _osd = optimizer.state_dict()
+        _n_now = [len(g['params']) for g in _osd['param_groups']]
+        _n_ck = [len(g['params']) for g in _start_opt[0]['param_groups']]
+        if _n_now != _n_ck:
+            print(f'WARNING: optimizer state NOT restored: parameter groups differ '
+                  f'(checkpoint {_n_ck}, now {_n_now})', flush=True)
+        else:
+            _osd['state'] = _start_opt[0]['state']
+            optimizer.load_state_dict(_osd)
+            # a resume that switches --rms_centered on or adds --momentum finds no
+            # grad_avg / momentum_buffer in the saved state: start those at zero
+            if args.opt == 'rmsprop':
+                for _st in optimizer.state.values():
+                    if args.rms_centered and 'grad_avg' not in _st and 'square_avg' in _st:
+                        _st['grad_avg'] = torch.zeros_like(_st['square_avg'])
+                    if args.momentum > 0 and 'momentum_buffer' not in _st and 'square_avg' in _st:
+                        _st['momentum_buffer'] = torch.zeros_like(_st['square_avg'])
+            print(f'optimizer state restored ({args.opt}, {len(_osd["state"])} tensors)',
+                  flush=True)
+elif args.load is not None and args.opt != 'sgd':
+    print(f'WARNING: {args.load} has no optimizer state; --opt {args.opt} restarts its '
+          f'running averages from zero', flush=True)
+_start_opt = None
 
 # ── scheduler ─────────────────────────────────────────────────────────────────
 # Every --schedule oscillates between --lr_min and --lr_max. LambdaLR multiplies the
@@ -6796,8 +6992,8 @@ def _heldout_eval_one(step, corpus):
         for _warm in ((0, args.eval_warm) if args.eval_warm else (0,)):
             _score_and_report(step, corpus, docs, _warm)
         # the quality evals: each guarded on its own, so one failing cannot cost the others
-        for _fn, _on in ((_recall_eval, args.eval_recall), (_gen_eval, args.eval_gen),
-                         (_info_eval, args.eval_info)):
+        for _fn, _on in ((_recall_eval, args.eval_recall), (_reach_eval, args.eval_reach),
+                         (_gen_eval, args.eval_gen), (_info_eval, args.eval_info)):
             if _on:
                 try:
                     _fn(step, corpus, docs)
@@ -6985,6 +7181,13 @@ def _ce_seqs(seqs):
     context (like a document): returns one numpy array per sequence, entry p = loss of
     predicting seq[p+1] after reading seq[:p+1]. The training context is saved and
     restored exactly as in _score_and_report."""
+    return _ce_pairs([(q[:-1], q[1:]) for q in seqs])
+
+
+def _ce_pairs(rows):
+    """_ce_seqs with explicit targets: rows of (inputs, targets), equal lengths, entry p =
+    loss of predicting targets[p] after reading inputs[:p+1] from a fresh context. For rows
+    whose next input is NOT the target, such as --eval_reach's spliced chunks."""
     _dev = next(model.parameters()).device
     _was_training = model.training
     _saved_dff, _saved_clk = model.dff, model.clk
@@ -6992,13 +7195,13 @@ def _ce_seqs(seqs):
     out = []
     try:
       with torch.no_grad():
-        for c in range(0, len(seqs), _EVAL_BATCH):
-            chunk = seqs[c:c + _EVAL_BATCH]
-            B = len(chunk); T = max(len(q) for q in chunk) - 1
+        for c in range(0, len(rows), _EVAL_BATCH):
+            chunk = rows[c:c + _EVAL_BATCH]
+            B = len(chunk); T = max(len(xs) for xs, _ in chunk)
             X = torch.zeros((B, T), dtype=torch.long)
             Y = torch.zeros((B, T), dtype=torch.long)
-            for r, q in enumerate(chunk):
-                X[r, :len(q) - 1] = torch.tensor(q[:-1]); Y[r, :len(q) - 1] = torch.tensor(q[1:])
+            for r, (xs, ys) in enumerate(chunk):
+                X[r, :len(xs)] = torch.tensor(xs); Y[r, :len(ys)] = torch.tensor(ys)
             X, Y = X.to(_dev), Y.to(_dev)
             model.dff = None
             ce = torch.zeros(B, T, device=_dev)
@@ -7007,12 +7210,71 @@ def _ce_seqs(seqs):
                 v = F.cross_entropy(logits, Y[:, t], reduction='none')
                 ce[:, t] = torch.where(torch.isfinite(v), v, torch.full_like(v, 30.0)).clamp(max=30.0)
             ce = ce.cpu().numpy()
-            out += [ce[r, :len(q) - 1] for r, q in enumerate(chunk)]
+            out += [ce[r, :len(xs)] for r, (xs, _) in enumerate(chunk)]
     finally:
         model.dff, model.clk = _saved_dff, _saved_clk
         if _was_training:
             model.train()
     return out
+
+
+_reach_plan = {}         # corpus -> fixed splice plan, built once so every eval is paired
+_REACH_CHUNKS = 4        # chunks per spliced row; the first is warm-up and not scored
+
+
+def _reach_eval(step, corpus, docs):
+    """--eval_reach: exp/reach.py's splice probe. Row r is _REACH_CHUNKS chunks of P tokens,
+    each cut at a random offset from a random held-out document, with ONE reset at the row
+    start. At offset c into chunk k >= 1 the state has read k*P + c tokens, but only the
+    last c+1 belong to the current document, so
+
+        excess(c) = loss(token | spliced row) - loss(same token | its whole document)
+
+    is the cost of losing the document history older than c tokens, with warm-up held
+    constant (memtest's reset-and-feed conflated the two). Tokens whose loss is a runaway
+    (>= 20 nats) on either side are dropped and counted, not averaged in."""
+    _t0 = time.time()
+    P, K = args.eval_reach_period, _REACH_CHUNKS
+    pool = [_doc_tokens(d) for d in docs]
+    elig = [i for i, q in enumerate(pool) if len(q) >= P + 2]
+    if not elig:
+        return
+    if corpus not in _reach_plan:
+        rng = random.Random(4321)
+        # start >= 1 skips <STX>; the last target q[st+P] stays inside the document
+        _reach_plan[corpus] = [[(i, rng.randint(1, len(pool[i]) - 1 - P))
+                                for i in (rng.choice(elig) for _ in range(K))]
+                               for _ in range(args.eval_reach)]
+    plan = _reach_plan[corpus]
+    need = sorted({i for row in plan for i, _ in row[1:]})
+    full = dict(zip(need, _ce_seqs([pool[i] for i in need])))
+    rows = [([t for i, st in row for t in pool[i][st:st + P]],
+             [t for i, st in row for t in pool[i][st + 1:st + P + 1]]) for row in plan]
+    spl = _ce_pairs(rows)
+    exc, cnt, bad = np.zeros(P), np.zeros(P), 0
+    for r, row in enumerate(plan):
+        for k in range(1, K):
+            i, st = row[k]
+            a, b = spl[r][k * P:(k + 1) * P], full[i][st:st + P]
+            ok = (a < 20.0) & (b < 20.0)
+            exc[ok] += (a - b)[ok]; cnt[ok] += 1; bad += int((~ok).sum())
+    curve = exc / np.maximum(cnt, 1)
+    edges = [0, 1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024]
+    edges = [e for e in edges if e < P] + [P]
+    parts, buckets = [], {}
+    for lo, hi in zip(edges, edges[1:]):
+        lbl = f'c{lo}' if hi == lo + 1 else f'c{lo}-{hi - 1}'
+        v = float((exc[lo:hi]).sum() / max(cnt[lo:hi].sum(), 1))
+        buckets[lbl] = v
+        parts.append(f'{lbl} {v:+.3f}')
+    mean = float(exc.sum() / max(cnt.sum(), 1))
+    tail = float(exc[64:].sum() / max(cnt[64:].sum(), 1)) if P > 64 else float('nan')
+    rate = 100.0 * bad / max(bad + cnt.sum(), 1)
+    _eval_results[f'{corpus}~reach'] = dict(mean=mean, tail64=tail, runaway=rate,
+                                            curve=[float(x) for x in curve], **buckets)
+    _emit(f'EVALX step {step:10} corpus {corpus:8} P {P} rows {len(plan)} '
+          f'runaway {rate:.1f}% | mean {mean:+.4f} tail64 {tail:+.4f} | ' + ' '.join(parts)
+          + f' | wall {time.time() - _t0:.1f}s')
 
 
 def _info_eval(step, corpus, docs):
@@ -7378,12 +7640,19 @@ def _chatqa_eval(step):
 
 
 class _Judge:
-    """--eval_gen: a frozen judge LM on the CPU scoring a continuation GIVEN its prompt."""
+    """--eval_gen: a frozen judge LM scoring a continuation GIVEN its prompt. On the
+    training device in bf16 when that is CUDA (a 1.5B judge on the CPU took minutes per
+    eval), else on the CPU in fp32."""
     def __init__(self, repo):
         from transformers import AutoTokenizer, AutoModelForCausalLM
+        _md = next(model.parameters()).device
+        self.dev = _md if _md.type == 'cuda' else torch.device('cpu')
+        dt = torch.bfloat16 if self.dev.type == 'cuda' else torch.float32
         self.tok = AutoTokenizer.from_pretrained(repo)
-        self.lm = AutoModelForCausalLM.from_pretrained(repo).to('cpu').eval()
-        print(f'--eval_gen: judge {repo} loaded on cpu', flush=True)
+        self.lm = AutoModelForCausalLM.from_pretrained(repo, torch_dtype=dt).to(self.dev).eval()
+        for p_ in self.lm.parameters():
+            p_.requires_grad_(False)
+        print(f'--eval_gen: judge {repo} loaded on {self.dev} ({dt})', flush=True)
 
     @torch.no_grad()
     def cond_nll(self, prompt, cont):
@@ -7392,9 +7661,10 @@ class _Judge:
         full = self.tok(prompt + cont, truncation=True, max_length=1024).input_ids
         if len(full) - len(p) < 2:
             return None
-        lab = torch.tensor([full])
+        ids = torch.tensor([full], device=self.dev)
+        lab = ids.clone()
         lab[0, :len(p)] = -100
-        v = float(self.lm(torch.tensor([full]), labels=lab).loss)
+        v = float(self.lm(ids, labels=lab).loss.float())
         return v if math.isfinite(v) else None
 
 
@@ -7416,6 +7686,7 @@ def _rep_stats(text):
 def _gen_eval(step, corpus, docs):
     """--eval_gen: prompted continuations scored by the judge against matched anchors."""
     global _judge
+    _t0 = time.time()
     if _judge is None:
         _judge = _Judge(args.eval_gen_judge)
     P, C = args.eval_gen_prompt, args.eval_gen_len
@@ -7465,7 +7736,7 @@ def _gen_eval(step, corpus, docs):
                                           rep1=float(np.mean(reps)), distinct2=float(np.mean(d2s)))
     _emit(f'EVALG step {step:10} corpus {corpus:8} prompts {len(g_n)} nats {g:.4f} '
           f'real {r:.4f} shuf {s_:.4f} fluency {flu:.1f}% rep1 {np.mean(reps):.3f} '
-          f'distinct2 {np.mean(d2s):.3f}')
+          f'distinct2 {np.mean(d2s):.3f} wall {time.time() - _t0:.1f}s')
 
 
 # ── zero-shot multiple-choice reasoning eval (--reason_eval) ──────────────────
@@ -7752,6 +8023,7 @@ try:
                 torch.save({'saved_args': vars(args), 'state_dict': model.state_dict(),
                             'log': _log_text, 'step': i, 'examples': n_examples,
                             'lr': optimizer.param_groups[0]['lr'],
+                            'optimizer': optimizer.state_dict(),
                             'plat': list(_plat_loss) if _plateau else None}, args.save)
             else:
                 print(f'WARNING: non-finite params at step {i}; skipping checkpoint save')

@@ -302,16 +302,22 @@ loss_mean = np.convolve(loss, weights, mode='same')
 
 #fig = plt.figure(figsize=(10,40))
 plt.style.use('dark_background')
-# --verbose shows all six panels; otherwise loss, grad, the DFF state (std + mean) and lr.
-# The DFF panel is third in BOTH layouts, so --verbose is unchanged by its promotion: it
-# is the one panel that says whether the recurrent state is healthy, and a run that is
-# quietly drifting toward a blow-up shows it here long before the loss moves. The lr is
-# fourth in both for the same reason: with cyclic and ramped schedules (v117-v119) the
-# loss and the state cannot be read without knowing where the schedule was at that step.
+# Default panels: loss, grad, the DFF state (std + mean), then the data clock when the run
+# has one. The DFF panel is third in BOTH layouts: it is the one panel that says whether the
+# recurrent state is healthy, and a run that is quietly drifting toward a blow-up shows it
+# here long before the loss moves. lr is not a default panel (removed 2026-10-10); it is
+# still plotted under --verbose.
 # one more panel, last, when the log carries learned/adapted register windows (win1, win2, ...)
 _have_wins = bool(d['wins'])
-nplots = (7 if args.verbose else 4) + (1 if _have_wins else 0)
-fig = plt.figure(figsize=(12, (16 if args.verbose else 11) + (2.5 if _have_wins else 0)))
+# VARIES, not merely present: a streaming run logs epoch 1.000 for its whole life (the
+# corpus never wraps), and a flat line at 1 says nothing. The data-clock panel appears only
+# for a run whose data actually cycles -- --subsample, --datarep, or a corpus small enough to
+# wrap -- or one carrying detector lines.
+_have_epoch = bool(epoch.size) and float(np.nanmax(epoch)) > float(np.nanmin(epoch))
+_have_clock = _have_epoch or bool(d['tg_step'].size)
+nplots = 3 + (1 if _have_clock else 0) + (3 if args.verbose else 0) + (1 if _have_wins else 0)
+fig = plt.figure(figsize=(12, (16 if args.verbose else 11) - (0 if _have_clock else 2.5)
+                            + (2.5 if _have_wins else 0)))
 if title:
     fig.suptitle(title)
 ax1 = fig.add_subplot(nplots,1,1)
@@ -400,25 +406,20 @@ ax3.set_ylabel('dff std / mean', color='w')
 
 # twins are tracked separately: twinx hides their x axis, so the shared x-axis label has to
 # land on a host subplot, never on a twin
-ax4 = fig.add_subplot(nplots,1,4, sharex=ax1)
-# %g, not a fixed decimal count: the schedules span 1e-6 floors to lr 2.0 peaks, and seven
-# decimals reads as 2.0000000 at one end and 0.0000010 at the other.
-ax4.yaxis.set_major_formatter(ticker.FormatStrFormatter('%g'))
+_panel = 3                                  # last panel index used so far
+ax4 = None
 
 # PANEL 4 IS THE DATA CLOCK when the log has one: passes over the --subsample pool on the
 # left axis, the --refresh stall detector on the right, and a vertical line wherever the
 # pool actually turned over. Read together they answer the question --refresh exists to
 # ask -- did the drift flatten, did that fire a refresh, and did the refresh restart it --
 # which no other panel shows: loss and dff_std move so slowly at this scale that a refresh
-# is invisible in them. A log with no epoch column and no TRIGGER lines (every run before
-# --subsample) falls back to the lr trace this panel used to carry.
+# is invisible in them. A log with no epoch column and no TRIGGER lines gets no panel 4.
 ax4b = None
-# VARIES, not merely present: a streaming run logs epoch 1.000 for its whole life (the
-# corpus never wraps), and a flat line at 1 is worth less than the lr trace it replaced.
-# The panel takes over only for a run whose data actually cycles -- --subsample, --datarep,
-# or a corpus small enough to wrap -- or one carrying detector lines.
-_have_epoch = bool(epoch.size) and float(np.nanmax(epoch)) > float(np.nanmin(epoch))
-if _have_epoch or d['tg_step'].size:
+if _have_clock:
+    _panel += 1
+    ax4 = fig.add_subplot(nplots, 1, _panel, sharex=ax1)
+    ax4.yaxis.set_major_formatter(ticker.FormatStrFormatter('%g'))
     if _have_epoch:
         ax4.plot(step, epoch, '-c', linewidth=2.0, alpha=0.6, label='epoch')
         ax4.set_ylim(bottom=0, top=float(np.nanmax(epoch)) * 1.05 + 1e-9)
@@ -447,28 +448,24 @@ if _have_epoch or d['tg_step'].size:
                     title=(f'{_nr} refresh' + ('es' if _nr != 1 else '')
                            + (f', hold {d["tg_need"]:.0f}' if d['tg_need'] else '')),
                     title_fontsize=7)
-else:
-    ax4.plot(step, lr, '-c', linewidth=2.0,alpha=0.5)
-    ax4.set_ylim(bottom=0, top=(float(lr.max()) * 1.05 if lr.size and lr.max() > 0 else 1.0))
-    ax4.set_ylabel('lr', color='c')
 
 # y axis: minor ticks between the majors, and a hairline major gridline in the trace's own
 # colour, so the grid reads as part of its plot instead of competing with the samples
-for ax, color in ((ax1, 'w'), (ax2, 'y'), (ax3, 'r'), (ax4, 'c')):
+for ax, color in ((ax1, 'w'), (ax2, 'y'), (ax3, 'r')) + (((ax4, 'c'),) if ax4 else ()):
     ax.yaxis.set_minor_locator(ticker.AutoMinorLocator())
     ax.grid(axis='y', which='major', color=color, linewidth=1, alpha=0.2)
 
-axes = [ax1, ax2, ax3, ax4]
+axes = [ax1, ax2, ax3] + ([ax4] if ax4 else [])
 twins = ([ax2b] if ax2b is not None else []) + ([ax4b] if ax4b is not None else [])
 if args.verbose:
-    ax5 = fig.add_subplot(nplots,1,5, sharex=ax1)
-    ax6 = fig.add_subplot(nplots,1,6, sharex=ax1)
-    ax7 = fig.add_subplot(nplots,1,7, sharex=ax1)
+    ax5 = fig.add_subplot(nplots,1,_panel + 1, sharex=ax1)
+    ax6 = fig.add_subplot(nplots,1,_panel + 2, sharex=ax1)
+    ax7 = fig.add_subplot(nplots,1,_panel + 3, sharex=ax1)
     ax5.plot(step, dmax, '-m', linewidth=2.0,alpha=0.5)
     ax6.set_ylim(bottom=0, top=1)
     ax6.plot(step, zero, '-g', linewidth=2.0,alpha=0.5)
-    # lr kept here now that panel 4 is the data clock: with ramped and cyclic schedules the
-    # loss and the state still cannot be read without knowing where the schedule was.
+    # lr lives only here: with ramped and cyclic schedules the loss and the state still
+    # cannot be read without knowing where the schedule was.
     ax7.yaxis.set_major_formatter(ticker.FormatStrFormatter('%g'))
     ax7.plot(step, lr, '-c', linewidth=2.0, alpha=0.5)
     ax7.set_ylim(bottom=0, top=(float(lr.max()) * 1.05 if lr.size and lr.max() > 0 else 1.0))
