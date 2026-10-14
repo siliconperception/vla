@@ -45,16 +45,19 @@ rm -f log/exp.$M
 # The baseline, as an ARRAY rather than a here-and-now command, so the exact argv that is
 # about to run can also be written to ./doit.  Expansion order is unchanged: "$@" still comes
 # last, so argparse still takes the caller's override of any flag.
+# Baseline = v395 (2026-10-14), after the vla.py rewrite: every option spelled out, including
+# the smolfwedu eval suite that the old vla.py applied implicitly.
 CMD=(python vla.py
-  --dataset web --preroll --tokenizer pythia31m
-  --context 16 --n_hidden 256 --kernel 3
-  --batch 250 --monitor 20
-  --opt sgd --momentum 0.0 --weight_decay 0.0
-  --schedule const --lr_max 0.03 --device cuda
-  --n_layers 3 --depth 17
-  --init zero --ema 0.5
-  --run_steps $((S+1)) --checkpoint 5000
-  --gen_interval 500 --eval_interval 5000
+  --dataset smolfwedu --shards 1 --tokenizer pythia31m
+  --context 8 --n_hidden 512 --c_context 384 --kernel 3 --depth 8 --init zero --bn_momentum 0.1
+  --ctx_ema 256,64,16,4,1 --ctx_read_norm 1 --dec_tree_kernels 3,3,3 --dec_width 256
+  --batch 250 --momentum 0.0 --weight_decay 0.0
+  --schedule coswarm --lr_min 0.0001 --lr_max 0.01 --lr_period 20000 --device cuda
+  --monitor 100 --run_steps $((S+1)) --checkpoint 4000
+  --gen_interval 4000 --gen_score
+  --eval_interval 20000 --eval_corpora smolfwedu --eval_docs 100 --eval_bands 1024,8192
+  --eval_info 100 --eval_reach 100
+  --eval_gen 50 --eval_gen_prompt 128 --eval_gen_len 128 --eval_gen_judge Qwen/Qwen2.5-1.5B
   --log log/exp.$M --save checkpoint/$M.pt
   "$@")
 

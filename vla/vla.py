@@ -1,219 +1,117 @@
 #!/usr/bin/env python3
-# vla.py -- Vision-Language-Audio CNN model (text-only core)
+# vla.py -- Vision-Language-Action recurrent CNN (text-only core)
 # Silicon Perception Inc.
 #
-# Recurrent CNN core: a per-token ContextCNN DFF loop + DecoderCNN. The current
-# token is embedded, broadcast over an S×S grid, projected and summed into the
-# recurrent DFF state; the decoder reads the state out to next-token logits.
-# Image and audio conditioning will be added back incrementally.
+# Each step the current token is embedded, broadcast over an SxS grid and concatenated with
+# the K DFF registers; one 1x1 conv (ctx_cat) reads that concat into a conv chain
+# (ContextCNN), a 1x1 (linout) projects the result back to register width, and the registers
+# are written as a Laplacian-pyramid cascade: register k blends toward what registers 1..k-1
+# missed, at its own rate 1/W_k. The text decoder reads the layer output to next-token logits
+# through a frozen, borrowed lm_head. No attention, no positional encoding.
 #
-# Vocabulary: 256 (raw bytes) by default, or a borrowed pretrained BPE vocabulary and its
-# embedding/readout -- TinyStories or Pile-trained pythia -- with --tokenizer (see
-# _TOKENIZERS). No attention, no positional encoding.
+# Built to be extended: the input side is a LIST of grids concatenated in front of ctx_cat
+# (more embeddings, a frozen image encoder), and the text readout is a self-contained decoder
+# module that other decoders (e.g. actions) can sit beside.
 
+import argparse
+import collections
+import datetime
+import glob
+import itertools
+import json
 import math
+import os
+import queue
+import random
+import re
+import subprocess
+import sys
+import threading
+import time
+import zlib
+
+import numpy as np
 import torch ; print('torch', torch.__version__)
 import torch.nn as nn
 from torch.nn import functional as F
-import torchinfo
-import numpy as np
-import argparse
-import collections
-import itertools
-import re
-import glob
-import json
-import zlib
-import os
-import queue
-import threading
-import subprocess
-import datetime
-import time
-import random
-import matplotlib.pyplot as plt
 
-NULL      = 0x00
-START     = 0x02
-END       = 0x03
+STX_TEXT = '<STX>'          # how the document-start token renders
+ETX_TEXT = '<ETX>'          # how the document-end token renders
+DOT_TEXT = '\xb7'           # how any other unprintable character renders
+_ESCAPES = {'\n': '\\n', '\t': '\\t', '\r': '\\r'}
 
-# length of the GEN sample printed each --gen_interval steps during training. Fixed, not
-# --n: --n is the length of a one-shot --generate run and nothing else.
-_GEN_SAMPLE = 200
+_GEN_SAMPLE = 200           # tokens in each periodic GEN sample (--n is for --generate)
 
-# In-training held-out eval (--eval_interval). These are protocol constants, not knobs:
-# they are exactly the document selection exp/score.py and exp/pythia_ref.py use for every
-# number in PLAN.txt's reference table (first --eval_docs documents of the held-out split
-# that tokenize to >= _EVAL_MINLEN steps, each clipped to _EVAL_MAXLEN). Changing one
-# silently makes the EVAL line incomparable to that table and to the pythia references,
-# which is the whole reason the eval exists -- so they are pinned here rather than exposed.
-_EVAL_MINLEN = 512
-# Short-document corpora (stories, chats) rarely reach 512 tokens, so their eval sets take
-# documents from 128 tokens up; every other corpus keeps the protocol's 512.
-_EVAL_MINLEN_SHORT = {'simplestories': 128, 'smolchat': 128}
+# Held-out eval protocol constants (exp/score.py and PLAN.txt's reference table use the same
+# selection). Pinned, not exposed: changing one makes EVAL lines incomparable with history.
+_EVAL_MINLEN = 512          # documents shorter than this (in tokens) are skipped ...
+_EVAL_MINLEN_SHORT = {'simplestories': 128}   # ... except on short-document corpora
+_EVAL_MAXLEN = 1024         # and each is clipped to this many
+_EVAL_BATCH = 400           # rows per eval forward chunk
+_EVAL_THRESH = 20.0         # a document with ANY token above this many nats is "runaway"
+
+
 def _eval_minlen(corpus):
     return _EVAL_MINLEN_SHORT.get(corpus, _EVAL_MINLEN)
-_EVAL_MAXLEN = 1024
-_EVAL_BATCH  = 400    # rows per forward chunk. Cost here is dominated by SEQUENTIAL steps
-                      # (51 conv launches each), not by batch width, so one wide chunk beats
-                      # several narrow ones even though it pads every row out to the longest.
-                      # exp/score.py scores all 400 documents as a single batch for the same
-                      # reason. Safe to lower if a bigger --eval_docs ever runs out of memory:
-                      # eval-mode BatchNorm uses running stats with --bn_track, so per-document
-                      # results are batch-invariant to 1e-4 and chunking changes nothing.
-_EVAL_THRESH = 20.0   # per-document nats above which a document is counted "runaway"
-
-STX_TEXT  = '<STX>'   # how START renders in displayed text
-ETX_TEXT  = '<ETX>'   # how END renders in displayed text
 
 
-DOT_TEXT  = '\xb7'    # how any other unprintable byte renders
-NULL_TEXT = '_'       # how NULL renders
-
-_ESCAPES  = {'\n': '\\n', '\t': '\\t', '\r': '\\r'}
-
-
-def _printable(s):
-    """Render model text for display: START/END as <STX>/<ETX>, NULL as '_',
-    whitespace escaped, any other unprintable character as '·'. Matches _vc(),
-    the --vis renderer, so all three modes display the same markers."""
-    out = []
-    for c in s:
-        o = ord(c)
-        if   o == START:      out.append(STX_TEXT)
-        elif o == END:        out.append(ETX_TEXT)
-        elif o == NULL:       out.append(NULL_TEXT)
-        elif c in _ESCAPES:   out.append(_ESCAPES[c])
-        elif c.isprintable(): out.append(c)
-        else:                 out.append(DOT_TEXT)
-    return ''.join(out)
-
-
-# ── tokenizers ────────────────────────────────────────────────────────────────
-# --tokenizer selects the vocabulary the whole script runs on: the clip builder emits
-# ids from it, the model embeds/decodes them, and every display path renders them.
-# 'char' is the raw-byte default; every other name pulls a pretrained BPE tokenizer
-# together with that model's embedding and lm_head (see VLAModel).
+# ── tokenizer ─────────────────────────────────────────────────────────────────
+# The vocabulary, token embedding and lm_head are borrowed from a pretrained causal LM and
+# frozen; the CNN meets them through the ctx_cat read on the way in and the decoder on the
+# way out.
 
 _TOKENIZERS = {
-    'char':       None,
-    'tiny1m':     'roneneldan/TinyStories-1M',   # GPT-Neo,  hidden 64,  vocab 50257
-    'tiny8m':     'roneneldan/TinyStories-8M',   # GPT-Neo,  hidden 256, vocab 50257
-    'pythia14m':  'EleutherAI/pythia-14m',       # GPT-NeoX, hidden 128, vocab 50304
-    'pythia31m':  'EleutherAI/pythia-31m',       # GPT-NeoX, hidden 256, vocab 50304
-    'pythia70m':  'EleutherAI/pythia-70m',       # GPT-NeoX, hidden 512, vocab 50304
-    'pythia160m': 'EleutherAI/pythia-160m',      # GPT-NeoX, hidden 768, vocab 50304
-    # simplified vocabulary: SimpleStories-V2-5M (llama), 4019-token lowercase WordPiece
-    # trained on simple-English stories, hidden 256, embedding TIED to lm_head
-    'ss4k':       'SimpleStories/SimpleStories-V2-5M',
+    'pythia14m':  'EleutherAI/pythia-14m',       # hidden 128, vocab 50304
+    'pythia31m':  'EleutherAI/pythia-31m',       # hidden 256, vocab 50304
+    'pythia70m':  'EleutherAI/pythia-70m',       # hidden 512, vocab 50304
+    'pythia160m': 'EleutherAI/pythia-160m',      # hidden 768, vocab 50304
+    'tiny8m':     'roneneldan/TinyStories-8M',   # hidden 256, vocab 50257 (tied embed/head)
 }
-
-# The TinyStories models are trained on a deliberately simple corpus, so most of their
-# 50257 embedding rows never receive gradient: 41% of TinyStories-8M's rows sit at their
-# random init, and 7-9% of OpenWebText/dolma3 tokens land on one. Frozen, those tokens are
-# unrepresentable on input and unpredictable on output. The pythia* models are trained on
-# the Pile (300B tokens) and have no untrained rows, so they are the ones to reach for on a
-# web-scale --dataset; tiny* remain the right choice for --dataset tiny.
-
-# --head_norm ln_f borrows the source model's own final norm, the one it applies
-# immediately before its unembedding. Probed in order; the first hit wins.
-_FINAL_NORM_PATHS = (
-    'transformer.ln_f',               # gpt_neo, gpt2
-    'gpt_neox.final_layer_norm',      # gpt_neox (pythia)
-    'model.norm',                     # llama, mistral
-    'model.decoder.final_layer_norm', # opt
-)
-
-
-def _final_norm(lm):
-    """The pretrained final norm layer of a causal LM, or (None, None) if the family is
-    unknown -- --head_norm ln_f then warns and falls back to no normalization."""
-    for path in _FINAL_NORM_PATHS:
-        m = lm
-        for part in path.split('.'):
-            m = getattr(m, part, None)
-            if m is None:
-                break
-        if isinstance(m, nn.Module):
-            return path, m
-    return None, None
-
-
-_tokenizer = None   # the live tokenizer, bound to model.tok once the model is built
-
-
-class ByteTokenizer:
-    """Raw bytes: the vocabulary is the 256 byte values and START/END/NULL are the
-    0x02/0x03/0x00 control bytes, so a clip is literally [START] utf-8 bytes [END]."""
-    is_char    = True
-    vocab_size = 256
-    start_id, end_id, null_id = START, END, NULL
-
-    def encode(self, text): return list(text.encode('utf-8', errors='replace'))
-    def decode(self, ids):  return bytes(ids).decode('utf-8', errors='replace')
 
 
 class HFTokenizer:
-    """A pretrained BPE tokenizer from the hub. GPT-Neo has no separate BOS token --
-    bos_token_id and eos_token_id are both <|endoftext|> (50256) -- so START and END are
-    the same id here and a clip is [EOT] tokens [EOT], the framing the TinyStories models
-    were trained with. There is no NULL equivalent (id 0 is an ordinary token), so
-    null_id is None and nothing is ever filtered out of the output."""
-    is_char = False
-    null_id = None
+    """A pretrained BPE tokenizer. GPT-NeoX/Neo have one <|endoftext|> id, so START and END
+    are the same token and a clip is [EOT] text [EOT]."""
 
     def __init__(self, repo, vocab_size):
         from transformers import AutoTokenizer
-        self.tok        = AutoTokenizer.from_pretrained(repo)
-        # A recurrent model has no context window, and we never truncate; without this the
-        # tokenizer warns about every document longer than the source model's 2048 tokens.
-        self.tok.model_max_length = int(1e12)
-        eot             = self.tok.eos_token_id
-        self.end_id     = eot if eot is not None else self.tok.bos_token_id
-        bos             = self.tok.bos_token_id
-        self.start_id   = bos if bos is not None else self.end_id
-        # the model's embedding rows, not len(tokenizer): the logits are that wide
-        self.vocab_size = vocab_size
+        self.tok = AutoTokenizer.from_pretrained(repo)
+        self.tok.model_max_length = int(1e12)   # recurrent: no context window, never truncate
+        eot = self.tok.eos_token_id
+        self.end_id = eot if eot is not None else self.tok.bos_token_id
+        bos = self.tok.bos_token_id
+        self.start_id = bos if bos is not None else self.end_id
+        self.vocab_size = vocab_size            # the embedding's rows, not len(tokenizer)
 
-    # add_special_tokens=False: some tokenizers (SimpleStories' WordPiece) append [EOS] to
-    # every encode(), which would plant end markers mid-document. A no-op for GPT-NeoX/Neo.
     def encode(self, text): return self.tok.encode(text, add_special_tokens=False)
     def decode(self, ids):  return self.tok.decode(ids)
 
 
+_tokenizer = None           # bound to model.tok once the model is built
+
+
+def _printable(s):
+    """Escape whitespace and mask unprintable characters for one-line display."""
+    return ''.join(_ESCAPES.get(c, c if c.isprintable() else DOT_TEXT) for c in s)
+
+
 def _decode_plain(ids):
-    """Token ids -> plain text, framing markers dropped. What _render() shows is for a
-    human (escaped whitespace, <STX>/<ETX> markers); a reference LM must see the text the
-    model actually generated, so this decodes and drops the markers instead."""
+    """Token ids -> plain text with the framing markers dropped (what a judge LM reads)."""
     body = [t for t in ids if t not in (_tokenizer.start_id, _tokenizer.end_id)]
-    if not body:
-        return ''
-    if _tokenizer.is_char:
-        return bytes(body).decode('utf-8', errors='replace')
-    return _tokenizer.decode(body)
+    return _tokenizer.decode(body) if body else ''
 
 
 def _render(ids):
-    """Render a token-id sequence for display. Byte mode decodes UTF-8 and hands the
-    string to _printable(); BPE mode decodes runs of ordinary tokens the same way and
-    renders the document marker itself. Since START and END are one id in BPE mode, the
-    marker shows as <STX> when it opens the sequence and <ETX> anywhere after -- which is
-    exactly the role it plays in the [START] text [END] framing. A marker with more
-    tokens after it is a document boundary -- generate() resets the state and re-feeds
-    the prompt there, and a corpus stream starts its next document there -- so it renders
-    as <ETX><STX>: without the <STX> the text after it reads as a continuation."""
-    if _tokenizer.is_char:
-        return _printable(bytes(ids).decode('utf-8', errors='replace'))
+    """Token ids -> display text. The marker shows as <STX> when it opens the sequence,
+    <ETX> at the end, and <ETX><STX> at a document boundary in the middle."""
     out, run = [], []
     for n, t in enumerate(ids):
         if t in (_tokenizer.start_id, _tokenizer.end_id):
             if run:
                 out.append(_printable(_tokenizer.decode(run)))
                 run = []
-            if n == 0:
-                out.append(STX_TEXT)
-            else:
-                out.append(ETX_TEXT + STX_TEXT if n < len(ids) - 1 else ETX_TEXT)
+            out.append(STX_TEXT if n == 0 else
+                       ETX_TEXT + STX_TEXT if n < len(ids) - 1 else ETX_TEXT)
         else:
             run.append(t)
     if run:
@@ -221,1907 +119,212 @@ def _render(ids):
     return ''.join(out)
 
 
-# ── DFF write clock (--clock) ─────────────────────────────────────────────────
-# How often each recurrent layer commits its new state; see DFFClock for the mechanism.
-# These modes take no numeric arguments -- the rates below are the whole parameterization.
-
-_QPROJ_MODES = ('none', 'read')   # where the 1x1 state projection sits (--qproj)
-# 'write' (a frozen random orthogonal 1x1 between the layer output and the register) was
-# removed: its only path to the loss is through the DFF, which forward() detaches every step,
-# so it could never receive gradient and was permanently random. It answered a narrow question
-# about signed-vs-rectified state and cost a live option to keep around.
-
-# The DFF write rule. There is only one: every register is written every step, blended by
-# --ema / --ema_ladder. The clock that used to gate writes per layer (sync/fixed/incr/
-# dither/exp, with --accumulate to average a hold) is gone -- an EMA every step spans the
-# same timescales continuously, and the ladders it needed are now expressed directly as
-# per-register blend rates.
-
 # ── args ──────────────────────────────────────────────────────────────────────
+# Defaults are the v395 baseline.
 
 parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-# architecture
-parser.add_argument('--context',       default=7,     type=int,
-                    help='spatial size S of the DFF grid (S×S)')
-parser.add_argument('--n_hidden',      default=512,   type=int,
-                    help='DFF state channel depth: the state carried between steps is '
-                         '[n_hidden, context, context], and every module that touches it '
-                         '(text_proj, deep_proj, linout, qproj, tap, decoder) is sized by '
-                         'it. ContextCNN\'s INTERIOR width is --c_context, which defaults '
-                         'to this')
-parser.add_argument('--c_context',     default=None,  type=int,
-                    help='ContextCNN INTERIOR conv width, independent of --n_hidden '
-                         '(default: n_hidden, which is the historical behavior and builds '
-                         'a byte-identical state_dict). The module\'s contract is fixed by '
-                         'the DFF it updates -- [n_hidden, S, S] in, the same out -- so '
-                         'only the interior is free: conv 1 widens n_hidden -> c_context, '
-                         'convs 2..depth-1 run c_context -> c_context, and the last conv '
-                         'narrows back to n_hidden. This decouples the two things '
-                         'n_hidden used to set at once: how much state is CARRIED between '
-                         'tokens, and how much width is spent COMPUTING the update. Cost '
-                         'is quadratic in the interior: a depth-D layer is '
-                         '(D-2)*c_context^2 + 2*n_hidden*c_context weights per kernel tap '
-                         'against D*n_hidden^2 before, so c_context < n_hidden is the '
-                         'cheaper-update knob and c_context > n_hidden the wider-update '
-                         'one, neither of which changes the state size or the DFF shapes. '
-                         'At --depth 1 there is no interior -- the single conv must be '
-                         'n_hidden -> n_hidden -- and this is ignored with a warning.\n'
-                         'WITH --linout the last conv does NOT widen: the chain stays at '
-                         'c_context throughout and linout projects c_context -> n_hidden, so '
-                         'the cost is (depth-1)*c_context^2 + n_hidden*c_context per layer '
-                         'and the final ReLU is at c_context. Without --linout nothing '
-                         'downstream can widen, so the last conv is c_context -> n_hidden '
-                         'and the ReLU is at n_hidden.')
-parser.add_argument('--c_text',        default=1,     type=int,
-                    help='token embedding channels (None → n_hidden). Ignored by every '
-                         'pretrained --tokenizer, which takes it from that model\'s '
-                         'embedding width (tiny1m 64, tiny8m/pythia31m 256, pythia14m 128, '
-                         'pythia70m 512, pythia160m 768)')
-parser.add_argument('--tokenizer',     default='char', choices=sorted(_TOKENIZERS),
-                    help='vocabulary and token embedding/readout: "char" is the raw 256-byte '
-                         'default (learned embedding, decoder straight to 256 logits). Every '
-                         'other value borrows a pretrained BPE tokenizer, token embedding '
-                         'and lm_head, and adapts the CNN to them with the linear '
-                         '1x1 conv2d already in text_proj (embedding width → n_hidden) and in '
-                         'the decoder (n_hidden → embedding width, then lm_head → '
-                         'logits). "tiny1m"/"tiny8m" take roneneldan/TinyStories-1M / -8M '
-                         '(50257-token vocabulary, but trained on simple English: ~41%% of '
-                         'tiny8m embedding rows are still at their random init, so prefer '
-                         'these only with --dataset tiny). "pythia14m".."pythia160m" take the '
-                         'Pile-trained EleutherAI/pythia-* (50304-token vocabulary, no '
-                         'untrained rows -- the ones to use with --dataset web|c4|dolma3). '
-                         'The pretrained weights are frozen unless --unfreeze')
-parser.add_argument('--head_norm',     default='none',
-                    choices=('none', 'ln_f', 'layer', 'rms', 'batch', 'batch2d'),
-                    help='normalize the decoder output before the borrowed lm_head. That '
-                         'head was trained downstream of a final norm, so it only ever saw '
-                         'unit-scale input, while decoder.proj emits whatever scale it '
-                         'likes. Ignored with --tokenizer char (there is no borrowed head). '
-                         '"none" (default) feeds lm_head directly. "ln_f" reuses the source '
-                         'model\'s own final norm, frozen with the rest of the borrowed '
-                         'weights (--unfreeze trains it). The rest are fresh and trained '
-                         'with the CNN: "layer" LayerNorm and "rms" RMSNorm normalize each '
-                         'token\'s readout vector across c_text (the axis a transformer '
-                         'normalizes); "batch" BatchNorm1d and "batch2d" BatchNorm2d '
-                         'normalize per channel across the batch instead, which fixes the '
-                         'average scale but not each vector. batch2d sits inside the decoder '
-                         'between proj and the pool, matching the Conv->BatchNorm2d idiom in '
-                         'ContextCNN, and folds into the conv at inference')
-parser.add_argument('--unfreeze',      default=False, action='store_true',
-                    help='train the borrowed token embedding and lm_head too '
-                         '(any --tokenizer but char); by default they are frozen and only '
-                         'the CNN and its two adapters are trained. Note the scale: the two '
-                         'pythia70m matrices are 51.5M params against an ~8M CNN')
-parser.add_argument('--depth',         default=7,     type=int,
-                    help='ContextCNN conv layer count')
-parser.add_argument('--n_layers',      default=3,     type=int,
-                    help='stack N (ContextCNN + feedback) recurrent layers in series between '
-                         'the thin encoder and decoder; each layer keeps its own DFF state. '
-                         '1 = original single-layer behavior')
-parser.add_argument('--clock',       default=None,
-                             help='DEPRECATED, ACCEPTED AND IGNORED. The DFF write clock is gone: every\n'
-                                  'register is written every step and the timescale is the --ema/\n'
-                                  '--ema_ladder blend rate, which spans the same spans continuously.\n'
-                                  'Kept parseable so the command lines in ./doit still run.')
-parser.add_argument('--bn_track',      default=True, action=argparse.BooleanOptionalAction,
-                    help='--norm batch: track_running_stats.  Default on, the historical '
-                         'behavior.  --no-bn_track makes BatchNorm use BATCH statistics in '
-                         'EVAL as well as train, which removes the train/eval discrepancy -- '
-                         'the source of every train/held-out blowup in this model -- and drops '
-                         'the running-statistics buffers, while KEEPING the cross-batch '
-                         'pooling over 250 document streams that per-sample normalizers '
-                         '(group, softmax, std) all failed without.  Caveat: inference '
-                         'statistics then come from whatever batch is fed, and at batch 1 '
-                         'BatchNorm2d degenerates to InstanceNorm over the SxS grid')
-parser.add_argument('--bn_affine',     default=False, action=argparse.BooleanOptionalAction,
-                    help='--norm batch: learnable per-channel scale and shift.  Default off, '
-                         'the historical behavior.  On costs 2*n_hidden per layer (~26K over '
-                         '51 layers, 0.09%% of the model) and lets the network partly undo '
-                         'normalization where it hurts -- the same BatchNorm sits on 51 '
-                         'layers with very different roles')
-parser.add_argument('--bn_momentum',   default=0.1,   type=float, metavar='M',
-                    help='--norm batch: running-statistics update rate, running = '
-                         '(1-M)*running + M*batch.  Default 0.1 is a ~10-step window, which '
-                         'is why the running statistics lag the weights and why eval-mode '
-                         'behavior can diverge from train.  0.01 gives ~100 steps; 0 selects '
-                         'a cumulative average over every batch seen (torch momentum=None)')
-parser.add_argument('--bn_eps',        default=1e-5,  type=float, metavar='E',
-                    help='--norm batch: epsilon in 1/sqrt(var+E).  A larger value damps the '
-                         'normalization of low-variance channels, so a near-dead channel is '
-                         'not amplified back up')
-parser.add_argument('--dff_norm',      default='none', choices=['none', 'softmax', 'std'],
-                    help='condition the DFF state ON THE WAY OUT of the register, on the '
-                         'feedback path only.  The register itself keeps the raw ReLU output '
-                         '(sparse, ~50%% exact zeros -- what a hardware state memory wants); '
-                         'only what is fed back into the layer is transformed, and because '
-                         'that transform is scale-free the recurrence is bounded however '
-                         'large the stored state grows.  "softmax" applies '
-                         'Softmax2d over the channel dimension to the value each layer '
-                         'commits to its register, so at every one of the SxS positions the '
-                         'n_hidden channel values form a probability distribution: unit mass '
-                         'per position, every value in (0,1), strictly positive.  The state '
-                         'therefore cannot explode, cannot collapse to zero, and cannot have '
-                         'dead units, by construction rather than by tuning -- which is what '
-                         'the recurrence needs, since the DFF is detached every step and is '
-                         'an input the model must be robust to rather than a path the '
-                         'optimizer can shape. '
-                         'Only the STORED state is transformed; the value travelling up the '
-                         'stack and into the decoder is untouched, so the feed-forward path '
-                         'is unchanged and only the feedback loop is bounded. '
-                         'Stateless and per-sample, so train and eval compute the same '
-                         'function.  Adds no parameters, so it can be toggled on an existing '
-                         'checkpoint.  Intended with --norm none, which leaves ContextCNN as '
-                         'plain conv2d + ReLU. '
-                         '"std" standardizes instead: subtract the state\'s own mean and '
-                         'divide by its standard deviation, per sample and per layer, over '
-                         'all of (channels, S, S).  Unlike softmax it keeps a SIGN and a full '
-                         'dynamic range -- the state is zero-mean unit-variance rather than a '
-                         'distribution on the simplex -- so roughly half the values are '
-                         'negative and no channel is forced positive.  Same guarantees that '
-                         'matter: the state cannot explode or collapse, train and eval agree, '
-                         'no parameters, no buffers')
-parser.add_argument('--norm_groups',   default=32,    type=int, metavar='G',
-                    help='--norm group: channel groups. G=1 is LayerNorm over the whole '
-                         'channel dimension, G=n_hidden is InstanceNorm. Clamped to '
-                         '[1, n_hidden]. No parameters either way (affine=False)')
-parser.add_argument('--norm',          default='batch', choices=['batch', 'none', 'group'],
-                    help='normalization inside ContextCNN. "batch" (default) is '
-                         'Conv->BatchNorm2d(affine=False)->ReLU, the historical model. '
-                         '"none" removes it entirely, leaving Conv->ReLU, and switches the '
-                         'convs to He initialization (kaiming_normal, fan_in, relu gain) '
-                         'because nothing downstream rescales any more -- PyTorch\'s default '
-                         'conv init has a gain far below 1 for ReLU and would shrink the '
-                         'signal ~3x per layer, which over 51 layers reaches the readout as '
-                         'nothing. '
-                         'Why it matters beyond simplicity: BatchNorm is the only module here '
-                         'whose function differs between train and eval, and the recurrence '
-                         'amplifies that difference -- it is the mechanism behind every '
-                         'train/held-out blowup seen in this model, and behind free-running '
-                         'generation locking up while training metrics stay clean. --norm '
-                         'none computes the same function in both modes by construction. '
-                         'It also drops the running-statistics buffers, which are real state '
-                         'in an FPGA implementation. '
-                         'Changes the state_dict (BatchNorm buffers disappear), so unlike '
-                         '--clock it cannot be toggled on an existing checkpoint')
-parser.add_argument('--tap_norm',      default='none', choices=['none', 'batch', 'group'],
-                    help='normalize the output of each --tap 1x1 conv, i.e. the value that '
-                         'feeds the DFF register. The feedback path is the one place in the '
-                         'model with no normalization: ContextCNN is Conv->BatchNorm->ReLU '
-                         'throughout, but tap, deep_proj and decoder.proj are bare 1x1 convs, '
-                         'so the recurrence gain is unconstrained and can drift above 1 as '
-                         'training proceeds -- which is what makes the state grow '
-                         'geometrically at inference and lock generation into a repeating '
-                         'token. Bounding the state itself (--clip_dff) does not fix that, '
-                         'because the drift is in the weights, not the state. '
-                         '"batch" is BatchNorm2d(affine=False), matching ContextCNN\'s idiom, '
-                         'but it carries running statistics and so behaves differently in '
-                         'train and eval -- and the train/eval gap compounding through the '
-                         'recurrence is itself a suspect for the runaway, so this adds to the '
-                         'very mechanism it is meant to fix. '
-                         '"group" is GroupNorm(32, affine=False): identical in train and eval '
-                         'because it normalizes per sample over channel groups with no '
-                         'running statistics, which bounds the feedback gain AND removes the '
-                         'train/eval mismatch on that path. It adds no parameters and no '
-                         'state_dict entries, so unlike "batch" it can be toggled on an '
-                         'existing checkpoint. Requires --tap')
-parser.add_argument('--dff_penalty',   default=0.0,   type=float, metavar='W',
-                    help='add W * relu(mean of the DFF state) to the training loss, so a '
-                         'POSITIVE mean state is penalized and a negative one is free '
-                         '(0 = off).\n'
-                         'What it is for: the state\'s scale inflates monotonically for a '
-                         'whole run -- the logged dff_std climbs 0.7 -> 1.65 over 3.6M steps '
-                         'and never settles -- and the mean rides with it, because the '
-                         'register accumulates the ReLU outputs of the stack, which are '
-                         'non-negative before the linear projection. relu() and not abs() '
-                         'because only the positive direction is the runaway one: pushing '
-                         'the mean below zero is not an improvement worth paying gradient '
-                         'for, and abs() would make 0 an attractor the state has no reason '
-                         'to sit at.\n'
-                         'Applied to the PRE-DETACH layer outputs, i.e. the tensors that are '
-                         'about to become the register, so the gradient reaches the '
-                         'projector that produced them. Penalizing self.dff instead would be '
-                         'a no-op: it is detached (gradient horizon = 1 token) and carries '
-                         'no graph. Complements --clip_dff, which bounds the state after the '
-                         'fact without any gradient signal to avoid the bound.')
-parser.add_argument('--dff_bias',      default=0.0,   type=float, metavar='W',
-                    help='add W * (mean of the DFF state) to the training loss -- the '
-                         'TWO-SIDED form of --dff_penalty: a positive mean costs and a '
-                         'negative one is rewarded, without limit (0 = off).\n'
-                         'Where it differs: --dff_penalty relu()s the mean, so it is a '
-                         'restoring force that goes silent once the mean is negative and '
-                         'therefore contributes nothing in steady state (measured: W=10 parks '
-                         'the mean at -0.0022 and the loss stays pure cross-entropy). This one '
-                         'never goes silent -- it is a constant downward pull on the mean, and '
-                         'the loss it reports is CE + W*mean, which is BELOW the true CE '
-                         'whenever the mean is negative. Read the loss column accordingly: '
-                         'with --dff_bias the logged loss is the objective, not the '
-                         'cross-entropy, and is not comparable with a run trained without it.\n'
-                         'The pull is bounded only by whatever the CE term is willing to pay, '
-                         'so a large W can drive the state arbitrarily negative; the DFF '
-                         'columns (dff_mean, dff_std) are what say whether the state is still '
-                         'carrying information or has simply been pushed down.\n'
-                         'Applied to the PRE-DETACH layer outputs, like --dff_penalty, so the '
-                         'gradient reaches the projector. May be combined with it, though the '
-                         'combination is two forces on the same quantity.')
-parser.add_argument('--clip_dff',      default=0.0,   type=float, metavar='MAX',
-                    help='bound the magnitude of the DFF state after every write (0 = off). '
-                         'Rescales rather than clamping element-wise -- if a layer\'s state '
-                         'for a row exceeds MAX in absolute value, the whole tensor is scaled '
-                         'down so its max is MAX -- so the spatial and channel pattern of the '
-                         'state is preserved and only its scale is bounded, the same '
-                         'reasoning as gradient-norm clipping. Applied per layer and per '
-                         'batch row, since rows are independent. '
-                         'What it is for: the recurrence can run with gain > 1 in FREE-RUNNING '
-                         'mode, where the model eats its own output -- the state then grows '
-                         'geometrically (measured at ~10x per 5 tokens) until it saturates '
-                         'the readout and generation locks into a repeating token. Teacher-'
-                         'forced loss never sees this, because ground truth is injected every '
-                         'step and holds the state bounded, so a checkpoint can score well '
-                         'and still be unusable as a generator. A healthy run here sits at '
-                         'dff_max ~10-40 during generation, so MAX of a few hundred bounds '
-                         'the blow-up without touching normal dynamics. Applies in training, '
-                         '--generate, --eval and --vis alike; adds no parameters, so it can '
-                         'be toggled on an existing checkpoint')
-parser.add_argument('--clock_ends',  default=None,
-                                  help='DEPRECATED, ACCEPTED AND IGNORED. The DFF write clock is gone: every\n'
-                                       'register is written every step and the timescale is the --ema/\n'
-                                       '--ema_ladder blend rate, which spans the same spans continuously.\n'
-                                       'Kept parseable so the command lines in ./doit still run.')
-parser.add_argument('--clock_max',   default=None,
-                                 help='DEPRECATED, ACCEPTED AND IGNORED. The DFF write clock is gone: every\n'
-                                      'register is written every step and the timescale is the --ema/\n'
-                                      '--ema_ladder blend rate, which spans the same spans continuously.\n'
-                                      'Kept parseable so the command lines in ./doit still run.')
-parser.add_argument('--clock_base',  default=None,
-                                  help='DEPRECATED, ACCEPTED AND IGNORED. The DFF write clock is gone: every\n'
-                                       'register is written every step and the timescale is the --ema/\n'
-                                       '--ema_ladder blend rate, which spans the same spans continuously.\n'
-                                       'Kept parseable so the command lines in ./doit still run.')
-parser.add_argument('--accumulate',    default=False,
-                    action=argparse.BooleanOptionalAction,
-                    help='DEPRECATED, ACCEPTED AND IGNORED. It averaged the outputs a layer '
-                         'computed while HOLDING its register, and nothing holds any more: '
-                         'the DFF write clock is gone and every register is written every '
-                         'step. Kept parseable so the command lines in ./doit still run.')
-parser.add_argument('--ema_ladder',    default=None,  type=str, nargs='?', const='13.15',
-                    metavar='SPEC',
-                    help='put the TIMESCALE LADDER IN THE EMA INSTEAD OF THE CLOCK. Every layer '
-                         'writes its register EVERY STEP (all clock periods forced to 1), and '
-                         'depth is expressed by the blend rate instead: layer li gets '
-                         'ema = 1/BASE**li, so layer 1 replaces outright (ema 1.0) and each '
-                         'deeper layer folds in a proportionally smaller share of its new '
-                         'output.\n'
-                         'The effective memory window is ~1/ema tokens, so BASE reproduces the '
-                         'clock ladder\'s spans: --ema_ladder 13.15 gives windows of 1, 13 and '
-                         '173 tokens, the same as --clock fixed --clock_base 13.15 -- but the '
-                         'deep register now moves a little every step rather than jumping once '
-                         'every 173. Same timescales, continuous instead of piecewise.\n'
-                         'Overrides --ema, and disables --accumulate, which has nothing to '
-                         'average when no layer ever holds.\n'
-                         'TWO FORMS. A single number is a BASE and the windows are 1, B, B**2 '
-                         '-- which pins layer 1 at a 1-token window for EVERY base, i.e. '
-                         'replace-outright, so no base can slow the top layer down. A '
-                         'COMMA-SEPARATED LIST is per-layer WINDOWS IN TOKENS and sets each '
-                         'layer independently: --ema_ladder 3.2,10,32 gives ema 0.3162, 0.1, '
-                         '0.03162. Size these against the data -- the vocab stream averages 11 '
-                         'tokens per sentence, so a 173-token window averages ~15 unrelated '
-                         'sentences while a 32-token one spans about three.')
-parser.add_argument('--ema',           default=None,  type=float, nargs='?', const=0.5,
-                    metavar='DECAY',
-                    help='hold a moving average in each layer\'s DFF register: a write blends '
-                         'into what is already there, register = register + DECAY*(new - '
-                         'register), instead of replacing it. Bare --ema uses 0.5; a value '
-                         'must be in (0,1), and 1 would be the default replace-outright '
-                         'behavior. Costs nothing to store -- the update is in place -- which '
-                         'is what makes it the cheap moving average next to --accumulate, and '
-                         'the two compose: --accumulate decides what value a write proposes '
-                         '(the mean over the hold rather than that step\'s output), --ema '
-                         'decides how it is committed. What it gives up is exactness -- an '
-                         'exponential window instead of a box mean, and blind to the steps '
-                         'where the layer did not write. The effective window is ~1/DECAY '
-                         'writes, so ~period/DECAY tokens under a --clock ladder, which makes '
-                         'it a second way to stretch the state\'s timescale without freezing '
-                         'it. Applies under every --clock mode including sync, where it turns '
-                         'each layer into a leaky integrator updated every step. A row\'s '
-                         'first write after a document boundary replaces rather than blends, '
-                         'so no --init seed is left in the state. No parameters, so it can be '
-                         'toggled on an existing checkpoint')
-parser.add_argument('--qproj',         default='none', choices=_QPROJ_MODES,
-                    help='put a pointwise 1x1 linear conv2d on each layer\'s DFF path, one '
-                         'per layer at --n_hidden: width^2 + width parameters per layer, '
-                         '65.8K per layer at --n_hidden 256. The value travelling up the '
-                         'stack and into the decoder is never projected, so the feed-forward '
-                         'path is unchanged. '
-                         '"read" projects on the way out of the register, between the state '
-                         'and the feedback add: the register keeps the sparse ReLU output '
-                         '(~50%% exact zeros) and what the layer adds back is a dense signed '
-                         'recombination of it. Trainable, and initialized to the identity, so '
-                         'at step 0 the model is exactly --qproj none. '
-                         'Why it is not redundant with the convs already there: it is applied '
-                         'to the state but not to the token injection it is summed with, so a '
-                         'layer can transform what it remembers differently from what it is '
-                         'being told. Adds parameters, so unlike --clock it cannot be toggled '
-                         'on an existing checkpoint')
-parser.add_argument('--linout',        default=False, action='store_true',
-                    help='ONE pointwise 1x1 linear conv2d at the end of EACH layer, whose '
-                         'output is both what the DFF register stores and what the next layer '
-                         'receives. The DFF therefore holds a DENSE SIGNED tensor instead of '
-                         'the sparse non-negative ReLU output (~50%% exact zeros), which is '
-                         'the point: --accumulate averages the register and the next step adds '
-                         'it back, so a non-negative register can only ever accumulate, never '
-                         'cancel.\n'
-                         'This is NOT --tap. --tap ADDS a 1x1 in front of the 1x1 already on '
-                         'the upward path (deep_proj), leaving two in series with no '
-                         'nonlinearity between them -- which compose to one, so the second is '
-                         'redundant weight. --linout REPLACES deep_proj rather than preceding '
-                         'it: n_layers convs total instead of --tap\'s 2*n_layers-1, and the '
-                         'projection that makes the register dense is the same one that feeds '
-                         'the layer above. Mutually exclusive with --tap.\n'
-                         'Identity-initialized, so the register starts holding exactly the '
-                         'ReLU output and becomes signed as the weights move -- within a few '
-                         'steps in practice. Note step 0 is NOT identical to the baseline, '
-                         'unlike --tap: dropping deep_proj changes the upward path even at '
-                         'identity.\n'
-                         'WITH --c_context THIS 1x1 IS ALSO THE WIDENING. ContextCNN then '
-                         'runs at c_context end to end -- final BN and ReLU included -- and '
-                         'this conv projects c_context -> n_hidden, replacing a 3x3 that '
-                         'would have cost 9x its weights to do the same job. The nonlinearity '
-                         'therefore sits at the INTERIOR width and the only thing that widens '
-                         'to the register is linear, which is the intended shape. Init is '
-                         'semi-orthogonal rather than identity in that case (an identity '
-                         'needs a square matrix): norm-preserving, and dense/signed from step '
-                         '0 instead of leaving n_hidden-c_context channels at zero.')
-parser.add_argument('--dff_every',     default=1,     type=int, metavar='K',
-                    help='DEPRECATED, ACCEPTED AND IGNORED. K=2 used to leave every other '
-                         'layer straight through -- no register, no feedback add. EVERY '
-                         'LAYER NOW HAS A DFF AND A FEEDBACK ADD. The measurement that '
-                         'settled it: at identical parameter count, identical conv depth and '
-                         'identical data, removing one of two registers cost 0.503 nats '
-                         '(6.7188 -> 7.2219) and landed WORSE than two replace-outright '
-                         'registers -- the recurrent state is what the model runs on, so a '
-                         'layer without one is not worth its convs. Kept parseable so the '
-                         'command lines in ./doit still run.')
-parser.add_argument('--linout_kernel', default=1,     type=int, metavar='K',
-                    help='kernel size of the --linout conv2d (odd; default 1 = pointwise). '
-                         'K=3 makes it a 3x3 with zero padding K//2, so the S x S grid comes '
-                         'out the size it went in and nothing else in the model changes '
-                         'shape. What DOES change is reach: at 1x1 the projection mixes '
-                         'channels at a single position and every spatial interaction in the '
-                         'layer comes from ContextCNN\'s own convs, so the tensor written to '
-                         'the DFF register is a per-position recombination of that layer\'s '
-                         'output. At 3x3 the write itself is spatial -- each position of the '
-                         'register sees a 3x3 neighbourhood of the layer output -- which adds '
-                         'one more hop of receptive field per step to the recurrence, on the '
-                         'path the state actually travels. Costs 9x the linout weights '
-                         '(n_hidden * c_context * 9), which is small next to the conv stack '
-                         'but not next to a 1x1: at n_hidden 4096, c_context 256 it is 9.4M '
-                         'against 1.0M. Identity init still holds -- dirac_ puts the identity '
-                         'on the CENTRE tap and zeros the rest, so K=3 starts as exactly K=1 '
-                         'and grows its neighbourhood as the off-centre taps move.')
-parser.add_argument('--ctx_mix',       default='conv',
-                    choices=['conv', 'none', 'sign', 'signperm', 'hadamard'],
-                    help='how each --ctx_ema register gets its OWN view of the layer output. '
-                         'conv (default): K separate --linout copies, summed on the way up -- '
-                         'the v219/v224 topology. none: ONE ordinary linout conv whose output '
-                         'goes up the stack AND to every register unchanged (see '
-                         '--dff_write_scale). The others use ONE shared linout and give '
-                         'register k a FIXED, multiplier-free transform T_k of its output '
-                         '(T_1 = identity, so register 1 holds the output itself): '
-                         'sign = random +-1 per channel (where signs agree the feedback sum is '
-                         'EMA_fast + EMA_slow, where they differ it is a band-pass difference); '
-                         'signperm = random channel permutation then +-1 (the cheapest exact '
-                         'orthogonal map, pure wiring in hardware); hadamard = random +-1 then '
-                         'the fast Walsh-Hadamard transform, a dense orthogonal rotation in '
-                         'log2(n_hidden) add/sub stages (n_hidden must be a power of 2). '
-                         'The transforms are seeded independently of --seed and saved in the '
-                         'checkpoint. Changes the linout shape, so it is restored from a '
-                         'checkpoint and cannot be toggled on one.')
-parser.add_argument('--linout_init',   default='orth', choices=['orth', 'tied', 'scaled', 'rotate'],
-                    help='init of the --ctx_ema --linout copies (--ctx_mix conv). orth (default): '
-                         'each copy its own independent semi-orthogonal draw, so the upward sum '
-                         'starts at ~sqrt(K) scale. tied: every copy starts as the SAME draw -- '
-                         'and since the copies get identical updates through the upward sum, '
-                         'they stay identical, i.e. one shared linout with K x upward gain and '
-                         'K x effective lr, every register holding the same projection. '
-                         'scaled: independent draws, each x 1/sqrt(K), so the upward sum starts '
-                         'at unit scale. All three make the SAME random draws, so every other '
-                         'module initializes identically. rotate: also give a SQUARE single '
-                         'linout (c_context == n_hidden, one copy) a random orthogonal init -- '
-                         'by default that one case starts as the IDENTITY, so the registers '
-                         'begin by averaging the non-negative ReLU output. Init only: no shapes change.')
-parser.add_argument('--linout_gain',   default=1.0,   type=float, metavar='G',
-                    help='multiply the --linout init weights by G (init only; no shapes change). '
-                         'With --ctx_mix none, G=2 reproduces the upward gain of two tied '
-                         'copies (v231).')
-parser.add_argument('--gate_lr_mult',  default=1.0,  type=float, metavar='M',
-                    help='--ctx_read_gate: train the gate conv at M x lr (its gradient carries '
-                         'the register values, ~0.02-0.15, so at 1x the gates barely leave 0.5)')
-parser.add_argument('--linout_lr_mult', default=1.0,  type=float, metavar='M',
-                    help='--linout gets its own optimizer parameter group at M x the learning '
-                         'rate (the schedule scales it like every other group). With --ctx_mix '
-                         'none, M=2 reproduces how fast the summed map of two tied copies moves.')
-parser.add_argument('--decoder_lr_mult', default=1.0, type=float, metavar='M',
-                    help='the decoder (decoder.proj and its norm) gets its own optimizer parameter '
-                         'group at M x the learning rate. The decoder is linear up to its pool, so '
-                         'a gain g on its input (--linout_gain) mainly rescales its updates by '
-                         '~g^2; this is the direct way to get the same effect without inflating '
-                         'the linout init.')
-parser.add_argument('--dff_write_scale', default=1.0, type=float, metavar='S',
-                    help='registers store S x the layer output instead of the output itself '
-                         '(the value going up the stack is unscaled). Linear all the way to '
-                         'linin, so at inference it folds into the weights: text_proj x 1/S and '
-                         'linin x S compute the same function with no extra op. --ctx_mix none '
-                         '--linout_gain 2 --dff_write_scale 0.5 --linout_lr_mult 2 is exactly '
-                         'two tied linout copies (--linout_init tied) as one conv.')
-parser.add_argument('--ctx_read_gain', default='none', choices=['none', 'scalar', 'channel'],
-                    help='a TRAINABLE gain on each --ctx_ema register as the feedback reads it, '
-                         'before the K registers are summed: feedback = sum_k g_k * DFF_k. '
-                         'scalar = one per register per layer, channel = one per register per '
-                         'channel per layer (K*n_hidden). On the read side, so it gets gradient '
-                         '(a write-side gain would not -- the registers are detached). It can '
-                         'weight the timescales differently, or take their difference. Replaces '
-                         'the fixed --dff_write_scale: by linearity, write 1 and read-gain init '
-                         '0.5 start exactly where write 0.5 does. Adds parameters, so it is '
-                         'restored from a checkpoint.')
-parser.add_argument('--ctx_read_gain_init', default=1.0, type=float, metavar='G',
-                    help='starting value of every --ctx_read_gain entry (init only)')
-parser.add_argument('--freeze_linout', default=False, action='store_true',
-                    help='keep every --linout conv (all --ctx_ema copies) at its random init: '
-                         'requires_grad off, so the optimizer never sees it. The control for '
-                         'the question "do the linout copies help because they TRAIN, or '
-                         'because their fixed random inits put the K registers in different '
-                         'subspaces?" -- under --ctx_ema the copies get identical updates '
-                         'through the upward sum, so their difference never trains anyway. '
-                         'Not an architecture arg: re-applied from the command line on every '
-                         'run, like --unfreeze.')
-parser.add_argument('--linin',         default=False, action='store_true',
-                    help='ONE pointwise 1x1 linear conv2d IN FRONT of each layer\'s ContextCNN, '
-                         'mapping the feedback sum (DFF + token / layer below, n_hidden '
-                         'channels) down to --c_context. The first 3x3 of the chain then runs '
-                         'c_context -> c_context instead of n_hidden -> c_context, so the '
-                         'only thing that touches the full register width on the way in is '
-                         'linear -- the mirror of --linout on the way out. Weights: '
-                         'n_hidden*c_context per layer at 1x1, against 9*n_hidden*c_context '
-                         'for the 3x3 it narrows. Semi-orthogonal init (norm-preserving rows). '
-
-                         'Adds parameters, so it is restored from a checkpoint and cannot be '
-                         'toggled on one.')
-parser.add_argument('--ctx_ema',       default=None,  type=str, metavar='W1,W2,...',
-                    help='give EVERY LAYER SEVERAL CONTEXTS instead of one: K = the number of '
-                         'comma-separated WINDOWS IN TOKENS, and each context is a DFF '
-                         'register of the usual [n_hidden, S, S] shape, blended at its own rate '
-                         '1/W (W=1 replaces outright). With --linout each register is written '
-                         'by its OWN COPY of the linout projection and the K copies are SUMMED '
-                         'on the way up; the copies all get the same update through that sum, '
-                         'so they differ by their independent random inits, which keeps the '
-                         'K registers in separate subspaces. Without --linout every register '
-                         'blends the same layer output. '
-                         '--ctx_ema 1,10,100 gives every layer a 1-, a 10- and a 100-token '
-                         'memory of what it computed.\n'
-                         'The K registers are SUMMED into the feedback add.\n'
-                         'The registers are held concatenated, [K*n_hidden, S, S] per layer: '
-                         'K times the state memory and (with --linout) K times its weights. '
-                         'What travels up the stack and into the decoder is the sum of the '
-                         'linout copies (the layer output itself without --linout). Replaces --ema/--ema_ladder (the per-'
-                         'context windows ARE the blend rates), so it cannot be combined with '
-                         'them. Restored from a checkpoint, since it changes the state shape. '
-                         'A single window is exactly --ema 1/W, apart from the linout init.')
-parser.add_argument('--tap',          default=False, action='store_true',
-                    help='put two pointwise 1x1 linear conv2d projections in series after '
-                         'each layer\'s last conv2d-BN-ReLU -- the tensor that normally feeds '
-                         'the DFF -- and tap the DFF from between them. This flag adds the '
-                         'first of the two; the second is the 1x1 already on the upward path '
-                         '(deep_proj into the next layer, decoder.proj on the last layer), so '
-                         'the series is  output -> tap -> [register] -> deep_proj -> next '
-                         'layer. A separate second module would be exactly redundant: two '
-                         '1x1s in series with no nonlinearity between compose to one, so '
-                         'folding it into deep_proj costs nothing representable and halves '
-                         'the parameters. The register therefore holds a dense signed '
-                         'embedding instead of the sparse ReLU output (~50%% exact zeros). '
-                         'The tap trains, unlike --qproj write in the same position: the '
-                         'register it feeds is detached, but the upward path through it is '
-                         'not. Identity-initialized, so step 0 is exactly the model without '
-                         '--tap. One conv per layer at --n_hidden: width^2 + width per layer, '
-                         '65.8K per layer at --n_hidden 256. Since the register goes dense, '
-                         '--init gaussian suits it better than the default relu, and '
-                         'dff_zeros will read ~0. Adds parameters, so it cannot be toggled on '
-                         'an existing checkpoint')
-parser.add_argument('--kernel',        default=3,     type=int,
-                    help='conv kernel size (odd integer)')
-# training
-parser.add_argument('--dataset',       default='tiny',
-                    help='tiny | c4 | web | brt | dolma3 | s1k | pile | pile_nc | wdef | '
-                         'bdict (local file, --bdict_file). s1k is only '
-                         '1000 reasoning examples -- meant for --mix, it loops quickly on '
-                         'its own. pile is EleutherAI\'s deduplicated Pile re-release '
-                         '(EleutherAI/pile itself was emptied by a DMCA takedown and cannot '
-                         'be loaded); pile_nc is the same corpus with the copyrighted '
-                         'subsets removed. Both are large -- use --streaming, or --shards N '
-                         'to pull only the first N shards')
-parser.add_argument('--mix',           default=None,
-                    help='joint multi-dataset training, "name:weight,..." e.g. '
-                         '"brt:0.5,web:0.5"; overrides --dataset, samples one dataset per clip '
-                         '(token-proportional)')
-parser.add_argument('--mix_slots',     default=False, action='store_true',
-                    help='read the --mix weights as SLOT fractions instead of sampling '
-                         'weights: each dataset gets its own round(w * --batch) slots and its '
-                         'own clip queue, fed by builder threads pinned to that dataset. '
-                         'Every slot contributes one token per step, so this is an EXACT '
-                         'token split -- "fwcrawl:0.5,tinytb:0.5 --batch 250" is 125 slots '
-                         'each, every step -- where plain --mix only holds on average and '
-                         'only after its running mean of clip lengths has settled. Same '
-                         'batchwise idea as --vocab_slots, for hub corpora.')
-parser.add_argument('--unframed',      default=None,
-                    help='comma-separated --dataset/--mix corpora whose documents are NOT '
-                         'wrapped in <STX>/<ETX>: on those slots the raw tokens of one '
-                         'document are followed directly by the first token of the next, the '
-                         'slot never signals a document start, and the recurrent state is '
-                         'never reset -- the same contract as an unframed --vocab_files pool, '
-                         'applied to a streaming corpus. Because a slot is either resetting '
-                         'or not, an unframed corpus needs slots of its own: with --mix this '
-                         'requires --mix_slots. Held-out eval (--eval_corpora) still scores '
-                         'that corpus FRAMED, one document at a time from a reset state, so '
-                         'its EVAL line measures the same thing as a framed run\'s.')
-parser.add_argument('--ctx_cat',       default=False, action='store_true',
-                    help='--ctx_ema feedback: CONCATENATE the K registers (K*n_hidden channels) '
-                         'and map them back to n_hidden with one 1x1 conv, instead of summing '
-                         'them. The conv starts as [I, I, ..., I] -- exactly the sum at step 0 -- '
-                         'and each register\'s block then trains as its own read projection, so '
-                         'the timescales can be weighted differently or subtracted. Adds '
-                         'K*n_hidden*n_hidden weights per layer. Restored from a checkpoint.')
-parser.add_argument('--no_text_proj',  default=False, action='store_true',
-                    help='drop the text_proj 1x1 conv: the replicated token embedding grid goes '
-                         'straight into the feedback (it must already be n_hidden wide -- true '
-                         'when the embedding width equals --n_hidden). With --ctx_cat_in the '
-                         'next op is the ctx_cat 1x1 conv, so text_proj composed with ctx_cat\'s '
-                         'input block was one linear map in two pieces. Restored from a checkpoint.')
-parser.add_argument('--ctx_cat_in',    default=False, action='store_true',
-                    help='like --ctx_cat, but the input from below (text_proj on layer 1, the '
-                         'layer below otherwise) is concatenated WITH the K registers: '
-                         '(K+1)*n_hidden channels -> one 1x1 conv -> n_hidden, which replaces '
-                         'the feedback add altogether. Starts as [I, I, ..., I] (the plain sum), '
-                         'so every source -- input and each timescale -- gets its own trained '
-                         'read. Implies --ctx_cat. Restored from a checkpoint.')
-parser.add_argument('--ctx_cat_spatial', default=False, action='store_true',
-                    help='with --ctx_cat_in: concatenate [input, DFF1, DFF2, DFF3] SPATIALLY '
-                         'instead of along channels. Every grid cell becomes a 2x2 group '
-                         '[input, DFF1; DFF2, DFF3] at n_hidden depth, so SxS -> 2Sx2S, read by '
-                         'S/2 unpadded (3x3 conv + BN + ReLU) blocks that take 2S back to S '
-                         '(8: 16 -> 14 -> 12 -> 10 -> 8) and end at the ctx_cat width. Needs '
-                         'exactly 3 --ctx_ema registers and an n_hidden-wide input (text_proj '
-                         'on, i.e. no --no_text_proj). Restored from a checkpoint.')
-parser.add_argument('--ctx_cat_kernel', default=1, type=int, metavar='K',
-                    help='kernel size of the --ctx_cat/--ctx_cat_in conv (odd; default 1). '
-                         'K=3 reads each source over a 3x3 neighbourhood; the identity init '
-                         'sits on the centre tap, so step 0 still equals the plain sum. '
-                         'Restored from a checkpoint.')
-parser.add_argument('--dec_depth',     default=0,     type=int, metavar='N',
-                    help='N extra (conv 3x3 + norm + ReLU) blocks at n_hidden, applied to the '
-                         'layer output AFTER the DFF tap (linout) and BEFORE decoder.proj. The '
-                         'registers still store linout\'s output; these blocks sit only on the '
-                         'path to the prediction, so the recurrent context representation is '
-                         'decoupled from the one the frozen lmhead reads. 0 (default) = none. '
-                         'Restored from a checkpoint.')
-parser.add_argument('--dec_width',     default=0,     type=int, metavar='W',
-                    help='channel width of the --dec_depth blocks (default 0 = n_hidden). The '
-                         'first block narrows n_hidden -> W, the rest stay at W, and decoder.proj '
-                         'reads W channels (W -> embedding width). The DFF tap is unaffected. '
-                         'Restored from a checkpoint.')
-parser.add_argument('--dec_kernel',    default=1,     type=int, metavar='K',
-                    help='kernel of decoder.proj, the linear conv before the global average pool '
-                         '(odd, padded to keep SxS; default 1 = 1x1). Restored from a checkpoint.')
-parser.add_argument('--dec_tree',      action='store_true',
-                    help='replace the decoder\'s spatial reduction (decoder.proj + global average '
-                         'pool) with a tree of unpadded (conv + norm + ReLU) blocks that shrinks '
-                         'the SxS grid to 1x1: 3x3 kernels while the side is >= 3 (8->6->4->2), '
-                         'then a 2x2 for the last step. Its ReLU output feeds decoder.proj as a '
-                         'plain 1x1 linear at 1x1 (no pool) and then the lmhead. Width from '
-                         '--dec_width (default n_hidden). Applied after --dec_depth if both are '
-                         'set; --dec_kernel must stay 1. Restored from a checkpoint.')
-parser.add_argument('--dec_tree_linear', action='store_true',
-                    help='--dec_tree blocks are bare convs (no norm, no ReLU), so the tree plus '
-                         'decoder.proj is one LINEAR map of the whole SxSxn_hidden layer output, '
-                         'factorized into stages. Convs get a variance-preserving init (fan_in, '
-                         'linear gain, zero bias). Restored from a checkpoint.')
-parser.add_argument('--dec_tree_kernels', default=None, type=str, metavar='K1,K2,...',
-                    help='--dec_tree with explicit unpadded kernels, which must take the SxS grid '
-                         'to 1x1 (sum of (k-1) = S-1; e.g. 5,4 or 3,3,4 for S=8). Every kernel but '
-                         'the last is a tree block; the LAST is decoder.proj itself, a KxK conv '
-                         'straight to the embedding width -- no separate 1x1, no pool. Default '
-                         '(unset): 3x3 blocks down to 2x2, a 2x2 block, then a 1x1 decoder.proj. '
-                         'Restored from a checkpoint.')
-parser.add_argument('--dec_tree_pool', action='store_true',
-                    help='with --dec_tree_kernels: the kernels may stop short of 1x1 (sum of '
-                         '(k-1) < S-1); decoder.proj (the last kernel) is followed by a global '
-                         'average pool over the grid it leaves, e.g. 3,3,3 on 8x8: 8->6->4->2, '
-                         'pool 2x2. Restored from a checkpoint.')
-parser.add_argument('--ctx_cat_narrow', action='store_true',
-                    help='with --ctx_cat_in: the ctx_cat 1x1 outputs --c_context channels (not '
-                         'n_hidden), so it reads the concat straight down to the ContextCNN width '
-                         'and the first 3x3 runs c_context -> c_context. Restored from a checkpoint.')
-parser.add_argument('--dff_dropout',   default=0.0,   type=float, metavar='P',
-                    help='--ctx_ema: inverted dropout with probability P on each register as it is '
-                         'READ into the feedback/concat, in training mode only. The registers '
-                         'themselves (and so their EMA) are untouched; eval/generation read them '
-                         'whole. 0 (default) = off.')
-parser.add_argument('--tok_dropout',   default=0.0,   type=float, metavar='P',
-                    help='inverted dropout with probability P on the SxSxC token grid (after '
-                         'replication and text_proj, elementwise -- each grid cell keeps its own '
-                         'subset of the embedding), training mode only. 0 (default) = off.')
-parser.add_argument('--ctx_read_norm', default=0.0, type=float, metavar='S',
-                    help='--ctx_ema: read each register RMS-normalized to S (per row, over its '
-                         'channels and grid), so the K registers enter ctx_cat at equal size '
-                         'whatever their own scale -- what v350\'s learned gates converged to '
-                         '(each register read at ~0.015). No parameters. 0 = off.')
-parser.add_argument('--ctx_read_norm_mode', default='row', choices=['row', 'running'],
-                    help='how --ctx_read_norm measures each register\'s RMS. row (default): per '
-                         'batch row, every step. running: one scale per register, a running '
-                         'average (momentum 0.01) of the batch RMS kept in a buffer and updated '
-                         'in training only, BatchNorm-style -- a fixed constant at inference '
-                         'that folds into ctx_cat\'s weights (no reduction, no rsqrt). '
-                         'Restored from a checkpoint.')
-parser.add_argument('--tok_norm', default=False, action='store_true',
-                    help='RMS-normalize each token embedding to 1 (over its c_text channels) '
-                         'before it is replicated to the grid. With --ctx_read_norm 1 the token '
-                         'and every register read enter ctx_cat at unit RMS. The embedding is '
-                         'frozen, so this is a fixed per-token rescale (pythia31m rows: rms '
-                         '0.030-0.032) that folds into the embedding ROM.')
-parser.add_argument('--tok_gain', default=1.0, type=float, metavar='G',
-                    help='fixed multiplier on the token grid (after text_proj, before the '
-                         'feedback add/concat). The frozen pythia31m embedding has rms ~0.031 '
-                         'while unnormalized registers sit at ~0.15-0.4, so with '
-                         '--ctx_read_norm off a gain ~10 puts the token at the registers\' '
-                         'level. A constant: folds into the embedding ROM. 1 (default) = off.')
-parser.add_argument('--ctx_learn_win', action='store_true',
-                    help='--ctx_ema windows as trainable parameters (one log-window per register, '
-                         'starting at the --ctx_ema values). The registers are detached, so the '
-                         'rate gets its gradient by one-step lookahead: register r_t = r_t-1 + '
-                         'a*e_t is read at t+1 as r_t + (a - a.detach())*e_t -- same value, exact '
-                         'd loss_t+1 / d a. Rates are fixed numbers at inference. See --win_lr_mult.')
-parser.add_argument('--ctx_win_param', default='clamp', choices=['clamp', 'exp1', 'rate2'],
-                    help='--ctx_learn_win parameterization. clamp: W = exp(theta) clamped to '
-                         '[1, 4096] -- a window that touches 1 can get stuck there (the clamp '
-                         'zeroes its gradient; v359). exp1: W = 1 + exp(theta), always above 1 '
-                         'with a live gradient (a --ctx_ema window of 1 starts at 1.001). '
-                         'rate2: the RATE a = 1/W learned as a = 2*sigmoid(phi), free in (0, 2): '
-                         'a < 1 smooths, a = 1 copies, 1 < a < 2 extrapolates (old state enters '
-                         'with a negative weight, emphasizing token-to-token change). The bounds '
-                         'are the EMA\'s stability limits, so W floats in (0.5, inf).')
-parser.add_argument('--win_lr_mult', default=1.0, type=float, metavar='M',
-                    help='--ctx_learn_win: train the log-windows at M x lr')
-parser.add_argument('--ctx_every',     default=None, metavar='N1,N2,...',
-                    help='--ctx_ema subsampled registers: register k updates once every N_k '
-                         'tokens (counted from <STX>), writing the MEAN of its input over those '
-                         'N_k tokens (box decimation), at rate 1-(1-1/W_k)^N_k so its window '
-                         'in tokens stays W_k. 1 = every token (default for all).')
-parser.add_argument('--ctx_read_gate', action='store_true',
-                    help='--ctx_ema learned read gates: every register channel is read through '
-                         'a sigmoid gate g = sigmoid(1x1 conv of the whole ctx_cat input -- token '
-                         'grid and all K registers), so the mix of the K timescales the layer '
-                         'sees is chosen per step, channel and grid cell: a learned, input-'
-                         'dependent effective window. On the READ side because the registers '
-                         'are detached: a write-side rate never reaches the loss under the '
-                         '1-step gradient. Starts at g = 0.5 everywhere (weights and bias 0), where the '
-                         'sigmoid is steepest and the gates learn fastest. '
-                         'Needs --ctx_cat_in.')
-parser.add_argument('--ctx_adapt',     action='store_true',
-                    help='--ctx_ema closed-form adaptive rates: each register, per document '
-                         'row, sets its rate to the steady-state Kalman gain of a local-level '
-                         'model fitted to its own innovations e = input - register: with V = '
-                         'E[e^2] and C1 = E[e_t e_t-1] (pooled over channels and grid, smoothed '
-                         'over --ctx_adapt_win tokens), R = (1-a)V - C1, Q = a(2-a)V - 2aR, '
-                         'lambda = Q/R, rate = 2/(1 + sqrt(1 + 4/lambda)), clamped to the '
-                         'register\'s --ctx_adapt_range. Rates are detached (a control law, not '
-                         'trained) and run identically at inference. Needs --ctx_first blend.')
-parser.add_argument('--ctx_adapt_range', default=None, metavar='LO:HI,...',
-                    help='--ctx_adapt window clamp per register, in tokens. Default: bands '
-                         'split at the geometric midpoints of the --ctx_ema windows, outer edges '
-                         'at /4 and x4 (16,64,256 -> 4:32,32:128,128:1024).')
-parser.add_argument('--ctx_adapt_win', default=None, metavar='W1,W2,...',
-                    help='--ctx_adapt statistics window per register, tokens (default: the '
-                         '--ctx_ema windows). Bias-corrected, so short documents still get an '
-                         'estimate.')
-parser.add_argument('--ctx_warm',      action='store_true',
-                    help='--ctx_ema warm-up correction: register k blends at rate '
-                         'a_k / (1 - (1 - a_k)^n), n = writes since <STX> (the Adam bias '
-                         'correction). Each register is a normalized (weights summing to 1) '
-                         'average of the document so far -- about the running mean while n is '
-                         'well under its window, the usual EMA after -- instead of a '
-                         'zero-started average that is shrunk toward 0 for its first ~window '
-                         'tokens. Needs --ctx_first blend. The effective window 1/rate is logged '
-                         '(win on STEP, EVALI).')
-parser.add_argument('--ctx_resid',     action='store_true',
-                    help='--ctx_ema registers written with what the FASTER register missed: '
-                         'register 1 blends toward the layer output x as usual, register k '
-                         'toward x - register k-1 (its value just written this step). A '
-                         'residual cascade meant to cut the overlap between the K windows: '
-                         'register k no longer holds a smoothed copy of what k-1 already '
-                         'holds. Needs --ctx_mix none (one shared output). See --eval_info.')
-parser.add_argument('--ctx_resid_mode', default='prev', choices=['prev', 'sum'],
-                    help='--ctx_resid input to register k (k > 1): "prev" (default, every run '
-                         'before this flag) = x - register k-1; "sum" = x - (registers 1..k-1), '
-                         'a true residual decomposition (Laplacian-pyramid style): each register '
-                         'holds only what ALL slower registers missed, and with a W=1 last '
-                         'register the K registers sum exactly to x. "prev" flips sign every '
-                         'stage, so register k+2 sees roughly what k saw (v392/v393 EVALI: '
-                         'canonical correlation ~0.99 between registers 1-3, 3-5, ...).')
-parser.add_argument('--ctx_chain',     action='store_true',
-                    help='--ctx_ema registers in SERIES (a clocked shift-register chain): '
-                         'register 1 blends toward the layer output, register k toward register '
-                         'k-1\'s value from the previous step. All update at once, so each stage '
-                         'adds one step of delay plus its EMA smoothing; the K registers become '
-                         'a smoothed delay line (impulse responses peaked progressively further '
-                         'in the past) instead of K windows all peaked at the present. Read '
-                         'exactly as before. Restored from a checkpoint.')
-parser.add_argument('--ctx_first',     default='replace', choices=['replace', 'blend'],
-                    help='a DFF register\'s FIRST write of a document. replace (default): the '
-                         'register is overwritten with the layer output, so no --init value '
-                         'survives -- but a long-window register is then dominated by that '
-                         'first output for the whole document (after 480 tokens a 4096-window '
-                         'register still holds 89%% of it). blend: the first write blends like '
-                         'every other, so the state leaves the reset value (--init zero: the '
-                         'origin) continuously and each register is a running average of THIS '
-                         'document, shrunken by 1-(1-e)^t while t << window.')
-parser.add_argument('--no_dff_reset',  default=False, action='store_true',
-                    help='never reset the recurrent state at a document start during training: '
-                         'the DFF registers are seeded once (--init, first write replaces) and '
-                         'then run continuously across documents. Unlike --unframed the '
-                         'documents keep their <STX>/<ETX> framing, so the model still SEES '
-                         'every boundary and has to learn for itself when to discount the '
-                         'previous document. Training only: held-out eval still scores each '
-                         'document from a fresh state, and generation still restarts after '
-                         '<ETX>, so EVAL lines stay comparable with framed runs.')
-parser.add_argument('--shuffle',       default=None,
-                    action=argparse.BooleanOptionalAction,
-                    help='shuffle the corpus, or read it in FILE ORDER. Unset (the default) '
-                         'is per-dataset: on for every hub corpus, which is what every run '
-                         'before this flag did, and OFF for --dataset file, whose whole '
-                         'purpose is a fixed sequence. --shuffle forces it on even for a '
-                         'file, --no-shuffle forces it off even for a hub corpus.\n'
-                         'What "on" means depends on the load: a buffer when streaming, a '
-                         'true permutation for a corpus small enough to fit page cache, a '
-                         'sharded buffer otherwise (see _make_iter). None of those is '
-                         'reproducible across runs -- the builder threads race for the '
-                         'iterator -- so --no-shuffle is what makes two runs see the same '
-                         'documents in the same order, and the only way to tell a 0.04-nat '
-                         'config difference from a different draw.')
-parser.add_argument('--subsample',     default=0,     type=int, metavar='N',
-                    help='train on a FIXED sample of N examples per corpus instead of the '
-                         'whole stream. The sample is drawn once at startup -- the first N '
-                         'usable examples the (shuffled) corpus iterator yields, after the '
-                         'per-corpus filter and the held-out hash split, so every one of '
-                         'them is a document the model will actually see -- and is then '
-                         'treated as the corpus: one pass over it is one epoch, and each '
-                         'epoch is an independent reshuffle of the same N documents '
-                         '(random.Random(--seed + epoch)). Under --mix every corpus gets '
-                         'its own N-example sample. The epoch column and the EPOCH lines '
-                         'behave as for any finite corpus, so this is the tool for '
-                         'measuring how many passes a closed set of documents takes to '
-                         'memorize: 10000 fineweb docs is ~1 step per document at batch '
-                         '250, so --subsample 10000 cycles the same text every few hundred '
-                         'steps. 0 (default) = off, stream the corpus as before.')
-parser.add_argument('--refresh',       default=0.0,   type=float, metavar='FRAC',
-                    help='--subsample turnover driven by a LEARNING-STALL DETECTOR instead of '
-                         'the fixed --epochs schedule: when the model has stopped learning '
-                         'from the current pool, replace FRAC of it (the oldest documents) '
-                         'with fresh ones, which should restart learning, and repeat. '
-                         '0 (default) = off. Mutually exclusive with --epochs.\n'
-                         'THE DETECTOR is arXiv:2403.02473 ("When do Convolutional Neural '
-                         'Networks Stop Learning?"), which stops training when the data '
-                         'variation across ALL layers goes still; here the same signal '
-                         'triggers a data refresh rather than a stop. Per conv layer i and '
-                         'epoch e: alpha = std of that layer\'s POST-CONVOLUTION activations, '
-                         'sampled every --refresh_sample steps; mu_i^e = mean(alpha) over the '
-                         'epoch; delta_i^e = round(mu_i^e, --refresh_r) - round(mu_i^(e-1), '
-                         '--refresh_r); the epoch is STILL when sum_i delta_i^e == 0, and the '
-                         'refresh fires after --refresh_hold consecutive still epochs.\n'
-                         'Post-CONVOLUTION and not post-norm on purpose: BatchNorm/GroupNorm '
-                         'with affine=False makes the post-norm std 1 by construction and the '
-                         'post-ReLU std a constant of it, so the only layer output that '
-                         'carries information about data variation is the conv output itself.')
-parser.add_argument('--refresh_r',     default=2,     type=int, metavar='R',
-                    help='--refresh: decimal places the per-layer mean is rounded to before '
-                         'differencing. The paper\'s r=2 is its one critical hyperparameter -- '
-                         'r=1 declares the stall too early, r>=3 never declares it.')
-parser.add_argument('--refresh_every', default=0,     type=int, metavar='K',
-                    help='--refresh on a FIXED SCHEDULE instead of on the stall detector: '
-                         'turn the pool over every K epochs regardless of what the detector '
-                         'says. 0 (default) = the detector decides.\n'
-                         'The refresh itself is identical -- the same --refresh fraction, the '
-                         'oldest first -- so this is the controlled comparison for a '
-                         'stall-driven run: same action, same pool, only the timing rule '
-                         'differs. It is NOT --epochs, which retires N/E documents EVERY '
-                         'epoch so the pool drifts continuously; this swaps a block at once, '
-                         'the way a triggered refresh does.\n'
-                         'The detector is DISABLED in this mode -- no activation hooks are '
-                         'registered and nothing is measured -- because a fixed schedule does '
-                         'not consult it, and leaving it on would pay one extra reduction per '
-                         'conv layer for a number nothing reads.')
-parser.add_argument('--refresh_mode',  default='rel', choices=['rel', 'abs'],
-                    help='--refresh: how a stalled epoch is declared.\n'
-                         '"abs" is the paper verbatim: still when abs(sum delta) <= '
-                         '--refresh_eps, with EPS 0 the paper\'s exact ==0.\n'
-                         '"rel" (default) asks whether the drift is STILL FALLING rather '
-                         'than whether it has reached a floor: an epoch counts as progress '
-                         'only if abs(sum delta) sets a new minimum (by more than '
-                         '--refresh_tol, relatively), and --refresh_hold epochs with no new '
-                         'minimum declare the stall. It is the default because the absolute '
-                         'floor is not a property of the data -- it is set by this model\'s '
-                         'permanent activation-scale inflation, so "abs" with EPS 0 never '
-                         'fires here and an EPS chosen above the floor degenerates into a '
-                         'fixed schedule: measured at --subsample 100, EPS 0.5 fired every '
-                         '1+--refresh_hold epochs exactly, i.e. --epochs 4 with extra steps. '
-                         'A minimum-tracking test needs no scale constant and so transfers '
-                         'across depth, width and step count.')
-parser.add_argument('--refresh_tol',   default=0.0,   type=float, metavar='T',
-                    help='--refresh_mode rel: relative margin a new minimum must beat, '
-                         'best*(1-T). 0 (default) counts any new minimum as progress; raise '
-                         'it to ignore noise-sized improvements (T 0.05 = "at least 5%% '
-                         'better than the best epoch so far").')
-parser.add_argument('--refresh_eps',   default=0.0,   type=float, metavar='EPS',
-                    help='--refresh: declare the epoch STILL when abs(sum of per-layer '
-                         'deltas) <= EPS, instead of the paper\'s exact == 0. Default 0.0 IS '
-                         'the paper.\n'
-                         'Why it is needed here and not there: the paper\'s networks are '
-                         'feed-forward image classifiers whose activation statistics settle, '
-                         'so the rounded per-layer means eventually stop moving. This model is '
-                         'RECURRENT and its state scale drifts upward for the whole run '
-                         '(measured: the DFF std climbs from 0.7 to 1.65 over 3.6M steps), '
-                         'which drags the post-convolution activation std with it, so a few '
-                         'layers cross a rounding boundary every epoch and the exact criterion '
-                         'may never fire. Measured on --subsample 100: sum_delta decays '
-                         '2.43 -> 0.40 over 20 epochs and then flattens near 0.40-0.45 while '
-                         'the mean activation std is still climbing. With 32 layers and r=2, '
-                         'EPS 0.5 means "no more than ~50 rounding units of total drift", i.e. '
-                         'most layers unchanged; EPS 0 means every layer identical twice over.')
-parser.add_argument('--refresh_hold',  default=3,     type=int, metavar='K',
-                    help='--refresh: consecutive still epochs (sum delta == 0) required before '
-                         'the pool is refreshed. The paper uses 3.')
-parser.add_argument('--refresh_sample', default=10,   type=int, metavar='N',
-                    help='--refresh: sample the per-layer activation std every N training '
-                         'steps rather than every step. The epoch mean is over the samples, '
-                         'so this trades a little precision for the cost of one extra full '
-                         'reduction per conv layer: every step is ~8%% of step time at '
-                         'depth 32, N=10 is under 1%%.')
-parser.add_argument('--epochs',        default=0,     type=int, metavar='E',
-                    help='--subsample turnover: how many epochs each sampled document lives '
-                         'before it is retired for a fresh one. 0 (default) = never, the '
-                         'sample is closed and every epoch is the same N documents. With E '
-                         'set the pool still holds N documents at all times, but after every '
-                         'epoch the N/E OLDEST are dropped and N/E fresh ones are drawn from '
-                         'the stream (the remainder spread so that exactly N turn over per E '
-                         'epochs), so the refresh is gradual rather than a wholesale swap: '
-                         'each document is seen E times, the pool composition drifts '
-                         'continuously, and at any moment it holds documents at every age '
-                         'from 1 to E epochs. E=1 replaces the whole pool every epoch. '
-                         'Requires --subsample.')
-parser.add_argument('--data_file',     default='data/fineweb2k.jsonl',
-                    help='file backing --dataset file: a LOCAL JSONL corpus, one JSON object '
-                         'per line with a "text" field. Unlike every hub corpus this one is '
-                         'READ IN FILE ORDER AND NEVER SHUFFLED -- not at load, not in a '
-                         'buffer, not per epoch -- so two runs see the same documents in the '
-                         'same sequence and the data stops being a source of run-to-run '
-                         'variance. That is the point: the streaming shuffle is not '
-                         'seed-controlled, so on a hub corpus even --seed leaves the batch '
-                         'composition thread-scheduling dependent, and a 0.04-nat difference '
-                         'between two configs cannot be told from a different draw. JSONL '
-                         'rather than plain lines because documents contain newlines; '
-                         'data/fineweb2k.jsonl (2000 fineweb docs, 6.3M chars) is the one '
-                         'this repo ships. Small enough to wrap many times in a run: the '
-                         'epoch column counts passes and they are IDENTICAL passes.')
-parser.add_argument('--bdict_file',    default='basic_dict_e3.txt',
-                    help='file backing --dataset bdict: a LOCAL plain-text corpus, ONE '
-                         'DOCUMENT PER LINE. Unlike every other corpus here it is authored '
-                         'rather than downloaded, so it is version-controlled with the code '
-                         'and the exact bytes trained on are recoverable from git. Used for '
-                         'the basic-vocabulary memorization probe, where the corpus is small '
-                         'enough (848 lines) that thousands of epochs fit in a normal run. '
-                         'The _eN suffix is SENTENCES PER WORD: basic_dict_e3.txt has 3 '
-                         'example sentences per vocabulary word, basic_dict_e10.txt has 10 '
-                         'and is a strict superset (same 848 words, same first 3 sentences '
-                         'verbatim), so a pair of runs isolates "more text per item" from '
-                         'every other variable.')
-parser.add_argument('--datarep',       default=1,     type=int, metavar='N',
-                    help='feed every token N TIMES IN A ROW, giving the recurrent state N '
-                         'steps of computation per input token instead of one (default 1 = '
-                         'off, byte-identical to before this flag existed). The replication '
-                         'is per slot and covers the framing: <STX> and <ETX> repeat like '
-                         'any other token, and the (x, y) pair repeats with them, so every '
-                         'replica is trained to predict the SAME next token -- the later '
-                         'replicas simply get to use a more settled state to do it.\n'
-                         'CADENCES ARE NOT SCALED: --monitor, --gen_interval, '
-                         '--eval_interval and --checkpoint are all counts of RAW STEPS at '
-                         'any N, so each flag means what it says. Note the consequence when '
-                         'comparing runs: a step is 1/N of a token, so an EVAL at step 20000 '
-                         'is 20000/N tokens in, and two runs at different N line up on '
-                         'step/N rather than on step.\n'
-                         'DECODE mirrors training: the prompt is fed N times per token and '
-                         'the sample is drawn from the logits of the LAST replica, then that '
-                         'sample is itself replicated N times, so one output token appears '
-                         'every N steps (--generate, --vis and the periodic GEN samples all '
-                         'work this way). Held-out eval replicates too, since it frames '
-                         'documents with the same clip_text the trainer uses -- so its '
-                         'nats/token stay comparable WITHIN a --datarep setting but not '
-                         'across two different ones.\n'
-                         'Costs N steps per token: at a fixed step budget the model sees 1/N '
-                         'of the data, and at a fixed data budget the run takes N times '
-                         'longer.')
-parser.add_argument('--gen_pool',      default='last', choices=('last', 'mean'),
-                    help='--datarep > 1: which of a token\'s N replica steps the next-token '
-                         'distribution is drawn from during DECODE (--generate, --vis, the '
-                         'periodic GEN samples). "last" (default) samples from the final '
-                         'replica\'s logits -- the state has settled longest there, and it '
-                         'is what the training stream\'s last replica is optimized to '
-                         'predict. "mean" takes the ARITHMETIC MEAN OF THE PROBABILITIES '
-                         'across all N replicas -- softmax each, average, sample from that -- '
-                         'so the replicas vote as distributions and one confidently wrong '
-                         'replica is outvoted rather than dominating. (An arithmetic mean of '
-                         'probabilities, not of logits: a logit mean is a GEOMETRIC mean once '
-                         'softmaxed, where a single near-zero probability vetoes a token no '
-                         'matter what the others say.) --temperature still applies, to the '
-                         'pooled distribution. Every replica is trained against the same '
-                         'target, so both readings are of the same quantity -- this chooses '
-                         'which one the sampler sees. No effect at --datarep 1, where there '
-                         'is one replica and the two are identical.')
-parser.add_argument('--vocab_files',   default=None,
-                    help='comma-separated local files of ONE SENTENCE PER LINE that feed a '
-                         'BATCHWISE stream (see --vocab_slots). These are NOT framed: no '
-                         '<STX>/<ETX> is added and the slot never signals a document start, '
-                         'so the model state is never reset on those slots -- the sentences '
-                         'run head to tail as an unbroken stream. Files are weighted EQUALLY '
-                         'by slot, so two files split the vocab slots 50/50 and three split '
-                         'them in thirds -- pass a multiple of the file count as '
-                         '--vocab_slots to get an exact split. The STEP line\'s epoch column '
-                         'is the MEAN number of complete passes over these files.')
-parser.add_argument('--vocab_framed',   default=None,
-                    help='comma-separated subset of --vocab_files (path or bare stem) whose '
-                         'examples ARE framed: each one is wrapped in <STX>...<ETX> and the '
-                         'slot signals a document start on its first step, so the recurrent '
-                         'state resets between examples exactly as it does on a corpus slot. '
-                         'This is the right setting for a pool whose examples are long, '
-                         'self-contained documents (reasoning_phase1: ~761 tokens of '
-                         'question + <think> + <answer>) rather than short sentences meant '
-                         'to run head to tail. Framed pools are EXCLUDED from the epoch '
-                         'column\'s mean -- they wrap tens of times more slowly than a '
-                         'sentence pool and would dominate nothing while being dominated.')
-parser.add_argument('--vocab_slots',   default=0,     type=int,
-                    help='how many of the --batch slots the --vocab_files stream occupies. '
-                         'The REMAINING slots are filled the normal way from --dataset/--mix, '
-                         'with <STX>/<ETX> framing. Because every slot contributes exactly '
-                         'one token per step, the slot split IS the token split: '
-                         '--batch 250 --vocab_slots 225 is exactly 90%% vocab / 10%% corpus '
-                         'tokens, with no dependence on document lengths. That is the point '
-                         'of doing this batchwise rather than through --mix, whose '
-                         'token-proportional sampling only holds on average.')
-parser.add_argument('--bdict_split',   default=False, action='store_true',
-                    help='--dataset bdict: drop the leading "word: " key and make EVERY '
-                         'SENTENCE its own training example. basic_dict_e10.txt goes from '
-                         '848 documents of 10 sentences to 8,480 documents of one sentence. '
-                         'This is the PRE-PRETRAINING form: without the key the corpus stops '
-                         'being a lookup table to memorize and becomes plain simple English, '
-                         'so what transfers downstream is ordinary sentence structure rather '
-                         'than "after a colon, recite". Documents get ~10x shorter, so <ETX> '
-                         'and the context reset arrive ~10x more often.')
-parser.add_argument('--gen_score',     default=None,  nargs='?', metavar='MODEL',
-                    const='EleutherAI/pythia-70m',
-                    help='score each GEN sample for FLUENCY with a frozen reference LM '
-                         '(bare flag: EleutherAI/pythia-70m, 70M params). Prints a GENSCORE '
-                         'line beside the sample: nats/token under the reference, plus a '
-                         '0-100%% position between two anchors computed ONCE from this run\'s '
-                         'own corpus -- FLOOR is real training text, CEILING is the same text '
-                         'with its words shuffled. The anchors are what make the number mean '
-                         'anything: raw nats/token is uninterpretable without knowing what '
-                         'the reference scores on real text of the same kind, and they are '
-                         'frozen after the first computation so the series is comparable '
-                         'across steps.\n'
-                         'READ IT WITH THE REPETITION COLUMN, NEVER ALONE. A reference LM is '
-                         'DELIGHTED by degenerate output -- "the the the" scores near-zero '
-                         'nats -- which is exactly the failure mode a recurrent model falls '
-                         'into (see exp/gencheck.py). GENSCORE therefore also reports rep1, '
-                         'the larger of the fraction of the sample made of its most common '
-                         'WORD and the fraction of its non-whitespace CHARACTERS made of the '
-                         'most common one -- a wall of one punctuation character broken by '
-                         'spaces defeats the word rate alone (0.08, while the reference LM '
-                         'scores it 98%% fluent) and the character rate catches it (0.75); '
-                         'a high fluency score next to a high rep1 is a collapsed model, not '
-                         'a fluent one.\n'
-                         'Runs on the CPU and only every --gen_interval steps, so it costs '
-                         'no GPU memory and no measurable training time. Off by default: a '
-                         'run without it is byte-identical to one from before the flag.')
-parser.add_argument('--blocks',        default=False, action=argparse.BooleanOptionalAction,
-                    help='read the corpus as ONE CONTIGUOUS STREAM PER SLOT instead of a bag '
-                         'of documents: each file is cut into --batch byte ranges and slot k '
-                         'reads range k of every file, head to tail, in file order.\n'
-                         'For a line-oriented corpus this is the difference between a slot '
-                         'seeing ~13 tokens of continuity and then jumping somewhere else in '
-                         'the corpus, and a slot reading hundreds of thousands of contiguous '
-                         'tokens. The ordinary path hands documents out from a shared queue, '
-                         'so a slot gets roughly every --batch-th line; on an --unframed slot, '
-                         'whose state is never reset, that asks the recurrence to carry '
-                         'context across boundaries with nothing behind them.\n'
-                         'PER FILE, so the batch moves through the files together and an '
-                         'unshuffled curriculum survives; cutting the concatenated corpus '
-                         'would put slot 0 in the first file and the last slot in the last, '
-                         'with every file present in every batch. One pass over every range '
-                         'of every file is one epoch, and the epoch length in steps is '
-                         'unchanged: corpus_tokens / batch.\n'
-                         'Local text corpora only (--dataset babylm), single dataset, and it '
-                         'is inherently ordered -- implies --no-shuffle.')
-parser.add_argument('--gen_null',      default=False, action=argparse.BooleanOptionalAction,
-                    help='sample from the SEEDED STATE ALONE: the prompt is empty, not even '
-                         '<STX>. Applies everywhere a sample is drawn -- the periodic GEN '
-                         'lines, --generate and --vis.\n'
-                         'Default off, where a prompt of "" still means the single token '
-                         '<STX> (see _prompt_ids), so generation always opens at a document '
-                         'boundary the way every training clip does. That is the right '
-                         'default for a FRAMED corpus and the wrong one for an UNDELIMITED '
-                         'stream (--unframed), which never sees <STX> in training: feeding '
-                         'one at sample time puts the model in a state it was never trained '
-                         'on. With --gen_null the DFF is seeded by --init (gaussian noise, '
-                         'say) and the first token is read straight off that state through '
-                         'the decoder, with no token injection at all -- which is what the '
-                         'recurrence does mid-stream, and the only honest way to sample a '
-                         'model trained without document markers.')
-parser.add_argument('--gen_prompts',   default=None,
-                    help='EXTRA prompts for the periodic GEN sample, comma-separated, e.g. '
-                         '"aardvark,telescope,zorbulate". The NULL prompt (bare <STX>, i.e. '
-                         'free-running text) is always sampled first and is not affected by '
-                         'this flag, so adding prompts never costs the unprompted sample: '
-                         'free-running text and a keyed probe answer different questions -- '
-                         '"what has this model learned to write" versus "does it know THIS '
-                         'entry" -- and on a memorization run both are needed. A confident, '
-                         'well-formed definition of a word that does not exist is the '
-                         'signature of having learned the FORM and not the CONTENT, which is '
-                         'why a deliberate non-word belongs in the list. Prompts cannot '
-                         'contain a comma.')
-parser.add_argument('--wdef_format',   default='term', choices=('term', 'defs'),
-                    help='how --dataset wdef renders one dictionary entry. "term" (default) '
-                         'emits the headword then its numbered senses, so the document is a '
-                         'term->definition MAPPING and free-running generation can be read '
-                         'as dictionary entries -- that is what makes "did it memorize the '
-                         'dictionary" a question the samples can answer. "defs" emits the '
-                         'definitions column alone, which is 466k unlabelled gloss sentences: '
-                         'still a memorization target, but with no headword to key on and no '
-                         'way to tell recall from fluent paraphrase.')
-parser.add_argument('--streaming',     default=False, action='store_true')
-parser.add_argument('--shards',        default=None,  type=int,
-                    help='non-streaming: load only the first N parquet shards of the dataset '
-                         '(skips most of the slow "Loading dataset shards" step for large '
-                         'corpora like web/openwebtext); ignored with --streaming or if the '
-                         'repo is not parquet')
-parser.add_argument('--batch',         default=100,   type=int)
-parser.add_argument('--workers',       default=12,    type=int,
-                    help='parallel clip-builder threads (decode/download); raise for cc3m image streaming')
-parser.add_argument('--preroll',       default=False,
-                    action=argparse.BooleanOptionalAction,
-                    help='decorrelate the batch before training: discard batches (no forward, '
-                         'no step) until the first <ETX> comes out of the data stream, then '
-                         'start training. Every slot loads its first clip on step 0, so on a '
-                         'corpus whose examples open alike (TinyStories: "Once upon a time...") '
-                         'the whole batch runs near-identical text in lockstep for its first '
-                         'few hundred steps. Draining to the first <ETX> ends the shortest clip '
-                         'in the batch and leaves every slot at a different point in a '
-                         'different story.\n'
-                         '--no-preroll turns it off, which is what a LONG-FORM corpus needs: '
-                         'the cost is one shortest-clip\'s worth of discarded batches, which '
-                         'is a few hundred steps on TinyStories but thousands on sebooks '
-                         '(whole books, mean 126k tokens) -- and the correlated-opening '
-                         'problem it fixes does not arise there, since 250 slots land on 250 '
-                         'different books that share no opening text. It is a negation rather '
-                         'than dropping the flag because exp/run.sh bakes --preroll into the '
-                         'baseline, so an override has to be expressible on the command line.')
-parser.add_argument('--run_steps',     default=None,  type=int,
-                    help='stop the run after this many gradient steps (None = run indefinitely); '
-                         'handy for fixed-length sweeps')
-parser.add_argument('--opt',           default='sgd',
-                    choices=['sgd', 'rmsprop', 'rprop', 'adagrad', 'adamw'],
-                    help='training optimizer')
-parser.add_argument('--momentum',      default=0.0,   type=float,
-                    help='momentum (--opt sgd/rmsprop; the fallback for adamw beta2 when '
-                         '--beta2 is unset, kept for compatibility with runs and '
-                         'checkpoints that predate --beta2; ignored by rprop/adagrad)')
-parser.add_argument('--rms_alpha',     default=0.99,  type=float, metavar='DECAY',
-                    help='--opt rmsprop squared-gradient EMA decay (torch default 0.99): the '
-                         'per-weight step-size normalizer averages ~1/(1-alpha) steps, so 0.99 '
-                         'is ~100 steps and 0.999 ~1000')
-parser.add_argument('--rms_eps',       default=1e-8,  type=float, metavar='EPS',
-                    help='--opt rmsprop denominator epsilon (torch default 1e-8). Per-weight '
-                         'gradient rms is ~3e-3 here, so 1e-8 is inert; a value near that rms '
-                         'damps steps for weights with tiny gradients (SGD-like below it)')
-parser.add_argument('--rms_centered',  default=True,  action=argparse.BooleanOptionalAction,
-                    help='--opt rmsprop centered (default, as every rmsprop run so far): '
-                         'normalize by the gradient VARIANCE (second moment minus squared mean) '
-                         'rather than the raw second moment. --no-rms_centered is plain RMSprop')
-parser.add_argument('--beta1',         default=None,  type=float, metavar='DECAY',
-                    help='--opt adamw first-moment (gradient EMA) decay. Default 0.9. The '
-                         'averaging window is ~1/(1-beta1) steps, so 0.9 averages ~10 '
-                         'gradients and 0.99 ~100; lower it to react faster, raise it to '
-                         'ride through a noisy stretch. Ignored, with a warning, by any '
-                         'other --opt (--momentum is the knob for sgd/rmsprop)')
-parser.add_argument('--beta2',         default=None,  type=float, metavar='DECAY',
-                    help='--opt adamw second-moment (squared-gradient EMA) decay, the '
-                         'per-parameter step-size normalizer. Torch defaults to 0.999 '
-                         '(~1000-step window); this script has historically taken it from '
-                         '--momentum, so --beta2 overrides that and --momentum remains the '
-                         'fallback when --beta2 is unset. A short window (0.9 = ~10 steps) '
-                         'lets one gradient spike rescale every parameter\'s step, which is '
-                         'worth knowing on a recurrent model whose state can spike at '
-                         'startup. Ignored, with a warning, by any other --opt')
-parser.add_argument('--nesterov',      default=False, action='store_true',
-                    help='Nesterov momentum for --opt sgd: take the gradient at the point '
-                         'the momentum is already carrying the weights to, instead of at '
-                         'the current weights. Needs --momentum > 0 (torch also requires '
-                         'zero dampening, which is what this script uses); ignored, with a '
-                         'warning, for any other --opt or at --momentum 0')
-parser.add_argument('--weight_decay',  default=0.0,   type=float,
-                    help='L2 weight decay (--opt sgd/rmsprop/adagrad; ignored by rprop)')
-parser.add_argument('--clip',          default=0.0,   type=float,
-                    help='clip the global gradient norm to this value before the optimizer '
-                         'step (0 = off). ContextCNN is a plain Conv->BatchNorm->ReLU chain '
-                         'with no residual path, which amplifies the backward signal by ~1.15x '
-                         'per layer, so the gradient norm at init grows like 1.15**--depth: '
-                         'harmless at depth 8, ~1e2 at 32, ~1e4 at 56. AdamW hides this (its '
-                         'step is bounded by the lr however large the gradient is) but SGD '
-                         'multiplies it straight into the weights and diverges on step 0. '
-                         'Clipping makes the deep configurations trainable with any optimizer. '
-                         'The logged grad column still reports the norm BEFORE clipping, and a '
-                         '"clipped" column reports the fraction of steps that hit the limit')
-# learning rate: all --schedule modes are driven by this one set. lr_max is the peak
-# (and the optimizer base lr); lr_min is the floor; lr_warmup / lr_period are step counts.
-parser.add_argument('--schedule',      default='const',
-                    choices=['const', 'warmup', 'step', 'linear', 'coswarm', 'triangle', 'cosine', 'plat'],
-                    help='lr schedule: "const" (fixed --lr_max), "warmup" (ramp '
-                         '--lr_min->--lr_max over --lr_warmup steps, then hold; the ramp is '
-                         'measured from the start of this run, so it restarts on --load), '
-                         '"step" (hold --lr_min for the first --lr_warmup GLOBAL steps, then '
-                         'jump to --lr_max: a short fixed low-lr settle instead of a ramp), '
-                         '"linear" (ramp '
-                         '--lr_min->--lr_max over --lr_period, then hold), "coswarm" (ONE '
-                         'half-cosine rise --lr_min->--lr_max over --lr_period GLOBAL steps, '
-                         'then hold: the first half of a "cosine" cycle without the descent, '
-                         'so the approach to --lr_max is gentle at both ends), "triangle" (ramp '
-                         '--lr_min->--lr_max over --lr_warmup, then --lr_max->--lr_min over '
-                         '--lr_period), "cosine" (cyclic --lr_min<->--lr_max, --lr_period '
-                         'steps/cycle) or "plat" (start at --lr_max; every --checkpoint steps '
-                         'fit a line to the loss over the last --lr_period steps and multiply '
-                         'the lr by --lr_rate if the slope is non-negative, floor at --lr_min; '
-                         'a decay clears the window, so the lr drops at most once per '
-                         '--lr_period steps)')
-parser.add_argument('--lr_min',        default=1e-6,  type=float,
-                    help='minimum / floor learning rate (warmup|step|linear|coswarm|triangle|cosine)')
-parser.add_argument('--lr_max',        default=0.001, type=float,
-                    help='peak learning rate; also the constant lr for --schedule const '
-                         'and the optimizer base lr')
-parser.add_argument('--lr_mult',       default=1.0,   type=float,
-                    help='per-layer lr multiplier: layer k (1-based) gets base_lr * '
-                         '--lr_mult**(k-1), so with --lr_mult 10 --n_layers 3 the three '
-                         'layers use lr, 10*lr, 100*lr. Default 1.0 (all layers equal)')
-parser.add_argument('--lr_warmup',     default=1000,  type=int,
-                    help='ramp-up length in steps (warmup|triangle); hold length for step')
-parser.add_argument('--lr_period',     default=10000, type=int,
-                    help='schedule length in steps: linear ramp / triangle ramp-down / cosine cycle '
-                         '/ plat slope window (steps of loss history the line is fit to, and '
-                         'the minimum gap between two plat decays)')
-parser.add_argument('--lr_rate',       default=0.5,   type=float,
-                    help='--schedule plat decay factor: lr *= --lr_rate when the fitted loss '
-                         'slope over the --lr_period window is non-negative')
-# I/O
-parser.add_argument('--load',          default=None)
-parser.add_argument('--save',          default='checkpoint.pt')
-parser.add_argument('--checkpoint',    default=1000,  type=int)
-parser.add_argument('--teacher',       default='openai-community/gpt2',
-                    help='--dataset synth: HuggingFace causal-LM whose samples ARE the '
-                         'corpus. Any text-generation repo works (gpt2, gpt2-medium, '
-                         'EleutherAI/pythia-160m, ...). Bigger teacher = cleaner text and '
-                         'slower generation; see --teacher_batch for the throughput budget')
-parser.add_argument('--teacher_batch', default=64,    type=int,
-                    help='sequences per generate() call. Generation is autoregressive, so '
-                         'wall time is set by the LONGEST sequence in the batch and batching '
-                         'is nearly free: measured 2084 tok/s at 16 and 4725 tok/s at 64 on '
-                         'a 4090 already running a trainer. VLA consumes 765 tok/s at '
-                         '--batch 250, so 64 keeps the teacher well ahead of the trainer')
-parser.add_argument('--teacher_temp', default=1.0,   type=float)
-parser.add_argument('--teacher_topk',  default=50,    type=int)
-parser.add_argument('--teacher_topp',  default=0.95,  type=float)
-parser.add_argument('--teacher_rep_penalty', default=1.15, type=float,
-                    help='repetition_penalty for the teacher. NOT cosmetic: suppressing eos '
-                         'to force a 500-1000 token document pushes a small model past where '
-                         'it wanted to stop and it degenerates into loops. Measured on '
-                         'pythia-160m, fraction of repeated 8-grams: 0.089 at 1.0, 0.000 at '
-                         '1.15, at identical wall time. 1.0 disables it. A corpus that loops '
-                         'is not the "clean text" this experiment is premised on')
-parser.add_argument('--synth_min',     default=500,   type=int,
-                    help='--dataset synth: each example is a uniform random length in '
-                         '[--synth_min, --synth_max] TEACHER tokens')
-parser.add_argument('--synth_max',     default=1000,  type=int)
-parser.add_argument('--teacher_device', default=None,
-                    help='device for the teacher (default: --device). Set cpu to keep the '
-                         'GPU entirely for training, at roughly 20x less generation speed')
-parser.add_argument('--synth_eval_docs', default=400, type=int,
-                    help='documents in the CACHED synthetic held-out set. Generated once, '
-                         'written to ./synth_eval/, and reused: an eval set regenerated per '
-                         'call would make the EVAL curve a walk over datasets as much as '
-                         'over training')
-parser.add_argument('--gen_interval',  default=0,     type=int,
-                    help='print a free-running GEN sample every N training steps. 0 (the '
-                         'default) means "every --checkpoint steps", which is what the '
-                         'generation sample was tied to before this flag existed, so every '
-                         'pre-existing invocation is unchanged. Generation is cheap next to '
-                         'a checkpoint save, and the text is the measurement that has '
-                         'overturned the scalars more than once, so it is worth sampling '
-                         'far more often than the weights are written')
-parser.add_argument('--eval_interval', default=0,     type=int,
-                    help='score the held-out split of --dataset every N training steps and '
-                         'print an EVAL line. 0 (the default) disables it. Uses the same '
-                         'held-out documents every time and the same framing as one-shot '
-                         '--eval, and reports clean/median/runaway% the way exp/score.py '
-                         'does -- a plain mean is not usable here, a handful of runaway '
-                         'documents move it by orders of magnitude')
-parser.add_argument('--eval_corpora',  default=None,
-                    help='comma-separated held-out sets to score every --eval_interval '
-                         'steps, e.g. "synth,pile". Default: the training corpus alone. '
-                         'Scoring a corpus the run was NOT trained on is the TRANSFER '
-                         'measurement -- for synthetic pre-pretraining that is the whole '
-                         'point, since fit to the teacher is not the claim. Each set gets '
-                         'its own EVAL line tagged with its corpus name; they are built '
-                         'once each and reused')
-parser.add_argument('--reason_eval',   default=None,
-                    help='comma-separated zero-shot multiple-choice benchmarks scored every '
-                         '--eval_interval steps: arc_easy | arc_chal | obqa | winogrande | '
-                         'piqa | hellaswag | copa. '
-                         'Held-out LOSS cannot measure reasoning -- on a factual corpus it '
-                         'rewards memorisation, which is the opposite of the goal -- so this '
-                         'is the metric that tracks whether the model REASONS. winogrande is '
-                         'the cleanest: it needs plausibility judgement and no retrievable '
-                         'fact. Chance is 1/n_choices and is printed on every line')
-parser.add_argument('--reason_docs',   default=0,     type=int,
-                    help='cap items per benchmark (0 = the whole validation split)')
-parser.add_argument('--eval_json',     default=None,
-                    help='--eval --eval_corpora: also write the results table as JSON here')
-parser.add_argument('--eval_docs',     default=400,   type=int,
-                    help='documents in the --eval_interval held-out set (400 matches '
-                         'exp/score.py and PLAN.txt\'s reference table)')
-parser.add_argument('--log',           default=None)
-parser.add_argument('--monitor',       default=100,   type=int)
-parser.add_argument('--generate',      default=False, action='store_true',
-                    help='one-shot: load checkpoint, generate from START+prompt, print, exit (no dataset/training)')
-parser.add_argument('--n',             default=200,   type=int,
-                    help='tokens to generate for --generate. Nothing else reads it: --vis '
-                         'streams until the window is closed, and the training-loop GEN '
-                         'samples are a fixed length')
-parser.add_argument('--prompt',        default='',
-                    help='generation prompt; START is always prepended (0x02 with '
-                         '--tokenizer char, <|endoftext|> with a pretrained one), so leave '
-                         'empty to generate from START alone')
-parser.add_argument('--gen_warm',      default=False, action='store_true',
-                    help='at every GEN interval also sample WARM: copy batch slot 0\'s live '
-                         'training state (all DFF registers and its EMA step counter), feed it '
-                         'the token that slot reads next, and sample a continuation from there '
-                         '-- no warm-up cost, the training state is only copied. Printed as a '
-                         'GENW line: the last 60 real tokens that slot read, then "⟹", then the '
-                         'model\'s continuation (with --gen_score, its GENSCORE line scores the '
-                         'continuation only). GEN lines stay cold (fresh state from <STX>); '
-                         '--no-gen_cold drops them.')
-parser.add_argument('--gen_cold',      default=True, action=argparse.BooleanOptionalAction,
-                    help='print the usual cold GEN samples (fresh state from <STX>) at every '
-                         'GEN interval. --no-gen_cold leaves only GENW (needs --gen_warm).')
-parser.add_argument('--eval_bands',    default='1024,8192', metavar='R1,R2,...',
-                    help='frequency-banded held-out loss: with every cold EVAL, also print an '
-                         'EVALB line splitting the clean documents\' loss by the FREQUENCY RANK '
-                         'of the target token, ranks counted over all --eval_corpora held-out '
-                         'text. Edges 1024,8192 give three bands: the ~1K most frequent tokens '
-                         '(function words, syntax -- "language"), the next 7K (common content), '
-                         'and the long tail (names, numbers, rare terms -- "facts"). "" = off.')
-parser.add_argument('--eval_recall',   default=0,     type=int, metavar='N',
-                    help='in-context recall eval at every cold EVAL, on N held-out documents per '
-                         'corpus (0 = off): each sequence is <STX> A filler A, A = the first '
-                         '--eval_recall_len tokens of a document, filler = text from other '
-                         'documents. Prints an EVALR line: loss on the FIRST copy of A (no help '
-                         'from context) and on the SECOND copy at each --eval_recall_gaps, plus '
-                         'the drop between them -- how much the model can reuse text it has '
-                         'read, which retrieval (feeding it search results) depends on.')
-parser.add_argument('--eval_recall_len', default=32,  type=int, metavar='L')
-parser.add_argument('--eval_info',     default=0,     type=int, metavar='N',
-                    help='register-overlap eval at every cold EVAL, on N held-out documents of '
-                         'the FIRST --eval_corpora corpus (0 = off; needs --ctx_ema). Prints an '
-                         'EVALI line: each register\'s rms and effective rank (participation '
-                         'ratio of its channel covariance, positions as samples, within-position), '
-                         'the rank of the concatenation, Gaussian mutual information between '
-                         'each register pair (CCA) and the total correlation of all K, and the '
-                         'held-out loss rise when each register / pair / all are read as their '
-                         'mean instead (unique vs shared predictive information).')
-parser.add_argument('--eval_recall_gaps', default='0,64,256', metavar='G1,G2,...')
-parser.add_argument('--eval_reach',    default=0,     type=int, metavar='N',
-                    help='context-reach eval at every cold EVAL, on N spliced rows per corpus '
-                         '(0 = off); exp/reach.py\'s splice probe, in the trainer. Each row is '
-                         '4 chunks of --eval_reach_period tokens cut from random held-out '
-                         'documents, with ONE state reset at the row start, so at offset c into '
-                         'chunks 2-4 the state is warm but only c of the tokens read belong to '
-                         'the current document. excess(c) = loss there minus the loss of the '
-                         'SAME token with its full document history. excess > 0 at offset c '
-                         'means the model uses history older than c tokens; where it falls to '
-                         '~0 is the reach. Prints an EVALX line: excess per log-spaced offset '
-                         'bucket, its mean, and tail64 (mean over c >= 64).')
-parser.add_argument('--eval_reach_period', default=256, type=int, metavar='P')
-parser.add_argument('--eval_facts',    default=0,     type=int, metavar='N',
-                    help='human-style reading-comprehension recall at every cold EVAL (0 = off): '
-                         'N fixed items. Each item is a short passage of simple facts about TWO '
-                         'people ("Maria lives in Denver. Tom works as a baker. ..."), then '
-                         '--eval_facts_gaps tokens of unrelated held-out text, then a cue '
-                         '("Maria lives in") that the model must complete. Scored as 4-way '
-                         'multiple choice by total log-probability: the right value, the OTHER '
-                         'person\'s value for the same attribute (a binding distractor) and two '
-                         'random ones -- chance 25%%. A no-passage control asks the same cues '
-                         'with nothing read. Prints an EVALF line.')
-parser.add_argument('--eval_facts_gaps', default='0,64,256', metavar='G1,G2,...')
-parser.add_argument('--eval_chatqa',   default=0,     type=int, metavar='N',
-                    help='chat-format Q&A at every cold EVAL (0 = off), in the "User: ...\\n\\n'
-                         'Assistant: ..." harness format the smolchat corpus teaches. Three '
-                         'parts, each multiple choice by log-probability of the assistant\'s '
-                         'answer: (1) the --eval_facts reading-comprehension items as a chat -- '
-                         'the user states the facts and asks ("Where does Robert live?"), the '
-                         'assistant answers "Robert lives in ___" (4-way, chance 25%%, plus a '
-                         'no-passage control); (2) PIQA goals as user questions, the solutions '
-                         'as answers (2-way); (3) COPA premises with "What happened as a '
-                         'result?" / "What was the cause?" (2-way). N caps the PIQA/COPA items. '
-                         'Prints an EVALQ line.')
-parser.add_argument('--gen_vocab',     default=0,     type=int, metavar='K',
-                    help='--generate: sample only from the K most frequent tokens (ranked as for '
-                         '--eval_bands, over the --eval_corpora held-out text; <STX>/<ETX> always '
-                         'allowed). The model\'s distribution is renormalized over that '
-                         'vocabulary. 0 = off.')
-parser.add_argument('--gen_vocab_words', default=False, action='store_true',
-                    help='with --gen_vocab: rank only WHOLE-WORD tokens -- alphabetic, with a '
-                         'leading space (or capitalized, for sentence starts), at least two '
-                         'letters except a/A/I -- so the K kept are the K most frequent words, '
-                         'not single letters, digits or word fragments. Basic punctuation '
-                         '(. , ? ! \' " : ; and newlines) is always allowed.')
-parser.add_argument('--char_onehot',   default=False, action='store_true',
-                    help='--tokenizer char: the token embedding is a FIXED one-hot (256x256 '
-                         'identity, frozen) instead of a learned 256 x --c_text table, so the '
-                         'token grid is 256 channels with exactly one lit. The readout is already '
-                         'degenerate under char (lm_head = Identity; decoder.proj emits the 256 '
-                         'byte logits and is trained). Restored from a checkpoint.')
-parser.add_argument('--eval_gen',      default=0,     type=int, metavar='N',
-                    help='prompted fluency eval at every cold EVAL, on N held-out documents per '
-                         'corpus (0 = off): the model continues each document\'s first '
-                         '--eval_gen_prompt tokens for --eval_gen_len tokens, and a frozen judge '
-                         'LM (--eval_gen_judge) scores the continuation GIVEN the prompt. The '
-                         'same judge scores the document\'s real continuation (floor) and that '
-                         'continuation with its words shuffled (ceiling), per prompt, so '
-                         'fluency%% is anchored on matched text. Prints an EVALG line with '
-                         'nats, fluency%%, rep1 and distinct-2 (blandness / repetition guard).')
+# architecture (restored from a checkpoint on --load)
+parser.add_argument('--context',    default=8,    type=int, help='DFF grid side S (SxS)')
+parser.add_argument('--n_hidden',   default=512,  type=int, help='channels per DFF register')
+parser.add_argument('--c_context',  default=384,  type=int,
+                    help='ContextCNN width: ctx_cat reads the concat down to it and linout '
+                         'projects it back up to --n_hidden')
+parser.add_argument('--depth',      default=8,    type=int, help='ContextCNN conv layers')
+parser.add_argument('--kernel',     default=3,    type=int, help='ContextCNN kernel (odd)')
+parser.add_argument('--tokenizer',  default='pythia31m', choices=sorted(_TOKENIZERS),
+                    help='borrowed vocabulary, token embedding and lm_head (frozen)')
+parser.add_argument('--ctx_ema',    default='256,64,16,4,1', metavar='W1,W2,...',
+                    help='register windows in tokens, slowest first: register k blends at '
+                         'rate 1/W_k toward the layer output minus registers 1..k-1, so with a '
+                         'last window of 1 the registers sum exactly to the output')
+parser.add_argument('--ctx_read_norm', default=1.0, type=float, metavar='S',
+                    help='read each register scaled to RMS S, using a running RMS per '
+                         'register (momentum 0.01, updated in training only); 0 = off')
+parser.add_argument('--dec_tree_kernels', default='3,3,3', metavar='K1,K2,...',
+                    help='text decoder: unpadded linear convs; all but the last run at '
+                         '--dec_width, the last maps to the embedding width; whatever grid is '
+                         'left is average-pooled. sum(k-1) <= S-1')
+parser.add_argument('--dec_width',  default=256,  type=int, help='text decoder tree width')
+parser.add_argument('--bn_momentum', default=0.1, type=float,
+                    help='ContextCNN BatchNorm running-statistics momentum (0 = cumulative)')
+parser.add_argument('--init',       default='zero', choices=['zero', 'gaussian', 'relu'],
+                    help='DFF register value at every document start')
+# data
+parser.add_argument('--dataset',    default='smolfwedu', help='training corpus (see _TEXT_DATASETS)')
+parser.add_argument('--shards',     default=None, type=int, help='load only the first N parquet shards')
+parser.add_argument('--streaming',  default=False, action='store_true')
+parser.add_argument('--shuffle',    default=True, action=argparse.BooleanOptionalAction,
+                    help='--no-shuffle reads the corpus in file order; with --seed and '
+                         '--workers 1 that makes two runs bit-identical')
+parser.add_argument('--workers',    default=12,   type=int, help='clip-builder threads')
+parser.add_argument('--batch',      default=250,  type=int, help='independent document streams')
+# optimization
+parser.add_argument('--lr_max',     default=0.01, type=float, help='peak / constant lr')
+parser.add_argument('--lr_min',     default=1e-4, type=float, help='coswarm start lr')
+parser.add_argument('--lr_period',  default=20000, type=int, help='coswarm rise length in steps')
+parser.add_argument('--schedule',   default='coswarm', choices=['const', 'coswarm'],
+                    help='const: --lr_max throughout. coswarm: half-cosine rise from --lr_min '
+                         'to --lr_max over --lr_period global steps, then hold')
+parser.add_argument('--momentum',   default=0.0,  type=float, help='SGD momentum')
+parser.add_argument('--weight_decay', default=0.0, type=float, help='SGD weight decay')
+parser.add_argument('--run_steps',  default=None, type=int, help='stop after N steps of this run')
+parser.add_argument('--seed',       default=None, type=int)
+parser.add_argument('--device',     default=None)
+# checkpoint / log
+parser.add_argument('--load',       default=None, help='resume from a checkpoint')
+parser.add_argument('--save',       default='checkpoint.pt')
+parser.add_argument('--checkpoint', default=4000, type=int, help='save every N steps')
+parser.add_argument('--log',        default=None)
+parser.add_argument('--monitor',    default=100,  type=int, help='STEP line every N steps')
+# periodic generation
+parser.add_argument('--gen_interval', default=4000, type=int, help='GEN sample every N steps')
+parser.add_argument('--gen_score',  default=None, nargs='?', const='EleutherAI/pythia-70m',
+                    metavar='MODEL',
+                    help='score GEN samples for fluency with a frozen reference LM (CPU), '
+                         'anchored between real corpus text (100%%) and the same text with its '
+                         'words shuffled (0%%); read it with rep1, never alone')
+parser.add_argument('--prompt',     default='', help='extra GEN prompt; prompt for --generate/--vis')
+parser.add_argument('--temperature', default=1.0, type=float, help='sampling temperature')
+# periodic held-out eval
+parser.add_argument('--eval_interval', default=20000, type=int,
+                    help='held-out EVAL every N steps (0 = off)')
+parser.add_argument('--eval_corpora', default=None, help='comma-separated; default --dataset')
+parser.add_argument('--eval_docs',  default=400,  type=int, help='held-out documents per corpus')
+parser.add_argument('--eval_bands', default='1024,8192', metavar='R1,R2,...',
+                    help='EVALB: held-out loss split by target-token frequency rank ("" = off)')
+parser.add_argument('--eval_info',  default=0,    type=int, metavar='N',
+                    help='EVALI on N documents: register rms/rank/overlap and read ablations')
+parser.add_argument('--eval_gen',   default=0,    type=int, metavar='N',
+                    help='EVALG on N prompts: continuations judged by --eval_gen_judge')
 parser.add_argument('--eval_gen_judge', default='EleutherAI/pythia-410m', metavar='MODEL')
-parser.add_argument('--eval_gen_prompt', default=32, type=int, metavar='P')
-parser.add_argument('--eval_gen_len',  default=96,    type=int, metavar='C')
-parser.add_argument('--eval_warm',     default=0,     type=int, metavar='N',
-                    help='ALSO score every held-out set WARM: each document is preceded by N '
-                         'tokens of OTHER held-out documents (framed <STX>...<ETX> exactly as in '
-                         'training, NO state reset at their boundaries), run through the model '
-                         'unscored, and then the document itself is scored from that state. '
-                         'Reported as a separate EVALW line next to the usual cold EVAL line '
-                         '(identical fields), so the two never mix. This is the fair held-out '
-                         'number for a --no_dff_reset model, which trains on a continuous warm '
-                         'state and is otherwise only ever evaluated cold. 0 (default) = off. '
-                         'Costs N extra sequential steps per eval batch.')
-parser.add_argument('--eval',          default=False, action='store_true',
-                    help='one-shot: load a checkpoint, compute teacher-forced loss over a '
-                         'held-out split of --dataset, report it and exit. No training. '
-                         'Each document is an independent batch row framed [START] text '
-                         '[END] with a fresh DFF state, and every step is scored -- the '
-                         'same clip framing and gradient target the training loop uses, and '
-                         'the same measurement gptneo.py --eval makes, so the two numbers '
-                         'compare directly. Note --init: a "relu"/"gaussian" context seed is '
-                         'random, so the loss moves slightly run to run unless --seed is '
-                         'fixed (--init zero is exactly reproducible)')
-parser.add_argument('--split',         default=None,
-                    help="--eval split; default is the corpus's held-out split (validation "
-                         "for tiny/c4), or 'validation' for a bare hub repo id")
-parser.add_argument('--column',        default=None,
-                    help='--eval text column (default: the corpus default, else "text")')
-parser.add_argument('--examples',      default=0,     type=int,
-                    help='--eval: stop after this many documents (0 = the whole split)')
-parser.add_argument('--init',          default='relu',
-                    choices=['zero', 'gaussian', 'relu'],
-                    help='how the DFF context is seeded before prompting and at every '
-                         'context reset, in all modes (training, --generate, --vis): '
-                         'zeros, standard-normal noise, or relu(randn) '
-                         '(non-negative, ~50%% zeros, matching the steady-state shape)')
-parser.add_argument('--seed',          default=None,  type=int)
-parser.add_argument('--device',        default=None)
-parser.add_argument('--verbose',       default=False, action='store_true',
-                    help='print the torchinfo model summaries in --generate/--vis (training '
-                         'always prints them, since they are logged)')
-parser.add_argument('--altvis',        default=False, action='store_true',
-                    help='live per-layer DFF map: an n_layers x 2 grid of imshow panels. Top '
-                         'row is each layer\'s ContextCNN INPUT, bottom row its OUTPUT -- the '
-                         'tensor the register stores and the layer above receives. Each panel '
-                         'is the STANDARD DEVIATION ACROSS CHANNELS at every spatial position, '
-                         'an SxS map, so it shows WHERE in the grid the state carries '
-                         'variation rather than how much of it there is overall. Like --vis '
-                         'this is read-only: it generates from --prompt and trains nothing.')
-parser.add_argument('--vis',           default=False, action='store_true',
-                    help='live text-generation viz from the prompt token; no training. One '
-                         'column per layer, left to right: the layer OUTPUT on top and its DFF '
-                         'register(s) stacked below it (one row per --ctx_ema context), each '
-                         'drawn as the std across channels at every SxS position; P(next '
-                         'token) in a column on the right. Read-only. Press x to exit')
-parser.add_argument('--delay',         default=0.1,   type=float,
-                    help='seconds to pause per vis frame')
-parser.add_argument('--cmap',          default='viridis',
-                    help='matplotlib colormap for --vis')
-parser.add_argument('--temperature',   default=1.0,   type=float,
-                    help='sampling temperature for --vis/--generate and the training-loop '
-                         'text samples (0 = argmax)')
-parser.add_argument('--push',          default=False, action='store_true',
-                    help='push the --load checkpoint to the HuggingFace hub as a '
-                         'PyTorchModelHubMixin model (repo --hub_repo), then exit. '
-                         'No training. Requires a write token (huggingface-cli login)')
-parser.add_argument('--pretrained',    default=None, nargs='?', metavar='REPO',
-                    const='siliconperception/VLA',
-                    help='load weights + architecture from this HuggingFace hub repo '
-                         'instead of a local checkpoint, e.g. siliconperception/VLA '
-                         '(the value used when the flag is given with no repo). '
-                         'Overrides --load')
-parser.add_argument('--revision',      default=None,
-                    help='--pretrained: hub branch, tag or commit (default: main)')
-parser.add_argument('--hub_repo',      default='siliconperception/VLA',
-                    help='--push target hub repo id')
-parser.add_argument('--private',       default=False, action='store_true',
-                    help='--push: create the hub repo private (default: the org/user default '
-                         'visibility). Ignored if the repo already exists')
+parser.add_argument('--eval_gen_prompt', default=32, type=int, metavar='P', help='prompt tokens')
+parser.add_argument('--eval_gen_len', default=96, type=int, metavar='C', help='continuation tokens')
+parser.add_argument('--eval_reach', default=0,    type=int, metavar='N',
+                    help='EVALX on N spliced rows: excess loss from losing history older than c')
+parser.add_argument('--eval_reach_period', default=256, type=int, metavar='P')
+# one-shot modes (no training)
+parser.add_argument('--generate',   default=False, action='store_true',
+                    help='load, generate --n tokens from <STX>+--prompt, print, exit')
+parser.add_argument('--n',          default=200,  type=int, help='--generate length')
+parser.add_argument('--eval',       default=False, action='store_true',
+                    help='load, run the held-out eval protocol (EVAL lines + table), exit')
+parser.add_argument('--eval_json',  default=None, help='--eval: also write results as JSON')
+parser.add_argument('--vis',        default=False, action='store_true',
+                    help='live generation view: layer output and registers (std across '
+                         'channels per grid cell) and P(next token); x exits')
+parser.add_argument('--delay',      default=0.1,  type=float, help='--vis seconds per frame')
+parser.add_argument('--cmap',       default='viridis', help='--vis colormap')
+parser.add_argument('--push',       default=False, action='store_true',
+                    help='push the --load checkpoint to the hub as --hub_repo, exit')
+parser.add_argument('--hub_repo',   default='siliconperception/VLA')
+parser.add_argument('--private',    default=False, action='store_true', help='--push: private repo')
+parser.add_argument('--pretrained', default=None, nargs='?', const='siliconperception/VLA',
+                    metavar='REPO', help='load weights + architecture from a hub repo')
+parser.add_argument('--revision',   default=None, help='--pretrained: branch, tag or commit')
+parser.add_argument('--verbose',    default=False, action='store_true',
+                    help='print the model graph and parameter table in one-shot modes too')
 args = parser.parse_args()
-if args.epochs and not args.subsample:
-    raise SystemExit('--epochs is the --subsample turnover rate and needs --subsample')
-if args.refresh and not args.subsample:
-    raise SystemExit('--refresh is the --subsample turnover rate and needs --subsample')
-if args.blocks:
-    if args.dataset != 'babylm' or args.mix:
-        raise SystemExit('--blocks needs a local text corpus and a single dataset '
-                         '(--dataset babylm, no --mix)')
-    if args.subsample:
-        raise SystemExit('--blocks and --subsample are two different ways to choose what a '
-                         'slot reads; pick one')
-    if args.shuffle:
-        raise SystemExit('--blocks is a contiguous read and cannot be shuffled')
-    args.shuffle = False
-    if args.dataset not in {n.strip() for n in (args.unframed or '').split(',')}:
-        raise SystemExit(f'--blocks needs --unframed {args.dataset}: a contiguous stream has '
-                         'no document boundaries to frame, and a framed slot resets the DFF '
-                         'at every refill -- the opposite of what blocks are for')
-if args.refresh_every and not args.refresh:
-    raise SystemExit('--refresh_every is the --refresh schedule and needs --refresh')
-if args.refresh and args.epochs:
-    raise SystemExit('--refresh and --epochs are two turnover schedules for the same pool: '
-                     '--epochs is a fixed rate, --refresh is stall-driven. Pick one.')
-if args.refresh and not (0.0 < args.refresh <= 1.0):
-    raise SystemExit(f'--refresh {args.refresh}: a fraction of the pool, in (0, 1]')
 
+_ONESHOT = args.generate or args.eval or args.vis or args.push
 
-def _cli_given(argv=None):
-    """The set of option dests actually typed on the command line. argparse fills every
-    default in, so a value in `args` cannot otherwise be told apart from one the user passed;
-    re-parsing with the defaults suppressed leaves only what was really there. Used to let a
-    few options beat the architecture a --load checkpoint carries (see _ARCH_OVERRIDE)."""
-    saved = [a.default for a in parser._actions]
-    for a in parser._actions:
-        a.default = argparse.SUPPRESS
-    try:
-        return set(vars(parser.parse_args(argv)))
-    finally:
-        for a, d in zip(parser._actions, saved):
-            a.default = d
+# ── checkpoint ────────────────────────────────────────────────────────────────
 
+_ARCH_ARGS = ('context', 'n_hidden', 'c_context', 'depth', 'kernel', 'tokenizer', 'ctx_ema',
+              'ctx_read_norm', 'dec_tree_kernels', 'dec_width', 'bn_momentum', 'init')
 
-_CLI_GIVEN = _cli_given()
-
-# The DEFAULT EVAL SUITE for fineweb-edu runs (2026-10-11): held-out loss on fineweb-edu
-# alone (SimpleStories dropped), the register-overlap EVALI, a deep prompted-fluency EVALG
-# (50 held-out prompts of 128 tokens, 128-token continuations, judged by Qwen2.5-1.5B), and
-# the context-reach EVALX. Applied to single-corpus --dataset smolfwedu runs, each entry
-# only where the flag was not typed, so any of them can still be overridden or turned off.
-_FWEDU_SUITE = dict(eval_corpora='smolfwedu', eval_docs=100, eval_info=100,
-                    eval_gen=50, eval_gen_prompt=128, eval_gen_len=128,
-                    eval_gen_judge='Qwen/Qwen2.5-1.5B', eval_reach=100)
-if args.dataset == 'smolfwedu' and not args.mix:
-    _suite = {k: v for k, v in _FWEDU_SUITE.items() if k not in _CLI_GIVEN}
-    for k, v in _suite.items():
-        setattr(args, k, v)
-    if _suite:
-        print('fwedu eval suite: ' + ' '.join(f'--{k} {v}' for k, v in _suite.items()),
-              flush=True)
-
-# ── multi-dataset mix ─────────────────────────────────────────────────────────
-
-def _parse_mix(spec):
-    """'brt:0.5,web:0.5' -> ([names], [normalized weights]); None if unset."""
-    if not spec:
-        return None
-    names, weights = [], []
-    for part in spec.split(','):
-        nm, _, w = part.partition(':')
-        names.append(nm.strip())
-        weights.append(float(w) if w else 1.0)
-    s = sum(weights) or 1.0
-    return names, [w / s for w in weights]
-
-_mix = _parse_mix(args.mix)
-
-# --unframed: every name must be a corpus this run trains on, and with several corpora the
-# unframed one has to own its slots (see the help text), which is what --mix_slots does.
-_UNFRAMED = {n.strip() for n in (args.unframed or '').split(',') if n.strip()}
-if _UNFRAMED:
-    _train_names = set(_mix[0]) if _mix else {args.dataset}
-    if _UNFRAMED - _train_names:
-        raise SystemExit(f'--unframed: not in --dataset/--mix: '
-                         f'{",".join(sorted(_UNFRAMED - _train_names))}')
-    if _mix and not args.mix_slots:
-        raise SystemExit('--unframed with --mix needs --mix_slots: a slot either resets on '
-                         'every document or never does, so an unframed corpus cannot share '
-                         'the one clip queue --mix feeds every slot from')
-
-# How many of the --batch slots the batchwise vocab stream occupies. worker() derives the
-# same number for slot construction; it is computed here too because the training loop logs
-# the vocab and corpus halves of the loss separately and has to know where the split is.
-# Slot order is vocab-first (see worker()), so rows [0:_N_VOCAB] are the vocab channel.
-_N_VOCAB = (min(args.vocab_slots, args.batch)
-            if (args.vocab_files or '').strip() and args.vocab_slots else 0)
-
-# --datarep, resolved once at module scope: clip_text, the vocab slots, generate() and the
-# --vis loop all read it, and they run in different threads.
-# --accumulate is deprecated: accepted so old command lines still run, ignored so it cannot
-# silently change a run. It only ever did anything for a layer that HELD its register, and
-# with --ema_ladder (periods forced to 1) or --clock sync nothing holds.
-if int(getattr(args, 'dff_every', 1) or 1) != 1:
-    print(f'WARNING: --dff_every {args.dff_every} is DEPRECATED and ignored: every layer has '
-          f'a DFF register and a feedback add. Removing one cost 0.503 nats at equal '
-          f'parameter count (see PLAN.txt).', flush=True)
-    args.dff_every = 1
-
-_dead = [f for f in ('clock', 'clock_base', 'clock_max', 'clock_ends')
-         if getattr(args, f, None) is not None]
-if _dead:
-    print(f'WARNING: {", ".join("--" + f for f in _dead)} DEPRECATED and ignored. The DFF '
-          f'write clock is gone -- every register is written every step and the timescale '
-          f'is the --ema/--ema_ladder blend rate.', flush=True)
-
-if getattr(args, 'accumulate', False):
-    print('WARNING: --accumulate is DEPRECATED and ignored. It applied only to layers that '
-          'hold their register between writes; --ema_ladder and --clock sync both write '
-          'every layer every step, so it averaged a single output. Drop it from the command '
-          'line.', flush=True)
-    args.accumulate = False
-
-_DATAREP = int(args.datarep or 1)
-if _DATAREP < 1:
-    raise SystemExit(f'--datarep {_DATAREP}: must be >= 1 (1 is off)')
-# Every human-facing cadence is scaled by N so the run READS the same at any --datarep: a
-# STEP line every --monitor tokens, a sample every --gen_interval tokens, an eval every
-# --eval_interval tokens, a checkpoint every --checkpoint tokens. Without this, N=8 would
-# print 8x the STEP lines and generate 8x the samples for the same data.
-# NOT scaled: --run_steps, which is the step budget the user is explicitly spending, and the
-# step NUMBER itself, which is the optimizer clock the checkpoint and resume logic run on.
-# NOT dedupable: the loss VALUE. Slots stream independent clips, so at any given step the
-# batch holds a mix of replica positions -- there is no "last replica" step to report.
-if _DATAREP > 1:
-    # NOTHING is scaled. Every interval -- --monitor, --gen_interval, --eval_interval,
-    # --checkpoint -- is a count of RAW STEPS at any --datarep, so each flag means exactly
-    # what it says. The consequence to keep in mind when comparing runs: at N > 1 a given
-    # step count is 1/N of the DATA, so an EVAL at step 20000 is 20000/N tokens in, and two
-    # runs at different N are only comparable on step/N, not on step.
-    print(f'--datarep {_DATAREP}: each token is fed {_DATAREP}x. All intervals are RAW '
-          f'STEPS -- monitor {args.monitor}, gen {args.gen_interval}, eval '
-          f'{args.eval_interval}, checkpoint {args.checkpoint}. A step is {1.0/_DATAREP:.3g} '
-          f'tokens, so compare runs at different --datarep on step/{_DATAREP}', flush=True)
-
-# Validated HERE, in the main thread, not in worker(): worker runs as a thread, and a
-# SystemExit raised there kills only that thread -- the training loop then blocks forever
-# on an empty clip queue instead of exiting. Anything that can be checked from the flags
-# alone therefore has to be checked before the worker starts.
-if _N_VOCAB:
-    _vf = [f.strip() for f in args.vocab_files.split(',') if f.strip()]
-    _fr = {os.path.splitext(os.path.basename(f))[0]
-           for f in (args.vocab_framed or '').split(',') if f.strip()}
-    if _N_VOCAB < len(_vf) and _fr and len(_fr) < len(_vf):
-        raise SystemExit(
-            f'--vocab_slots {_N_VOCAB} with {len(_vf)} --vocab_files merges several files '
-            f'into one slot, but --vocab_framed names only {sorted(_fr)}. A framed pool '
-            f'resets the recurrent state between examples and an unframed one never does; '
-            f'one slot cannot do both. Either frame all of them, none of them, or give each '
-            f'file its own slot (--vocab_slots >= {len(_vf)}).')
-
-# ── restore architecture args from checkpoint ─────────────────────────────────
-
-_ARCH_ARGS = ('context', 'n_hidden', 'c_context', 'c_text', 'n_layers', 'depth', 'kernel',
-              'tokenizer', 'head_norm', 'ema', 'ema_ladder', 'qproj',
-              'tap', 'linout', 'linout_kernel', 'dff_every', 'ctx_ema', 'linin', 'ctx_mix',
-              'dff_write_scale', 'ctx_read_gain', 'ctx_first', 'ctx_cat', 'ctx_cat_in', 'ctx_cat_spatial',
-              'no_text_proj', 'ctx_cat_kernel', 'dec_depth', 'dec_width', 'dec_kernel', 'dec_tree', 'dec_tree_linear', 'dec_tree_kernels', 'dec_tree_pool', 'ctx_cat_narrow', 'ctx_chain', 'ctx_resid', 'ctx_resid_mode', 'ctx_warm', 'ctx_adapt', 'ctx_adapt_range', 'ctx_adapt_win', 'ctx_read_gate', 'ctx_read_norm', 'ctx_read_norm_mode', 'tok_gain', 'tok_norm', 'ctx_learn_win', 'ctx_win_param', 'ctx_every', 'char_onehot',
-              'init', 'clock_base', 'clock_max', 'clock_ends', 'clip_dff', 'tap_norm', 'norm', 'norm_groups', 'dff_norm', 'bn_track', 'bn_affine',
-                  'bn_momentum', 'bn_eps')
-
-# Architecture args a command-line value may override on --load/--pretrained, instead of the
-# checkpoint's own. These add no parameters and no shapes, so the state_dict loads either way
-# and the run is still the model that was trained -- the DFF write schedule is the one thing
-# you can legitimately change at load time. Everything else in _ARCH_ARGS defines the weights
-# and is taken from the checkpoint whatever the command line says.
-# --init seeds the DFF at every context reset, in training, --generate and --vis alike, so
-# a checkpoint sampled without it was being seeded differently than it was trained -- it adds
-# no parameters, so it restores like the rest and overrides like the other write-schedule
-# options.
-_ARCH_OVERRIDE = ('ema', 'ema_ladder', 'init', 'clip_dff', 'tap_norm', 'norm', 'norm_groups', 'dff_norm', 'bn_track', 'bn_affine',
-                  'bn_momentum', 'bn_eps')
-
-
-def _restore_arch(saved, source):
-    """Copy the architecture a checkpoint was trained with into args, except for the
-    _ARCH_OVERRIDE options the user actually typed -- those win, e.g. training a model with
-    --clock dither and then sampling it with --clock fixed."""
-    for k in _ARCH_ARGS:
-        if k in _ARCH_OVERRIDE and k in _CLI_GIVEN:
-            was = saved.get(k, '(unset)')
-            if was != getattr(args, k):
-                print(f'--{k} {getattr(args, k)} overrides the {source} value {was}')
-            continue
-        # older checkpoints may predate an arch arg → keep the current default for it
-        if k in saved:
-            setattr(args, k, saved[k])
-
+# Checkpoints from before this rewrite carry every option the old script had. Those listed
+# here are now fixed behaviour, so a checkpoint is loadable only if it used these values,
+# i.e. if it is v395-type (or later, where the key is absent).
+_FIXED_ARCH = dict(n_layers=1, linout=True, linout_kernel=1, linin=False, ctx_mix='none',
+                   ctx_first='blend', ctx_resid=True, ctx_resid_mode='sum', ctx_chain=False,
+                   ctx_cat_in=True, ctx_cat_narrow=True, ctx_cat_kernel=1, ctx_cat_spatial=False,
+                   no_text_proj=True, tok_norm=True, tok_gain=1.0, ctx_read_norm_mode='running',
+                   ctx_read_gain='none', ctx_read_gate=False, ctx_learn_win=False,
+                   ctx_warm=False, ctx_adapt=False, ctx_every=None, dff_write_scale=1.0,
+                   dec_tree=True, dec_tree_linear=True, dec_depth=0, head_norm='none',
+                   norm='batch', bn_affine=False, bn_track=True, bn_eps=1e-5, dff_norm='none',
+                   qproj='none', tap=False, clip_dff=0.0, char_onehot=False)
 
 _loaded_ckpt = None
-_start_step  = 0                 # resumed global step count (0 for a fresh run)
-_start_exs   = 0                 # resumed cumulative training-example count
-_start_lr    = None              # lr the checkpoint was saved at (--schedule plat resume)
-_start_plat  = None              # binned loss window carried across a --schedule plat resume
-_start_opt   = (None, None)      # (optimizer state_dict, its --opt) carried across a --load
-if args.pretrained and args.load is not None:
-    # --pretrained overrides --load: the hub repo carries both weights and config.json,
-    # so a local checkpoint would only be half-used (its saved_args then foreign weights).
-    print(f'--pretrained overrides --load {args.load}: loading {args.pretrained} from the hub')
+_start_step = 0
+_start_exs = 0
+if args.pretrained and args.load:
+    print(f'--pretrained overrides --load {args.load}')
     args.load = None
-if args.load is not None:
+if args.load:
     _loaded_ckpt = torch.load(args.load, map_location='cpu', weights_only=True)
-    # rebuild the model with the architecture it was trained with
-    _restore_arch(_loaded_ckpt['saved_args'], 'checkpoint')
-    _start_step = int(_loaded_ckpt.get('step', 0))   # continue the step sequence
-    _start_exs  = int(_loaded_ckpt.get('examples', 0))   # continue the example count
-    # read here: the ckpt is freed before the scheduler is built
-    _start_lr   = _loaded_ckpt.get('lr')
-    _start_plat = _loaded_ckpt.get('plat')
-    # per-parameter optimizer state (RMSprop/AdamW moments), restored after the optimizer
-    # is built -- only when the checkpoint was trained with the SAME --opt
-    _start_opt  = (_loaded_ckpt.get('optimizer'), _loaded_ckpt['saved_args'].get('opt'))
+    _saved = _loaded_ckpt['saved_args']
+    _bad = {k: _saved[k] for k, v in _FIXED_ARCH.items() if k in _saved and _saved[k] != v}
+    if _bad:
+        raise SystemExit(f'{args.load} is not a v395-type checkpoint: {_bad}')
+    for k in _ARCH_ARGS:
+        if k in _saved:
+            setattr(args, k, _saved[k])
+    _start_step = int(_loaded_ckpt.get('step', 0))
+    _start_exs = int(_loaded_ckpt.get('examples', 0))
 
-if args.c_text is None:          # default token embedding width to n_hidden
-    args.c_text = args.n_hidden
 
-# Resolved AFTER _restore_arch, so a checkpoint's own interior width wins over the default
-# on --load. Unset means n_hidden, which is what every run before this flag existed built.
-if args.c_context is None:       # default ContextCNN interior width to n_hidden
-    args.c_context = args.n_hidden
-if args.c_context != args.n_hidden and args.depth < 2:
-    print(f'WARNING: --c_context {args.c_context} ignored at --depth {args.depth}: a '
-          f'single conv has to map the DFF state to itself, so there is no interior to '
-          f'widen or narrow. Building n_hidden -> n_hidden.')
+def _upgrade_state_dict(sd):
+    """Rename a pre-rewrite (v395) state_dict to this model's module names."""
+    out = {}
+    for k, v in sd.items():
+        k = re.sub(r'^(ctx_cat|linout)\.0\.', r'\1.', k)
+        k = re.sub(r'^dec_tree\.layers\.(\d+)\.0\.', r'text_dec.tree.\1.', k)
+        k = re.sub(r'^decoder\.proj\.', 'text_dec.proj.', k)
+        k = re.sub(r'^lmhead\.', 'text_dec.lmhead.', k)
+        if k == 'ctx_read_rms' and v.dim() == 2:
+            v = v[0]
+        out[k] = v
+    return out
+
 
 # ── log / device / seed ───────────────────────────────────────────────────────
 
 if args.log is None:
-    if args.generate or args.vis or args.altvis or args.push or args.eval:  # one-shot: no log
+    if _ONESHOT:
         args.log = os.devnull
     else:
-        # training -> log/log.<date>. Never reuse a name: two runs started in the
-        # same second would otherwise interleave their lines in one file.
         os.makedirs('log', exist_ok=True)
-        date = subprocess.check_output(['/usr/bin/date', '+%Y.%m.%d-%H.%M.%S']).decode().strip()
-        stem = f'log/log.{date}'
+        stem = 'log/log.' + datetime.datetime.now().strftime('%Y.%m.%d-%H.%M.%S')
         args.log, n = stem, 1
-        while os.path.exists(args.log):
+        while os.path.exists(args.log):        # never interleave two runs in one file
             args.log, n = f'{stem}.{n}', n + 1
 if args.device is None:
     args.device = 'cuda' if torch.cuda.is_available() else 'cpu'
 if args.seed is None:
     args.seed = int.from_bytes(os.urandom(4), byteorder='big')
     print('seed', args.seed)
-
 torch.manual_seed(args.seed)
 print(args)
-# Prepend the resumed checkpoint's log so chart.py sees one uninterrupted sequence.
-# Only for real training log files (skip devnull / generate / vis).
-if _loaded_ckpt is not None and args.log and args.log != os.devnull:
-    _prev_log = _loaded_ckpt.get('log') or ''
-    if _prev_log:
-        with open(args.log, 'a') as f:
-            f.write(_prev_log)
-            if not _prev_log.endswith('\n'):
-                f.write('\n')
-with open(args.log, 'a') as f:
-    print('ARGS', args, file=f)
+# a resumed run's log starts with the checkpoint's log, so chart.py sees one sequence
+if _loaded_ckpt is not None and args.log != os.devnull and _loaded_ckpt.get('log'):
+    with open(args.log, 'a') as f:
+        f.write(_loaded_ckpt['log'].rstrip('\n') + '\n')
+
+
+def _emit(line, stdout=True):
+    """One line to stdout and the log."""
+    if stdout:
+        print(line, flush=True)
+    with open(args.log, 'a') as f:
+        print(line, file=f)
+
+
+_emit(f'ARGS {args}', stdout=False)
 
 # ── model ─────────────────────────────────────────────────────────────────────
 
+
 class ContextCNN(nn.Module):
-    """DFF state update: a plain chain of conv(-norm)-ReLU blocks.
-    Input:  [B, n_hidden, S, S]
-    Output: [B, n_hidden, S, S]
+    """The state update: depth x (conv -> BatchNorm(affine=False) -> ReLU) at constant width."""
 
-    The interior runs at c_context channels (--c_context, default n_hidden): the first
-    conv is n_hidden -> c_context and everything after is c_context -> c_context. The INPUT
-    width is not free -- it is the DFF state's -- and the output width is c_out, which is
-    n_hidden when this module has to widen back to the register itself, or c_context under
-    --linout, where the 1x1 does the widening and the whole chain, final ReLU included,
-    stays narrow.
-
-    --norm none removes the BatchNorm entirely, leaving conv2d + ReLU. That is a
-    bigger change than it looks, because BatchNorm is the source of every
-    train/eval discrepancy this model has: it is the ONLY module whose function
-    differs between the two modes, and the recurrence amplifies that difference.
-    Concretely, with --norm batch:
-      - the DFF carried between steps is recomputed in EVAL mode, so the state the
-        model trains on is normalized by running statistics that lag the weights
-      - a model can score well on teacher-forced training loss and be unusable
-        held-out (observed twice: 2.9 and 3.4 nats)
-      - free-running generation can lock into a repeating token while every
-        training-time metric stays clean
-    With --norm none the model computes the same function in both modes, so all
-    of that goes away by construction. It also removes running-statistics buffers
-    from the state_dict and from an FPGA implementation.
-
-    What it costs: BatchNorm is what keeps a 51-conv chain trainable. Without it
-    the initialization has to preserve variance itself, so the convs are
-    He-initialized (kaiming_normal, fan_in, relu gain) instead of PyTorch's
-    default kaiming_uniform(a=sqrt(5)), which has a gain far below 1 for ReLU and
-    would shrink the signal by ~3x per layer -- over 51 layers that is 3**-51,
-    i.e. nothing reaches the readout. Even so, a deep plain chain is harder to
-    train than a normalized one; that is the experiment.
-    """
-    def __init__(self, n_hidden, depth, kernel, norm='batch', groups=32,
-                 bn_track=True, bn_affine=False, bn_momentum=0.1, bn_eps=1e-5,
-                 c_context=None, c_out=None, c_in=None):
+    def __init__(self, width, depth, kernel, bn_momentum=0.1):
         super().__init__()
-        pad = kernel // 2
-        self.norm_kind = norm
-        # --c_context: the interior width. The ENDS are pinned by the DFF state this module
-        # updates -- it reads [B, n_hidden, S, S] and its output is written back to a
-        # register of that shape -- so the first conv widens into the interior and the last
-        # narrows out of it. depth 1 has no interior and stays n_hidden -> n_hidden.
-        # The EFFECTIVE width, not the requested one: at depth 1 there is no interior, so
-        # what gets built is n_hidden -> n_hidden and that is what this must report --
-        # saved_args reads it back, and a --load has to rebuild the stack that was trained.
-        self.c_context = int(c_context) if (c_context and depth > 1) else n_hidden
-        w = self.c_context
-        # c_out: what the LAST conv produces. n_hidden by default -- the chain widens back to
-        # the DFF's width itself, because its output goes straight into the register. Under
-        # --linout the caller passes c_out=c_context instead and lets the 1x1 do the widening,
-        # so the chain never runs a wide conv and the final ReLU sits at the interior width.
-        self.c_out = int(c_out) if c_out else n_hidden
-        # c_in: what the FIRST conv reads. n_hidden by default (the feedback sum itself);
-        # under --linin a 1x1 has already narrowed it to c_context.
-        self.c_in = int(c_in) if c_in else n_hidden
-        def block(cin, cout):
-            conv = nn.Conv2d(cin, cout, kernel, padding=pad)
-            if norm == 'group':
-                # GroupNorm normalizes each SAMPLE over channel groups and space, so it
-                # carries no running statistics and computes the same function in train
-                # and eval -- the property that motivated trying to remove BatchNorm,
-                # kept while restoring the per-layer per-step re-centring that --norm
-                # none turned out to need.  affine=False keeps the parameter count
-                # identical to the BatchNorm path.
-                return nn.Sequential(conv,
-                                     nn.GroupNorm(max(1, min(groups, cout)), cout,
-                                                  affine=False),
-                                     nn.ReLU())
-            if norm == 'none':
-                # variance-preserving init: without BatchNorm nothing downstream
-                # rescales, so the init has to do it. fan_in + relu gain keeps
-                # Var(out) ~ Var(in) through conv->ReLU.
-                nn.init.kaiming_normal_(conv.weight, mode='fan_in', nonlinearity='relu')
-                nn.init.zeros_(conv.bias)
-                return nn.Sequential(conv, nn.ReLU())
-            # --bn_track False makes BatchNorm use BATCH statistics in eval as well as
-            # train, so there is no train/eval discrepancy and no running-statistics
-            # buffers -- while keeping the cross-batch pooling that per-sample normalizers
-            # (group, softmax, std) all failed without.  Note that at inference the
-            # statistics come from whatever batch is fed: at batch 1 BatchNorm2d degenerates
-            # to InstanceNorm over the SxS grid, a well-defined but different function.
-            return nn.Sequential(conv,
-                                 nn.BatchNorm2d(cout, affine=bn_affine,
-                                                track_running_stats=bn_track,
-                                                momentum=bn_momentum, eps=bn_eps),
-                                 nn.ReLU())
         self.layers = nn.ModuleList(
-            block(self.c_in if i == 0 else w, self.c_out if i == depth - 1 else w)
-            for i in range(depth))
-
-    def forward(self, x):
-        for layer in self.layers:
-            x = layer(x)
-        return x
-
-
-class SpatialCat(nn.Module):
-    """--ctx_cat_spatial: the ctx_cat read with its sources tiled in space, not stacked in
-    depth. Input [B, 4C, S, S] (the channel concat _feed already builds: input, DFF1..3)
-    -> [B, C, 2S, 2S] with cell (i, j) expanded to the 2x2 group
-         [ input  DFF1 ]
-         [ DFF2   DFF3 ]
-    then S/2 unpadded 3x3 (conv + BN + ReLU) blocks, each removing 2 from the side, so
-    2S -> S. A 3x3 tap is shared by whichever source lands under it, so the first conv
-    mixes all four sources inside every window."""
-
-    def __init__(self, c, c_out, S, bn_track=True, bn_affine=False, bn_momentum=0.1,
-                 bn_eps=1e-5):
-        super().__init__()
-        self.in_channels = 4 * c          # what the op summary reads, as for an nn.Conv2d
-        self.c = c
-        self.layers = nn.ModuleList(
-            nn.Sequential(nn.Conv2d(c if i == 0 else c_out, c_out, 3, padding=0),
-                          nn.BatchNorm2d(c_out, affine=bn_affine, track_running_stats=bn_track,
-                                         momentum=bn_momentum, eps=bn_eps),
+            nn.Sequential(nn.Conv2d(width, width, kernel, padding=kernel // 2),
+                          nn.BatchNorm2d(width, affine=False, momentum=bn_momentum or None),
                           nn.ReLU())
-            for i in range(S // 2))
-
-    def forward(self, x):
-        B, _, S, _ = x.shape
-        x = x.view(B, 2, 2, self.c, S, S).permute(0, 3, 4, 1, 5, 2).reshape(B, self.c, 2 * S, 2 * S)
-        for layer in self.layers:
-            x = layer(x)
-        return x
-
-
-class DecoderTree(nn.Module):
-    """--dec_tree: unpadded (conv + norm + ReLU) blocks that reduce [B, c_in, S, S] to
-    [B, width, 1, 1] -- a 3x3 kernel while the side is >= 3 (each removes 2), then a 2x2 to
-    finish an even side. S=8 is 8 -> 6 -> 4 -> 2 -> 1. Norm follows ContextCNN's (BatchNorm,
-    or GroupNorm / none); at the last 1x1 stages BatchNorm normalizes over the batch alone."""
-    def __init__(self, c_in, S, width, norm='batch', groups=32, bn_track=True,
-                 bn_affine=False, bn_momentum=0.1, bn_eps=1e-5, linear=False, kernels=None):
-        super().__init__()
-        layers, s, c = [], S, c_in
-        _ks = list(kernels) if kernels is not None else None
-        while (s > 1) if _ks is None else _ks:
-            k = (3 if s >= 3 else 2) if _ks is None else _ks.pop(0)
-            conv = nn.Conv2d(c, width, k, padding=0)
-            if linear:
-                # --dec_tree_linear: nothing rescales between the convs, so the init keeps
-                # Var(out) ~ Var(in) per stage (PyTorch's default would lose ~3x per conv)
-                nn.init.kaiming_normal_(conv.weight, mode='fan_in', nonlinearity='linear')
-                nn.init.zeros_(conv.bias)
-                layers.append(nn.Sequential(conv))
-                s, c = s - k + 1, width
-                continue
-            if norm == 'group':
-                nrm = nn.GroupNorm(max(1, min(groups, width)), width, affine=False)
-            elif norm == 'none':
-                nn.init.kaiming_normal_(conv.weight, mode='fan_in', nonlinearity='relu')
-                nn.init.zeros_(conv.bias)
-                nrm = nn.Identity()
-            else:
-                nrm = nn.BatchNorm2d(width, affine=bn_affine, track_running_stats=bn_track,
-                                     momentum=bn_momentum, eps=bn_eps)
-            layers.append(nn.Sequential(conv, nrm, nn.ReLU()))
-            s, c = s - k + 1, width
-        self.layers = nn.ModuleList(layers)
+            for _ in range(depth))
 
     def forward(self, x):
         for layer in self.layers:
@@ -2129,1407 +332,215 @@ class DecoderTree(nn.Module):
         return x
 
 
-class DecoderCNN(nn.Module):
-    """1×1 conv n_hidden→n_out, then global average pool.
-    Input:  [B, n_hidden, S, S]
-    Output: [B, n_out]
+def _linear_init(conv):
+    """Variance-preserving init for a conv with nothing after it to rescale."""
+    nn.init.kaiming_normal_(conv.weight, mode='fan_in', nonlinearity='linear')
+    nn.init.zeros_(conv.bias)
+    return conv
 
-    n_out is the readout width: 256 (the byte vocabulary, so this is already the logits)
-    for --tokenizer char, or the pretrained embedding width for every other --tokenizer,
-    where the conv is the linear adapter feeding a frozen lm_head.
 
-    norm2d (--head_norm batch2d) inserts a BatchNorm2d between the conv and the pool, the
-    same Conv->BatchNorm2d shape ContextCNN uses. It normalizes per channel over batch and
-    space, before the pool averages, and is a plain affine per channel at inference, so it
-    folds into proj's weights."""
-    def __init__(self, n_hidden, S, n_out=256, norm2d=False, kernel=1, padded=True,
-                 linear_init=False):
+class TextDecoder(nn.Module):
+    """Layer output [B, C, S, S] -> logits [B, vocab]. A linear tree of unpadded convs
+    shrinks the grid, the last conv maps to the embedding width, whatever grid remains is
+    average-pooled, and the borrowed (frozen) lm_head produces the logits."""
+
+    def __init__(self, c_in, S, kernels, width, lmhead):
         super().__init__()
-        self.proj = nn.Conv2d(n_hidden, n_out, kernel, padding=kernel // 2 if padded else 0)
-        if linear_init:   # same variance-preserving init as the --dec_tree_linear stages
-            nn.init.kaiming_normal_(self.proj.weight, mode='fan_in', nonlinearity='linear')
-            nn.init.zeros_(self.proj.bias)
-        self.norm = nn.BatchNorm2d(n_out) if norm2d else nn.Identity()
-        # no pool when proj's output is already 1x1 (--dec_tree): proj is then the whole decoder
-        S_out = S if padded else S - kernel + 1
-        self.pool = nn.AvgPool2d(S_out) if S_out > 1 else nn.Identity()
+        red = sum(k - 1 for k in kernels)
+        if not kernels or min(kernels) < 1 or red > S - 1:
+            raise SystemExit(f'--dec_tree_kernels {kernels}: need sum(k-1) <= S-1 = {S - 1}')
+        c_out = lmhead.in_features
+        self.proj = _linear_init(nn.Conv2d(width if len(kernels) > 1 else c_in, c_out,
+                                           kernels[-1]))
+        self.tree = nn.ModuleList(_linear_init(nn.Conv2d(c_in if i == 0 else width, width, k))
+                                  for i, k in enumerate(kernels[:-1]))
+        self.pool = nn.AvgPool2d(S - red) if S - red > 1 else nn.Identity()
+        self.lmhead = lmhead
 
     def forward(self, x):
-        return self.pool(self.norm(self.proj(x))).squeeze(-1).squeeze(-1)
+        for conv in self.tree:
+            x = conv(x)
+        return self.lmhead(self.pool(self.proj(x)).squeeze(-1).squeeze(-1))
 
 
-def _fwht(x):
-    """Orthonormal fast Walsh-Hadamard transform over dim 1 of [B, C, S, S], C a power of 2:
-    log2(C) stages of pairwise add/subtract, then one 1/sqrt(C) scale. No multiplies in the
-    butterflies, which is the point for hardware."""
-    B, C = x.shape[0], x.shape[1]
-    rest = x.shape[2:]
-    y, h = x.reshape(B, C, -1), 1
-    while h < C:
-        y = y.view(B, C // (2 * h), 2, h, -1)
-        a, b = y[:, :, 0], y[:, :, 1]
-        y = torch.stack((a + b, a - b), dim=2).view(B, C, -1)
-        h *= 2
-    return (y * C ** -0.5).view(B, C, *rest)
-
-
-class DFFEma:
-    """How a register commits the value its layer just computed.
-
-    Every register is written every step -- there is no gating and no schedule -- so all
-    this holds is the blend: register <- register + e*(new - register), with e from
-    --ema/--ema_ladder. e == 1.0 (or ema None) replaces outright.
-
-    It owns one piece of state, a per-row step counter, and that exists for a single rule:
-    a row's FIRST write of a document must replace the register outright rather than blend,
-    or (1-e) of the --init seed would survive in the state for the rest of the document.
-
-    One writer belongs to one context, like the DFF list beside it: forward() keeps its own,
-    generate() and --vis keep theirs, so a sample drawn mid-training cannot disturb the
-    training state."""
-
-    def __init__(self, ema, B, device, ctx_rates=None, first='replace', chain=False, resid=False,
-                 warm=False, adapt=None, every=None, learn=False, resid_sum=False):
-        self.ema = ema                       # float, or one per register (--ema_ladder)
-        self.chain = chain                   # --ctx_chain: register k is fed by register k-1
-        self.resid = resid                   # --ctx_resid: register k fed x - register k-1
-        self.resid_sum = resid_sum           # --ctx_resid_mode sum: x - (registers 1..k-1)
-        self.warm = warm                     # --ctx_warm: bias-corrected rate per row
-        self.last_win = None                 # [B or 1, K] effective window 1/rate, last write
-        self.every = every                   # --ctx_every: [N_k] or None
-        self.learn = learn                   # --ctx_learn_win: rate set by the model per step
-        self.acc = None                      # --ctx_every: running input sum per register
-        self.e_last = None                   # last write's innovation (--ctx_learn_win read)
-        # --ctx_adapt: (nominal windows, [(lo, hi)] window clamps, stat windows) or None
-        self.adapt = adapt
-        if adapt is not None:
-            wins, rng, swin = adapt
-            Kc = len(wins)
-            f = lambda v: torch.tensor(v, dtype=torch.float32, device=device).view(1, Kc)
-            self.a_nom = f([1.0 / w for w in wins])
-            self.a_lo  = f([1.0 / hi for lo, hi in rng])     # slowest allowed rate
-            self.a_hi  = f([1.0 / lo for lo, hi in rng])     # fastest allowed rate
-            self.beta  = f([1.0 / w for w in swin])
-            z = lambda: torch.zeros(B, Kc, device=device)
-            self.sV, self.nV, self.sC, self.nC = z(), z(), z(), z()
-            self.a = self.a_nom.expand(B, Kc).clone()
-            self.e_prev = None
-        self.t   = torch.zeros(B, dtype=torch.long, device=device)
-        # --ctx_ema: K registers per layer held concatenated on channels, each with its own
-        # rate. Stored as a [1, K*C, 1, 1] tensor so one blend writes all K at once.
-        self.K   = 0
-        # --ctx_first: 'replace' (default) -- a row's first write of a document overwrites
-        # the register; 'blend' -- it blends like every other write, so the state leaves the
-        # reset value continuously and each register is a (shrunken) running average of the
-        # current document only.
-        self.first_replace = (first != 'blend')
-        if ctx_rates is not None:
-            self.K   = len(ctx_rates[0])
-            self.rate = torch.tensor(ctx_rates[1], dtype=torch.float32,
-                                     device=device).view(1, -1, 1, 1)
-
-    def write(self, li, o, prev):
-        if self.K and self.adapt is not None:
-            return self._write_adapt(o, prev)
-        if self.K:
-            rate = self.rate
-            if self.warm:
-                # n-th write since <STX> (n = t+1): rate a/(1-(1-a)^n), 1 at n=1
-                n = (self.t + 1).view(-1, 1, 1, 1).to(rate.dtype)
-                rate = rate / (1.0 - (1.0 - rate) ** n)
-            self.last_win = (1.0 / rate).view(rate.shape[0], self.K, -1)[..., 0].detach()
-            if self.every is not None or self.learn:
-                return self._write_loop(o, prev, rate)
-            # under --linout o is already [B, K*C, S, S] (block k = copy k for register k);
-            # without it the one layer output is proposed to every context
-            if self.resid:
-                # residual cascade: register k blends toward what register k-1 (as written
-                # THIS step) did not capture of the layer output
-                C = prev.shape[1] // self.K
-                if o.shape[1] != C:
-                    raise ValueError('--ctx_resid needs one layer output per step (--ctx_mix none)')
-                pk, rk = prev.split(C, dim=1), rate.split(C, dim=1)
-                new, inp = [], o
-                for k in range(self.K):
-                    if k:
-                        inp = o - (sum(new) if self.resid_sum else new[-1])
-                    n = pk[k] + rk[k] * (inp - pk[k])
-                    if self.first_replace:
-                        n = torch.where((self.t == 0).view(-1, 1, 1, 1), inp, n)
-                    new.append(n)
-                return torch.cat(new, dim=1)
-            if self.chain:
-                # shift register: register 1 sees the layer output, register k the PREVIOUS
-                # value of register k-1 (all clocked at once)
-                C = prev.shape[1] // self.K
-                if o.shape[1] != C:
-                    raise ValueError('--ctx_chain needs one layer output per step (--ctx_mix none)')
-                o = torch.cat([o, prev[:, :-C]], dim=1)
-            elif o.shape[1] != prev.shape[1]:
-                o = o.repeat(1, self.K, 1, 1)
-            blend = prev + rate * (o - prev)
-            if not self.first_replace:
-                return blend
-            return torch.where((self.t == 0).view(-1, 1, 1, 1), o, blend)
-        if self.ema is None:
-            return o
-        e = self.ema[li] if isinstance(self.ema, (list, tuple)) else self.ema
-        if e >= 1.0:
-            return o
-        # first write of a document replaces; every later one blends
-        if not self.first_replace:
-            return prev + e * (o - prev)
-        return torch.where((self.t == 0).view(-1, 1, 1, 1), o, prev + e * (o - prev))
-
-    def _write_loop(self, o, prev, rate):
-        """Register-by-register write: parallel or --ctx_resid cascade, each register every
-        token or every N_k tokens (--ctx_every, box-averaged input), and the innovation of
-        each actual update kept in e_last for --ctx_learn_win's lookahead read."""
-        K = self.K
-        C = prev.shape[1] // K
-        if self.resid and o.shape[1] != C:
-            raise ValueError('--ctx_resid needs one layer output per step (--ctx_mix none)')
-        ok = o.split(C, dim=1) if o.shape[1] == prev.shape[1] else [o] * K
-        pk, rk = prev.split(C, dim=1), rate.split(C, dim=1)
-        ev = self.every or [1] * K
-        if any(n > 1 for n in ev) and (self.acc is None or self.acc.shape != prev.shape):
-            self.acc = torch.zeros_like(prev)
-        acc = self.acc.split(C, dim=1) if self.acc is not None else [None] * K
-        new, es, accs = [], [], []
-        for k in range(K):
-            u = (ok[k] if (k == 0 or not self.resid) else
-                 ok[k] - (sum(new) if self.resid_sum else new[-1]))
-            if ev[k] > 1:
-                N = ev[k]
-                a_sum = acc[k] + u.detach()
-                fire = ((self.t + 1) % N == 0).view(-1, 1, 1, 1)
-                m = a_sum / N
-                a = 1.0 - (1.0 - rk[k]) ** N                  # per-update rate, window W_k
-                e = torch.where(fire, m - pk[k], torch.zeros_like(m))
-                n = pk[k] + a * e
-                accs.append(torch.where(fire, torch.zeros_like(a_sum), a_sum))
-            else:
-                e = u - pk[k]
-                n = pk[k] + rk[k] * e
-                if self.first_replace:
-                    n = torch.where((self.t == 0).view(-1, 1, 1, 1), u, n)
-                if acc[k] is not None:
-                    accs.append(acc[k])
-            new.append(n); es.append(e.detach())
-        if accs and self.acc is not None:
-            self.acc = torch.cat(accs, dim=1).detach()
-        self.e_last = torch.cat(es, dim=1)
-        return torch.cat(new, dim=1)
-
-    def advance(self):
-        """One step of the token stream has been consumed."""
-        self.t = self.t + 1
-
-    def _write_adapt(self, o, prev):
-        """--ctx_adapt: the K registers (parallel, or --ctx_resid cascade), each blending at
-        its own per-row rate from the closed-form Kalman gain of its innovation statistics.
-
-        Local-level model: input u_t = m_t + v_t (noise variance R), m_t = m_t-1 + w_t
-        (drift variance Q). An EMA at rate a has innovations e_t = u_t - r_t-1 with
-            V  = E[e^2]       = Q/(a(2-a)) + 2R/(2-a)
-            C1 = E[e_t e_t-1] = (1-a)Q/(a(2-a)) - aR/(2-a)
-        so R = (1-a)V - C1 and Q = a(2-a)V - 2aR, and the optimal (Kalman) rate is the root
-        of a^2/(1-a) = lambda = Q/R: a* = 2/(1 + sqrt(1 + 4/lambda)). At a* the innovations are
-        white (C1 = 0), so this is a fixed point of the update. Statistics are pooled over
-        channels and grid (one rate per register per row), smoothed with a bias-corrected EMA,
-        and detached: a control law, not a trained parameter."""
-        K = self.K
-        C = prev.shape[1] // K
-        ok = o.split(C, dim=1) if o.shape[1] == prev.shape[1] else [o] * K
-        if self.resid and o.shape[1] != C:
-            raise ValueError('--ctx_resid needs one layer output per step (--ctx_mix none)')
-        pk = prev.split(C, dim=1)
-        if self.e_prev is None or self.e_prev.shape != prev.shape:
-            self.e_prev = torch.zeros_like(prev).detach()
-        ep = self.e_prev.split(C, dim=1)
-        B = prev.shape[0]
-        started = (self.t >= 1).float().view(-1)[:B]      # e_t-1 exists in this document
-        ready = (self.t >= 2).view(-1)[:B]
-        new, es, a_all = [], [], []
-        for k in range(K):
-            u = (ok[k] if (k == 0 or not self.resid) else
-                 ok[k] - (sum(new) if self.resid_sum else new[-1]))
-            e = (u - pk[k]).detach()
-            v = e.pow(2).mean(dim=(1, 2, 3))
-            c = (e * ep[k]).mean(dim=(1, 2, 3))
-            b = self.beta[0, k]
-            self.sV[:, k] += b * (v - self.sV[:, k]); self.nV[:, k] += b * (1 - self.nV[:, k])
-            bc = b * started
-            self.sC[:, k] += bc * (c - self.sC[:, k]); self.nC[:, k] += bc * (1 - self.nC[:, k])
-            V = self.sV[:, k] / self.nV[:, k].clamp_min(1e-12)
-            C1 = self.sC[:, k] / self.nC[:, k].clamp_min(1e-12)
-            a0 = self.a[:, k].clone()
-            R = (1 - a0) * V - C1
-            Q = a0 * (2 - a0) * V - 2 * a0 * R
-            lam = torch.where(R > 0, Q.clamp_min(0) / R.clamp_min(1e-30),
-                              torch.full_like(R, 1e12))
-            a = 2.0 / (1.0 + torch.sqrt(1.0 + 4.0 / lam.clamp_min(1e-12)))
-            a = torch.minimum(torch.maximum(a, self.a_lo[0, k]), self.a_hi[0, k])
-            a = torch.where(ready, a, self.a_nom[0, k].expand_as(a))
-            self.a[:, k] = a
-            n = pk[k] + a.view(-1, 1, 1, 1) * (u - pk[k])
-            new.append(n); es.append(e)
-        self.e_prev = torch.cat(es, dim=1)
-        self.last_win = (1.0 / self.a).detach().clone()
-        return torch.cat(new, dim=1)
-
-    def reset(self, flag):
-        """Rows starting a new document are back at their first write."""
-        self.t = torch.where(flag, torch.zeros_like(self.t), self.t)
-        f4 = flag.view(-1, 1, 1, 1)
-        if self.acc is not None and self.acc.shape[0] == flag.shape[0]:
-            self.acc = torch.where(f4, torch.zeros_like(self.acc), self.acc)
-        if self.e_last is not None and self.e_last.shape[0] == flag.shape[0]:
-            self.e_last = torch.where(f4, torch.zeros_like(self.e_last), self.e_last)
-        if self.adapt is not None:
-            f = flag.view(-1, 1)
-            for name in ('sV', 'nV', 'sC', 'nC'):
-                t = getattr(self, name)
-                setattr(self, name, torch.where(f, torch.zeros_like(t), t))
-            self.a = torch.where(f, self.a_nom.expand_as(self.a), self.a)
-            if self.e_prev is not None:
-                self.e_prev = torch.where(flag.view(-1, 1, 1, 1), torch.zeros_like(self.e_prev),
-                                          self.e_prev)
-
-
-# PyTorchModelHubMixin gives VLAModel save_pretrained()/push_to_hub()/from_pretrained()
-# (see --push). It records the __init__ kwargs as config.json, so a hub checkpoint rebuilds
-# with the architecture it was trained with. huggingface_hub is optional: without it the
-# model is a plain nn.Module and only --push is unavailable.
+# PyTorchModelHubMixin adds save_pretrained/push_to_hub/from_pretrained (--push,
+# --pretrained) and records the __init__ kwargs as the hub config.
 try:
     from huggingface_hub import PyTorchModelHubMixin as _HubMixin
 except ImportError:                                  # pragma: no cover
-    class _HubMixin:                                 # no-op base
+    class _HubMixin:
         pass
 
 
 class VLAModel(nn.Module, _HubMixin):
-    """Recurrent CNN language model. Each step the current token is embedded, broadcast
-    to an S×S grid, projected to n_hidden and summed into the per-layer DFF state;
-    ContextCNN updates the state and the decoder reads it out to next-token logits.
-    n_layers stacks (ContextCNN + feedback) units in series, each carrying its own DFF
-    state. clock (--clock) decides how often each layer
-    commits its new state -- every step, on a per-layer ladder, or on a random schedule --
-    and accumulate (--accumulate) makes each of those writes an average rather than a
-    sample; see DFFClock.
+    """One recurrent layer with K DFF registers, held concatenated as one
+    [B, K*n_hidden, S, S] tensor (self.dff, detached every step: gradient horizon 1 token).
 
-    `tokenizer` picks the vocabulary and both ends of the token path:
-      char           learned nn.Embedding(256, c_text) in, decoder straight to 256
-                     logits out, lmhead = Identity. Fully self-contained.
-      tiny1m/tiny8m  the pretrained TinyStories GPT-Neo embedding in and its lm_head out.
-      pythia*        the same, from the Pile-trained EleutherAI GPT-NeoX models, whose
-                     embeddings (unlike TinyStories') have no untrained rows.
+    step:  inputs   token grid                                        [c_text, S, S]
+           read     K registers, each scaled to RMS --ctx_read_norm   K x [n_hidden, S, S]
+           x      = ctx_cat(concat(inputs, reads))                    [c_context, S, S]
+           o      = linout(ContextCNN(x))                             [n_hidden, S, S]
+           write    r_k <- r_k + a_k * (o - sum_{j<k} r_j[t] - r_k),  a_k = 1/W_k
+           logits = text_dec(o)
+    """
 
-    For every pretrained tokenizer the borrowed layers are frozen (see
-    set_pretrained_trainable / --unfreeze) and c_text is forced to that model's embedding
-    width, so the CNN meets them through two linear 1×1 conv2d adapters: text_proj
-    (c_text → n_hidden) and decoder.proj (n_hidden → c_text). By default nothing sits
-    between the decoder and the head; head_norm (--head_norm) optionally normalizes the
-    readout there, since the borrowed head was trained downstream of a final norm."""
-    def __init__(self, n_hidden, depth, kernel, S,
-                 c_context=None, c_text=None, n_layers=1, tokenizer='char', head_norm='none',
-                 ema=None, qproj='none', tap=False, clip_dff=0.0,
-                 tap_norm='none', norm='batch', norm_groups=32, dff_norm='none',
-                 bn_track=True, bn_affine=False, bn_momentum=0.1, bn_eps=1e-5):
+    def __init__(self, S=8, n_hidden=512, c_context=384, depth=8, kernel=3,
+                 tokenizer='pythia31m', windows=(256, 64, 16, 4, 1), read_norm=1.0,
+                 dec_kernels=(3, 3, 3), dec_width=256, bn_momentum=0.1, init='zero'):
         super().__init__()
-        self.S          = S
-        self.n_hidden   = n_hidden
-        # ContextCNN's interior width (--c_context). n_hidden still sizes the DFF state and
-        # every module that reads or writes it; this sizes only the conv chain in between.
-        self.c_context  = int(c_context) if c_context else n_hidden
-        self.c_text     = c_text if c_text is not None else n_hidden
-        self.n_layers   = max(1, n_layers)    # stacked (ContextCNN + feedback) layers (see --n_layers)
-        # --ema/--ema_ladder: how much of its new output each register takes. Every
-        # register is written every step (see DFFEma); the convs run every step regardless.
-        self.ema = None                                  # derived in set_ema
-        self.clip_dff   = float(clip_dff or 0.0)
-        # --dff_penalty: read off the module-level args, the same way --linout is, so a
-        # checkpoint rebuilt by exp/score.py or exp/reach.py does not need a new kwarg --
-        # it changes the LOSS, not the architecture, and no state_dict entry depends on it.
-        self.dff_penalty = float(getattr(args, 'dff_penalty', 0.0) or 0.0)
-        self.dff_bias    = float(getattr(args, 'dff_bias', 0.0) or 0.0)
-        self.tap_norm_kind = tap_norm or 'none'
-        self.norm_kind     = norm or 'batch'
-        self.norm_groups   = int(norm_groups)
-        self.bn_track    = bool(bn_track)
-        self.bn_affine   = bool(bn_affine)
-        self.bn_momentum = float(bn_momentum)
-        self.bn_eps      = float(bn_eps)
-        self.dff_norm_kind = dff_norm or 'none'
-        self.dff_softmax   = nn.Softmax2d() if self.dff_norm_kind == 'softmax' else None
-        # Every layer owns a DFF register and reads a feedback add. (--dff_every, which
-        # made every Kth layer straight through, is deprecated: removing a register cost
-        # 0.503 nats at identical parameter count and conv depth.) These are kept as the
-        # identity map because the ladder reporting and --altvis index through them.
-        self.dff_layers = list(range(self.n_layers))
-        self.dff_slot   = {li: li for li in range(self.n_layers)}
-        self.n_dff      = self.n_layers
-        self.set_ema(ema, getattr(args, 'ema_ladder', None))
-        self.tokenizer  = tokenizer           # vocabulary / token path (see --tokenizer)
-        # --head_norm only has a job when there is a borrowed head to feed; with char the
-        # decoder emits logits directly and normalizing them would just rescale the
-        # softmax. Forced to 'none' there so head_norm always describes what was built.
-        self.head_norm_kind = head_norm if tokenizer != 'char' else 'none'
-        _ln_f = _ln_f_path = None             # the borrowed final norm, for head_norm='ln_f'
+        from transformers import AutoModelForCausalLM
+        repo = _TOKENIZERS[tokenizer]
+        lm = AutoModelForCausalLM.from_pretrained(repo)
+        self.S, self.n_hidden, self.c_context = S, n_hidden, c_context
+        self.windows = [float(w) for w in windows]
+        if not self.windows or min(self.windows) < 1:
+            raise SystemExit(f'--ctx_ema {windows}: windows must be >= 1 token')
+        self.K = len(self.windows)
+        self.read_norm = float(read_norm)
+        self.init_mode = init
+        self.vocab, self.c_text = lm.config.vocab_size, lm.config.hidden_size
+        self.tok = HFTokenizer(repo, self.vocab)
+        self.start_id, self.end_id = self.tok.start_id, self.tok.end_id
 
-        if tokenizer == 'char':
-            self.tok      = ByteTokenizer()
-            self.vocab    = self.tok.vocab_size
-            self.tok_embed = nn.Embedding(self.vocab, self.c_text)   # token → c_text channels
-            if getattr(args, 'char_onehot', False):
-                # --char_onehot: a FIXED one-hot input -- byte b lights channel b of a
-                # 256-wide token vector, nothing learned before the CNN. Built as a frozen
-                # identity Embedding so every embed path (training, generate, --vis) is unchanged.
-                self.c_text = self.vocab
-                self.tok_embed = nn.Embedding(self.vocab, self.vocab)
-                with torch.no_grad():
-                    self.tok_embed.weight.copy_(torch.eye(self.vocab))
-                self.tok_embed.weight.requires_grad_(False)
-            self.lmhead   = nn.Identity()     # the decoder already emits the 256 byte logits
-        else:
-            # Pull the vocabulary-facing layers out of the pretrained causal LM and drop the
-            # transformer blocks. get_input_embeddings/get_output_embeddings are the
-            # family-agnostic accessors, so gpt_neo (transformer.wte / lm_head) and gpt_neox
-            # (gpt_neox.embed_in / embed_out) are both handled without naming either. GPT-Neo
-            # ties its two (lm_head.weight IS wte.weight, one weight matrix); GPT-NeoX does
-            # not, so pythia* contributes two independently trained matrices.
-            from transformers import AutoModelForCausalLM
-            repo = _TOKENIZERS[tokenizer]
-            lm   = AutoModelForCausalLM.from_pretrained(repo)
-            self.vocab     = lm.config.vocab_size
-            self.c_text    = lm.config.hidden_size   # the embedding width is not ours to choose
-            self.tok       = HFTokenizer(repo, self.vocab)
-            self.tok_embed = lm.get_input_embeddings()    # vocab → c_text
-            self.lmhead    = lm.get_output_embeddings()   # c_text → vocab
-            # --head_norm ln_f additionally borrows the final norm the source model applies
-            # right before this head, so the head sees the input distribution it was fit to.
-            if self.head_norm_kind == 'ln_f':
-                _ln_f_path, _ln_f = _final_norm(lm)
-                if _ln_f is None:
-                    print(f'WARNING: --head_norm ln_f: no final norm found on {repo} '
-                          f'(model_type {lm.config.model_type}); falling back to none. Add '
-                          f'its path to _FINAL_NORM_PATHS.')
-                    self.head_norm_kind = 'none'
+        self.tok_embed = lm.get_input_embeddings()                      # frozen
+        self.context = ContextCNN(c_context, depth, kernel, bn_momentum)
+        self.text_dec = TextDecoder(n_hidden, S, list(dec_kernels), dec_width,
+                                    lm.get_output_embeddings())         # lm_head frozen
+        for p in self.pretrained_params():
+            p.requires_grad_(False)
 
-        self.start_id  = self.tok.start_id
-        self.end_id    = self.tok.end_id
-        self.null_id   = self.tok.null_id
+        # ctx_cat reads [input grids..., registers...]. It starts as [I, I, ..., I] onto the
+        # first outputs each block fits, i.e. the plain sum of the sources.
+        self.in_widths = [self.c_text]                    # one entry per input grid
+        widths = self.in_widths + [n_hidden] * self.K
+        self.ctx_cat = nn.Conv2d(sum(widths), c_context, 1)
+        with torch.no_grad():
+            self.ctx_cat.weight.zero_()
+            o = 0
+            for w in widths:
+                n = min(w, c_context)
+                self.ctx_cat.weight[:n, o:o + n, 0, 0] = torch.eye(n)
+                o += w
+            self.ctx_cat.bias.zero_()
 
-        # --linout puts a 1x1 at the end of every layer, and that 1x1 is the natural place
-        # for the widening: with it on, the conv chain STAYS at c_context (final BN+ReLU
-        # included) and linout projects c_context -> n_hidden. Without it there is nothing
-        # downstream to widen, so the chain's last conv has to reach n_hidden itself.
-        # Decided here because it sets ContextCNN's output width. When c_context == n_hidden
-        # (the default) both paths build exactly the same convs as before either flag existed.
-        self.ctx_out   = self.c_context if getattr(args, 'linout', False) else n_hidden
-        # --linin: the mirror image on the way IN -- a 1x1 narrows the feedback sum to
-        # c_context, so the chain's first conv reads c_context rather than n_hidden.
-        # --ctx_cat_narrow does the same narrowing inside the ctx_cat read
-        if getattr(args, 'ctx_cat_narrow', False) and (getattr(args, 'linin', False)
-                                                       or not getattr(args, 'ctx_cat_in', False)):
-            raise SystemExit('--ctx_cat_narrow needs --ctx_cat_in and excludes --linin')
-        self.ctx_in    = (self.c_context if (getattr(args, 'linin', False)
-                                             or getattr(args, 'ctx_cat_narrow', False))
-                          else n_hidden)
-        self.context   = ContextCNN(n_hidden, depth, kernel, norm=self.norm_kind,
-                                    groups=self.norm_groups, bn_track=self.bn_track,
-                                    bn_affine=self.bn_affine,
-                                    bn_momentum=(self.bn_momentum or None),
-                                    bn_eps=self.bn_eps, c_context=self.c_context,
-                                    c_out=self.ctx_out, c_in=self.ctx_in)
-        # --dec_width: the --dec_depth blocks run at this width and decoder.proj reads it
-        _dd = int(getattr(args, 'dec_depth', 0) or 0)
-        _dt = bool(getattr(args, 'dec_tree', False))
-        self.dec_width = (int(getattr(args, 'dec_width', 0) or 0) or n_hidden) if (_dd > 0 or _dt) else n_hidden
-        if getattr(args, 'dec_tree_linear', False) and not _dt:
-            raise SystemExit('--dec_tree_linear needs --dec_tree')
-        if _dt and int(getattr(args, 'dec_kernel', 1) or 1) != 1:
-            raise SystemExit('--dec_tree feeds decoder.proj a 1x1 grid; leave --dec_kernel at 1')
-        _dtk = getattr(args, 'dec_tree_kernels', None)
-        _dtk = [int(k) for k in str(_dtk).split(',') if k.strip()] if _dtk else None
-        if _dtk is not None:
-            if not _dt:
-                raise SystemExit('--dec_tree_kernels needs --dec_tree')
-            _red = sum(k - 1 for k in _dtk)
-            if getattr(args, 'dec_tree_pool', False):
-                if _red > S - 1 or min(_dtk) < 1:
-                    raise SystemExit(f'--dec_tree_kernels {_dtk}: sum of (k-1) must be <= S-1 = '
-                                     f'{S - 1} with --dec_tree_pool')
-            elif _red != S - 1 or min(_dtk) < 1:
-                raise SystemExit(f'--dec_tree_kernels {_dtk}: sum of (k-1) must be S-1 = {S - 1} '
-                                 f'to reach 1x1 from {S}x{S} (or add --dec_tree_pool)')
-        elif getattr(args, 'dec_tree_pool', False):
-            raise SystemExit('--dec_tree_pool needs --dec_tree_kernels')
-        self.dec_tree_kernels = _dtk
-        if _dtk is not None:
-            # the last kernel IS decoder.proj: unpadded, on the grid the tree leaves (k x k, or
-            # larger under --dec_tree_pool, where DecoderCNN then pools what proj leaves)
-            self.decoder = DecoderCNN(self.dec_width, S - sum(k - 1 for k in _dtk[:-1]),
-                                      self.c_text if tokenizer != 'char' else 256,
-                                      norm2d=self.head_norm_kind == 'batch2d',
-                                      kernel=_dtk[-1], padded=False,
-                                      linear_init=bool(getattr(args, 'dec_tree_linear', False)))
-        else:
-            self.decoder = DecoderCNN(self.dec_width, 1 if _dt else S,
-                                      self.c_text if tokenizer != 'char' else 256,
-                                      norm2d=self.head_norm_kind == 'batch2d',
-                                      kernel=int(getattr(args, 'dec_kernel', 1) or 1))
-        # --dec_depth: nonlinear blocks between the DFF tap and decoder.proj (see _decode).
-        # Built with the RNG forked so every other module initializes as without it.
-        self.dec_stack = None
-        _dd = int(getattr(args, 'dec_depth', 0) or 0)
-        if _dd > 0:
-            with torch.random.fork_rng(devices=[]):
-                self.dec_stack = ContextCNN(n_hidden, _dd, kernel, norm=self.norm_kind,
-                                            groups=self.norm_groups, bn_track=self.bn_track,
-                                            bn_affine=self.bn_affine,
-                                            bn_momentum=(self.bn_momentum or None),
-                                            bn_eps=self.bn_eps, c_context=self.dec_width,
-                                            c_out=self.dec_width, c_in=n_hidden)
-        # --dec_tree: the SxS -> 1x1 reduction in front of decoder.proj (see _decode)
-        self.dec_tree = None
-        if _dt:
-            with torch.random.fork_rng(devices=[]):
-                self.dec_tree = DecoderTree(self.dec_width if _dd > 0 else n_hidden, S,
-                                            self.dec_width, norm=self.norm_kind,
-                                            groups=self.norm_groups, bn_track=self.bn_track,
-                                            bn_affine=self.bn_affine,
-                                            bn_momentum=(self.bn_momentum or 0.1),
-                                            bn_eps=self.bn_eps,
-                                            linear=bool(getattr(args, 'dec_tree_linear', False)),
-                                            kernels=(self.dec_tree_kernels[:-1]
-                                                     if self.dec_tree_kernels is not None else None))
-        # token grid (c_text) → n_hidden, summed into the DFF state
-        if getattr(args, 'no_text_proj', False):
-            # a narrower token grid is fine when nothing adds it to n_hidden-wide state: under
-            # --ctx_cat_in (one layer) it is just another block of the concat ctx_cat reads
-            if self.c_text != n_hidden and not (getattr(args, 'ctx_cat_in', False)
-                                                and self.n_layers == 1):
-                raise SystemExit(f'--no_text_proj needs the embedding width ({self.c_text}) to '
-                                 f'equal --n_hidden ({n_hidden}), or --ctx_cat_in with '
-                                 f'--n_layers 1')
-            self.text_proj = nn.Identity()       # no parameters; the grid feeds the add/concat
-        else:
-            self.text_proj = nn.Conv2d(self.c_text, n_hidden, 1)
+        # linout: c_context -> n_hidden, semi-orthogonal (norm-preserving, dense and signed)
+        self.linout = nn.Conv2d(c_context, n_hidden, 1)
+        with torch.no_grad():
+            self.linout.weight.copy_(
+                nn.init.orthogonal_(torch.empty(n_hidden, c_context)).view(n_hidden, c_context, 1, 1))
+            self.linout.bias.zero_()
 
-        # --head_norm, on the [B, c_text] readout between the decoder and the head.
-        # batch2d already lives inside the decoder (before the pool), so it is Identity here.
-        # ln_f is borrowed and frozen with the other pretrained weights; layer/rms/batch are
-        # fresh and train with the CNN.
-        self.norm_path = _ln_f_path              # provenance of an ln_f head_norm, for the summaries
-        self.head_norm = {
-            'none':    lambda: nn.Identity(),
-            'batch2d': lambda: nn.Identity(),
-            'ln_f':    lambda: _ln_f,
-            'layer':   lambda: nn.LayerNorm(self.c_text),
-            'rms':     lambda: nn.RMSNorm(self.c_text),
-            'batch':   lambda: nn.BatchNorm1d(self.c_text),
-        }[self.head_norm_kind]()
-
-        if tokenizer != 'char':
-            self.set_pretrained_trainable(False)  # frozen unless --unfreeze
-
-        # Deep layers 2..N: each is its own (ContextCNN + feedback) unit. Layer 1 takes
-        # the token injection; deep layers take the previous layer's output combined with
-        # their own DFF state. Only built when n_layers>1, so the n_layers=1 state_dict is
-        # byte-identical to the single-layer model.
-        if self.n_layers > 1:
-            # Every layer is built the same: n_hidden in, c_context through the chain,
-            # linout back out to n_hidden.
-            self.deep_context = nn.ModuleList(
-                ContextCNN(n_hidden, depth, kernel, norm=self.norm_kind,
-                                    groups=self.norm_groups, bn_track=self.bn_track,
-                                    bn_affine=self.bn_affine,
-                                    bn_momentum=(self.bn_momentum or None),
-                                    bn_eps=self.bn_eps, c_context=self.c_context,
-                                    c_out=self.ctx_out, c_in=self.ctx_in)
-                for _ in range(self.n_layers - 1))
-            self.deep_proj = nn.ModuleList(
-                nn.Conv2d(n_hidden, n_hidden, 1) for _ in range(self.n_layers - 1))
-        else:
-            self.deep_context = self.deep_proj = None
-
-        # --linout: one 1x1 per layer, replacing deep_proj on the upward path. Identity-
-        # initialized so the register starts out holding the ReLU output exactly; the weights
-        # move off identity within a few steps and the register goes signed from then on.
-        # args.linout is restored from the checkpoint by _restore_arch on --load (it is in
-        # _ARCH_ARGS and deliberately NOT in _ARCH_OVERRIDE: it adds convolutions, so the
-        # checkpoint's value defines the weights and a command-line value must not win).
-        # getattr keeps checkpoints that predate the flag loadable -- they simply have no
-        # 'linout' key and fall back to False.
-        # --ctx_ema: K contexts per layer, same shape, each written by its own linout copy (the
-        # same layer output without --linout) and blended at its own rate, the K summed into
-        # the feedback add. The K registers live concatenated on channels, [B, K*n_hidden, S,
-        # S], so every list-of-per-layer-tensors consumer (reset, clip, stats, vis) is
-        # unchanged -- and so do the K linout copies: one conv with K*n_hidden outputs.
-        self.ctx_windows = None
-        _spec = getattr(args, 'ctx_ema', None)
-        if _spec:
-            try:
-                _w = [float(x) for x in str(_spec).split(',') if x.strip()]
-            except ValueError:
-                raise SystemExit(f'--ctx_ema {_spec!r}: expected comma-separated windows in tokens')
-            if not _w or any(x < 1.0 for x in _w):
-                raise SystemExit(f'--ctx_ema {_spec!r}: windows must be >= 1 token')
-            self.ctx_windows = _w
-            self.ctx_every = None
-            if getattr(args, 'ctx_every', None):
-                self.ctx_every = [int(v) for v in str(args.ctx_every).split(',') if v.strip()]
-                if len(self.ctx_every) != len(_w) or min(self.ctx_every) < 1:
-                    raise SystemExit('--ctx_every: one positive integer per --ctx_ema window')
-            if getattr(args, 'ctx_resid_mode', 'prev') == 'sum' and not getattr(args, 'ctx_resid', False):
-                raise SystemExit('--ctx_resid_mode sum needs --ctx_resid')
-            if self.ema is not None:
-                raise SystemExit('--ctx_ema replaces --ema/--ema_ladder (each context window IS '
-                                 'its blend rate); drop one of them')
-        # --ctx_mix: fixed per-register transforms of ONE shared linout output (see _ctx_fan).
-        # Buffers, so they are saved with the weights; their own generator, so they are the
-        # same in every run regardless of --seed and of what else the model draws.
-        self.ctx_mix = getattr(args, 'ctx_mix', 'conv') or 'conv'
-        # not `or 1.0`: 0 is a legal value (no feedback at all) and must not become 1
-        _ws = getattr(args, 'dff_write_scale', None)
-        self.dff_write_scale = 1.0 if _ws is None else float(_ws)
-        # --ctx_read_gain: trainable per-register gains, applied in _fb before the sum. A
-        # ParameterList (a Module) so the summaries can name it. Created with the RNG forked:
-        # torch.full draws nothing anyway, but this keeps every other init identical by design.
-        self.ctx_read_gain_kind = getattr(args, 'ctx_read_gain', 'none') or 'none'
-        self.ctx_rgain = None
-        # --ctx_cat: the K registers concatenated and read through one 1x1 conv; built with
-        # the RNG forked so every other module still initializes as it did without it
-        self.ctx_cat = None
-        self.ctx_cat_spatial = False
-        self.ctx_cat_in = bool(getattr(args, 'ctx_cat_in', False))
-        if getattr(args, 'ctx_cat', False) or self.ctx_cat_in:
-            # --ctx_cat_in reads [input, registers] through one conv, so ONE register is a
-            # meaningful case there; plain --ctx_cat only mixes registers and needs two
-            if not self.ctx_windows or len(self.ctx_windows) < (1 if self.ctx_cat_in else 2):
-                raise SystemExit('--ctx_cat needs --ctx_ema with K >= 2 (K >= 1 with --ctx_cat_in)')
-            _Kc = len(self.ctx_windows) + (1 if self.ctx_cat_in else 0)   # + the input block
-            with torch.random.fork_rng(devices=[]):
-                _ck = int(getattr(args, 'ctx_cat_kernel', 1) or 1)
-                if _ck < 1 or _ck % 2 == 0:
-                    raise SystemExit(f'--ctx_cat_kernel {_ck}: must be a positive ODD integer')
-                # block widths in concat order: the input (the raw c_text grid under
-                # --no_text_proj, else n_hidden), then the K registers
-                _bw = (([self.c_text if getattr(args, 'no_text_proj', False) else n_hidden]
-                        if self.ctx_cat_in else []) + [n_hidden] * len(self.ctx_windows))
-                _co = self.ctx_in if self.ctx_cat_in else n_hidden   # --ctx_cat_narrow: c_context
-                self.ctx_cat_spatial = bool(getattr(args, 'ctx_cat_spatial', False))
-                if self.ctx_cat_spatial:
-                    if not self.ctx_cat_in or len(self.ctx_windows) != 3 or set(_bw) != {n_hidden}:
-                        raise SystemExit('--ctx_cat_spatial needs --ctx_cat_in, exactly 3 '
-                                         '--ctx_ema registers and an n_hidden-wide input '
-                                         '(drop --no_text_proj)')
-                    if self.S % 2 or getattr(args, 'ctx_read_gate', False):
-                        raise SystemExit('--ctx_cat_spatial needs an even --context and no '
-                                         '--ctx_read_gate')
-                    self.ctx_cat = nn.ModuleList(
-                        SpatialCat(n_hidden, _co, self.S, bn_track=self.bn_track,
-                                   bn_affine=self.bn_affine, bn_momentum=self.bn_momentum,
-                                   bn_eps=self.bn_eps)
-                        for _ in range(self.n_layers))
-                else:
-                    self.ctx_cat = nn.ModuleList(nn.Conv2d(sum(_bw), _co, _ck, padding=_ck // 2)
-                                                 for _ in range(self.n_layers))
-                # --ctx_learn_win: one trainable log-window per register per layer
-                self.ctx_logw = None
-                if getattr(args, 'ctx_learn_win', False):
-                    if self.n_layers != 1:
-                        raise SystemExit('--ctx_learn_win supports --n_layers 1')
-                    _w0 = torch.tensor(self.ctx_windows, dtype=torch.float32)
-                    if getattr(args, 'ctx_win_param', 'clamp') == 'exp1':   # theta = log(W - 1)
-                        _w0 = torch.log((_w0 - 1.0).clamp_min(1e-3))
-                    elif getattr(args, 'ctx_win_param', 'clamp') == 'rate2':  # phi = logit(a/2)
-                        _a = (1.0 / _w0 / 2.0).clamp(1e-6, 1 - 1e-6)
-                        _w0 = torch.log(_a / (1.0 - _a))
-                    else:                                                   # theta = log W
-                        _w0 = torch.log(_w0)
-                    self.ctx_logw = nn.ParameterList(nn.Parameter(_w0.clone())
-                                                     for _ in range(self.n_layers))
-                # --ctx_read_gate: sigmoid gates on the K register reads, from the same input
-                self.ctx_rgate = None
-                if getattr(args, 'ctx_read_gate', False):
-                    if not self.ctx_cat_in:
-                        raise SystemExit('--ctx_read_gate needs --ctx_cat_in')
-                    self.ctx_rgate = nn.ModuleList(
-                        nn.Conv2d(sum(_bw), n_hidden * len(self.ctx_windows), 1)
-                        for _ in range(self.n_layers))
-                    with torch.no_grad():
-                        for _g in self.ctx_rgate:
-                            _g.weight.zero_(); _g.bias.zero_()
-            with torch.no_grad():
-                for _c in (self.ctx_cat if not self.ctx_cat_spatial else []):
-                    _c.weight.zero_()
-                    _m = _c.weight.shape[-1] // 2  # centre tap (0 for a 1x1)
-                    _o = 0
-                    for _w in _bw:               # [I, I, ..., I]: the plain sum at step 0
-                        _n = min(_w, _c.out_channels)   # onto the first outputs that fit
-                        _c.weight[:_n, _o:_o + _n, _m, _m] = torch.eye(_n)
-                        _o += _w
-                    _c.bias.zero_()
-        if self.ctx_read_gain_kind != 'none':
-            if not self.ctx_windows or len(self.ctx_windows) < 2:
-                raise SystemExit('--ctx_read_gain needs --ctx_ema with K >= 2')
-            _shape = ((len(self.ctx_windows), n_hidden) if self.ctx_read_gain_kind == 'channel'
-                      else (len(self.ctx_windows),))
-            _g0 = float(getattr(args, 'ctx_read_gain_init', 1.0))
-            self.ctx_rgain = nn.ParameterList(nn.Parameter(torch.full(_shape, _g0))
-                                              for _ in range(self.n_layers))
-        # --ctx_read_norm_mode running: each register's running RMS (0 = not measured yet)
-        if getattr(args, 'ctx_read_norm_mode', 'row') == 'running' and self.ctx_windows:
-            self.register_buffer('ctx_read_rms', torch.zeros(self.n_layers, len(self.ctx_windows)))
-        if self.ctx_mix not in ('conv', 'none'):
-            if not self.ctx_windows or len(self.ctx_windows) < 2:
-                raise SystemExit(f'--ctx_mix {self.ctx_mix} needs --ctx_ema with K >= 2')
-            if self.ctx_mix == 'hadamard' and (n_hidden & (n_hidden - 1)):
-                raise SystemExit(f'--ctx_mix hadamard needs a power-of-2 --n_hidden, got {n_hidden}')
-            _g = torch.Generator().manual_seed(20261002)
-            _Km = len(self.ctx_windows)
-            self.register_buffer('ctx_sign', (torch.randint(0, 2, (_Km, n_hidden), generator=_g)
-                                              * 2 - 1).float())
-            self.register_buffer('ctx_perm', torch.stack([torch.randperm(n_hidden, generator=_g)
-                                                          for _ in range(_Km)]))
-
-        self.linout = None
-        if getattr(args, 'linout', False):
-            if getattr(args, 'tap', False):
-                raise SystemExit('--linout and --tap are mutually exclusive: both put a 1x1 '
-                                 'on the register path, and --tap also keeps deep_proj')
-            # in_channels is the CHAIN's output width: n_hidden when --c_context is unset,
-            # c_context when it is -- in which case this 1x1 IS the widening, and the last
-            # 3x3 (c_context x n_hidden x 9 weights) disappears in favour of it
-            # (c_context x n_hidden x 1).
-            _lk = int(getattr(args, 'linout_kernel', 1) or 1)
-            if _lk < 1 or _lk % 2 == 0:
-                raise SystemExit(f'--linout_kernel {_lk}: must be a positive ODD integer '
-                                 f'(even kernels cannot keep the grid the same size with '
-                                 f'symmetric padding)')
-            # padding K//2 with the default zeros padding_mode: S x S in, S x S out, so the
-            # register, the feedback add and the decoder all keep the shapes they had.
-            # one per LAYER, recurrent or not: every chain ends at c_context and every
-            # layer widens back to n_hidden with its own 1x1/3x3 (see --dff_every).
-            # --ctx_ema: K copies per layer, held as one conv with K*n_hidden outputs; output
-            # block k is copy k and writes register k, and their SUM goes up (see _layers)
-            _K = self.n_ctx if self.ctx_mix == 'conv' else 1   # --ctx_mix: one shared linout
-            # --ctx_mix none: construct at the K-copy width first. Conv2d draws its default init
-            # at construction, so this consumes exactly the random numbers --ctx_mix conv does,
-            # and every module built after it initializes identically. The real one-copy convs
-            # are then built with the RNG forked, so they draw nothing.
-            _Kc = self.n_ctx if self.ctx_mix == 'none' else _K
-            self.linout = nn.ModuleList(nn.Conv2d(self.ctx_out, _Kc * n_hidden, _lk, padding=_lk // 2)
-                                        for _ in range(self.n_layers))
-            if _Kc != _K:
-                with torch.random.fork_rng(devices=[]):
-                    self.linout = nn.ModuleList(
-                        nn.Conv2d(self.ctx_out, _K * n_hidden, _lk, padding=_lk // 2)
-                        for _ in range(self.n_layers))
-            for _c in self.linout:
-                if (self.ctx_out == n_hidden and _K == 1
-                        and getattr(args, 'linout_init', 'orth') != 'rotate'):
-                    # square: dirac_ is the identity on the CENTRE tap (and zeros elsewhere
-                    # when K>1), so K=3 starts out computing exactly what K=1 does
-                    nn.init.dirac_(_c.weight)
-                else:
-                    # Rectangular, so there is no identity. Semi-orthogonal instead: it
-                    # preserves the norm of the channel vector at every position (no rescaling
-                    # inside a recurrence that is prone to blowing up) and makes the register
-                    # dense and SIGNED from step 0 -- which is the entire point of --linout.
-                    # dirac_ would also "work" here, but it would copy the ReLU output into
-                    # the first c_context channels and leave the other n_hidden-c_context at
-                    # zero, i.e. a sparse non-negative register: the thing the flag exists to
-                    # avoid, and 75% of the state dead at init when c_context is n_hidden/4.
-                    # Under --ctx_ema each copy gets its own draw: the copies all receive the
-                    # same gradient (through the upward sum), so their difference stays at
-                    # this init -- which is what keeps the K registers in separate subspaces.
-                    _w = torch.cat([nn.init.orthogonal_(torch.empty(n_hidden, self.ctx_out))
-                                    for _ in range(_K)])
-                    # --linout_init: same draws either way (other modules' inits unchanged)
-                    _li = getattr(args, 'linout_init', 'orth')
-                    if _li == 'tied' and _K > 1:
-                        _w = _w[:n_hidden].repeat(_K, 1)
-                    elif _li == 'scaled' and _K > 1:
-                        _w = _w * _K ** -0.5
-                    if self.ctx_mix == 'none' and self.n_ctx > 1:
-                        # one conv, but make the SAME K draws --ctx_mix conv makes, so every
-                        # module built after this initializes identically (v233 == v231)
-                        for _ in range(self.n_ctx - 1):
-                            nn.init.orthogonal_(torch.empty(n_hidden, self.ctx_out))
-                    _w = _w * float(getattr(args, 'linout_gain', 1.0) or 1.0)
-                    with torch.no_grad():
-                        _c.weight.zero_()
-                        # centre tap carries the whole projection; the off-centre taps start
-                        # at zero, so K>1 is again exactly K=1 at step 0 and grows from there
-                        _c.weight[:, :, _lk // 2, _lk // 2] = _w
-                nn.init.zeros_(_c.bias)
-            self.deep_proj = None          # its job is done by linout now
-
-        # --linin: one 1x1 per layer between the feedback sum and ContextCNN. Semi-orthogonal
-        # (orthonormal rows when narrowing): no rescaling inside a loop prone to blowing up,
-        # and dense from step 0. Square (c_context == n_hidden) it is a plain rotation.
-        self.linin = None
-        if getattr(args, 'linin', False):
-            self.linin = nn.ModuleList(nn.Conv2d(n_hidden, self.ctx_in, 1)
-                                       for _ in range(self.n_layers))
-            for _c in self.linin:
-                with torch.no_grad():
-                    _w = torch.empty(self.ctx_in, n_hidden)
-                    nn.init.orthogonal_(_w)
-                    _c.weight.copy_(_w.view(self.ctx_in, n_hidden, 1, 1))
-                nn.init.zeros_(_c.bias)
-
-        # --qproj: a 1x1 linear conv per layer on the DFF path, at that layer's own width
-        # since it has to land on a tensor of the register's shape. Two placements,
-        # applied between the register and the feedback add -- see _fb.
-        #
-        #   read   between the register and the feedback add. Trainable, so it is initialized
-        #          to the identity (dirac kernel, zero bias): at step 0 the model is exactly
-        #          --qproj none and training moves it off from there, which keeps an A/B
-        #          honest and keeps a random mixer out of a loop prone to blowing up.
-        #   write  between the layer output and the register, so the register holds a dense
-        #          signed embedding. Its output only ever reaches the loss through the DFF,
-        #          which forward() detaches, so it can never get gradient: it is frozen, and
-        #          random rather than identity (an identity that cannot learn would be a
-        #          no-op). Orthogonal, not gaussian -- a rotation preserves the norm of the
-        #          channel vector at every position, so a fixed mixer inside the recurrence
-        #          cannot rescale or collapse the state, and it stays invertible, so nothing
-        #          in the state is destroyed. Frozen parameters are still state_dict entries,
-        #          so a reload gets the same random projection back.
-        if qproj == 'write':
-            raise SystemExit("--qproj write was removed: its only path to the loss is through "
-                             "the DFF, which is detached every step, so it could never train. "
-                             "Use --qproj read (trainable) or --qproj none.")
-        self.qproj_mode = qproj if qproj in _QPROJ_MODES else ('read' if qproj else 'none')
-        # per RECURRENT layer (--dff_every): both sit on the register path, and a
-        # straight-through layer has no register to read from or write to.
-        self.qproj = (nn.ModuleList(nn.Conv2d(n_hidden, n_hidden, 1)
-                                    for _ in range(self.n_dff))
-                      if self.qproj_mode != 'none' else None)
-        if self.qproj is not None:
-            for _c in self.qproj:
-                nn.init.dirac_(_c.weight)
-                nn.init.zeros_(_c.bias)
-
-
-        # --tap: a 1x1 linear conv after each layer's last conv-BN-ReLU, with the DFF
-        # register fed from its output (see _tap). It is the first of the two convs in
-        # series -- the second is the 1x1 already sitting on the upward path, deep_proj into
-        # the next layer or decoder.proj on the last one, so no second module is needed.
-        # Identity-initialized, like --qproj read, so step 0 is exactly the model without
-        # --tap.
-        self.tap = None
-        self.tap_norm = None
-        if tap:
-            self.tap = nn.ModuleList(nn.Conv2d(n_hidden, n_hidden, 1)
-                                     for _ in range(self.n_dff))
-            # --tap_norm: normalize what leaves the tap, so the feedback gain is bounded by
-            # construction rather than left to whatever the weights drift to. affine=False in
-            # both cases, so no parameters are added; group additionally has no running
-            # statistics, so train and eval compute the same function.
-            if self.tap_norm_kind == 'batch':
-                self.tap_norm = nn.ModuleList(nn.BatchNorm2d(n_hidden, affine=False)
-                                              for _ in range(self.n_dff))
-            elif self.tap_norm_kind == 'group':
-                self.tap_norm = nn.ModuleList(
-                    nn.GroupNorm(min(32, n_hidden), n_hidden, affine=False)
-                    for _ in range(self.n_dff))
-            for _c in self.tap:
-                nn.init.dirac_(_c.weight)
-                nn.init.zeros_(_c.bias)
-
-        self.dff = None   # list of n_layers tensors [B, n_hidden, S, S], detached; None until first step
-        self.clk = None   # DFFClock for self.dff (None under --clock sync); built with it
-
-        # How a fresh context is seeded, set from --init after construction. Runtime
-        # behaviour, not architecture: deliberately not part of the hub config, so it never
-        # affects checkpoint or from_pretrained compatibility.
-        self.init_mode = 'relu'
+        self.register_buffer('ctx_read_rms', torch.zeros(self.K))       # 0 = not measured yet
+        self.register_buffer('rate', torch.tensor([min(1.0, 1.0 / w) for w in self.windows]),
+                             persistent=False)
+        self.dff = None              # [B, K*n_hidden, S, S], detached; None until first step
+        self._ablate = None          # --eval_info: registers read as their mean ...
+        self._read_mean = None       # ... which is this [1, K*n_hidden, S, S] tensor
 
     def pretrained_params(self):
-        """The borrowed embedding + lm_head, plus the final norm under --head_norm ln_f
-        (empty with --tokenizer char). Deduped by identity: GPT-Neo ties lm_head.weight to
-        tok_embed.weight, so there it is one tensor; GPT-NeoX (pythia*) keeps them separate.
-        The fresh --head_norm kinds are not borrowed, so they are not listed here and stay
-        trainable regardless of --unfreeze."""
-        if self.tokenizer == 'char':
-            return []
-        mods = (self.tok_embed, self.lmhead)
-        if self.head_norm_kind == 'ln_f':
-            mods += (self.head_norm,)
+        """The borrowed embedding and lm_head, deduplicated (tiny8m ties them)."""
         seen, out = set(), []
-        for m in mods:
+        for m in (self.tok_embed, self.text_dec.lmhead):
             for p in m.parameters():
                 if id(p) not in seen:
                     seen.add(id(p))
                     out.append(p)
         return out
 
-    def _decode(self, ctx):
-        """Layer output -> [B, c_text]: the --dec_depth blocks (if any), then the decoder."""
-        if self.dec_stack is not None:
-            ctx = self.dec_stack(ctx)
-        if self.dec_tree is not None:
-            ctx = self.dec_tree(ctx)
-        return self.decoder(ctx)
-
-    def readout(self, dec):
-        """Decoder output [B, c_text] → logits [B, vocab]: --head_norm, then the borrowed
-        unembedding. Both are Identity with --tokenizer char, where the decoder already
-        emits the 256 byte logits, and head_norm is Identity for 'none' and for 'batch2d'
-        (which normalizes earlier, inside the decoder)."""
-        return self.lmhead(self.head_norm(dec))
-
-    def set_pretrained_trainable(self, flag):
-        """Freeze/unfreeze the borrowed embedding + lm_head (see --unfreeze). Called from
-        __init__ with False, so a model is frozen by default however it was built."""
-        for p in self.pretrained_params():
-            p.requires_grad_(bool(flag))
-
-    def _new_dff(self, B, device):
-        """A fresh DFF context state (--init). Used everywhere a context is started or
-        reset, so train/generate/vis all begin from the same distribution.
-
-          zero      zeros
-          gaussian  standard-normal noise
-          relu      relu(randn): non-negative and ~50% exact zeros, the shape the state
-                    actually has in steady state, since it is a ReLU output
-
-        Unit variance needs no scale knob: every step puts the state through `depth`
-        stacked Conv->BatchNorm(affine=False)->ReLU, which drives it onto a fixed attractor
-        (measured: mean 0.43, std 0.71, 52% exact zeros) regardless of how it started. The
-        init is forgotten fast -- relative divergence between a zero and a gaussian start
-        falls to 3% by 20 bytes and to float32 noise by 50 -- so --init only changes what
-        the model sees for the first few dozen bytes of a context."""
-        shapes = [(B, self.n_hidden * self.n_ctx, self.S, self.S)] * self.n_dff
+    def new_state(self, B, device):
+        shape = (B, self.n_hidden * self.K, self.S, self.S)
         if self.init_mode == 'gaussian':
-            return [torch.randn(s, device=device) for s in shapes]
+            return torch.randn(shape, device=device)
         if self.init_mode == 'relu':
-            return [torch.randn(s, device=device).relu() for s in shapes]
-        return [torch.zeros(s, device=device) for s in shapes]
+            return torch.randn(shape, device=device).relu()
+        return torch.zeros(shape, device=device)
 
-    def set_ema(self, ema=None, ema_ladder=None):
-        """Set (or change) the DFF blend rate; None leaves it alone. It adds no parameter
-        and changes no shape, so this is safe on a model whose weights are already loaded --
-        it is what lets --ema/--ema_ladder on the command line override what a checkpoint was
-        trained with (see _ARCH_OVERRIDE). Any live writer is dropped and rebuilt with the
-        next context.
+    def _inputs(self, idx):
+        """The input grids, in self.in_widths order: the RMS-normalized token embedding
+        broadcast over the grid."""
+        tok = self.tok_embed(idx)
+        tok = tok * torch.rsqrt(tok.pow(2).mean(dim=1, keepdim=True) + 1e-12)
+        return [tok.view(idx.shape[0], self.c_text, 1, 1).expand(-1, -1, self.S, self.S)]
 
-        Rates are indexed over the layers that HAVE REGISTERS (--dff_every): a blend rate
-        describes a register, and a straight-through layer has none. At --dff_every 1 that
-        is every layer."""
-        if ema is not None:
-            if isinstance(ema, (list, tuple)):
-                self.ema = list(ema)          # a per-register ladder, already built
+    def _read(self, dff):
+        """The K registers as ctx_cat reads them."""
+        regs = list(dff.chunk(self.K, dim=1))
+        if self._ablate:
+            mu = self._read_mean.chunk(self.K, dim=1)
+            regs = [mu[k].expand_as(r) if k in self._ablate else r for k, r in enumerate(regs)]
+        if self.read_norm > 0:
+            run = self.ctx_read_rms
+            if self.training or bool((run == 0).any()):
+                with torch.no_grad():
+                    b = torch.stack([r.float().pow(2).mean() for r in regs]).sqrt()
+                    if self.training:
+                        run.copy_(torch.where(run == 0, b, 0.99 * run + 0.01 * b))
+                    sc = torch.where(run == 0, b, run)
             else:
-                self.ema = float(ema) if 0.0 < float(ema) < 1.0 else None
-        if ema_ladder is not None:
-            _spec = str(ema_ladder).strip()
-            self.ema_ladder = _spec if _spec else None
-        _nreg = getattr(self, 'n_dff', self.n_layers)
-        if getattr(self, 'ema_ladder', None):
-            _spec = str(self.ema_ladder)
-            if ',' in _spec:
-                # per-register WINDOWS in tokens. Short lists repeat their last entry, long
-                # ones are truncated, so the spec need not be re-typed when --n_layers or
-                # --dff_every changes.
-                _w = [float(x) for x in _spec.split(',') if x.strip()]
-                if not _w:
-                    raise SystemExit(f'--ema_ladder {_spec!r}: no windows parsed')
-                _w = (_w + [_w[-1]] * _nreg)[:_nreg]
-                if any(x <= 0 for x in _w):
-                    raise SystemExit(f'--ema_ladder {_spec!r}: windows must be > 0')
-                self.ema = [min(1.0, 1.0 / x) for x in _w]
-            else:
-                _b = float(_spec)
-                if _b <= 1.0:
-                    raise SystemExit(f'--ema_ladder {_spec!r}: a bare BASE must be > 1 '
-                                     f'(use a comma-separated window list for anything else)')
-                self.ema = [min(1.0, 1.0 / (_b ** i)) for i in range(_nreg)]
-        if getattr(self, 'ctx_windows', None) and self.ema is not None:
-            raise SystemExit('--ctx_ema replaces --ema/--ema_ladder (each context window IS '
-                             'its blend rate); drop one of them')
-        self.clk = None
+                sc = run
+            regs = [r * (self.read_norm / (sc[k] + 1e-12)) for k, r in enumerate(regs)]
+        return regs
 
-    @property
-    def n_ctx(self):
-        """Contexts per layer (--ctx_ema); 1 without it."""
-        return len(self.ctx_windows) if getattr(self, 'ctx_windows', None) else 1
+    def _write(self, o, dff):
+        """Laplacian-pyramid cascade: register k blends toward o minus registers 1..k-1 as
+        just written."""
+        new = []
+        for k, p in enumerate(dff.chunk(self.K, dim=1)):
+            inp = o - sum(new) if k else o
+            new.append(p + self.rate[k] * (inp - p))
+        return torch.cat(new, dim=1)
 
-    def _new_writer(self, B, device):
-        """The blend state for one context. None when there is nothing to blend -- no --ema
-        and no --ema_ladder -- where a write is a plain replace and needs no state. Always
-        built under --ctx_ema: it is what fans the layer output out to the K registers."""
-        if getattr(self, 'ctx_windows', None):
-            _r = [min(1.0, 1.0 / w) for w in self.ctx_windows]
-            return DFFEma(None, B, device, first=getattr(args, 'ctx_first', 'replace'),
-                          ctx_rates=(_r, [r for r in _r for _ in range(self.n_hidden)]),
-                          chain=bool(getattr(args, 'ctx_chain', False)),
-                          resid=bool(getattr(args, 'ctx_resid', False)),
-                          resid_sum=getattr(args, 'ctx_resid_mode', 'prev') == 'sum',
-                          warm=bool(getattr(args, 'ctx_warm', False)),
-                          adapt=self._adapt_spec(),
-                          every=getattr(self, 'ctx_every', None),
-                          learn=getattr(self, 'ctx_logw', None) is not None)
-        return (DFFEma(self.ema, B, device, first=getattr(args, 'ctx_first', 'replace'))
-                if self.ema is not None else None)
+    def step(self, idx, dff):
+        """One token for every row: -> (new registers, layer output). No detach."""
+        x = self.ctx_cat(torch.cat(self._inputs(idx) + self._read(dff), dim=1))
+        o = self.linout(self.context(x))
+        return self._write(o, dff), o
 
-    def _ctx_alpha(self, li):
-        """--ctx_learn_win: per-token rate 1/W of each register, [1, K*n_hidden, 1, 1]."""
-        if getattr(args, 'ctx_win_param', 'clamp') == 'rate2':
-            a = 2.0 * torch.sigmoid(self.ctx_logw[li])
-            return a.repeat_interleave(self.n_hidden).view(1, -1, 1, 1)
-        if getattr(args, 'ctx_win_param', 'clamp') == 'exp1':
-            w = (1.0 + self.ctx_logw[li].exp()).clamp(max=4096.0)
-        else:
-            w = self.ctx_logw[li].exp().clamp(1.0, 4096.0)
-        return (1.0 / w).repeat_interleave(self.n_hidden).view(1, -1, 1, 1)
-
-    def _ctx_aeff(self, li):
-        """The rate each register actually applies per update (1-(1-a)^N under --ctx_every)."""
-        a = self._ctx_alpha(li)
-        if getattr(self, 'ctx_every', None) and any(n > 1 for n in self.ctx_every):
-            N = torch.tensor(self.ctx_every, dtype=a.dtype, device=a.device)
-            N = N.repeat_interleave(self.n_hidden).view(1, -1, 1, 1)
-            a = 1.0 - (1.0 - a) ** N
-        return a
-
-    def _adapt_spec(self):
-        """--ctx_adapt: (nominal windows, [(lo, hi)] clamps, stat windows), or None."""
-        if not getattr(args, 'ctx_adapt', False):
-            return None
-        if getattr(args, 'ctx_first', 'replace') != 'blend':
-            raise SystemExit('--ctx_adapt needs --ctx_first blend')
-        if getattr(args, 'ctx_warm', False):
-            raise SystemExit('--ctx_adapt replaces --ctx_warm; drop one')
-        w = list(self.ctx_windows)
-        if getattr(args, 'ctx_adapt_range', None):
-            rng = [tuple(float(v) for v in p.split(':')) for p in args.ctx_adapt_range.split(',')]
-        else:
-            edges = [w[0] / 4] + [math.sqrt(a * b) for a, b in zip(w, w[1:])] + [w[-1] * 4]
-            rng = list(zip(edges, edges[1:]))
-        sw = ([float(v) for v in args.ctx_adapt_win.split(',')]
-              if getattr(args, 'ctx_adapt_win', None) else w)
-        if len(rng) != len(w) or len(sw) != len(w):
-            raise SystemExit('--ctx_adapt_range/--ctx_adapt_win: one entry per --ctx_ema window')
-        return (w, rng, sw)
-
-    def _init_dff(self, B, device):
-        dev = torch.device(device)
-        if (self.dff is None or len(self.dff) != self.n_layers
-                or self.dff[0].shape[0] != B or self.dff[0].device != dev):
-            self.dff = self._new_dff(B, device)
-            self.clk = self._new_writer(B, dev)   # blend state too: rebuilt with the DFF
-
-    def _fb(self, li, d):
-        """Layer li's DFF state as the feedback add sees it (--qproj read). Off, this is the
-        state itself: the ReLU output the layer last wrote, ~50% exact zeros. On, it is that
-        state through a trainable 1x1 linear conv -- every output channel a signed
-        combination of all the input channels at that spatial position -- so what the layer
-        adds in is dense and signed even though the register holding it is sparse.
-
-        This placement is the trainable one. Projecting on the way into the register instead
-        (--qproj write) puts the conv outside the gradient horizon: its output reaches the
-        loss only through self.dff, which forward() detaches every step, so those weights get
-        grad None (measured: None, against 1.21 for text_proj on the same batch) and the
-        mode only makes sense frozen.
-
-        Note the two placements feed the *same* tensor into the add, since this conv is
-        linear and --accumulate's running mean is linear too: mean(Q(o)) == Q(mean(o)) to
-        float precision. What differs is what sits in the register -- sparse and
-        non-negative here, dense and signed under write -- and therefore what the next
-        step's ReLU sees.
-
-        Why it is not redundant with the convs already on that path: Q is applied to the
-        state but not to the token injection it is summed with, so the layer can transform
-        what it remembers differently from what it is being told. Applied to the whole output
-        instead, it would just be a reparameterization of the following 1x1 (deep_proj,
-        decoder.proj) or 3x3 (ContextCNN) conv."""
-        if self.ctx_windows:
-            # --ctx_ema: condition each of the K registers exactly as a lone one would be,
-            # then sum them into the one feedback tensor
-            _clk = getattr(self, '_cur_clk', None)
-            if (getattr(self, 'ctx_logw', None) is not None and _clk is not None
-                    and getattr(_clk, 'e_last', None) is not None and _clk.e_last.shape == d.shape):
-                # --ctx_learn_win lookahead: same value, d read / d a = last write's innovation
-                a = self._ctx_aeff(li)
-                d = d + (a - a.detach()) * _clk.e_last
-            regs = [self._fb_one(li, c) for c in d.chunk(self.n_ctx, dim=1)]
-            _pd = float(getattr(args, 'dff_dropout', 0.0) or 0.0)
-            if _pd > 0 and self.training:
-                regs = [F.dropout(r, _pd, training=True) for r in regs]
-            _abl = getattr(self, '_read_ablate', None)   # --eval_info: read as the mean
-            if _abl:
-                _mu = self._read_mean.chunk(self.n_ctx, dim=1)
-                regs = [_mu[k].expand_as(r) if k in _abl else r for k, r in enumerate(regs)]
-            _rn = float(getattr(args, 'ctx_read_norm', 0.0) or 0.0)
-            if _rn > 0:                                  # --ctx_read_norm: equal-size reads
-                # eps INSIDE the sqrt: a register reset to 0 at <STX> has rms 0, where sqrt
-                # has an infinite slope -- harmless while registers carry no gradient, NaN
-                # once --ctx_learn_win puts its lookahead gradient through the read
-                if getattr(self, 'ctx_read_rms', None) is not None:   # running mode
-                    _run = self.ctx_read_rms[li]
-                    if self.training or bool((_run == 0).any()):
-                        with torch.no_grad():
-                            _b = torch.stack([r.float().pow(2).mean() for r in regs]).sqrt()
-                            if self.training:
-                                _run.copy_(torch.where(_run == 0, _b, 0.99 * _run + 0.01 * _b))
-                            _sc = torch.where(_run == 0, _b, _run)
-                    else:
-                        _sc = _run
-                    regs = [r * (_rn / (_sc[k] + 1e-12)) for k, r in enumerate(regs)]
-                else:
-                    regs = [r * (_rn * torch.rsqrt(r.pow(2).mean(dim=(1, 2, 3), keepdim=True) + 1e-12))
-                            for r in regs]
-            if self.ctx_rgain is not None:
-                g = self.ctx_rgain[li]
-                g = g.view(len(regs), -1, 1, 1) if g.dim() == 2 else g.view(len(regs), 1, 1, 1)
-                regs = [r * g[k] for k, r in enumerate(regs)]
-            if self.ctx_cat is not None:
-                if self.ctx_cat_in:
-                    return torch.cat(regs, dim=1)    # read with the input, in _feed
-                return self.ctx_cat[li](torch.cat(regs, dim=1))
-            return sum(regs)
-        return self._fb_one(li, d)
-
-    def _feed(self, li, d, inp):
-        """Layer li's ContextCNN input before --linin: the DFF feedback plus what arrives
-        from below (the token grid on layer 0). --ctx_cat_in: the input and the K registers
-        concatenated and read by one 1x1 conv instead of added."""
-        if self.ctx_cat is not None and self.ctx_cat_in:
-            x = torch.cat([inp, self._fb(li, d)], dim=1)
-            if getattr(self, 'ctx_rgate', None) is not None:
-                # --ctx_read_gate: gate only the register block, from the whole input
-                w0 = inp.shape[1]
-                g = torch.sigmoid(self.ctx_rgate[li](x))
-                self._last_gate = g.detach().view(g.shape[0], self.n_ctx, -1).mean(-1)
-                x = torch.cat([inp, x[:, w0:] * g], dim=1)
-            return self.ctx_cat[li](x)
-        return self._fb(li, d) + inp
-
-    def _to_regs(self, z):
-        """What linout's output writes to the layer's registers: the copies themselves
-        (--ctx_mix conv), the output as-is for every register (none; DFFEma.write fans it out),
-        or the fixed per-register transforms -- then x --dff_write_scale."""
-        w = z if self.ctx_mix in ('conv', 'none') else self._ctx_fan(z)
-        return w if self.dff_write_scale == 1.0 else w * self.dff_write_scale
-
-    def _ctx_fan(self, o):
-        """--ctx_mix: [B, C, S, S] -> [B, K*C, S, S], register k's view T_k(o). T_1 is the
-        identity; the others are fixed, multiplier-free transforms."""
-        views = [o]
-        for k in range(1, self.n_ctx):
-            s = self.ctx_sign[k].view(1, -1, 1, 1)
-            if self.ctx_mix == 'sign':
-                v = o * s
-            elif self.ctx_mix == 'signperm':
-                v = o[:, self.ctx_perm[k]] * s
-            else:                                   # hadamard: H(D o) / sqrt(C)
-                v = _fwht(o * s)
-            views.append(v)
-        return torch.cat(views, dim=1)
-
-    def _ctx_sum(self, z):
-        """[B, K*n_hidden, S, S] -> [B, n_hidden, S, S]: the K linout copies summed (identity
-        at K=1, and when z is already n_hidden wide)."""
-        K = z.shape[1] // self.n_hidden
-        return z if K == 1 else sum(z.chunk(K, dim=1))
-
-    def _lin_in(self, li, x):
-        """--linin: layer li's feedback sum narrowed to c_context (identity when off)."""
-        return x if self.linin is None else self.linin[li](x)
-
-    def _fb_one(self, li, d):
-        """_fb for one [B, n_hidden, S, S] register: --dff_norm, then --qproj read."""
-        # --dff_norm conditions the state ON THE WAY OUT, so the REGISTER keeps the raw
-        # ReLU output -- sparse, ~50% exact zeros, which is what a hardware state memory
-        # wants -- while what is fed back into the layer is bounded.  Normalizing on the
-        # write side instead would store a dense tensor and throw that sparsity away.
-        # Because the read is scale-free, the stored state's magnitude no longer matters to
-        # the recurrence: the feedback loop is bounded however large the register grows.
-        if self.dff_norm_kind == 'std':
-            # zero mean, unit variance per sample over the whole (C, S, S) volume.  Keeps
-            # the sign and dynamic range that softmax removes.
-            m = d.mean(dim=(1, 2, 3), keepdim=True)
-            v = d.var(dim=(1, 2, 3), keepdim=True, unbiased=False)
-            d = (d - m) * torch.rsqrt(v + 1e-5)
-        elif self.dff_norm_kind == 'softmax':
-            d = self.dff_softmax(d)
-        return d if self.qproj_mode != 'read' else self.qproj[li](d)
-
-    def _tap(self, li, o):
-        """Layer li's ContextCNN output, through the --tap projection (identity when off).
-        The result is both what the register stores and what leaves the layer:
-
-            o -> tap -> a ,   a -> register
-                        a -> deep_proj -> next layer   (decoder.proj on the last layer)
-
-        which is the two-1x1-in-series arrangement with the register tapped between them --
-        the second 1x1 being the one already on the upward path rather than a module of its
-        own. A separate second conv there would be exactly redundant: two 1x1s in series with
-        no nonlinearity between compose to a single 1x1, so folding it into deep_proj costs
-        nothing representable and halves the added parameters.
-
-        Both consumers of `a` matter. The register is detached, so on its own it would leave
-        these weights with no gradient (that is what --qproj write runs into); the upward path
-        is not, so the tap trains through it.
-
-        The register therefore holds a dense signed embedding of the layer's output rather
-        than the sparse ReLU output -- which is the part that changes what the model can
-        remember, since --accumulate averages it and the next step adds it back in."""
-        if self.tap is None:
-            return o
-        a = self.tap[li](o)
-        return a if self.tap_norm is None else self.tap_norm[li](a)
-
-    def _clip_state(self, outs):
-        """--clip_dff: bound the DFF state's magnitude, per layer and per batch row.
-
-        Rescales instead of clamping element-wise, so what the state *encodes* -- the pattern
-        across channels and the SxS grid -- is untouched and only its overall scale is capped.
-        Element-wise clamping would flatten the peaks against the ceiling and distort the
-        representation; this is the same argument that makes gradient-norm clipping preferable
-        to clamping individual gradients.
-
-        Rows are clipped independently because the CNN never mixes the batch dimension, so one
-        row running away must not rescale its neighbours.
-
-        Only the stored state is clipped. The value travelling up the stack and into the
-        decoder is the layer output itself, which is left alone -- this bounds the feedback
-        loop without altering the feed-forward path."""
-        c = self.clip_dff
-        if not c:
-            return outs
-        out = []
-        for d in outs:
-            m = d.detach().abs().amax(dim=(1, 2, 3), keepdim=True)
-            out.append(d * torch.clamp(c / m.clamp_min(1e-12), max=1.0))
-        return out
-
-    def _tok_grid(self, byte_idx):
-        B   = byte_idx.shape[0]
-        tok = self.tok_embed(byte_idx)                             # [B, c_text]
-        if getattr(args, 'tok_norm', False):                         # --tok_norm
-            tok = tok * torch.rsqrt(tok.pow(2).mean(dim=1, keepdim=True) + 1e-12)
-        return tok.view(B, self.c_text, 1, 1).expand(-1, -1, self.S, self.S)
-
-    def _layers(self, dff, tok_grid, clk=None, record=None):
-        """Run the stack of n_layers (ContextCNN + feedback) units once.
-        dff: list of n_layers tensors [B, n_hidden, S, S]. Layer 0 takes the token injection;
-        each deeper layer takes the previous layer's output summed with its own DFF state,
-        so a deep layer sees the current token only through the layers below it.
-        clk: the DFFClock for this context (None under --clock sync). It is consumed here —
-        one step of it per call — so pass the clock that belongs to the state in `dff`.
-        --qproj puts a 1x1 conv either on the way out of each register (read, see _fb) or
-        --tap puts one between the layer output and the
-        register (see _tap), on the path the stack above takes as well.
-        Returns (new_dff_list, last_layer_output [B, n_hidden, S, S]). No detach here — the
-        caller detaches the returned list to bound the time horizon.
-
-        record: if a list is passed, one {'in':…, 'out':…} dict per layer is appended, holding
-        that layer's ContextCNN INPUT (the feedback sum, i.e. what the register contributes
-        plus what arrives from below) and its OUTPUT (what the register will store and the
-        layer above receives). --altvis draws these; nothing else uses them, and passing None
-        leaves the forward pass byte-identical."""
-        self._cur_clk = clk                    # --ctx_learn_win reads the writer's e_last
-        if clk is not None and getattr(self, 'ctx_logw', None) is not None:
-            clk.rate = self._ctx_alpha(0).detach()
-        tok  = self.text_proj(tok_grid)        # [B, n_hidden, S, S], computed once
-        _tg = float(getattr(args, 'tok_gain', 1.0) or 1.0)
-        if _tg != 1.0:                            # --tok_gain
-            tok = tok * _tg
-        _pt = float(getattr(args, 'tok_dropout', 0.0) or 0.0)
-        if _pt > 0 and self.training:             # --tok_dropout
-            tok = F.dropout(tok, _pt, training=True)
-        if self.linout is not None:
-            # ONE 1x1 per layer. `o` leaves the projection already dense and signed, and is
-            # both stored in the register and handed straight to the layer above -- there is
-            # no second projection on the way up, which is the whole difference from --tap.
-            # Layer 0 always owns a register (--dff_every counts from it).
-            # --ctx_ema: the conv emits all K copies concatenated; each block goes to its own
-            # register, and the layer above (and the decoder) gets their SUM -- the only path
-            # by which the copies train, since the registers are detached.
-            x0   = self._feed(0, dff[0], tok)
-            z    = self.linout[0](self.context(self._lin_in(0, x0)))
-            o    = self._ctx_sum(z)
-            outs = [self._to_regs(z)]
-            if record is not None:
-                record.append({'in': x0, 'out': o})
-            for li in range(self.n_layers - 1):
-                x = self._feed(li + 1, dff[li + 1], o)
-                z = self.linout[li + 1](self.deep_context[li](self._lin_in(li + 1, x)))
-                o = self._ctx_sum(z)
-                outs.append(self._to_regs(z))
-                if record is not None:
-                    record.append({'in': x, 'out': o})
-        else:
-            x0   = self._feed(0, dff[0], tok)
-            o    = self._tap(0, self.context(self._lin_in(0, x0)))
-            outs = [o]
-            if record is not None:
-                record.append({'in': x0, 'out': o})
-            for li in range(self.n_layers - 1):
-                x = self._feed(li + 1, dff[li + 1], self.deep_proj[li](o))
-                o = self._tap(li + 1, self.deep_context[li](self._lin_in(li + 1, x)))
-                outs.append(o)
-                if record is not None:
-                    record.append({'in': x, 'out': o})
-        # --clock: a layer that does not write this step keeps the state it had, while still
-        # passing the output it just computed up the stack -- so the decoder, which reads the
-        # top layer's output, moves every step whatever the clock does.
-        if clk is not None:
-            outs = [clk.write(li, oi, d) for li, (oi, d) in enumerate(zip(outs, dff))]
-            clk.advance()
-        return self._clip_state(outs), o
-
-    def forward(self, byte_idx, targets=None, flag=None):
-        """
-        byte_idx  [B] long — current token (teacher-forced: ground truth at t)
-        targets   [B] long — next token (CE target), or None
-        flag      [B] bool — reset DFF for these batch elements
-        """
-        B, dev = byte_idx.shape[0], byte_idx.device
-        self._init_dff(B, dev)
-
+    def forward(self, idx, targets=None, flag=None):
+        """idx [B] current tokens; targets [B] next tokens or None; flag [B] rows starting a
+        document (their registers reset). Advances self.dff by one step."""
+        B, dev = idx.shape[0], idx.device
+        if self.dff is None or self.dff.shape[0] != B or self.dff.device != dev:
+            self.dff = self.new_state(B, dev)
         if flag is not None and flag.any():
-            self.dff = [d.clone() for d in self.dff]   # clone before in-place
-            # reseed just the restarting rows, via _new_dff so --init has one definition
-            fresh = self._new_dff(int(flag.sum()), self.dff[0].device)
-            for d, f in zip(self.dff, fresh):
-                d[flag] = f
-            if self.clk is not None:
-                self.clk.reset(flag)     # a restarting row is back at step 0 (--clock phase)
-
-        stack, new_ctx = self._layers(self.dff, self._tok_grid(byte_idx), self.clk)
-        self.dff = [d.detach().clone() for d in stack]   # store for next step (gradient horizon = 1)
-
-        logits = self.readout(self._decode(new_ctx))
-        loss   = F.cross_entropy(logits, targets.long()) if targets is not None else None
-        if loss is not None and (self.dff_penalty or self.dff_bias):
-            # Mean state, element-weighted across layers so a wide layer counts for what it
-            # is rather than one layer one vote. On `stack`, which still carries the graph --
-            # self.dff above is detached and would contribute nothing.
-            _n = sum(d.numel() for d in stack)
-            _m = sum(d.sum() for d in stack) / _n
-            if self.dff_penalty:
-                loss = loss + self.dff_penalty * F.relu(_m)   # one-sided: restoring force
-            if self.dff_bias:
-                loss = loss + self.dff_bias * _m              # two-sided: constant pull
+            self.dff = self.dff.clone()
+            self.dff[flag] = self.new_state(int(flag.sum()), dev)
+        new, o = self.step(idx, self.dff)
+        self.dff = new.detach().clone()
+        logits = self.text_dec(o)
+        loss = F.cross_entropy(logits, targets.long()) if targets is not None else None
         return logits, loss
 
     @torch.no_grad()
-    def generate_from_state(self, dff, clk, first_id, n_tokens, temperature=1.0):
-        """--gen_warm: continue from a GIVEN state (one batch row's registers and its
-        writer), feeding `first_id` first. The state passed in is a copy, so nothing here
-        touches the training context. No reset at <ETX>: the stream just carries on, as it
-        does in --no_dff_reset training."""
-        self.eval()
-        dev = dff[0].device
-        out, b = [], int(first_id)
-        for _ in range(n_tokens):
-            stack, ctx = self._layers(dff, self._tok_grid(torch.tensor([b], device=dev)), clk)
-            dff = [d.detach() for d in stack]
-            logits = self.readout(self._decode(ctx))
-            if not logits.isfinite().all():
-                break
-            prob = F.softmax(logits[0] / max(temperature, 1e-6), dim=-1)
-            b = int(torch.multinomial(prob, 1).item())
-            out.append(b)
-        return out
-
-    @torch.no_grad()
     def generate(self, prompt_ids, n_tokens, temperature=1.0):
-        """Autoregressive generation seeded by prompt_ids (temperature 0 = argmax).
-
-        Returns n_tokens tokens. An END ends a SEQUENCE, not the sample: it is kept in the
-        output so callers render <ETX>, and if the budget is not yet filled the state is
-        reset, the prompt fed again, and a fresh sequence appended -- exactly what the
-        model does at a document boundary in training. Without this a model that has
-        learned to end documents returns a few dozen tokens of a 200-token budget and the
-        sample stops showing what it does mid-document. Both --generate and the in-training
-        GEN line go through here, so they see the same behaviour. Capped at 20 sequences so
-        a model that emits END immediately cannot spin. Returns short only on NaN/Inf."""
+        """Sample n_tokens after prompt_ids on a private state. An END is kept in the output
+        and, if the budget is not filled, the state resets and the prompt is fed again, as
+        at a training document boundary (at most 20 sequences). Short only on NaN/Inf."""
         self.eval()
         dev = next(self.parameters()).device
-        dff = clk = None
 
-        def _step(b):
-            nonlocal dff
-            bi   = torch.tensor([b], dtype=torch.long, device=dev)
-            tok  = self._tok_grid(bi)
-            stack, new_ctx = self._layers(dff, tok, clk)
-            dff     = [d.detach().clone() for d in stack]
-            if not all(d.isfinite().all() for d in dff):
-                print('generate: dff NaN/Inf')
-                return None
-            logits = self.readout(self._decode(new_ctx))
-            if not logits.isfinite().all():
-                print('generate: logits NaN/Inf')
-                return None
-            return logits
-
-        _pool = getattr(args, 'gen_pool', 'last')
-
-        def _feed(b):
-            """--datarep: one token, N steps. The logits returned are the LAST replica's by
-            default -- the one that has seen the token settle longest -- or the MEAN over
-            all N replicas under --gen_pool mean. At N=1 both are exactly _step().
-            Everything above it therefore reads the same at any --datarep: one sample per
-            token, one token per output position."""
-            lg = acc = None
-            for _ in range(_DATAREP):
-                lg = _step(b)
-                if lg is None:
-                    return None
-                if _pool == 'mean':
-                    p = F.softmax(lg, dim=-1)          # pool PROBABILITIES, not logits
-                    acc = p if acc is None else acc + p
-            if _pool != 'mean':
-                return lg
-            # Returned as log(mean p) so every caller downstream is unchanged: they do
-            # softmax(x / T), and softmax(log p / T) is p^(1/T)/Z -- the temperature applied
-            # to the POOLED distribution, and exactly p at T=1. clamp keeps log(0) finite.
-            return torch.log((acc / _DATAREP).clamp_min(1e-20))
+        def feed(b, dff):
+            new, o = self.step(torch.tensor([b], device=dev), dff)
+            logits = self.text_dec(o)
+            if not (new.isfinite().all() and logits.isfinite().all()):
+                print('generate: NaN/Inf')
+                return None, None
+            return logits, new
 
         out = []
         for _ in range(20):
-            # fresh state per sequence: its own dff and blend state, so generate runs locally
-            dff = self._new_dff(1, dev)
-            clk = self._new_writer(1, dev)
-            # feed each prompt token exactly once; logits after the last one seed generation
-            logits = None
+            dff, logits = self.new_state(1, dev), None
             for b in prompt_ids:
-                logits = _feed(b)
+                logits, dff = feed(b, dff)
                 if logits is None:
                     return out
-            if logits is None:
-                # EMPTY PROMPT (--gen_null): there is no token to inject, so the first
-                # distribution is read straight off the freshly seeded state -- decode the
-                # top register exactly as _step does with the layer output. Everything after
-                # this is the ordinary loop: the sampled token is fed back normally.
-                if not prompt_ids:
-                    with torch.no_grad():
-                        logits = self.readout(self._decode(self._ctx_sum(dff[-1])))
-                    if not logits.isfinite().all():
-                        print('generate: logits NaN/Inf from seed')
-                        return out
-                else:
-                    return out
             while len(out) < n_tokens:
-                _vm = getattr(self, 'vocab_mask', None)    # --gen_vocab: restricted sampling
-                if _vm is not None:
-                    logits = logits.masked_fill(~_vm, float('-inf'))
                 prob = F.softmax(logits[0] / max(temperature, 1e-6), dim=-1)
-                bval = torch.multinomial(prob, 1).item()
-                if bval == self.end_id:
-                    out.append(bval)   # keep the terminator so callers render <ETX>
+                b = torch.multinomial(prob, 1).item()
+                out.append(b)
+                if b == self.end_id:
                     break
-                if bval != self.null_id:   # null_id is None outside byte mode: nothing filtered
-                    out.append(bval)
-                logits = _feed(bval)           # the sample is replicated too, like a real token
+                logits, dff = feed(b, dff)
                 if logits is None:
                     return out
             if len(out) >= n_tokens:
@@ -3537,1919 +548,385 @@ class VLAModel(nn.Module, _HubMixin):
         return out
 
 
-# ── DFF state stats ─────────────────────────────────────────────────────────────
-# The DFF state is a list of one tensor per recurrent layer. These flatten across all
-# layers to report a single aggregate (element-weighted over the whole state).
+# ── data ──────────────────────────────────────────────────────────────────────
 
-def _dff_absmax(dff):
-    """Max |value| across the whole per-layer DFF list (0.0 if empty/None)."""
-    return max((d.abs().max().item() for d in dff), default=0.0) if dff else 0.0
+# name -> (hub repo, config, split, text column)
+_TEXT_DATASETS = {
+    'tiny':          ('roneneldan/TinyStories', None, 'train', 'text'),
+    'c4':            ('allenai/c4', 'en', 'train', 'text'),
+    'web':           ('Skylion007/openwebtext', None, 'train', 'text'),
+    'pile':          ('EleutherAI/the_pile_deduplicated', None, 'train', 'text'),
+    'pile_nc':       ('monology/pile-uncopyrighted', None, 'train', 'text'),
+    'swiki':         ('wikimedia/wikipedia', '20231101.simple', 'train', 'text'),
+    'fwedu':         ('HuggingFaceFW/fineweb-edu', 'sample-10BT', 'train', 'text'),
+    'fineweb':       ('HuggingFaceFW/fineweb', 'sample-10BT', 'train', 'text'),
+    'fwcrawl':       ('HuggingFaceFW/fineweb', 'CC-MAIN-2025-26', 'train', 'text'),
+    'cosmo':         ('HuggingFaceTB/cosmopedia', 'stories', 'train', 'text'),
+    'cosmoweb':      ('HuggingFaceTB/cosmopedia', 'web_samples_v2', 'train', 'text'),
+    'smolcosmo':     ('HuggingFaceTB/smollm-corpus', 'cosmopedia-v2', 'train', 'text'),
+    'smolfwedu':     ('HuggingFaceTB/smollm-corpus', 'fineweb-edu-dedup', 'train', 'text'),
+    'dclmedu':       ('HuggingFaceTB/dclm-edu', None, 'train', 'text'),
+    'strangetb':     ('nampdn-ai/tiny-strange-textbooks', None, 'train', 'text'),
+    'tinytb':        ('nampdn-ai/tiny-textbooks', None, 'train', 'textbook'),
+    'sebooks':       ('Nelathan/standardebooks', None, 'train', 'text'),
+    'simplestories': ('SimpleStories/SimpleStories', None, 'train', 'story'),
+    'littlec':       ('littlelearner/LittleCurriculum', None, 'train', 'text'),
+}
 
+# Repos too large to resolve on demand: only the shards already in the hub cache are read,
+# from (repo, subdirectory).
+_HUB_SUBSET = {
+    'smolcosmo': ('HuggingFaceTB/smollm-corpus', 'cosmopedia-v2'),
+    'smolfwedu': ('HuggingFaceTB/smollm-corpus', 'fineweb-edu-dedup'),
+    'dclmedu':   ('HuggingFaceTB/dclm-edu', 'data'),
+    'fineweb':   ('HuggingFaceFW/fineweb', 'sample/10BT'),
+    'fwcrawl':   ('HuggingFaceFW/fineweb', 'data/CC-MAIN-2025-26'),
+}
 
-def _dff_stats(dff):
-    """(mean, std, absmax, zero_frac) flattened across the whole per-layer DFF list."""
-    if not dff:
-        return 0.0, 0.0, 0.0, 0.0
-    flat = torch.cat([d.reshape(-1) for d in dff])
-    return (flat.mean().item(), flat.std().item(),
-            flat.abs().max().item(), (flat == 0).float().mean().item())
+# Train-only corpora: a fixed 1/_HOLDOUT_MOD of documents, chosen by a hash of the text, is
+# held out for eval and skipped in training (deterministic, streaming-compatible).
+_HASH_HOLDOUT = {'swiki', 'fwedu', 'fineweb', 'fwcrawl', 'cosmo', 'cosmoweb', 'smolcosmo',
+                 'smolfwedu', 'strangetb', 'sebooks', 'dclmedu', 'littlec', 'simplestories'}
+_HOLDOUT_MOD = 32
 
-
-# ── clip builders ──────────────────────────────────────────────────────────────
-
-# Thread-safe tally of text examples. Builder threads
-# count examples/tokens and stash the most recent raw sample; the main loop drains
-# both each checkpoint to report throughput and show a training-text sample.
-_text_lock  = threading.Lock()
-# 'sample' is the last FRAMED corpus document, 'vsample' a dict of the last undelimited
-# sentence PER VOCAB POOL. They are kept apart because the two streams pull at wildly
-# different rates -- 75 vocab slots take a sentence every ~12 steps while 175 corpus slots
-# take a document every ~1000, so a single shared field would be vocab text essentially
-# always and the corpus half of the mix would never be seen.
-# vsample is per-pool rather than one field for the same reason one field is wrong across
-# the two streams: with three curriculum files a single slot shows whichever pool happened
-# to draw last, so math_phase1 would appear in only a third of the reports. Keyed by pool
-# name, every report shows one line from EACH file.
-_text_stats = {'examples': 0, 'tokens': 0, 'sample': '', 'vsample': {},
-               # first few CORPUS documents, kept verbatim for the --gen_score
-               # anchors. Capped: this is a fixed reference sample, not a log.
-               'anchor': []}
-
-# Passes over each corpus, published by the builder threads and read by the TEXT line.
-# Same worker->main-loop channel as _text_stats, and for the same reason: the epoch counter
-# lives inside worker()'s closure, but the only place it is worth reading is the throughput
-# line in the training loop. 1-based and means "currently consuming pass N", matching the
-# EPOCH line _next_example writes on each wrap. On an effectively infinite corpus this stays
-# at 1 forever and is just noise; on a CLOSED corpus (wdef) it is the experiment's clock.
-_epoch_lock  = threading.Lock()
-_epoch_stats = {}
-# Fractional passes over each --vocab_files pool, e.g. 812.437 = 812 complete passes and
-# 44% of the next.  Separate from _epoch_stats, which stays the 1-based "consuming pass N"
-# integer the EPOCH line and _epoch_report() have always printed.
-_epoch_frac  = {}
-# Pools kept OUT of the epoch column's mean (--vocab_framed). Written once at worker
-# start-up, before any thread reads it.
-_epoch_mean_exclude = set()
-# --vocab_slots: pool name -> example count, published once at worker start-up. The STEP
-# line's epoch_vocab column needs the DENOMINATOR of the vocab channel's own consumption,
-# which otherwise lives only in worker()'s closure.
-_vocab_total = {}
-
-# ── learning-stall detector (--refresh, arXiv:2403.02473) ─────────────────────
-# "When do Convolutional Neural Networks Stop Learning?" measures DATA VARIATION across
-# every layer: per layer, the std of its post-convolution activations, averaged over the
-# epoch's iterations, rounded to r decimals; when the SUM of the per-layer epoch-over-epoch
-# differences is exactly 0 for three consecutive epochs, the network has reached its
-# near-optimal capacity on that data. The paper stops training there. Here the same signal
-# says "this pool is exhausted", and the response is to replace part of the pool.
-#
-# The trainer accumulates; the WORKER reads, because the worker is what owns the pool and
-# knows where an epoch ends. Everything here is a no-op unless --refresh is set: no hooks are
-# registered, so a run without it is byte-identical to one from before the flag.
-_stab_lock = threading.Lock()
-_stab_sum  = collections.defaultdict(float)   # layer -> sum of sampled activation stds
-_stab_cnt  = collections.defaultdict(int)     # layer -> number of samples
-_stab_prev = {}                               # layer -> previous epoch's ROUNDED mean
-_stab_hold = [0]                              # consecutive still epochs
-_stab_step = [0]                              # step counter for --refresh_sample
-_stab_last = [None]                           # last closed epoch's (delta, abs delta, layers)
-_stab_best = [None]                           # --refresh_mode rel: smallest abs(sum delta) yet
+# Corpora with a real held-out split; a triple is a held-out set in another repo.
+_EVAL_SPLITS = {
+    'tinytb':  'test',
+    'tiny':    'validation',
+    'c4':      'validation',
+    'web':     'train[-3000:]',       # the tail exp/score.py holds out
+    'pile':    ('mit-han-lab/pile-val-backup', None, 'validation'),
+    'pile_nc': ('mit-han-lab/pile-val-backup', None, 'validation'),
+}
+_STREAM_EVAL = {'c4'}                  # always streamed for eval (the config is huge)
 
 
-def _stab_register(model):
-    """Forward hooks on every Conv2d in the recurrent stack. Post-convolution, pre-norm:
-    with affine=False the post-norm std is 1 by construction, so the conv output is the only
-    place the layer's data variation is still visible."""
-    n = 0
-    for name, m in model.named_modules():
-        if isinstance(m, nn.Conv2d) and ('context' in name or 'deep_context' in name):
-            def _hook(mod, inp, out, _k=name):
-                # sampled, and detached: this must not touch the graph or the step time.
-                # TRAIN MODE ONLY -- the loop runs a second forward after optimizer.step()
-                # to recompute the DFF, and generation/eval run more; counting those would
-                # mix distributions into one epoch mean.
-                if not mod.training or _stab_step[0] % max(1, args.refresh_sample):
-                    return
-                v = float(out.detach().float().std())
-                if math.isfinite(v):
-                    with _stab_lock:
-                        _stab_sum[_k] += v
-                        _stab_cnt[_k] += 1
-            m.register_forward_hook(_hook)
-            n += 1
-    print(f'--refresh: stall detector on {n} conv layers, sampled every '
-          f'{args.refresh_sample} steps, r={args.refresh_r}, hold={args.refresh_hold}',
-          flush=True)
-    return n
+def _is_heldout(text):
+    # crc32, not hash(): stable across processes and Python versions
+    return zlib.crc32(text[:512].encode('utf-8', 'ignore')) % _HOLDOUT_MOD == 0
 
 
-def _stab_peek():
-    """Detector state for the periodic TRIGGER line: the epoch-SO-FAR mean activation std,
-    how many samples it rests on, and the last closed epoch's verdict. Does NOT drain the
-    accumulator -- only _stab_epoch() may, or an epoch mean would be taken over a partial
-    window and the deltas would compare unequal amounts of evidence."""
-    with _stab_lock:
-        mus = [_stab_sum[k] / _stab_cnt[k] for k in _stab_sum if _stab_cnt[k]]
-        nsamp = min([_stab_cnt[k] for k in _stab_cnt], default=0)
-    mu = sum(mus) / len(mus) if mus else float('nan')
-    return mu, nsamp, len(mus), _stab_last[0], _stab_hold[0]
+def _corpus_text(name, example):
+    col = _TEXT_DATASETS[name][3] if name in _TEXT_DATASETS else 'text'
+    return example.get(col, example.get('text', '')) or ''
 
 
-def _stab_epoch(r):
-    """Close the epoch: -> (sum of per-layer deltas, n layers, mean mu, n samples per layer).
-    Drains the accumulator, so each epoch's mean is over that epoch's samples only."""
-    with _stab_lock:
-        mus = {k: _stab_sum[k] / _stab_cnt[k] for k in _stab_sum if _stab_cnt[k]}
-        nsamp = min([_stab_cnt[k] for k in _stab_cnt], default=0)
-        _stab_sum.clear(); _stab_cnt.clear()
-    if not mus:
-        return None
-    cur = {k: round(v, r) for k, v in mus.items()}
-    if not _stab_prev:                      # first epoch: nothing to difference against
-        _stab_prev.update(cur)
-        return None
-    d = sum(cur[k] - _stab_prev.get(k, cur[k]) for k in cur)
-    dabs = sum(abs(cur[k] - _stab_prev.get(k, cur[k])) for k in cur)
-    _stab_prev.update(cur)
-    _stab_last[0] = (d, dabs, len(cur))
-    return d, dabs, len(cur), sum(mus.values()) / len(mus), nsamp
+def _hub_subset_files(name):
+    repo, sub = _HUB_SUBSET[name]
+    home = os.environ.get('HF_HOME') or os.path.expanduser('~/.cache/huggingface')
+    root = os.path.join(home, 'hub', 'datasets--' + repo.replace('/', '--'), 'snapshots')
+    return sorted(glob.glob(os.path.join(root, '*', sub, '*.parquet')))
 
 
-def _epoch_set(name, n):
-    with _epoch_lock:
-        _epoch_stats[name] = n
-
-def _epoch_frac_set(name, v):
-    with _epoch_lock:
-        _epoch_frac[name] = v
-
-def _epoch_num():
-    """The STEP line's `epoch` column.
-
-    With --vocab_files active it is the MEAN number of complete passes over the curriculum
-    pools, fractional, and a mean rather than the min so it does not quantise to a step
-    change when one pool wraps a few thousand steps before another.  The corpus is
-    effectively infinite and is deliberately excluded (see _track_corpus_epochs).
-
-    --vocab_framed pools are EXCLUDED from the mean.  Pools are equal in SLOTS, not in
-    tokens, so equal slot counts do NOT make equal epoch rates: at 10 slots each the
-    ~12-token sentence files wrap every ~12k steps while the ~761-token reasoning_phase1
-    wraps every ~776k, a 60x spread.  Averaging across that spread produces a number that
-    describes neither group, so the mean covers the short curriculum pools only and the
-    long one is reported on its own.  _epoch_report() still prints EVERY pool separately
-    and fractionally, which is the honest reading when example lengths differ.
-
-    Without vocab files it is the old reading: passes over the corpus that has wrapped LEAST,
-    which for a single dataset is simply its epoch. 0 before the worker starts."""
-    with _epoch_lock:
-        frac = {k: v for k, v in _epoch_frac.items() if k not in _epoch_mean_exclude}
-        if frac:
-            return sum(frac.values()) / len(frac)
-        return float(min(_epoch_stats.values())) if _epoch_stats else 0.0
+def _shard_files(hf, cfg, n):
+    """First n train shard paths of a hub dataset repo (config subdir cfg if any)."""
+    from huggingface_hub import HfApi
+    exts = ('.parquet', '.jsonl.zst', '.json.zst', '.jsonl.gz', '.json.gz', '.jsonl')
+    sib = [s.rfilename for s in HfApi().repo_info(hf, repo_type='dataset').siblings]
+    par = sorted(f for f in sib if f.endswith(exts) and 'train' in f)
+    if cfg:
+        par = [f for f in par if f'/{cfg}/' in f or f.startswith(f'{cfg}/')]
+    return par[:n]
 
 
-def _epoch_vocab():
-    """The STEP line's `epoch_vocab` column: fractional passes over the vocab stream as a
-    WHOLE, i.e. every example the vocab slots have drawn divided by the size of the pool
-    they draw from. With several files merged into one channel that is the number that
-    describes the channel -- the per-file breakdown is still in the EPOCH line.
+def _load_corpus(name, streaming, shards=None):
+    from datasets import load_dataset, DownloadConfig
+    if name in _HUB_SUBSET:
+        files = _hub_subset_files(name)
+        if not files:
+            raise SystemExit(f'{name}: no downloaded parquet files under HF_HOME for '
+                             f'{_HUB_SUBSET[name]}; fetch a subset first')
+        files = files[:shards] if shards else files
+        print(f'{name}: {len(files)} local parquet file(s) from the hub cache', flush=True)
+        return load_dataset('parquet', data_files={'train': files}, streaming=streaming)
+    if name not in _TEXT_DATASETS:
+        raise SystemExit(f'unknown dataset: {name}')
+    hf, cfg, _, _ = _TEXT_DATASETS[name]
+    if streaming:
+        return load_dataset(hf, cfg, streaming=True)
+    files = _shard_files(hf, cfg, shards) if shards else []
+    if files:
+        print(f'{name}: --shards {shards} -> {len(files)} shard(s)')
+        load = lambda dlc: load_dataset(hf, data_files={'train': files}, download_config=dlc,
+                                        verification_mode='no_checks')
+    else:
+        load = lambda dlc: load_dataset(hf, cfg, download_config=dlc)
+    dlc = DownloadConfig(num_proc=4, max_retries=8)
+    while True:                       # ride out HF 429 rate limits; cached shards persist
+        try:
+            return load(dlc)
+        except Exception as e:
+            if '429' not in str(e) and 'Too Many Requests' not in str(e):
+                raise
+            print(f'HF 429 rate-limit on {name}; cooling down 300s ...', flush=True)
+            time.sleep(300)
 
-    Distinct from the `epoch` column, which is the MEAN of the per-file fractions: the two
-    agree only when the files are the same length (vocab_phase1/2 are both 10k lines, so
-    they do here). 0 before the worker starts."""
-    with _epoch_lock:
-        tot = sum(_vocab_total.values())
-        if not tot:
-            return 0.0
-        return sum(_vocab_consumed.get(k, 0) for k in _vocab_total) / tot
+
+def _make_iter(ds, streaming, seed, shuffle=True):
+    split = ds['train']
+    if not shuffle:
+        return iter(split)
+    if streaming:
+        return iter(split.shuffle(buffer_size=10000, seed=seed))
+    if (getattr(split, 'dataset_size', None) or 1 << 31) <= 1 << 30:
+        return iter(split.shuffle(seed=seed))       # small: a true permutation
+    # large and on disk: never Dataset.shuffle() (random access across the arrow file reads
+    # ~400x the data); read shards sequentially through a shuffle buffer instead
+    return iter(split.to_iterable_dataset(num_shards=64).shuffle(buffer_size=10000, seed=seed))
 
 
-def _epoch_report():
-    """'name=pass' per dataset, e.g. 'wdef=3' or 'math_phase1=12.48,web=1'; '' before load.
+def clip_text(text):
+    """A document as (input, target) pairs over [START] tokens [END]."""
+    full = [_tokenizer.start_id] + _tokenizer.encode(text) + [_tokenizer.end_id]
+    return [(full[i], full[i + 1]) for i in range(len(full) - 1)]
 
-    Vocab pools report the FRACTIONAL pass, corpora the integer one. A pool whose examples
-    are long enough to wrap only a handful of times in a whole run (reasoning_phase1: ~5
-    passes in 4M steps) sits at the integer 1 for hundreds of thousands of steps, which is
-    indistinguishable from a stalled stream; the fraction shows it moving."""
-    with _epoch_lock:
-        return ','.join(f'{k}={_epoch_frac[k]:.2f}' if k in _epoch_frac else f'{k}={v}'
-                        for k, v in sorted(_epoch_stats.items()))
 
-def _text_tally(n_tokens, sample='', vocab=False):
-    """`vocab` is the POOL NAME for a --vocab_files sentence, False for a corpus document."""
+# Worker -> training-loop tallies: documents/tokens since the last TEXT line, the latest
+# document (TXT-SAMPLE), the first few documents (GENSCORE anchors), and the corpus epoch.
+_text_lock = threading.Lock()
+_text_stats = {'examples': 0, 'tokens': 0, 'sample': '', 'anchor': []}
+_epoch = [1]
+
+
+def _text_tally(n_tokens, sample):
     with _text_lock:
         _text_stats['examples'] += 1
-        _text_stats['tokens']   += n_tokens
-        if sample:
-            if vocab:
-                _text_stats['vsample'][vocab if isinstance(vocab, str) else 'vocab'] = sample
-            else:
-                _text_stats['sample'] = sample
-                if len(_text_stats['anchor']) < 24:
-                    _text_stats['anchor'].append(sample)
+        _text_stats['tokens'] += n_tokens
+        _text_stats['sample'] = sample
+        if len(_text_stats['anchor']) < 24:
+            _text_stats['anchor'].append(sample)
+
 
 def _text_drain():
-    """Return (examples, tokens, sample) since the last drain; reset the counters.
-    The sample is kept (not cleared) so a recent one is always available."""
     with _text_lock:
-        e, t, s = _text_stats['examples'], _text_stats['tokens'], _text_stats['sample']
+        e, t = _text_stats['examples'], _text_stats['tokens']
         _text_stats['examples'] = _text_stats['tokens'] = 0
-    return e, t, s
-
-
-def _text_peek():
-    """The most recent raw training-text sample, WITHOUT touching the counters.
-
-    Exists so the GEN block can print a TXT-SAMPLE on its own (fast) interval while the
-    TEXT throughput line stays on the checkpoint interval.  _text_drain() RESETS
-    examples/tokens, so calling it every --gen_interval steps would silently rescale every
-    TEXT line to a tenth of the window it claims to cover.  The sample itself is safe to
-    read repeatedly: builder threads overwrite it in place and the drain never clears it."""
-    with _text_lock:
-        return _text_stats['sample'], dict(_text_stats['vsample'])
+    return e, t
 
 
 def _sample_window(text, n=240):
-    """A RANDOM window of a training document, not its opening n characters.
-
-    A head slice is fine when documents are short, and actively misleading when they are
-    not. On sebooks (whole books, mean 126k tokens) every TXT-SAMPLE showed a book's
-    chapter-one opening -- never the text the model was really training on, a hundred
-    thousand steps deep -- and the SAME opening repeated in report after report, because
-    the stored sample only changes when a slot loads a new document and a slot holds one
-    book for ~126k steps. A random offset shows where the run actually is, and makes a
-    repeated document read as a repeat rather than as a stalled data pipeline.
-    """
+    """A random window of a document (its opening would repeat on long documents)."""
     if len(text) <= n:
         return text
     i = random.randrange(0, len(text) - n)
     return ('...' + text[i:i + n]) if i else text[:n]
 
 
-def _text_anchors():
-    with _text_lock:
-        return list(_text_stats['anchor'])
-# Each builder returns (steps, caption). A step is a 4-tuple
-#   (x_byte, y_byte, img_or_None, aud_or_None)
-# one entry per 100 Hz frame.
+class _Slot:
+    """One batch row: the document it is currently reading."""
+    __slots__ = ['steps', 'pos']
 
-def clip_text(text):
-    """One step per token: input/target are consecutive ids of [START]+text+[END].
-    Tokens are raw bytes or BPE ids depending on --tokenizer; nothing downstream cares.
+    def __init__(self):
+        self.steps, self.pos = [], 0
 
-    --datarep N repeats each (x, y) pair N times, so the stream is the same tokens with the
-    same targets, N steps each. Done HERE because this is the one place both the training
-    clips and the held-out eval documents are framed -- putting it in the slot instead would
-    replicate training and leave eval scoring a different stream. _ClipSlot needs no change:
-    its is_start() is pos == 0, which is still the first replica of the first pair, so the
-    state resets once per document rather than once per replica."""
-    full = [_tokenizer.start_id] + _tokenizer.encode(text) + [_tokenizer.end_id]
-    steps = [(full[i], full[i + 1]) for i in range(len(full) - 1)]
-    if _DATAREP > 1:
-        steps = [pair for pair in steps for _ in range(_DATAREP)]
-    return steps, text
+    def load(self, steps):
+        self.steps, self.pos = steps, 0
 
 
-# ── dataset loading ────────────────────────────────────────────────────────────
+def worker(stop, q, ds):
+    """Builder threads tokenize documents into a clip queue; this loop advances every slot
+    one token per step and puts (x_list, y_list, start_flags) on q."""
+    it, lock = [_make_iter(ds, args.streaming, args.seed, args.shuffle)], threading.Lock()
 
-# The Pile: EleutherAI/pile itself is an empty shell -- the 2023 DMCA takedown left it with
-# a README and a loading script pointing at dead the-eye.eu mirrors, and datasets>=3 dropped
-# script support, so it cannot be loaded at all. 'pile' therefore points at EleutherAI's own
-# deduplicated re-release (1650 parquet shards, text column, no meta), and 'pile_nc' at the
-# community copy with the copyrighted subsets (Books3 etc.) removed. Both are the corpus the
-# pythia* tokenizers were trained on, so they pair with --tokenizer pythia14m..pythia160m.
-_TEXT_DATASETS = {
-    'tiny':    ('roneneldan/TinyStories', None, 'train', 'text'),
-    'c4':      ('allenai/c4',            'en', 'train', 'text'),
-    'web':     ('Skylion007/openwebtext', None, 'train', 'text'),
-    'brt':     ('allenai/big-reasoning-traces', 'DeepSeek', 'train', 'text'),
-    'dolma3':  ('allenai/dolma3_mix-150B-1025', None, 'train', 'text'),
-    's1k':     ('simplescaling/s1K',      None, 'train', None),
-    'pile':    ('EleutherAI/the_pile_deduplicated', None, 'train', 'text'),
-    # LittleCurriculum: 2546 parquet shards of (id, text), ~74k rows each -- far too large to
-    # fetch whole, and it needs no subset file list because it STREAMS: 250 slots at one token
-    # per step is ~24 KB/s, so the network is never the bottleneck. Ordinary framed corpus,
-    # so <STX>/<ETX> and the usual prompting apply.
-    'littlec': ('littlelearner/LittleCurriculum', None, 'train', 'text'),
-    'pile_nc': ('monology/pile-uncopyrighted', None, 'train', 'text'),
-    # conversational / Q&A: HuggingFaceTB/smol-smoltalk, SmolTalk cut down for small models
-    # (~460K multi-turn chats). No text column -- _fmt_smolchat renders the turns.
-    'smolchat': ('HuggingFaceTB/smol-smoltalk', None, 'train', None),
-    # SimpleStories/SimpleStories: ~2M short simple-English stories (gpt-4o-mini, ~6th-grade
-    # reading level, tagged by topic/theme/style) -- the corpus the ss4k vocabulary is from.
-    'simplestories': ('SimpleStories/SimpleStories', None, 'train', 'story'),
-    # synth has no repo: examples are generated on the fly by --teacher. The tuple exists so
-    # _build_clip finds the 'text' column and _split_for_name resolves, exactly as for a
-    # real corpus -- everything downstream of the worker is unchanged.
-    'synth':   (None, None, 'train', 'text'),
-    # ── fifth-grade / reasoning corpora ──────────────────────────────────────────
-    # Chosen because they are simple AND explanatory. Filtering openwebtext by reading
-    # level does NOT get you here: measured over 3000 documents its median Flesch-Kincaid
-    # grade is 10.3, only 3.9% fall at grade <=6, and what survives that filter is blog
-    # chatter (a Disney donut review, a DIY lamp build) -- simple language, no reasoning.
-    # Readability and reasoning are anti-correlated on raw web text.
-    'swiki':   ('wikimedia/wikipedia', '20231101.simple', 'train', 'text'),
-    'fwedu':   ('HuggingFaceFW/fineweb-edu', 'sample-10BT', 'train', 'text'),
-    # The SAME 10BT sample of the SAME crawl as fwedu, but WITHOUT the edu classifier:
-    # HuggingFaceFW/fineweb sample-10BT is 15 parquet files of 2.15 GB (~10B tokens, ~667M
-    # per file), the unfiltered FineWeb pipeline output. Registered so 'raw web' and
-    # 'edu-filtered web' can be compared with the filter as the only variable -- fwedu is
-    # this corpus after the classifier, and smolfwedu is fwedu after exact dedup. Too large
-    # to materialize casually (32 GB), so pair it with --streaming.
-    'fineweb': ('HuggingFaceFW/fineweb', 'sample-10BT', 'train', 'text'),
-    # ONE CRAWL of fineweb rather than the cross-crawl 10BT sample. FineWeb's MinHash
-    # dedup runs WITHIN a crawl and not across them, so a single dump is already clean of
-    # near-duplicates while a sample drawn over 110 crawls is not -- the same page recrawled
-    # in 2023 and 2025 survives as two documents there. CC-MAIN-2025-26 is the newest dump
-    # (250 shards, 450 GB); 18 shards is ~10B tokens, matching sample-10BT's budget with the
-    # duplicate structure removed. In _HUB_SUBSET, so only the fetched shards are read.
-    'fwcrawl': ('HuggingFaceFW/fineweb', 'CC-MAIN-2025-26', 'train', 'text'),
-    # cosmo is cosmopedia/stories UNFILTERED as of 2026-08-29. It previously kept only
-    # audience == 'young_children' (26.3% of rows, the same rows format == 'story_children'
-    # selects) via _fmt_cosmo, which has been REMOVED. BACKWARD COMPATIBILITY IS BROKEN ON
-    # PURPOSE: every 'cosmo' number recorded before that date -- f1_grade5_1b, c1_sense_1b,
-    # and their EVAL lines -- was measured on the young_children subset and is NOT
-    # comparable to anything measured after. Unfiltered, the config is 73.7% 'general'
-    # (median Flesch-Kincaid grade 11.5 vs 9.4) and spans five formats: story_children
-    # 26.3, story_life_lessons 25.7, story_reddit 25.3, story_morality 11.5,
-    # story_forums 11.2 -- so it now carries a conversational/forum register too.
-    'cosmo':   ('HuggingFaceTB/cosmopedia', 'stories', 'train', 'text'),
-    # The BROAD cosmopedia config: 10.3M examples / 58.7GB, seeded from open web samples
-    # rather than one source type, which is what makes it general-domain where every other
-    # config is a genre. Internally general 73% / college_students 27%, and blogpost 62% /
-    # textbook_academic 27% / textbook_narrative 5% / wikihow 5%. web_samples_v1 is the same
-    # idea and slightly larger (12.4M / 69.1GB); v2 is the refined seeding, so it is the one
-    # registered. Far too large to materialize -- always pair with --streaming.
-    'cosmoweb': ('HuggingFaceTB/cosmopedia', 'web_samples_v2', 'train', 'text'),
-    # smollm-corpus: the two text subsets SmolLM was trained on. 'smolcosmo' is
-    # cosmopedia-v2, the regenerated synthetic textbook/story corpus (28B tokens, better
-    # prompts and a wider audience mix than cosmopedia v1, which is what 'cosmo'/'cosmoweb'
-    # above still point at); 'smolfwedu' is fineweb-edu-dedup, fineweb-edu with exact
-    # dedup applied. Both carry a plain 'text' column.
-    # Registered in _HUB_SUBSET, NOT resolved on demand: the two configs are 672 GB (550 +
-    # 122), and load_dataset would try to resolve the whole repo. Fetch a spread subset of
-    # shards into the HF cache first; the longest run here reads ~1 GB of text.
-    # nampdn-ai/tiny-strange-textbooks: 4.4 GB of synthetic textbook-style prose in one
-    # 'text' column, ~1B tokens. Small enough to download whole (no _HUB_SUBSET needed) and
-    # small enough that a 4M-step run at batch 250 -- 1e9 tokens -- is roughly ONE pass, so
-    # unlike fwedu the epoch column on the STEP line is a real clock here rather than
-    # pinned at 1. NOT named 'tiny*': that prefix is TinyStories in this table.
-    'strangetb': ('nampdn-ai/tiny-strange-textbooks', None, 'train', 'text'),
-    # nampdn-ai/tiny-textbooks: 399k train / 21k test rows. Trains on the 'textbook' column,
-    # NOT 'text' -- same call as finephrase above: 'text' is the SOURCE snippet the row was
-    # generated from (refinedweb/minipile, mean 219 tokens, visibly scraped web text) while
-    # 'textbook' is the generated textbook prose the dataset exists to provide (mean 622
-    # tokens, median 605). Short-form, so preroll and held-out eval both apply normally.
-    'tinytb':    ('nampdn-ai/tiny-textbooks', None, 'train', 'textbook'),
-    # Same repo as tinytb; the column is None because _fmt_tinytb_pair builds the text from
-    # two columns, the way s1k and wdef do.
-    'tinytbpair': ('nampdn-ai/tiny-textbooks', None, 'train', None),
-    # Nelathan/standardebooks: 1233 public-domain books, whole book per row. 0.43 GB,
-    # ~175M tokens. UNLIKE EVERY OTHER CORPUS HERE THE DOCUMENTS ARE ENORMOUS -- mean
-    # 126k tokens, median 107k, max 659k -- so a slot holds one book for ~126k steps and
-    # sees only ~32 of them in a 4M-step run. The <ETX> document reset therefore fires
-    # ~100x more rarely than on fwedu (mean 1080 tokens), which is a real change to the
-    # training signal, not just to the text. --preroll still terminates promptly: it waits
-    # for the SHORTEST clip of the batch, and the shortest of 250 draws from this corpus is
-    # a few thousand tokens, not 126k.
-    'sebooks':   ('Nelathan/standardebooks', None, 'train', 'text'),
-    'smolcosmo': ('HuggingFaceTB/smollm-corpus', 'cosmopedia-v2',     'train', 'text'),
-    'smolfwedu': ('HuggingFaceTB/smollm-corpus', 'fineweb-edu-dedup', 'train', 'text'),
-    # HuggingFaceTB/dclm-edu: DCLM-baseline re-filtered with the FineWeb-Edu classifier
-    # (edu_int_score >= 2 kept), 1769 parquet shards of ~2.9 GB each -- ~5 TB, so it is in
-    # _HUB_SUBSET like the smollm configs and a spread subset is fetched by hand. Plain
-    # 'text' column; the other columns (edu_score, url, language) are metadata we ignore.
-    # This is REAL WEB TEXT that an education classifier liked, which is what it contributes
-    # to a mix whose other two members are synthetic prose (smolcosmo) and a differently
-    # filtered slice of the SAME web (smolfwedu, fineweb-edu-dedup): the three are not
-    # independent samples, they are three filters over overlapping crawls.
-    'dclmedu':   ('HuggingFaceTB/dclm-edu', None, 'train', 'text'),
-    # finephrase: reasoning-shaped generations over fineweb-edu documents. The corpus we
-    # train on is rollout_results, NOT the `text` column -- `text` is the source document
-    # verbatim, i.e. fineweb-edu, which --dataset fwedu already provides. See _fmt_finephrase.
-    'fpfaq':   ('HuggingFaceFW/finephrase', 'faq',  'train', 'text'),
-    'fpmath':  ('HuggingFaceFW/finephrase', 'math', 'train', 'text'),
-    # finephrase 'tutorial': explanatory how-to / popular-science rewrites of fineweb-edu
-    # documents. Registered for the k1 curriculum stage, which needs AI-generated LANGUAGE
-    # AND GENERAL KNOWLEDGE with no math and no code -- fpmath and brt are both disqualified
-    # on that rule, which otherwise leaves only two AI sources. Only ONE shard (67,000 rows,
-    # ~27M tokens) is on disk, enough for roughly one pass at this mix weight.
-    'fptut':   ('HuggingFaceFW/finephrase', 'tutorial', 'train', 'text'),
-    # ── closed, finite corpus: a memorization probe, not a sample of a distribution ──
-    # 466,670 headwords, 1.72 senses each, ~43 tokens per rendered entry -> ONE EPOCH IS
-    # ~20M tokens (80k steps at batch 250). Every other corpus here is effectively infinite
-    # at our budget and is seen once; this one is meant to be repeated until it is learned,
-    # which is the point (see --wdef_format, and _make_iter's exact-shuffle branch).
-    # The payload is 'definitions', a LIST of strings -- there is no 'text' column, so the
-    # entry is rendered by _fmt_wdef and the column name here is documentation only.
-    'wdef':    ('MongoDB/english-words-definitions', None, 'train', 'definitions'),
-    # Authored locally, not downloaded: --bdict_file, one document per line. The tuple's
-    # repo is None for the same reason 'synth' is -- _init_one_dataset intercepts the name
-    # before the repo is read -- but the 'text' column and 'train' split still have to be
-    # here so _corpus_text and _split_for_name resolve exactly as for a hub corpus.
-    'bdict':   (None, None, 'train', 'text'),
-    # Local JSONL, --data_file. repo None for the same reason bdict's is: _init_one_dataset
-    # intercepts the name before the repo is read. Split and column still have to be here so
-    # _corpus_text and _split_for_name resolve exactly as for a hub corpus.
-    'file':    (None, None, 'train', 'text'),
-    # BabyLM 2026 Strict: six plain-text files (bnc_spoken, childes, gutenberg,
-    # open_subtitles, simple_wiki, switchboard), ~543 MB, fetched from the hub as TEXT rather
-    # than parquet. repo None for the same reason 'file' and 'bdict' are: _init_one_dataset
-    # builds it locally and nothing downstream needs to know the difference.
-    'babylm':  (None, None, 'train', 'text'),
-}
-
-# Repos where only a SUBSET of the files is on disk, loaded from the hub cache directly.
-# finephrase is 4.69 TB across 27,104 parquet files: it does not fit, and load_dataset()
-# cannot even enumerate it -- streaming yielded no row in 10 minutes because HF resolves
-# the entire file list first. Pointing 'parquet' at the downloaded snapshot files skips
-# resolution entirely and uses exactly what was fetched. ~33M tokens of rollout per file,
-# so a few dozen files exceed a 1B-token run.
-_HUB_SUBSET = {
-    'smolcosmo': ('HuggingFaceTB/smollm-corpus', 'cosmopedia-v2'),
-    'smolfwedu': ('HuggingFaceTB/smollm-corpus', 'fineweb-edu-dedup'),
-    # dclm-edu's shards live under data/ rather than a config directory, so 'data' is the
-    # subdirectory _hub_subset_files globs -- not a config name (the repo has none).
-    'dclmedu': ('HuggingFaceTB/dclm-edu', 'data'),
-    # fineweb's 10BT sample lives under sample/10BT/, so that path is what gets globbed --
-    # a subdirectory, not a config name, even though 'sample-10BT' IS a real config of the
-    # repo. Going through _HUB_SUBSET rather than load_dataset(repo, 'sample-10BT') keeps
-    # the read on the 15 files already in the cache: no repo resolution, no network, and
-    # with --streaming no arrow build either (the parquet loader streams local files).
-    'fineweb': ('HuggingFaceFW/fineweb', 'sample/10BT'),
-    'fwcrawl': ('HuggingFaceFW/fineweb', 'data/CC-MAIN-2025-26'),
-    'fpfaq':  ('HuggingFaceFW/finephrase', 'faq'),
-    'fpmath': ('HuggingFaceFW/finephrase', 'math'),
-    'fptut':  ('HuggingFaceFW/finephrase', 'tutorial'),
-}
-
-
-def _babylm_files():
-    """The BabyLM-2026-Strict .txt files in the hub cache, SORTED -- the order is the
-    curriculum under --no-shuffle, and the block partition under --blocks."""
-    home = os.environ.get('HF_HOME') or os.path.expanduser('~/.cache/huggingface')
-    root = os.path.join(home, 'hub',
-                        'datasets--BabyLM-community--BabyLM-2026-Strict', 'snapshots')
-    files = sorted(glob.glob(os.path.join(root, '*', '*.txt')))
-    if not files:
-        raise SystemExit('babylm: no .txt files under HF_HOME for '
-                         'BabyLM-community/BabyLM-2026-Strict -- fetch it first with '
-                         "snapshot_download('BabyLM-community/BabyLM-2026-Strict', "
-                         "repo_type='dataset')")
-    return files
-
-
-def _hub_subset_files(name):
-    repo, cfg = _HUB_SUBSET[name]
-    home = os.environ.get('HF_HOME') or os.path.expanduser('~/.cache/huggingface')
-    root = os.path.join(home, 'hub', 'datasets--' + repo.replace('/', '--'), 'snapshots')
-    return sorted(glob.glob(os.path.join(root, '*', cfg, '*.parquet')))
-
-
-_FP_REFUSALS = ('no answer', 'no table', 'no question', 'none', 'n/a', 'no faq')
-
-
-def _fmt_finephrase(ex):
-    """The GENERATED rollout, not the source document.
-
-    ~99% of rows carry a usable generation (median ~1.9k chars for faq, ~1.0k for math);
-    the rest are refusals the generator emitted when the source had nothing to work with
-    ('No answer', 'No table'). Returning '' skips the row, the contract _fmt_s1k uses."""
-    rr = ex.get('rollout_results')
-    if not isinstance(rr, (list, tuple)) or not rr:
-        return ''
-    first = rr[0]
-    txt = (first.get('text') if isinstance(first, dict) else None) or ''
-    txt = txt.strip()
-    if len(txt) < 40 or txt.lower().startswith(_FP_REFUSALS):
-        return ''
-    return txt
-
-# Corpora that ship a TRAIN SPLIT ONLY. There is no held-out set to point --eval_corpora at,
-# and slicing (train[-3000:]) cannot be streamed. So the split is made by HASHING the
-# document: a fixed 1/_HOLDOUT_MOD of documents is reserved for eval and skipped by the
-# training worker. Deterministic, streaming-compatible, and disjoint regardless of shuffle
-# order or --seed -- none of which is true of "take the first N documents".
-# Corpora with a real held-out split (tiny/c4/pile/web) are NOT hashed: they keep the exact
-# sets every earlier number in PLAN.txt was measured on.
-_HASH_HOLDOUT = {'swiki', 'fwedu', 'fineweb', 'fwcrawl', 'cosmo', 'cosmoweb', 'fpfaq', 'fpmath', 'fptut',
-                 'smolcosmo', 'smolfwedu', 'strangetb', 'sebooks', 'dclmedu', 'babylm',
-                 'littlec', 'simplestories', 'smolchat'}
-_HOLDOUT_MOD = 32                       # ~3.1% held out. Sized by the SCAN COST of building
-                                        # the eval set, not by statistics: the filters
-                                        # compound. cosmo keeps 26.5% (audience) x 1/MOD
-                                        # x ~13% (>= _EVAL_MINLEN tokens), so at MOD=256
-                                        # assembling 400 documents meant scanning ~3M rows.
-                                        # At 32 it is ~375k. Losing 3.1% of training data
-                                        # is immaterial next to a corpus of millions.
-
-
-def _is_heldout(text):
-    # crc32 of a prefix: cheap, stable across processes and Python versions (unlike hash(),
-    # which is randomised per process by PYTHONHASHSEED and would silently reshuffle the
-    # split on every restart).
-    return zlib.crc32(text[:512].encode('utf-8', 'ignore')) % _HOLDOUT_MOD == 0
-
-# --eval: the held-out split to score, for the corpora that have one. A plain string is a
-# split of the training repo itself; a (repo, config, split) triple is a held-out set that
-# lives in a different repo, which is how the Pile ships its validation split -- neither
-# pile re-release carries one, so both score the Pile's own official validation set.
-# Anything missing here falls back to the training split in _TEXT_DATASETS, with a warning
-# -- that number is a training loss, not a validation loss.
-# Eval corpora always streamed whatever --streaming says (see _eval_docs): preparing their
-# config non-streaming means building every split of a multi-hundred-GB repo.
-_STREAM_EVAL = {'c4'}
-
-_EVAL_SPLITS = {
-    # ships a genuine test split (21k rows), so there is nothing to hash out of training
-    'tinytb':  'test',
-    'tinytbpair': 'test',
-    'tiny':    'validation',
-    'c4':      'validation',
-    # openwebtext ships no validation split. train[-3000:] is the tail exp/score.py,
-    # exp/ngram.py and exp/pythia_ref.py all hold out, and every web number in PLAN.txt's
-    # reference table is measured on it. Without this line --eval_corpora web would score
-    # the TRAINING split and silently report a training loss as a held-out one.
-    'web':     'train[-3000:]',
-    'pile':    ('mit-han-lab/pile-val-backup', None, 'validation'),
-    'pile_nc': ('mit-han-lab/pile-val-backup', None, 'validation'),
-}
-
-# Datasets with no single text column: the example is rendered to one string here.
-# s1K (https://huggingface.co/datasets/simplescaling/s1K) is 1000 curated reasoning
-# examples with columns question / thinking_trajectories (list of traces, one per
-# teacher sample) / attempt (the final written answer) / solution (reference answer).
-# Rendered in the same <think>/<answer> shape brt's text column uses, so a
-# --mix "brt:...,s1k:..." teaches one consistent reasoning format.
-
-def _fmt_s1k(ex):
-    traj = ex.get('thinking_trajectories') or []
-    think = (traj[0] if traj else '') or ''
-    # 'attempt' is the teacher's written-out answer; fall back to the reference solution
-    answer = (ex.get('attempt') or ex.get('solution') or '').strip()
-    q = (ex.get('question') or '').strip()
-    if not q or not (think.strip() or answer):
-        return ''
-    return f'{q}<think>\n{think.strip()}\n</think>\n<answer>\n{answer}\n</answer>'
-
-
-_BD_ABBREV = ('Mr.', 'Mrs.', 'Ms.', 'Dr.', 'St.')
-
-def _split_sentences(text):
-    """Split one bdict line body into sentences, for --bdict_split.
-
-    Two things defeat a plain split on [.!?]: the abbreviation HEADWORDS this corpus
-    defines ('Mr.', 'Mrs.', 'Ms.') -- "Mr. Johnson teaches math." is ONE sentence -- and
-    quoted dialogue, where `"Great job!" he shouted.` would break at the exclamation mark
-    and leave `he shouted.` as its own "sentence". Abbreviations are masked before the
-    split; a fragment that begins lower-case is a dialogue tag and is merged back.
-
-    A boundary is TERMINAL PUNCTUATION OPTIONALLY FOLLOWED BY A CLOSING QUOTE, then space.
-    Both halves of that matter. Without the quote a sentence ending in a quotation runs into
-    the next one (`with "Dear friend." His grandmother...`, exactly one line of e3: 'dear').
-    But splitting after ANY quote is wrong the other way: `"No candy before dinner," Mom
-    reminded him` has a COMMA before the quote and is one sentence, and 'Mom' is capitalised
-    so the lower-case merge cannot rescue it. Matching [.!?] before the optional quote keeps
-    both cases right."""
-    t = text
-    for i, a in enumerate(_BD_ABBREV):
-        t = t.replace(a, f'\x00{i}\x00')
-    # mark boundaries, then split on the marker, so the closing quote stays on its sentence
-    t = re.sub(r'([.!?]["\']?)\s+', '\\1\x01', t)
-    out = []
-    for part in t.split('\x01'):
-        for i, a in enumerate(_BD_ABBREV):
-            part = part.replace(f'\x00{i}\x00', a)
-        part = part.strip()
-        if not part:
-            continue
-        if out and part[:1].islower():
-            out[-1] = out[-1] + ' ' + part
-        else:
-            out.append(part)
-    return out
-
-
-def _fmt_wdef(ex):
-    """One dictionary entry. 'definitions' is a list of senses, not a string.
-
-    --wdef_format term (default) renders the headword and its numbered senses; a single-sense
-    entry is left unnumbered so the common case reads like a dictionary line rather than a
-    one-item list. --wdef_format defs drops the headword and emits the senses alone.
-    ~0.05% of rows carry an empty definition list; '' skips them, the contract _fmt_s1k uses."""
-    defs = [d.strip() for d in (ex.get('definitions') or []) if d and d.strip()]
-    if not defs:
-        return ''
-    if args.wdef_format == 'defs':
-        return '\n'.join(defs)
-    term = (ex.get('term') or '').strip()
-    if not term:
-        return ''
-    if len(defs) == 1:
-        return f'{term}\n{defs[0]}'
-    return term + '\n' + '\n'.join(f'{i}. {d}' for i, d in enumerate(defs, 1))
-
-
-# cosmo has NO entry here any more: _fmt_cosmo (the audience == 'young_children' filter)
-# was removed 2026-08-29, so cosmo now reads its 'text' column like any other corpus.
-def _fmt_tinytb_pair(ex):
-    """tiny-textbooks SOURCE then LESSON in one example: text + '\n\n' + textbook.
-
-    The corpus is a rewrite pair -- `text` is the raw web snippet an entry was built from
-    (~600 chars, scraped and fragmentary) and `textbook` is the synthetic lesson generated
-    FROM it (~3000 chars, titled and sectioned). vla.py's 'tinytb' reads the lesson alone, so
-    the model never sees what the lesson was written about. Concatenated, one framed example
-    is <STX> raw source, then the lesson derived from it <ETX>, and the transition from messy
-    source to structured exposition falls inside a single document -- which, for a model whose
-    state carries across the whole example, is the part worth having.
-
-    A blank line between them, not a marker: the boundary is a paragraph break in ordinary
-    text, which is what the tokenizer and the model already know how to read. Entries missing
-    either half are dropped -- half a pair is just 'tinytb' or raw web text under a name that
-    claims otherwise."""
-    raw  = (ex.get('text') or '').strip()
-    book = (ex.get('textbook') or '').strip()
-    return f'{raw}\n\n{book}' if raw and book else ''
-
-
-def _fmt_smolchat(ex):
-    """A chat as plain text, one turn per paragraph: 'User: ...' / 'Assistant: ...'
-    (a system prompt, when present, as 'System: ...'). Role labels in ordinary words rather
-    than special tokens, so the harness format is text the frozen embedding already knows.
-    Chats with no assistant turn are skipped."""
-    msgs = ex.get('messages') or []
-    lbl = {'user': 'User', 'assistant': 'Assistant', 'system': 'System'}
-    turns = [f"{lbl.get(m.get('role'), 'User')}: {(m.get('content') or '').strip()}"
-             for m in msgs if (m.get('content') or '').strip()]
-    if not any(m.get('role') == 'assistant' for m in msgs):
-        return ''
-    return '\n\n'.join(turns)
-
-
-_TEXT_FORMAT = {'s1k': _fmt_s1k, 'smolchat': _fmt_smolchat, 'wdef': _fmt_wdef, 'tinytbpair': _fmt_tinytb_pair,
-                'fpfaq': _fmt_finephrase, 'fpmath': _fmt_finephrase,
-                'fptut': _fmt_finephrase}
-
-# A dataset prepared on local disk takes precedence over the hub repo. dolma3 must be
-# prepared this way (see dolma3_prep.py): the hub shards are topic-partitioned and
-# per-source schemas differ, so streaming them trains on one topic at a time and loading
-# them non-streaming fails to cast. dolma3_prep.py rewrites the corpus into text-only
-# parquet parts that are each a uniform random sample of the whole corpus.
-_LOCAL_DIRS = {'dolma3': './dolma3_text'}
-
-
-def _local_files(name):
-    d = _LOCAL_DIRS.get(name)
-    return sorted(glob.glob(os.path.join(d, '*.parquet'))) if d else []
-
-
-def _split_for_name(name):
-    return _TEXT_DATASETS[name][2] if name in _TEXT_DATASETS else 'train'
-
-
-_SHARD_EXTS = ('.parquet', '.jsonl.zst', '.json.zst', '.jsonl.gz', '.json.gz', '.jsonl')  # .json.gz: allenai/c4
-
-
-def _shard_files(hf, cfg, n):
-    """First n train shard paths in dataset repo `hf` (config subdir `cfg` if the repo is
-    multi-config). Parquet plus the compressed-jsonl layouts, since pile_nc ships
-    train/NN.jsonl.zst and --shards is what keeps a 200GB+ corpus off the disk. Empty list
-    if nothing matches, in which case the caller loads the whole repo."""
-    from huggingface_hub import HfApi
-    sib = [s.rfilename for s in HfApi().repo_info(hf, repo_type='dataset').siblings]
-    par = sorted(f for f in sib if f.endswith(_SHARD_EXTS) and 'train' in f)
-    if cfg:                                       # multi-config repo: keep only this config
-        par = [f for f in par if f'/{cfg}/' in f or f.startswith(f'{cfg}/')]
-    return par[:n]
-
-
-# ── synthetic corpus (--dataset synth) ────────────────────────────────────────
-# Pre-pretraining on CLEAN text before real data: a pretrained LLM writes the corpus, so
-# phase 1 sees fluent, well-formed English with none of the boilerplate, markup, encoding
-# damage or truncated fragments a web/Pile crawl carries.  Phase 2 then continues on real
-# text (--load the phase-1 checkpoint, --dataset pile).
-#
-# THREE THINGS THIS GOT WRONG FIRST, all measured, all now handled:
-#  1. An EMPTY-STRING prompt does not batch.  transformers' text-generation pipeline
-#     collapses ['']*16 to ONE result -- 16 requests in, 1 sequence out, silently.  The null
-#     prompt here is the tokenizer's eos/bos marker ('<|endoftext|>' for gpt2), which is a
-#     real token, batches correctly, and is what GPT-2 saw at document starts in training.
-#  2. GPT-2 emits eos early.  Asked for 750 tokens it stopped at ~157, so lengths would have
-#     been whatever the teacher felt like, not the requested 500-1000.  eos is suppressed and
-#     min_new_tokens is set, which forces the length.
-#  3. Decoder-only models need LEFT padding.  Right padding corrupts generation; the
-#     tokenizer is constructed with padding_side='left' rather than patched afterwards,
-#     because the pipeline keeps its own reference.
-#
-# Diversity comes from temperature/top-k/top-p alone (the prompt is constant), so those are
-# the knobs that matter.  Measured 64/64 unique openings at the defaults.
-
-
-class SyntheticCorpus:
-    """Infinite stream of teacher-generated documents, shaped like an HF dataset row.
-
-    Thread-safe: the worker runs --workers builder threads and they share one teacher, so
-    generation is serialised under a lock and handed out from a buffer.  One generate() call
-    costs the same wall time whether it fills 1 request or --teacher_batch of them, so
-    batching is what keeps the teacher ahead of the trainer."""
-
-    def __init__(self, teacher, batch, temp, topk, topp, lo, hi, device, seed=0,
-                 rep_penalty=1.15):
-        self.teacher, self.batch = teacher, max(1, batch)
-        self.temp, self.topk, self.topp, self.rep = temp, topk, topp, rep_penalty
-        self.lo, self.hi = lo, hi
-        self.device = device
-        self.rng = random.Random(seed)
-        self._pipe = None
-        self._buf = []
-        self._lock = threading.Lock()
-
-    def _ensure(self):
-        if self._pipe is not None:
-            return
-        import torch as _t
-        from transformers import pipeline, AutoTokenizer
-        dev = self.device
-        tok = AutoTokenizer.from_pretrained(self.teacher, padding_side='left')
-        if tok.pad_token_id is None:
-            tok.pad_token = tok.eos_token
-        kw = {}
-        if str(dev).startswith('cuda'):
-            kw = dict(device=0, dtype=_t.float16)
-        else:
-            kw = dict(device=-1)
-        self._pipe = pipeline('text-generation', model=self.teacher, tokenizer=tok, **kw)
-        self._eos = tok.eos_token_id
-        self._null = tok.eos_token or tok.bos_token or '\n'
-        print(f'synth: teacher {self.teacher} on {dev}, null prompt {self._null!r}, '
-              f'lengths {self.lo}-{self.hi}, batch {self.batch}', flush=True)
-
-    def _fill(self):
-        self._ensure()
-        # one target length per example; generate to the longest and truncate each to its
-        # own, so lengths are genuinely uniform rather than constant within a batch
-        tgts = [self.rng.randint(self.lo, self.hi) for _ in range(self.batch)]
-        want = max(tgts)
-        out = self._pipe([self._null] * self.batch, max_new_tokens=want,
-                         min_new_tokens=want, do_sample=True, temperature=self.temp,
-                         top_k=self.topk, top_p=self.topp, repetition_penalty=self.rep,
-                         pad_token_id=self._eos, suppress_tokens=[self._eos],
-                         return_full_text=False, batch_size=self.batch)
-        tk = self._pipe.tokenizer
-        for o, n in zip(out, tgts):
-            txt = o[0]['generated_text'] if isinstance(o, list) else o['generated_text']
-            ids = tk.encode(txt)[:n]
-            if ids:
-                self._buf.append(tk.decode(ids))
-
-    def __iter__(self):
-        return self
-
-    def __next__(self):
-        with self._lock:
-            if not self._buf:
-                self._fill()
-            # pop(0), not pop(): documents must come out in generation order, or the cached
-            # eval set's first N are a reversed tail of each batch and "first 400 of 500"
-            # stops equalling a 400-document set.
-            return {'text': self._buf.pop(0)}
-
-
-# The synthetic HELD-OUT set is generated ONCE and cached to disk, never regenerated.
-# vla.py's --eval_interval, exp/score.py and exp/reach.py all read the same file, so an EVAL
-# curve reflects the weights alone and a checkpoint scored today is comparable to one scored
-# next week.  Regenerating per call would make every number a fresh sample of the teacher.
-# The filename carries everything that changes the distribution, so altering the teacher or
-# the length range produces a DIFFERENT file rather than silently reusing the old one.
-SYNTH_EVAL_DIR = './synth_eval'
-SYNTH_EVAL_SEED = 987654321          # fixed and distinct from any training seed
-
-
-def synth_eval_file(teacher, n, lo, hi):
-    slug = teacher.replace('/', '_')
-    return os.path.join(SYNTH_EVAL_DIR, f'{slug}.{n}.{lo}-{hi}.jsonl')
-
-
-SYNTH_EVAL_BATCH = 16                # PINNED, see below. Small on purpose: generating the
-                                     # eval set spins up a SECOND teacher pipeline while the
-                                     # training one is still resident, and its KV cache is
-                                     # ~110MB per batch row at 750 tokens. At 64 that is
-                                     # ~1.8GB landing on a GPU already at 22.1/24.5GB, i.e.
-                                     # an OOM at the first eval -- two hours into a run, and
-                                     # one the supervisor would faithfully restart into
-                                     # again at every subsequent eval.
-
-
-def ensure_synth_eval(teacher, n, lo, hi, batch, temp, topk, topp, device, rep=1.15):
-    """Path to the cached synthetic held-out set, generating it on first use.
-
-    REPRODUCIBILITY.  The filename keys only (teacher, n, lo, hi), so everything else that
-    changes the content has to be pinned here or two runs produce different held-out sets
-    under the same name:
-      * torch's global RNG drives do_sample, and SyntheticCorpus seeds only its own length
-        picker -- so without the manual_seed below the set was NOT reproducible across
-        processes at all, merely stable once written.
-      * generation batch size changes how the RNG stream is consumed, so --teacher_batch
-        would leak into the content.  Eval generation therefore ignores it and uses
-        SYNTH_EVAL_BATCH.
-    Content now depends only on (teacher, n, lo, hi, temp, topk, topp, SYNTH_EVAL_SEED),
-    which also makes the first 400 documents of a 500-document set identical to a
-    400-document set -- so --eval_docs can be varied without changing which documents are
-    scored."""
-    path = synth_eval_file(teacher, n, lo, hi)
-    if os.path.exists(path):
-        return path
-    os.makedirs(SYNTH_EVAL_DIR, exist_ok=True)
-    print(f'synth eval: generating {n} held-out documents -> {path}', flush=True)
-    torch.manual_seed(SYNTH_EVAL_SEED)
-    corpus = SyntheticCorpus(teacher, SYNTH_EVAL_BATCH, temp, topk, topp, lo, hi, device,
-                             seed=SYNTH_EVAL_SEED, rep_penalty=rep)
-    tmp = path + '.tmp'
-    with open(tmp, 'w') as f:
-        for i in range(n):
-            f.write(json.dumps({'text': next(corpus)['text']}) + '\n')
-            if (i + 1) % 100 == 0:
-                print(f'  synth eval: {i+1}/{n}', flush=True)
-    os.replace(tmp, path)              # atomic: a killed run must not leave a partial set
-    # Release the eval teacher immediately. In a TRAINING process the corpus teacher is still
-    # loaded and about to be used again, so leaving a second copy of the model plus its KV
-    # cache in the allocator costs headroom for the whole run, not just this call.
-    del corpus
-    try:
-        torch.cuda.empty_cache()
-    except Exception:
-        pass
-    return path
-
-
-def _corpus_text(name, example):
-    """The training text of one raw example, after any per-corpus filter/render.
-
-    ONE definition, used by both the training worker and the held-out eval builder. They
-    used to derive it separately, which meant cosmo's eval set was drawn from the whole
-    corpus while training saw only the audience-filtered subset -- scoring a distribution
-    the model was never trained on."""
-    fmt = _TEXT_FORMAT.get(name)
-    if fmt is not None:
-        return fmt(example) or ''
-    col = _TEXT_DATASETS[name][3] if name in _TEXT_DATASETS else 'text'
-    return example.get(col, example.get('text', '')) or ''
-
-
-def _init_one_dataset(name, streaming, shards=None):
-    from datasets import load_dataset
-    if name in _HUB_SUBSET:
-        files = _hub_subset_files(name)
-        if not files:
-            raise SystemExit(f'{name}: no downloaded parquet files found under HF_HOME for '
-                             f'{_HUB_SUBSET[name][0]} [{_HUB_SUBSET[name][1]}]. Fetch a '
-                             f'subset first -- this repo is too large to resolve on demand.')
-        if shards:
-            files = files[:shards]
-        print(f'{name}: {len(files)} local parquet file(s) from the hub cache', flush=True)
-        return load_dataset('parquet', data_files={'train': files}, streaming=streaming)
-    if name == 'synth':
-        return SyntheticCorpus(args.teacher, args.teacher_batch, args.teacher_temp,
-                               args.teacher_topk, args.teacher_topp, args.synth_min,
-                               args.synth_max, args.teacher_device or args.device,
-                               seed=args.seed, rep_penalty=args.teacher_rep_penalty)
-    if name == 'file':
-        path = args.data_file
-        if not os.path.exists(path):
-            raise SystemExit(f'--dataset file: no such file: {path} (set --data_file)')
-        n = sum(1 for _ in open(path))
-        _how = 'SHUFFLED (--shuffle)' if args.shuffle else 'file order, NOT shuffled'
-        print(f'file: {path} ({n} documents, {_how})', flush=True)
-        return load_dataset('json', data_files={'train': path}, streaming=streaming)
-    if name == 'babylm':
-        # One document per LINE, like bdict: the transcripts and subtitles are line-oriented
-        # and a whole 152 MB file is not a "document" in any sense the slot machinery means.
-        # Files are concatenated in SORTED ORDER and, with --no-shuffle, read in that order,
-        # so the run sees bnc_spoken, then childes, then gutenberg ... -- a curriculum by
-        # corpus rather than an interleaving. That is only meaningful unshuffled; with the
-        # default per-corpus shuffle it is an ordinary mixed stream.
-        files = _babylm_files()
-        _how = 'file order, NOT shuffled' if args.shuffle is False else 'shuffled'
-        print(f'babylm: {len(files)} text file(s), {_how}: '
-              f'{", ".join(os.path.basename(f) for f in files)}', flush=True)
-        return load_dataset('text', data_files={'train': files}, streaming=streaming)
-    if name == 'bdict':
-        # one document per LINE. datasets' 'text' builder with the default sample_by='line'
-        # is exactly that, so the rest of the pipeline (shuffle, epoch wrap, _corpus_text)
-        # is identical to a hub corpus and nothing downstream needs to know the difference.
-        path = args.bdict_file
-        if not os.path.exists(path):
-            raise SystemExit(f'bdict: no such file: {path} (set --bdict_file)')
-        if args.bdict_split:
-            # built in memory rather than by load_dataset('text'): the split is one row to
-            # MANY documents, which the line-oriented builder cannot express. The corpus is
-            # ~300 KB, so materializing it costs nothing and the epoch counter then reports
-            # passes over SENTENCES, which is what the run is actually measured in.
-            from datasets import Dataset, DatasetDict
-            sents = []
-            for line in open(path):
-                line = line.strip()
-                if not line:
-                    continue
-                body = line.split(':', 1)[1] if ':' in line else line
-                sents.extend(_split_sentences(body.strip()))
-            print(f'bdict: {path} -> {len(sents)} sentence examples '
-                  f'(--bdict_split, key stripped)', flush=True)
-            return DatasetDict({'train': Dataset.from_dict({'text': sents})})
-        print(f'bdict: {path} ({sum(1 for _ in open(path))} lines)', flush=True)
-        return load_dataset('text', data_files={'train': path}, streaming=streaming)
-    if name not in _TEXT_DATASETS:
-        raise ValueError(f'unknown dataset: {name}')
-    hf, cfg, _, _ = _TEXT_DATASETS[name]
-
-    # prepared local copy (dolma3_prep.py) wins over the hub repo: no download, and its
-    # parts are pre-shuffled across the whole corpus.
-    local = _local_files(name)
-    if local:
-        if shards:
-            local = local[:shards]
-        print(f'{name}: loading {len(local)} local parquet part(s) from {_LOCAL_DIRS[name]}')
-        return load_dataset('parquet', data_files={'train': local}, streaming=streaming)
-    if name in _LOCAL_DIRS:
-        print(f'{name}: no prepared copy at {_LOCAL_DIRS[name]} -- falling back to the hub '
-              f'repo. Hub shards are topic-partitioned: streaming trains on one topic at a '
-              f'time and non-streaming fails to cast. See dolma3_prep.py')
-
-    # --shards: restrict a non-streaming load to the first N parquet shards via data_files,
-    # so datasets only resolves/reads those files instead of the whole repo.
-    data_files = None
-    if not streaming and shards:
-        files = _shard_files(hf, cfg, shards)
-        if files:
-            print(f'{name}: --shards {shards} -> loading {len(files)} shard(s)')
-            data_files = {'train': files}
-        else:
-            print(f'{name}: --shards set but no shard files found; loading full dataset')
-
-    if data_files is not None:
-        # no_checks: skip the split-size verification, which would fail since we load only
-        # a subset of the repo's shards (recorded rows != the repo's recorded full split).
-        loader = lambda dlc: load_dataset(hf, data_files=data_files, download_config=dlc,
-                                          verification_mode='no_checks')
-    else:
-        loader = lambda dlc: load_dataset(hf, cfg, streaming=streaming, download_config=dlc)
-
-    # Non-streaming eagerly resolves every shard (large corpora have thousands), which
-    # can blow past HF's 5000-requests/5-min limit -> 429. Throttle the download workers
-    # and retry across rate-limit windows; cached shards persist between tries so each
-    # attempt makes forward progress until the cache is complete.
-    if streaming:
-        return loader(None)
-    from datasets import DownloadConfig
-    dlc = DownloadConfig(num_proc=4, max_retries=8)
-    for attempt in range(1, 1000):
-        try:
-            return loader(dlc)
-        except Exception as e:
-            if '429' not in str(e) and 'Too Many Requests' not in str(e):
-                raise
-            print(f'HF 429 rate-limit on {name} (attempt {attempt}); cached shards kept, '
-                  f'cooling down 300s then resuming...')
-            time.sleep(300)
-
-
-# Below this on-disk size a corpus is shuffled by TRUE PERMUTATION rather than by a
-# sliding buffer: it fits in page cache, so the read-amplification argument in _make_iter
-# does not apply. 1 GiB covers wdef (~70MB) with room to spare and excludes every web-scale
-# corpus here by three orders of magnitude.
-_EXACT_SHUFFLE_BYTES = 1 << 30
-
-
-def _make_iter(ds, split, streaming, seed, buffer_size=10000, shuffle=True):
-    # a SyntheticCorpus is already an infinite iid stream: there is no split to select and
-    # nothing a shuffle buffer could reorder that is not already random.
-    if isinstance(ds, SyntheticCorpus):
-        return iter(ds)
-    split_ds = ds[split] if split in ds else ds['train']
-    # --dataset file: iterate in FILE ORDER. Every other branch below shuffles somehow --
-    # a buffer when streaming, a permutation when small, a sharded buffer otherwise -- and
-    # none of that is reproducible across runs, so a fixed corpus is the only way to take
-    # the data out of the comparison. Returned before any of them.
-    if not shuffle:
-        return iter(split_ds)
-    if streaming:
-        return iter(split_ds.shuffle(buffer_size=buffer_size, seed=seed))
-    # SMALL corpus: a true permutation. The amplification disaster described below is a
-    # property of random access into a 45.7GB arrow file, not of Dataset.shuffle() itself --
-    # a corpus that fits in page cache pays nothing for it. This matters specifically for a
-    # CLOSED corpus that is REPEATED (wdef): under a 10k-row buffer an entry's neighbours are
-    # largely the same on every pass, so each epoch would re-present the same local orderings
-    # and any "memorization" could be an artifact of that correlation. A full permutation
-    # makes each epoch an independent ordering, which is what --seed + epoch is for.
-    _bytes = getattr(split_ds, 'dataset_size', None)
-    if _bytes is not None and _bytes <= _EXACT_SHUFFLE_BYTES:
-        return iter(split_ds.shuffle(seed=seed))
-    # NON-STREAMING: never Dataset.shuffle() here. It builds a permutation and iteration
-    # then becomes RANDOM ACCESS across the whole arrow file. Measured on fineweb-edu
-    # (45.7GB local): 164MB of logical reads pulled 73GB off disk -- 445x amplification --
-    # at 10MB/s, and the trainer produced ZERO steps in nine minutes while looking healthy
-    # (process running, GPU allocated, no error).
-    # to_iterable_dataset() reads the shards SEQUENTIALLY and shuffles inside a buffer, the
-    # same approximate shuffle the streaming path uses, at disk-friendly access patterns.
-    it = split_ds.to_iterable_dataset(num_shards=64)
-    return iter(it.shuffle(buffer_size=buffer_size, seed=seed))
-
-
-class _BlockReader:
-    """--blocks: the corpus as ONE CONTIGUOUS STREAM per slot, not a bag of documents.
-
-    Why it exists. A line-oriented corpus (babylm) loaded the ordinary way becomes one
-    "document" per line -- ~13 tokens for transcripts and subtitles -- and every slot draws
-    from a shared queue, so a slot gets roughly every Bth line: thirteen tokens of real
-    continuity, then a jump to a distant part of the corpus. For an --unframed slot, whose
-    state is never reset, that asks the recurrence to carry context across boundaries with no
-    continuity behind them. Contiguity is the whole point of a long-reach model, so it has to
-    come from the reader.
-
-    PER FILE, not per corpus. Each file is cut into B byte ranges at newline boundaries and
-    slot k reads range k of file 0, then range k of file 1, and so on. Cutting the CONCATENATED
-    corpus instead would be simpler and would destroy the curriculum: slot 0 would sit in
-    bnc_spoken while slot 200 sits in simple_wiki, so every batch would hold all six corpora
-    at once. This way the whole batch moves through the files together -- childes while the
-    model is learning child-directed speech -- and each slot still reads its own range of that
-    file head to tail.
-
-    One pass over every range of every file is one EPOCH, and the token count is the corpus
-    token count, so the epoch length in steps is unchanged: corpus_tokens / batch.
-    """
-    CHUNK = 1 << 16          # bytes per refill; ~16k tokens, so a slot refills rarely
-
-    def __init__(self, files, nslots, name):
-        self.files, self.n, self.name = files, nslots, name
-        # byte ranges per file, aligned FORWARD to the next newline so no line is split
-        # across two slots and none is dropped.
-        self.ranges = []
-        for f in files:
-            size = os.path.getsize(f)
-            cuts = [0]
-            with open(f, 'rb') as fh:
-                for i in range(1, nslots):
-                    fh.seek(size * i // nslots)
-                    fh.readline()                  # advance past the partial line
-                    cuts.append(min(fh.tell(), size))
-            cuts.append(size)
-            self.ranges.append([(cuts[i], cuts[i + 1]) for i in range(nslots)])
-        self.fi   = [0] * nslots                   # current file index, per slot
-        self.pos  = [self.ranges[0][k][0] for k in range(nslots)]
-        self.epoch = [1] * nslots
-        tot = sum(os.path.getsize(f) for f in files)
-        print(f'blocks: {name} {len(files)} file(s) cut into {nslots} contiguous ranges each, '
-              f'{tot / nslots / 1e6:.1f} MB per slot per pass', flush=True)
-
-    def next_text(self, k):
-        """The next chunk of slot k's stream, as text. Advances to the next file at the end
-        of a range and wraps to file 0 (a new epoch) at the end of the last."""
-        for _ in range(len(self.files) + 1):
-            f          = self.files[self.fi[k]]
-            start, end = self.ranges[self.fi[k]][k]
-            if self.pos[k] >= end:
-                self.fi[k] += 1
-                if self.fi[k] >= len(self.files):
-                    self.fi[k] = 0
-                    self.epoch[k] += 1
-                    _epoch_set(self.name, min(self.epoch))
-                self.pos[k] = self.ranges[self.fi[k]][k][0]
-                continue
-            at_start = self.pos[k] == start        # first read of this range?
-            with open(f, 'rb') as fh:
-                fh.seek(self.pos[k])
-                buf = fh.read(min(self.CHUNK, end - self.pos[k]))
-                if self.pos[k] + len(buf) < end:
-                    buf += fh.readline()           # never split a line
-                self.pos[k] += len(buf)
-            # NEWLINES OUT. The line breaks are the corpus FILE's format, not the text: a
-            # BabyLM transcript puts one utterance per line, so a raw read stitches the block
-            # together with a '\n' every ~13 tokens and the model spends its capacity
-            # learning to emit them. --blocks exists to present the corpus as one continuous
-            # document, so the separator becomes a space -- a space and not nothing, or the
-            # last word of one line would fuse with the first of the next -- and runs of
-            # whitespace collapse, since a blank line would otherwise leave a double space.
-            # A chunk that CONTINUES a range keeps its leading space, because each chunk is
-            # tokenized on its own: without it the first word would encode as a
-            # start-of-text token instead of the ' word' form it has mid-document, once per
-            # refill. One boundary in ~16k tokens either way, but it costs one space.
-            txt = ' '.join(buf.decode('utf-8', errors='replace').split())
-            return txt if at_start else ' ' + txt
-        return ''
-
-
-# ── worker ─────────────────────────────────────────────────────────────────────
-
-class _ClipSlot:
-    """One batch slot: independent clip stream. `name` is the dataset whose clip queue
-    refills it under --mix_slots; None means the shared queue every slot draws from."""
-    __slots__ = ['steps', 'pos', 'caption', 'name']
-
-    def __init__(self, name=None):
-        self.steps   = []
-        self.pos     = 0
-        self.caption = ''
-        self.name    = name
-
-    def load(self, steps, caption=''):
-        self.steps   = steps
-        self.pos     = 0
-        self.caption = caption
-
-    def done(self):       return self.pos >= len(self.steps)
-    def is_start(self):   return self.pos == 0
-
-    def advance(self):
-        item     = self.steps[self.pos]
-        self.pos += 1
-        return item   # (x_byte, y_byte)
-
-
-class _StreamSlot(_ClipSlot):
-    """A corpus slot for an --unframed dataset. The builder hands it raw token ids rather
-    than <STX>...<ETX> pairs, load() APPENDS them to a running buffer instead of replacing
-    the clip, and the (x, y) pair that straddles a document boundary is the last token of
-    one document -> the first of the next. is_start() is always False, so the recurrent
-    state is never reset on this slot. Identical to the unframed _VocabSlot contract, for a
-    streaming corpus instead of a local file; the buffer trim and --datarep handling are
-    the same code."""
-    __slots__ = ['ids', 'rep']
-
-    def __init__(self, name=None):
-        super().__init__(name)
-        self.ids = []
-        self.rep = 0
-
-    def load(self, ids, caption=''):
-        self.ids.extend(ids)
-        self.caption = caption
-
-    def done(self):       return self.pos + 1 >= len(self.ids)
-    def is_start(self):   return False
-
-    def advance(self):
-        x, y = self.ids[self.pos], self.ids[self.pos + 1]
-        self.rep += 1
-        if self.rep < _DATAREP:
-            return (x, y)
-        self.rep = 0
-        self.pos += 1
-        if self.pos > 8192:                 # drop the consumed prefix; keeps memory flat
-            self.ids = self.ids[self.pos:]
-            self.pos = 0
-        return (x, y)
-
-
-# Sentences drawn per vocab file, so the epoch column can report passes over the FILE
-# rather than per-slot cycles. Touched only by the worker thread (the stepping loop), which
-# is single-threaded, so it needs no lock.
-_vocab_consumed = {}
-
-
-class _VocabSlot:
-    """One batch slot fed by an endless stream of examples drawn from one local file.
-
-    UNFRAMED (the default) differs from _ClipSlot in the two ways that matter:
-      * NO FRAMING. clip_text wraps every document in <STX>...<ETX>; here the raw sentence
-        tokens are concatenated head to tail, so the (x, y) pair that straddles a sentence
-        boundary is a real transition from one sentence's last token to the next sentence's
-        first. There is no delimiter for the model to key on.
-      * is_start() IS ALWAYS FALSE, so this slot never signals a document start and the
-        recurrent state is never reset on it. A corpus slot resets every <ETX>; this one
-        runs forever.
-
-    FRAMED (--vocab_framed) gives up both of those and behaves exactly like a corpus slot:
-    one example at a time, wrapped <STX>...<ETX>, is_start() true on its first step so the
-    DFF and the clock reset between examples. It is deliberately NOT the unframed stream
-    with delimiters added -- examples do not run head to tail, so no (x, y) pair ever
-    straddles a boundary and the model is never asked to predict across one. That is the
-    same contract _ClipSlot has, which is the point: a pool of long self-contained documents
-    should look to the model like documents, not like an unbroken sentence stream.
-
-    Each slot keeps its own shuffled permutation and reshuffles on wrap, so N slots are
-    N independent orderings of the same file rather than N copies of one ordering."""
-    __slots__ = ['pool', 'texts', 'name', 'rng', 'order', 'oi', 'ids', 'pos',
-                 'framed', 'steps', 'names', 'rep']
-
-    def __init__(self, pool, name, seed, texts=None, framed=False, names=None):
-        self.pool, self.name, self.texts = pool, name, texts
-        # names: the SOURCE FILE of each example, when this slot merges several pools (see
-        # the slot assignment in worker()). Epoch and text-sample accounting stay per FILE
-        # even though the stream is one channel; None means every example came from `name`.
-        self.names  = names
-        self.framed = framed
-        self.rng   = random.Random(seed)
-        self.order = list(range(len(pool)))
-        self.rng.shuffle(self.order)
-        self.oi, self.ids, self.pos = 0, [], 0
-        self.rep   = 0        # --datarep: replicas of the current pair already emitted
-        self.steps = []
-
-    def _next_index(self):
-        """Index of the next example in this slot's permutation; reshuffles on wrap."""
-        if self.oi >= len(self.order):
-            self.oi = 0
-            self.rng.shuffle(self.order)
-        j = self.order[self.oi]
-        self.oi += 1
-        return j
-
-    def _load_example(self):
-        """FRAMED mode: make the next example the slot's current clip, <STX>...<ETX>."""
-        j   = self._next_index()
-        ids = [_tokenizer.start_id] + list(self.pool[j]) + [_tokenizer.end_id]
-        self.steps = [(ids[i], ids[i + 1]) for i in range(len(ids) - 1)]
-        if _DATAREP > 1:                       # same replication clip_text applies
-            self.steps = [pair for pair in self.steps for _ in range(_DATAREP)]
-        self.pos   = 0
-        k = self.names[j] if self.names else self.name
-        _vocab_consumed[k] = _vocab_consumed.get(k, 0) + 1
-        _text_tally(len(ids), sample=(self.texts[j] if self.texts else ''),
-                    vocab=k)
-
-    def _append_next(self):
-        j = self._next_index()
-        ids = self.pool[j]
-        self.ids.extend(ids)
-        k = self.names[j] if self.names else self.name
-        _vocab_consumed[k] = _vocab_consumed.get(k, 0) + 1
-        _text_tally(len(ids), sample=(self.texts[j] if self.texts else ''), vocab=k)
-
-    def done(self):      return False       # never refilled from clip_q
-
-    def is_start(self):
-        # unframed: never resets the state. framed: true on the <STX> step, like _ClipSlot.
-        if not self.framed:
-            return False
-        if self.pos >= len(self.steps):     # called before advance(), so fill here too
-            self._load_example()
-        return self.pos == 0
-
-    def advance(self):
-        if self.framed:
-            if self.pos >= len(self.steps):
-                self._load_example()
-            item = self.steps[self.pos]
-            self.pos += 1
-            return item
-        while self.pos + 1 >= len(self.ids):
-            self._append_next()
-        x, y = self.ids[self.pos], self.ids[self.pos + 1]
-        # --datarep: hold this pair for N steps before moving down the stream. The unframed
-        # slot has no steps list to pre-expand, so the counter lives here instead.
-        self.rep += 1
-        if self.rep < _DATAREP:
-            return (x, y)
-        self.rep = 0
-        self.pos += 1
-        if self.pos > 8192:                 # drop the consumed prefix; keeps memory flat
-            self.ids = self.ids[self.pos:]
-            self.pos = 0
-        return (x, y)
-
-
-def _load_vocab_pools(paths, framed=None):
-    """path -> (token-id lists one per line, path, n_lines, raw lines, framed).
-
-    An UNFRAMED pool carries no <STX>/<ETX> and a trailing space is tokenized with each
-    sentence, so concatenation reads as 'One sentence. Another sentence.' rather than
-    running the words together.  A pool named in `framed` is wrapped per example by the
-    slot instead, and gets NO trailing space: the example ends at <ETX>, so a space before
-    it would train a token that the corpus path never emits there."""
-    framed_stems = {os.path.splitext(os.path.basename(f.strip()))[0]
-                    for f in (framed or '').split(',') if f.strip()}
-    unknown = framed_stems - {os.path.splitext(os.path.basename(p))[0] for p in paths}
-    if unknown:
-        raise SystemExit(f'--vocab_framed: not in --vocab_files: {",".join(sorted(unknown))}')
-    pools = {}
-    for i, path in enumerate(paths):
-        if not os.path.exists(path):
-            raise SystemExit(f'--vocab_files: no such file: {path}')
-        lines = [l.strip() for l in open(path) if l.strip()]
-        # Keyed by FILE STEM, not by position: with three curriculum files the epoch
-        # report has to say which one wrapped, and 'vocab3=812' does not identify
-        # math_phase1.txt.  Positional keys are kept only to break a stem collision.
-        key = os.path.splitext(os.path.basename(path))[0]
-        if key in pools:
-            key = f'{key}#{i+1}'
-        is_framed = key in framed_stems
-        pools[key] = ([_tokenizer.encode(l if is_framed else l + ' ') for l in lines],
-                      path, len(lines), lines, is_framed)
-    return pools
-
-
-def worker(stop, q, datasets, args, mix=None):
-    # datasets: {name: hf_dataset}. mix: (names, weights) or None (single dataset).
-    if mix is None:
-        names, weights = [args.dataset], [1.0]
-    else:
-        names, weights = mix
-    _iters  = {}
-    _locks  = {}
-    _epochs = {}
-    _shufs  = {}          # per-corpus shuffle decision, reused by every iterator re-make
-    # When the batchwise vocab stream is active the epoch column must report passes over the
-    # VOCAB FILES only: the corpus is effectively infinite and would pin the reported epoch
-    # at 1 forever, since _epoch_num() takes the minimum across datasets.
-    _track_corpus_epochs = not (args.vocab_files and args.vocab_slots)
-    for n in set(names):
-        # --shuffle unset: file order for --dataset file, shuffled for everything else.
-        # Set either way, it applies to every corpus in the mix.
-        # Remembered per corpus, because EVERY later _make_iter must reproduce it: an epoch
-        # wrap and a --subsample stream re-make both rebuild the iterator, and _make_iter
-        # defaults to shuffle=True. Without this, --no-shuffle held only for epoch 1 and the
-        # corpus was silently shuffled from epoch 2 on -- which for an unshuffled curriculum
-        # run is the whole experiment.
-        _shuf      = (n != 'file') if args.shuffle is None else bool(args.shuffle)
-        _shufs[n]  = _shuf
-        _iters[n]  = _make_iter(datasets[n], _split_for_name(n), args.streaming, args.seed,
-                                shuffle=_shuf)
-        _locks[n]  = threading.Lock()   # HF streaming iterator is not thread-safe
-        _epochs[n] = [1]
-        if _track_corpus_epochs:
-            _epoch_set(n, 1)
-
-    # --subsample: replace each corpus iterator with a fixed list of N raw examples, drawn
-    # once here from the shuffled stream. Drawn AFTER the same filters _build_clip applies
-    # (_corpus_text and the held-out hash split), so the N examples are N usable documents
-    # rather than N raw rows of which some would be dropped every epoch. The list itself is
-    # the corpus from here on: exhaustion is an epoch, and the next epoch is a fresh
-    # permutation of the same list under --seed + epoch, the convention _make_iter already
-    # uses for its reshuffle seed.
-    # HOW MANY DOCUMENTS CAN BE IN FLIGHT AT ONCE: one per batch slot, plus the built-clip
-    # queue (maxsize 2*workers), plus one in each builder's hand. Conservative under
-    # --mix_slots, where the batch is split across corpora and each has its own queue.
-    _INFLIGHT = args.batch + 3 * max(1, args.workers)
-    _recent = collections.defaultdict(lambda: collections.deque(maxlen=_INFLIGHT))
-
-    def _subsample_epoch(pool, seed, hold=()):
-        """Permute the pool for one epoch, with the documents still IN FLIGHT deferred to
-        the end of it.
-
-        Without this a reshuffle is independent of what the slots are holding, so a document
-        drawn near the end of one epoch can be handed to a second slot at the start of the
-        next while the first is still running it -- the same text twice in one batch, at two
-        offsets, correlating the gradient and the BatchNorm statistics. Deferring the
-        in-flight set turns an unbounded collision rate into a bounded one: a document cannot
-        be redrawn until the other N - |hold| have been, which buys it
-        (N - |hold|) * mean_len / batch steps to finish. Only documents LONGER than that can
-        still double, so the bound is printed at startup rather than left implicit."""
-        held, rest = [], []
-        for d in pool:
-            (held if id(d) in hold else rest).append(d)
-        rng = random.Random(seed)
-        rng.shuffle(rest)
-        rng.shuffle(held)
-        return rest + held
-
-    _samples = {}
-    _stream  = {}     # the underlying corpus iterator, kept for --epochs refreshes
-    _spass   = {}     # how many times the stream has been re-made (its reshuffle seed)
-
-    _fresh_docs = collections.Counter()   # --subsample: distinct documents drawn so far
-    _fresh_toks = collections.Counter()   # ...and their token count, per corpus
-
-    def _sub_log(msg):
-        """subsample lines go to stdout AND log/exp.$M: the fresh-token tally is the x-axis
-        of a --epochs experiment and has to survive a resume, which rewrites .out."""
-        print(msg, flush=True)
-        with open(args.log, 'a') as f:
-            print(msg, file=f)
-
-    def _draw(n, k):
-        """k usable examples off the corpus stream (re-made, reseeded, on exhaustion)."""
-        drawn, seen, remade = [], 0, False
-        while len(drawn) < k:
+    def next_example():
+        with lock:
             try:
-                ex = next(_stream[n])
+                return next(it[0])
             except StopIteration:
-                if remade:
-                    break                        # corpus smaller than k: take what there is
-                remade = True                    # one fresh pass per draw, then stop
-                _spass[n] += 1
-                _stream[n] = _make_iter(datasets[n], _split_for_name(n), args.streaming,
-                                        args.seed + 7919 * _spass[n], shuffle=_shufs[n])
-                continue
-            seen += 1
-            text = _corpus_text(n, ex)
-            if not text or (n in _HASH_HOLDOUT and _is_heldout(text)):
-                continue
-            drawn.append(ex)
-            _fresh_toks[n] += len(_tokenizer.encode(text))
-        _fresh_docs[n] += len(drawn)
-        return drawn, seen
+                _epoch[0] += 1
+                print(f'EPOCH {args.dataset} -> {_epoch[0]} (reshuffle seed '
+                      f'{args.seed + _epoch[0]})', flush=True)
+                it[0] = _make_iter(ds, args.streaming, args.seed + _epoch[0], args.shuffle)
+                return next(it[0])
 
-    def _fresh(n):
-        return f'fresh total {_fresh_docs[n]} docs / {_fresh_toks[n]:,} tokens'
+    clip_q = queue.Queue(maxsize=2 * max(1, args.workers))
 
-    def _refresh_count(epoch):
-        """Documents to turn over at the start of this epoch: N/E, remainder spread so that
-        exactly N have turned over after every E epochs."""
-        N, E = args.subsample, args.epochs
-        return (N * epoch) // E - (N * (epoch - 1)) // E
-
-    if args.subsample:
-        for n in set(names):
-            _stream[n] = _iters[n]
-            _spass[n]  = 0
-            drawn, seen = _draw(n, args.subsample)
-            _samples[n] = drawn
-            _sub_log(f'SUBSAMPLE {n} {len(drawn)} examples drawn from {seen} '
-                     f'(requested {args.subsample}, seed {args.seed}'
-                     f'{f", {_refresh_count(2)}/epoch turnover over {args.epochs} epochs" if args.epochs else ", closed"}) '
-                     f'{_fresh(n)}')
-            _iters[n] = iter(_subsample_epoch(drawn, args.seed + 1, set(_recent[n])))
-            # The bound the holdback buys, in the corpus's own units. A document longer than
-            # this can still be redrawn while a slot is running it; shorter ones cannot.
-            _mlen = _fresh_toks[n] / max(_fresh_docs[n], 1)
-            _gap  = max(len(drawn) - _INFLIGHT, 0) * _mlen / max(args.batch, 1)
-            if len(drawn) <= _INFLIGHT:
-                print(f'WARNING: --subsample {args.subsample} is not larger than the '
-                      f'{_INFLIGHT} documents that can be in flight ({args.batch} slots + '
-                      f'{3 * max(1, args.workers)} queued/building), so every batch holds '
-                      f'duplicates and no holdback can prevent it', flush=True)
-            else:
-                print(f'subsample holdback: {n} defers up to {_INFLIGHT} in-flight docs to '
-                      f'the end of each reshuffle; a redrawn document has had >= {_gap:,.0f} '
-                      f'steps to finish, so only documents longer than {_gap:,.0f} tokens '
-                      f'(mean is {_mlen:,.0f}) can appear twice in one batch', flush=True)
-
-    def _next_example(name):
-        """Thread-safe pull of the next raw example for one dataset (loops on exhaustion)."""
-        with _locks[name]:
-            try:
-                _ex = next(_iters[name])
-                if args.subsample:
-                    _recent[name].append(id(_ex))   # identity, for the reshuffle holdback
-                return _ex
-            except StopIteration:
-                _epochs[name][0] += 1
-                # For a finite corpus that is deliberately repeated (wdef) the epoch boundary
-                # is a real landmark: it is where documents start being seen for the Nth time,
-                # and memorization should appear as a loss step at exactly these positions.
-                # Written to args.log, not just stdout, so it interleaves with the STEP lines
-                # in log/exp.$M instead of landing only in the buffered .out.
-                if _track_corpus_epochs:
-                    _epoch_set(name, _epochs[name][0])
-                # stdout only. The epoch is a COLUMN on every STEP line now, so a
-                # standalone line in the main log would duplicate it and break the
-                # one-row-per-step shape chart.py reads. This still lands in log/exp.$M.out,
-                # which is where the reshuffle seed stays recoverable.
-                print(f'EPOCH {name} -> {_epochs[name][0]} '
-                      f'(reshuffle seed {args.seed + _epochs[name][0]})', flush=True)
-                if name in _samples:
-                    if args.refresh:
-                        if args.refresh_every:
-                            # FIXED SCHEDULE. The stall detector is not consulted and is not
-                            # even running -- no hooks are registered (see _stab_register),
-                            # nothing is measured, nothing is logged -- because a schedule
-                            # does not read it, and the measurement costs one extra full
-                            # reduction per conv layer. The epoch counter alone decides.
-                            _fire = _epochs[name][0] % args.refresh_every == 0
-                        else:
-                            # STALL-DRIVEN. _stab_epoch is drained here, at the epoch
-                            # boundary, so 'epoch' means the same thing to the detector as
-                            # it does to the pool.
-                            _fire = False
-                            _st = _stab_epoch(args.refresh_r)
-                            if _st is None:
-                                _sub_log(f'TRIGGER {name} epoch {_epochs[name][0]} detector '
-                                         f'warming up (no baseline yet)')
-                            else:
-                                _d, _da, _nl, _mu, _ns = _st
-                                # STILL? Either the drift is under an absolute floor (the
-                                # paper), or it has stopped setting new minima (relative).
-                                _ad = abs(_d)
-                                if args.refresh_mode == 'abs':
-                                    _still = _ad <= args.refresh_eps
-                                    _extra = f'eps {args.refresh_eps:g}'
-                                else:
-                                    _b = _stab_best[0]
-                                    _improved = _b is None or _ad < _b * (1.0 - args.refresh_tol)
-                                    if _improved:
-                                        _stab_best[0] = _ad
-                                    _still = not _improved
-                                    _extra = f'best {_stab_best[0]:.{args.refresh_r}f}'
-                                _stab_hold[0] = _stab_hold[0] + 1 if _still else 0
-                                _sub_log(f'TRIGGER {name} epoch {_epochs[name][0]} '
-                                         f'sum_delta {_d:+.{args.refresh_r}f} '
-                                         f'sum_abs_delta {_da:.{args.refresh_r}f} '
-                                         f'mean_std {_mu:.4f} layers {_nl} samples {_ns} '
-                                         f'{args.refresh_mode} {_extra} '
-                                         f'still {_stab_hold[0]}/{args.refresh_hold}')
-                                _fire = _stab_hold[0] >= args.refresh_hold
-                        if _fire:
-                            k = max(1, int(round(args.refresh * args.subsample)))
-                            fresh, seen = _draw(name, k)
-                            pool = _samples[name]
-                            del pool[:len(fresh)]
-                            pool.extend(fresh)
-                            # The detector's baseline goes too -- a no-op on the scheduled
-                            # path, where it was never built: the next epoch runs on partly
-                            # new data, so differencing it against the stalled epoch would
-                            # compare two different datasets and fire spuriously.
-                            _stab_hold[0] = 0
-                            _stab_prev.clear()
-                            _stab_best[0] = None
-                            _sub_log(f'TRIGGER {name} '
-                                     f'{"SCHEDULED" if args.refresh_every else "STALLED"} '
-                                     f'at epoch {_epochs[name][0]} -- retired {len(fresh)} '
-                                     f'oldest, drew {len(fresh)} fresh from {seen} '
-                                     f'(pool {len(pool)}) {_fresh(name)}')
-                    if args.epochs:
-                        # --epochs: retire the oldest k, draw k fresh. The pool is kept in
-                        # insertion order so "oldest" is the head; a document therefore
-                        # lives exactly E epochs from the epoch it entered.
-                        k = _refresh_count(_epochs[name][0])
-                        fresh, seen = _draw(name, k)
-                        pool = _samples[name]
-                        del pool[:len(fresh)]
-                        pool.extend(fresh)
-                        _sub_log(f'SUBSAMPLE {name} epoch {_epochs[name][0]} retired '
-                                 f'{len(fresh)} oldest, drew {len(fresh)} fresh from {seen} '
-                                 f'(pool {len(pool)}) {_fresh(name)}')
-                    _iters[name] = iter(_subsample_epoch(_samples[name],
-                                                         args.seed + _epochs[name][0],
-                                                         set(_recent[name])))
-                else:
-                    _iters[name] = _make_iter(datasets[name], _split_for_name(name),
-                                              args.streaming, args.seed + _epochs[name][0],
-                                              shuffle=_shufs[name])
-                return next(_iters[name])
-
-    def _build_clip(name, example):
-        text = _corpus_text(name, example)
-        # '' means the example was filtered or unusable -> empty steps, builder skips it.
-        # The hash check must come AFTER the _TEXT_FORMAT branch and apply to BOTH: a
-        # corpus with a formatter (cosmo) is still hash-split, and returning early here
-        # would train on exactly the documents the eval holds out.
-        if not text:
-            return ([], '')
-        if name in _HASH_HOLDOUT and _is_heldout(text):
-            return ([], '')
-        if name in _UNFRAMED:             # raw ids; the _StreamSlot runs them head to tail
-            return (_tokenizer.encode(text), text)
-        return clip_text(text)
-
-    # BATCHWISE MIX. The first --vocab_slots slots stream undelimited sentences from
-    # --vocab_files (split evenly between the files); the rest are ordinary _ClipSlots fed
-    # from --dataset/--mix with <STX>/<ETX>. Slots map 1:1 to tokens per step, so this is an
-    # exact token split rather than the on-average one --mix gives.
-    _vocab_paths = [p.strip() for p in (args.vocab_files or '').split(',') if p.strip()]
-    n_vocab = min(args.vocab_slots, args.batch) if _vocab_paths else 0
-    if args.vocab_slots and not _vocab_paths:
-        raise SystemExit('--vocab_slots set but --vocab_files is empty')
-    slots = []
-    if n_vocab:
-        pools = _load_vocab_pools(_vocab_paths, args.vocab_framed)
-        keys  = sorted(pools)
-        for k in keys:
-            _vocab_consumed[k] = 0
-            _vocab_total[k] = pools[k][2]
-            _epoch_set(k, 1)
-            if pools[k][4]:
-                _epoch_mean_exclude.add(k)   # framed pools sit outside the epoch mean
-            _framing = '<STX>/<ETX> framed' if pools[k][4] else 'undelimited'
-            print(f'{k}: {pools[k][1]} ({pools[k][2]} examples, {_framing})', flush=True)
-        if _epoch_mean_exclude:
-            print(f'epoch mean over {[k for k in keys if k not in _epoch_mean_exclude]}, '
-                  f'excluding framed {sorted(_epoch_mean_exclude)}', flush=True)
-        def _merge(ks):
-            """Several files as ONE stream: pools concatenated, each example remembering
-            which file it came from. Drawn uniformly over the union, so files contribute in
-            proportion to their LINE COUNTS (two 10k-line files are 50/50)."""
-            fr = {pools[k][4] for k in ks}
-            if len(fr) > 1:
-                raise SystemExit(
-                    f'--vocab_slots {n_vocab} would merge {",".join(ks)} into one slot, but '
-                    f'they disagree on framing (--vocab_framed). A framed pool resets the '
-                    f'state between examples and an unframed one never does; one slot cannot '
-                    f'do both. Give them separate slots (--vocab_slots >= {len(keys)}).')
-            pool, texts, nm = [], [], []
-            for k in ks:
-                pool.extend(pools[k][0])
-                texts.extend(pools[k][3])
-                nm.extend([k] * pools[k][2])
-            return pool, texts, nm, fr.pop()
-
-        for i in range(n_vocab):
-            # More slots than files: round robin, one file per slot (the historical split).
-            # FEWER slots than files: each slot merges a stripe of the files into a single
-            # undelimited stream, so --vocab_slots 1 with two files is ONE channel carrying
-            # both -- not the first file only, which is what a bare round robin would give.
-            my = [keys[i % len(keys)]] if n_vocab >= len(keys) else keys[i::n_vocab]
-            if len(my) == 1:
-                k = my[0]
-                slots.append(_VocabSlot(pools[k][0], k, args.seed + 9973 * i, pools[k][3],
-                                        framed=pools[k][4]))
-            else:
-                _pl, _tx, _nm, _fr = _merge(my)
-                print(f'vocab slot {i}: {" + ".join(my)} merged, {len(_pl)} examples, '
-                      f'{"<STX>/<ETX> framed" if _fr else "undelimited"}', flush=True)
-                slots.append(_VocabSlot(_pl, '+'.join(my), args.seed + 9973 * i, _tx,
-                                        framed=_fr, names=_nm))
-        print(f'batchwise mix: {n_vocab}/{args.batch} vocab slots '
-              f'({100.0*n_vocab/args.batch:.1f}% of tokens), '
-              f'{args.batch-n_vocab} corpus slots', flush=True)
-    n_corpus = args.batch - n_vocab
-    _slot_of = lambda n: _StreamSlot(n) if n in _UNFRAMED else _ClipSlot(n)
-    if args.mix_slots and mix is not None:
-        # --mix_slots: round(w * slots) each, the remainder to the largest fractional parts
-        # so the counts sum exactly to n_corpus. A weight that rounds to zero slots is a
-        # corpus that would silently never be trained on, so it is an error.
-        _exact = [w * n_corpus for w in weights]
-        _cnt   = [int(e) for e in _exact]
-        for i in sorted(range(len(names)), key=lambda i: _exact[i] - _cnt[i], reverse=True):
-            if sum(_cnt) >= n_corpus:
-                break
-            _cnt[i] += 1
-        _zero = [n for n, c in zip(names, _cnt) if c == 0]
-        if _zero:
-            raise SystemExit(f'--mix_slots: {",".join(_zero)} rounds to 0 of {n_corpus} slots')
-        for n, c in zip(names, _cnt):
-            slots += [_slot_of(n) for _ in range(c)]
-        print('batchwise mix: ' + ', '.join(
-            f'{n} {c} slots ({"undelimited" if n in _UNFRAMED else "<STX>/<ETX> framed"})'
-            for n, c in zip(names, _cnt)), flush=True)
-    else:
-        # one shared queue (slot name None); a single --dataset may be --unframed, in which
-        # case every corpus slot is a _StreamSlot
-        _un = mix is None and names[0] in _UNFRAMED
-        slots += [(_StreamSlot() if _un else _ClipSlot()) for _ in range(n_corpus)]
-
-    # Pool of builder threads runs the dataset pull/encode in parallel and parks
-    # finished clips in clip_q, so the stepping loop below never blocks on one clip.
-    # Under --mix_slots each dataset has its own queue and its own builders (pinned round
-    # robin, so every dataset gets at least one): a shared queue would let one corpus's
-    # clips block the other's slots, and a random per-clip dataset choice would let a full
-    # queue on one side stall a builder the other side needs.
-    n_builders = max(1, args.workers)
-    clip_q     = queue.Queue(maxsize=2 * n_builders)
-    if args.mix_slots and mix is not None:
-        _ds_list = sorted(set(names))
-        _pinned  = [_ds_list[i % len(_ds_list)] for i in range(max(n_builders, len(_ds_list)))]
-        clip_qs  = {n: queue.Queue(maxsize=2 * _pinned.count(n)) for n in _ds_list}
-    else:
-        _pinned  = [None] * n_builders
-        clip_qs  = {None: clip_q}
-
-    # token-proportional dataset sampling: `weights` is the desired *token* mix, but
-    # datasets have very different tokens-per-example, so choosing examples directly by
-    # `weights` skews the token mix. Track a running mean clip length per dataset and
-    # sample examples with weight w/mean_len, so expected tokens per dataset ∝ w.
-    _len_lock = threading.Lock()
-    _len_sum  = {n: 0.0 for n in set(names)}
-    _len_cnt  = {n: 0   for n in set(names)}
-
-    def _mix_weights():
-        with _len_lock:
-            # bootstrap unseen datasets with mean_len=1 so they still get sampled
-            return [w / max(_len_sum[n] / _len_cnt[n] if _len_cnt[n] else 1.0, 1e-9)
-                    for n, w in zip(names, weights)]
-
-    def builder(fixed=None):
-        rng = random.Random()   # per-clip dataset choice (thread-local instance)
-        cq  = clip_qs[fixed]    # --mix_slots: this thread's dataset and its queue
+    def builder():
         while not stop.is_set():
-            name = fixed if fixed is not None else rng.choices(names, weights=_mix_weights(), k=1)[0]
             try:
-                steps, caption = _build_clip(name, _next_example(name))
+                text = _corpus_text(args.dataset, next_example())
             except Exception as e:
                 print(f'builder: {e}')
                 continue
-            if not steps:
+            if not text or (args.dataset in _HASH_HOLDOUT and _is_heldout(text)):
                 continue
-            with _len_lock:                      # update token-length stats for the mix
-                _len_sum[name] += len(steps)
-                _len_cnt[name] += 1
-            _text_tally(len(steps), sample=caption)
+            steps = clip_text(text)
+            _text_tally(len(steps), text)
             while not stop.is_set():
                 try:
-                    cq.put((steps, caption), timeout=0.5)
+                    clip_q.put(steps, timeout=0.5)
                     break
                 except queue.Full:
                     pass
 
-    # --blocks: each slot reads its own contiguous byte range, so the shared clip queue and
-    # its builder threads are bypassed for corpus slots entirely. Refills happen inline in
-    # the loop below: a 64 KB chunk is ~16k tokens and a slot consumes one token per step, so
-    # a slot refills about every 16k steps and the tokenizer cost is a fraction of a percent.
-    _blocks = _BlockReader(_babylm_files(), n_corpus, names[0]) if args.blocks else None
+    for _ in range(max(1, args.workers)):
+        threading.Thread(target=builder, daemon=True).start()
 
-    builders = [] if _blocks else [threading.Thread(target=builder, args=(f,), daemon=True)
-                                   for f in _pinned]
-    for b in builders:
-        b.start()
-
+    slots = [_Slot() for _ in range(args.batch)]
     while not stop.is_set():
-        for _si, slot in enumerate(slots):
-            while slot.done():
-                if _blocks is not None and _si >= n_vocab:
-                    # RAW IDS, not (x, y) pairs: a _StreamSlot appends to a running buffer
-                    # and forms the pair itself, so the pair straddling a refill is the last
-                    # token of one chunk -> the first of the next and the stream is unbroken
-                    # across the 64 KB boundary. Passing pairs here made load() extend the
-                    # buffer with tuples and the slot never became ready.
-                    text = _blocks.next_text(_si - n_vocab)
-                    ids  = _tokenizer.encode(text) if text else []
-                    if _DATAREP > 1:
-                        ids = [x for x in ids for _ in range(_DATAREP)]
-                    if not ids:
-                        break          # nothing left to read this sweep; retry on the next
-                    # The WHOLE chunk as the sample, not its opening 400 characters.
-                    # _sample_window draws a random window from the stored sample precisely
-                    # so a long-lived load does not show its first lines forever (see the
-                    # sebooks note there) -- and a 400-char store defeats that: every window
-                    # overlaps, so report after report reads as the same text. A slot holds
-                    # this chunk for ~16k steps, so the chunk IS what the run is training on
-                    # for that whole stretch, and a window of it is the honest sample.
-                    _text_tally(len(ids), sample=text)
-                    slot.load(ids, text[:400])
-                    continue
+        for slot in slots:
+            while slot.pos >= len(slot.steps):
                 try:
-                    steps, caption = clip_qs[slot.name].get(timeout=0.5)
+                    slot.load(clip_q.get(timeout=0.5))
                 except queue.Empty:
                     if stop.is_set():
                         return
-                    continue
-                slot.load(steps, caption)
-
-        if n_vocab:
-            # passes over the FILE = total sentences drawn / file size, which is the honest
-            # reading when 225 slots each hold their own permutation of the same file.
-            for k in keys:
-                _epoch_set(k, 1 + _vocab_consumed[k] // pools[k][2])
-                _epoch_frac_set(k, _vocab_consumed[k] / pools[k][2])
-
-        x_list, y_list, flag_list = [], [], []
+        flags = [slot.pos == 0 for slot in slots]
+        xy = [slot.steps[slot.pos] for slot in slots]
         for slot in slots:
-            flag_list.append(slot.is_start())
-            x, y = slot.advance()
-            x_list.append(x)
-            y_list.append(y)
-
-        q.put((x_list, y_list, flag_list))
+            slot.pos += 1
+        q.put(([x for x, _ in xy], [y for _, y in xy], flags))
 
 
-# ── dataset loading (before CUDA init) ───────────────────────────────────────
-
-if args.vis or args.altvis or args.generate or args.push or args.eval:
-    hf_dataset = None                 # one-shot modes: --vis/--generate run from the prompt
-                                      # token, --push only uploads weights, and --eval loads
-                                      # its own held-out split — none of them needs the
-                                      # training dataset
-else:
+hf_dataset = None
+if not _ONESHOT:
     print('loading dataset...')
-    if _mix is not None:
-        _ds_names  = sorted(set(_mix[0]))
-        hf_dataset = {n: _init_one_dataset(n, args.streaming, args.shards) for n in _ds_names}
-        print('mix:', ', '.join(f'{n}:{w:.3f}' for n, w in zip(_mix[0], _mix[1])))
-    else:
-        hf_dataset = {args.dataset: _init_one_dataset(args.dataset, args.streaming, args.shards)}
+    hf_dataset = _load_corpus(args.dataset, args.streaming, args.shards)
     print('dataset ready')
 
-# ── model instantiation ───────────────────────────────────────────────────────
+# ── build / load the model ────────────────────────────────────────────────────
 
 if args.pretrained:
-    # Hub checkpoint: config.json (written by save_pretrained) supplies the architecture,
-    # so the model is built from it rather than from the --context/--n_hidden/... args.
-    # Those args are then synced to what was actually built, since the rest of the script
-    # reads them (DFF shapes, summaries, logged ARGS line).
     if not hasattr(VLAModel, 'from_pretrained'):
-        print('ERROR: --pretrained requires huggingface_hub (pip install huggingface_hub)')
-        raise SystemExit(1)
+        raise SystemExit('--pretrained requires huggingface_hub')
     print(f'loading {args.pretrained} from the hub...')
     model = VLAModel.from_pretrained(args.pretrained, revision=args.revision)
-    _cfg  = getattr(model, '_hub_mixin_config', None) or {}
-    _restore_arch({_k: _cfg[_a] for _k, _a in
-                   (('context', 'S'), ('n_hidden', 'n_hidden'), ('c_context', 'c_context'),
-                    ('c_text', 'c_text'),
-                    ('n_layers', 'n_layers'), ('depth', 'depth'), ('kernel', 'kernel'),
-                    ('tokenizer', 'tokenizer'),
-                    ('head_norm', 'head_norm'),
-                    ('clock', 'clock'), ('clock_base', 'clock_base'),
-                    ('accumulate', 'accumulate'), ('ema', 'ema'),
-                    ('qproj', 'qproj'), ('tap', 'tap')) if _a in _cfg},
-                  'pretrained config')
-    # from_pretrained built the model straight from that config, so an overridden blend
-    # rate has to be pushed onto the model too -- unlike --load there is no later
-    # construction step.
-    if _CLI_GIVEN & {'ema', 'ema_ladder'}:
-        model.set_ema(args.ema, ema_ladder=args.ema_ladder)
-    print('pretrained config', _cfg)
-    # The ARGS line was logged before the hub config was known, so it still shows the CLI
-    # arch defaults. Re-log the corrected args, or the log would misattribute the run.
-    print('ARGS (pretrained)', args)
-    with open(args.log, 'a') as f:
-        print('ARGS', args, file=f)
+    args.context, args.n_hidden, args.c_context = model.S, model.n_hidden, model.c_context
+    args.ctx_ema = ','.join(f'{w:g}' for w in model.windows)
+    args.ctx_read_norm, args.init = model.read_norm, model.init_mode
+    _emit(f'ARGS (pretrained) {args}')
 else:
-    model = VLAModel(
-        n_hidden  = args.n_hidden,
-        depth     = args.depth,
-        kernel    = args.kernel,
-        S         = args.context,
-        c_context = args.c_context,
-        c_text    = args.c_text,
-        n_layers  = args.n_layers,
-        clip_dff   = args.clip_dff,
-        tap_norm   = args.tap_norm,
-        norm       = args.norm,
-        norm_groups= args.norm_groups,
-        dff_norm   = args.dff_norm,
-        bn_track   = args.bn_track,
-        bn_affine  = args.bn_affine,
-        bn_momentum= args.bn_momentum,
-        bn_eps     = args.bn_eps,
-        ema        = args.ema,
-        qproj      = args.qproj,
-        tap        = args.tap,
-        tokenizer = args.tokenizer,
-        head_norm = args.head_norm,
-    )
-
+    model = VLAModel(S=args.context, n_hidden=args.n_hidden, c_context=args.c_context,
+                     depth=args.depth, kernel=args.kernel, tokenizer=args.tokenizer,
+                     windows=[float(w) for w in str(args.ctx_ema).split(',') if w.strip()],
+                     read_norm=args.ctx_read_norm,
+                     dec_kernels=[int(k) for k in str(args.dec_tree_kernels).split(',') if k.strip()],
+                     dec_width=args.dec_width, bn_momentum=args.bn_momentum, init=args.init)
     if _loaded_ckpt is not None:
-        model.load_state_dict(_loaded_ckpt['state_dict'])
-        del _loaded_ckpt
-
-# Bind the module-level tokenizer used by clip_text() and every display path. The worker
-# threads that call clip_text() are only started further down, so this is set in time.
+        model.load_state_dict(_upgrade_state_dict(_loaded_ckpt['state_dict']))
+model = model.to(args.device)
 _tokenizer = model.tok
-if args.refresh and not args.refresh_every:
-    _stab_register(model)
-# --tokenizer tiny* takes c_text from the pretrained embedding width, so sync it back:
-# saved_args must describe the model that was actually built or a --load would rebuild
-# a different one.
-args.c_text = model.c_text
-# likewise --c_context: --depth 1 forces it to n_hidden, so saved_args must record the width
-# that was built or a --load would rebuild a different stack.
-args.c_context = model.context.c_context
-# likewise --head_norm: char forces it to 'none', and so does an ln_f that the source model
-# turned out not to expose, so read back what was actually built.
-args.head_norm = model.head_norm_kind
-args.clip_dff   = model.clip_dff
-args.tap_norm   = model.tap_norm_kind
-args.norm       = model.norm_kind
-args.norm_groups = model.norm_groups
-args.dff_norm   = model.dff_norm_kind
-args.bn_track   = model.bn_track
-args.bn_affine  = model.bn_affine
-# Only a SCALAR ema syncs back. Under --ema_ladder model.ema is a per-layer list, and
-# writing that into args would put a list in saved_args['ema'] -- which _restore_arch then
-# hands to set_clock on the next --load, where float(list) raises. ema_ladder is the source
-# of truth for the ladder and is saved separately.
-args.ema        = model.ema if isinstance(model.ema, float) else args.ema
-args.qproj      = model.qproj_mode
-args.tap        = model.tap is not None
-
-# --unfreeze trains the borrowed embedding/lm_head too. requires_grad is not part of the
-# state_dict, so this is re-applied on every run (including --load/--pretrained) from the
-# flag rather than inherited from the checkpoint.
-if args.unfreeze:
-    model.set_pretrained_trainable(True)
-# --freeze_linout: same deal -- requires_grad is not in the state_dict, so it comes from the
-# flag every run, and a resume without it would quietly start training the copies.
-if args.freeze_linout:
-    if model.linout is None:
-        raise SystemExit('--freeze_linout needs --linout')
-    for _p in model.linout.parameters():
-        _p.requires_grad_(False)
 
 
-def _prompt_ids(text=None):
-    """A prompt as token ids, with START prepended: the same [START] text framing every
-    training clip opens with, so a sample always starts at a document boundary.
+def _model_graph(model):
+    """One token step as a table, modules in execution order (conv rows absorb their
+    BN/ReLU/pool), with marker rows for the tensor ops between modules."""
+    names = {m: n for n, m in model.named_modules()}
+    rows = []
 
-    text=None means --prompt (the original behaviour, unchanged for every existing caller);
-    the periodic GEN block passes each entry of _gen_prompt_list() explicitly."""
-    t = args.prompt if text is None else text
-    if args.gen_null and not t:
-        return []                      # --gen_null: no <STX>, no tokens; see generate()
-    return [_tokenizer.start_id] + (_tokenizer.encode(t) if t else [])
+    def shape(t):
+        t = t[0] if isinstance(t, (tuple, list)) else t
+        return 'x'.join(str(d) for d in t.shape[1:]) if t.dim() > 1 else 'token'
+
+    def hook(m, inp, out):
+        n = names[m]
+        tr = sum(p.numel() for p in m.parameters(recurse=False) if p.requires_grad)
+        fr = sum(p.numel() for p in m.parameters(recurse=False) if not p.requires_grad)
+        if isinstance(m, (nn.BatchNorm2d, nn.ReLU, nn.AvgPool2d)) and rows:
+            rows[-1]['op'] += '+' + type(m).__name__.replace('BatchNorm2d', 'BN')
+            rows[-1]['out'] = shape(out)
+            return
+        op = (f'Conv2d {m.kernel_size[0]}x{m.kernel_size[1]}' if isinstance(m, nn.Conv2d)
+              else type(m).__name__)
+        rows.append(dict(name=n, op=op, inp=shape(inp), out=shape(out), tr=tr, fr=fr))
+
+    hooks = [m.register_forward_hook(hook) for m in model.modules()
+             if not list(m.children()) and not isinstance(m, nn.Identity)]
+    was = model.training
+    model.eval()
+    try:
+        with torch.no_grad():
+            dev = next(model.parameters()).device
+            new, o = model.step(torch.zeros(1, dtype=torch.long, device=dev),
+                                model.new_state(1, dev))
+            model.text_dec(o)
+    finally:
+        for h in hooks:
+            h.remove()
+        model.train(was)
+
+    S, H = model.S, f'{model.n_hidden}x{model.S}x{model.S}'
+    regs = [f'DFF_{k + 1}' for k in range(model.K)]
+    out = []
+    for r in rows:
+        if r['name'] == 'ctx_cat':
+            srcs = ['(token grid)'] + [f'{g}[t-1]' for g in regs]
+            out.append(dict(name=', '.join(srcs), op='Concat (channels)',
+                            inp=f'{"+".join(map(str, model.in_widths))}+{model.K}x{model.n_hidden} x{S}x{S}',
+                            out=r['inp'], tr=0, fr=0))
+        out.append(r)
+        if r['name'] == 'tok_embed':
+            out.append(dict(name='(token grid)', op=f'RMSnorm, replicate 1x1 -> {S}x{S}',
+                            inp=r['out'], out=f'{r["out"]}x{S}x{S}', tr=0, fr=0))
+        if r['name'] == 'linout':
+            for k, (g, w) in enumerate(zip(regs, model.windows)):
+                src = 'linout' + (f' - ({" + ".join(f"{q}[t]" for q in regs[:k])})' if k else '')
+                out.append(dict(name=f'{g}[t] <- {src}',
+                                op='Write (replace)' if w <= 1 else f'Write (EMA w={w:g})',
+                                inp=H, out=H, tr=0, fr=0))
+    w = max(len(r['name']) for r in out)
+    wo = max(len(r['op']) for r in out)
+    ws = max(max(len(r['inp']), len(r['out'])) for r in out)
+    lines = [f'{"#":>3}  {"module":<{w}}  {"op":<{wo}}  {"in":>{ws}}    {"out":<{ws}}  {"params":>12}']
+    for n, r in enumerate(out, 1):
+        p = r['tr'] + r['fr']
+        ps = '' if not p else f'{p:,}' + (' frozen' if r['fr'] and not r['tr'] else '')
+        lines.append(f'{n:>3}  {r["name"]:<{w}}  {r["op"]:<{wo}}  {r["inp"]:>{ws}} -> '
+                     f'{r["out"]:<{ws}}  {ps:>12}')
+    return lines
+
+
+def _param_summary(model):
+    """Trainable/frozen parameter counts per top-level module, and the total."""
+    seen, rows = set(), []
+    for name, mod in model.named_children():
+        tr = fr = 0
+        for p in mod.parameters():
+            if id(p) not in seen:
+                seen.add(id(p))
+                tr, fr = (tr + p.numel(), fr) if p.requires_grad else (tr, fr + p.numel())
+        if tr or fr:
+            rows.append((name, tr, fr))
+    w = max(len(r[0]) for r in rows)
+    out = [f'PARAMS  {"module":<{w}}  {"trainable":>13}  {"frozen":>13}  {"total":>13}']
+    out += [f'PARAMS  {n:<{w}}  {tr:>13,}  {fr:>13,}  {tr + fr:>13,}' for n, tr, fr in rows]
+    t_tr, t_fr = sum(r[1] for r in rows), sum(r[2] for r in rows)
+    out.append('PARAMS  ' + '-' * (w + 46))
+    out.append(f'PARAMS  {"TOTAL":<{w}}  {t_tr:>13,}  {t_fr:>13,}  {t_tr + t_fr:>13,}')
+    out.append(f'PARAMS  total {(t_tr + t_fr) / 1e6:.3f} M ({t_tr / 1e6:.3f} M trainable, '
+               f'{t_fr / 1e6:.3f} M frozen), weights {(t_tr + t_fr) * 4 / 2**20:.1f} MiB at fp32')
+    return out
+
+
+if not _ONESHOT or args.verbose:
+    for line in ['── model graph (one token step, execution order) ──'] + _model_graph(model):
+        print(line)
+        _emit(f'INFO {line}', stdout=False)
+    for line in _param_summary(model):
+        _emit(line)
+
+# ── generation helpers ────────────────────────────────────────────────────────
+
+
+def _prompt_ids(text=''):
+    """A prompt as ids, opened with START like every training document."""
+    return [_tokenizer.start_id] + (_tokenizer.encode(text) if text else [])
+
+
+def _rep1(text):
+    """Share of the text taken by its most common word or non-space character (the larger):
+    a high fluency score next to a high rep1 is a collapsed model, not a fluent one."""
+    w = text.split()
+    ch = [c for c in text if not c.isspace()]
+    return max(max(collections.Counter(w).values()) / len(w) if w else 0.0,
+               max(collections.Counter(ch).values()) / len(ch) if ch else 0.0)
 
 
 class _GenScorer:
-    """Fluency of a GEN sample under a frozen reference LM, anchored to this run's corpus.
+    """--gen_score: nats/token of a GEN sample under a frozen reference LM on the CPU,
+    placed between anchors computed once from this run's corpus: FLOOR real text (100%),
+    CEILING the same text with its words shuffled (0%)."""
 
-    nats/token alone says nothing -- a reference model's absolute surprise depends on the
-    domain. So the score is placed between two anchors drawn from the training text itself:
-        FLOOR    real corpus text            -> 100%, as fluent as this corpus gets
-        CEILING  the same text, words shuffled -> 0%, same words with the syntax destroyed
-    Anchors are computed ONCE, from the first corpus documents the data worker produced, and
-    then frozen -- a drifting anchor would make the series incomparable across steps.
-
-    The reference is a different model from the one under test, so this cannot be gamed by
-    the run. It lives on the CPU: it runs once per --gen_interval, so it costs nothing worth
-    contending for GPU memory over, and it can never perturb the training allocation.
-
-    rep1 is reported alongside, and exists because THIS METRIC IS BACKWARDS ON DEGENERATE
-    TEXT: a model emitting one token forever is maximally predictable and scores as maximally
-    fluent. rep1 is the larger of two rates -- the fraction of the sample made of its most
-    common WORD and the fraction of its non-whitespace CHARACTERS made of the most common one
-    -- because a word-only rate has a hole: a wall of one punctuation character broken by
-    spaces splits into many distinct "words" and reads 0.08, while the reference LM scores
-    that sample 98% fluent (v196 step 10000); the character rate calls it 0.75. Read together, a
-    high score with a high rep1 is collapse, not fluency.
-    """
     def __init__(self, repo):
         self.repo, self.ref, self.tok = repo, None, None
         self.floor = self.ceil = None
@@ -5463,71 +940,54 @@ class _GenScorer:
             self.tok = AutoTokenizer.from_pretrained(self.repo)
             self.ref = AutoModelForCausalLM.from_pretrained(self.repo).to('cpu').eval()
             print(f'--gen_score: reference model {self.repo} loaded on cpu', flush=True)
-        except Exception as e:                      # never take the training run down
+        except Exception as e:                     # never take the training run down
             print(f'--gen_score: DISABLED, could not load {self.repo}: {e}', flush=True)
             self.failed = True
 
     @torch.no_grad()
     def _nll(self, text):
-        ids = self.tok(text, return_tensors='pt', truncation=True,
-                       max_length=512).input_ids
+        ids = self.tok(text, return_tensors='pt', truncation=True, max_length=512).input_ids
         if ids.shape[1] < 2:
             return None
         v = float(self.ref(ids, labels=ids).loss)
         return v if math.isfinite(v) else None
 
     def _anchor(self):
-        """FLOOR/CEILING from real corpus text; computed once, then frozen."""
         if self.floor is not None:
             return True
-        docs = [d for d in _text_anchors() if len(d.split()) >= 24][:12]
+        with _text_lock:
+            docs = [d for d in _text_stats['anchor'] if len(d.split()) >= 24][:12]
         if len(docs) < 4:
-            return False                            # not enough corpus text yet
-        rng = random.Random(1234)                   # fixed: the same shuffle every run
+            return False
+        rng = random.Random(1234)
         lo, hi = [], []
         for d in docs:
             w = d.split()[:256]
             a = self._nll(' '.join(w))
-            sw = w[:]; rng.shuffle(sw)
+            sw = w[:]
+            rng.shuffle(sw)
             b = self._nll(' '.join(sw))
             if a is not None and b is not None:
-                lo.append(a); hi.append(b)
+                lo.append(a)
+                hi.append(b)
         if len(lo) < 4 or np.mean(hi) - np.mean(lo) < 1e-6:
             return False
         self.floor, self.ceil = float(np.mean(lo)), float(np.mean(hi))
-        print(f'--gen_score: anchors from {len(lo)} corpus documents -- '
-              f'FLOOR {self.floor:.3f} (real text) CEILING {self.ceil:.3f} (words shuffled)',
-              flush=True)
+        print(f'--gen_score: anchors from {len(lo)} corpus documents -- FLOOR {self.floor:.3f} '
+              f'(real text) CEILING {self.ceil:.3f} (words shuffled)', flush=True)
         return True
 
     def score(self, text):
         """-> 'nats 4.812 fluency 63% rep1 0.07', or '' if unavailable."""
         self._load()
-        if self.failed:
-            return ''
-        # Gate on CHARACTERS, not words. A collapsed sample is often one unbroken run
-        # ('okinetics*******...'), i.e. a single "word" -- and that is exactly the case this
-        # metric exists to flag, so it must not be the case that gets skipped.
         text = text.strip()
-        if len(text) < 16:
+        if self.failed or len(text) < 16:
             return ''
         words = text.split()
-        # rep1 is the MAX of the word-level and character-level rates, not a fallback from
-        # one to the other. A word-only rep1 has a hole this metric cannot afford: a wall of
-        # one punctuation character broken by spaces ('||| H|| |||||||| ...') splits into
-        # many DISTINCT 'words' of different run lengths, so no single word dominates and
-        # rep1 reads a healthy 0.12 -- while the reference LM, delighted by the most
-        # predictable text imaginable, scored that sample 3.53 nats and 98% fluency
-        # (v196 step 10000). Measured at the character level the same sample is ~0.7.
-        # Whitespace is excluded from the character count so ordinary spacing cannot itself
-        # become the dominant 'character' in a short sample.
-        _chars = [c for c in text if not c.isspace()]
-        rep1w  = max(collections.Counter(words).values()) / len(words) if words else 0.0
-        rep1c  = max(collections.Counter(_chars).values()) / len(_chars) if _chars else 0.0
-        rep1   = max(rep1w, rep1c)
         n = self._nll(' '.join(words[:256]) if words else text[:1024])
         if n is None:
             return ''
+        rep1 = _rep1(text)
         if not self._anchor():
             return f'nats {n:.3f} fluency n/a (no anchors yet) rep1 {rep1:.2f}'
         pct = 100.0 * (self.ceil - n) / (self.ceil - self.floor)
@@ -5536,1704 +996,311 @@ class _GenScorer:
 
 _gen_scorer = _GenScorer(args.gen_score) if args.gen_score else None
 
-
-def _gen_prompt_list():
-    """Prompts for the periodic GEN sample: the NULL prompt first, then --prompt, then
-    --gen_prompts, de-duplicated in that order.
-
-    The null prompt is unconditional and first because it is exactly what every run before
-    2026-08-28 sampled (--prompt defaults to '', so _prompt_ids() was already [START] alone).
-    An invocation that adds reference prompts therefore gets them as EXTRA lines and its
-    free-running sample is unchanged -- no run loses the measurement that has overturned the
-    scalar reading more than once."""
-    out = ['']
-    if args.prompt:
-        out.append(args.prompt)
-    for p in (args.gen_prompts or '').split(','):
-        p = p.strip()
-        if p and p not in out:
-            out.append(p)
-    return out
-
-
-_dff_shape = (1, args.n_hidden, args.context, args.context)
-def _summ(title, mod, **kw):
-    # --generate/--vis have no log file, so their summaries would only be terminal noise in
-    # front of the sample / the plot window. --verbose asks for them anyway.
-    if (args.generate or args.vis or args.altvis or args.push or args.eval) and not args.verbose:
-        return
-    s = str(torchinfo.summary(mod, col_names=['input_size', 'output_size', 'num_params'],
-                              verbose=0, **kw))
-    block = f'── {title} ──\n{s}'
-    print(block)
-    with open(args.log, 'a') as f:                  # mirror to log, each line prefixed INFO
-        for line in block.splitlines():
-            print(f'INFO {line}', file=f)
-
-def _model_graph(model):
-    """The whole model as ONE table, every layer in the order a token step executes it.
-
-    One real step is traced with a forward hook on every leaf module (eval mode, no_grad,
-    a fresh local DFF and writer -- nothing on the model is touched). A conv and the
-    norm/ReLU that follow it inside the same block collapse to one row, so a depth-16
-    ContextCNN is 16 rows, not 48. Marker rows (no parameters) show where the recurrence
-    enters and leaves each layer, since the feedback add and the DFF write are tensor ops,
-    not modules, and would otherwise be invisible. Shapes are per sample: [C, S, S]."""
-    rows, mods = [], {m: n for n, m in model.named_modules()}
-
-    def _shape(t):
-        t = t[0] if isinstance(t, (tuple, list)) else t
-        if not torch.is_tensor(t):
-            return '?'
-        return 'x'.join(str(d) for d in t.shape[1:]) if t.dim() > 1 else 'token'
-
-    def _desc(m):
-        if isinstance(m, nn.Conv2d):
-            k = m.kernel_size
-            return f'Conv2d {k[0]}x{k[1]}'
-        if isinstance(m, nn.Embedding):
-            return 'Embedding'
-        if isinstance(m, nn.Linear):
-            return 'Linear'
-        return type(m).__name__
-
-    def _hook(m, inp, out):
-        n = mods.get(m, '?')
-        tr = sum(q.numel() for q in m.parameters(recurse=False) if q.requires_grad)
-        fr = sum(q.numel() for q in m.parameters(recurse=False) if not q.requires_grad)
-        parent = n.rsplit('.', 1)[0] if '.' in n else n
-        # fold norm/activation into the conv row of the same block (e.g. context.layers.3.*)
-        if (rows and not isinstance(m, (nn.Conv2d, nn.Linear, nn.Embedding))
-                and rows[-1]['parent'] == parent and rows[-1]['kind'] == 'conv'):
-            r = rows[-1]
-            r['op'] += '+' + _desc(m).replace('BatchNorm2d', 'BN').replace('GroupNorm', 'GN')
-            r['out'] = _shape(out); r['tr'] += tr; r['fr'] += fr
-            return
-        _op = _desc(m)
-        if n.startswith('linout.') and model.n_ctx > 1 and model.ctx_mix == 'conv':
-            _op += f' x{model.n_ctx} copies'          # one per DFF register, summed upward
-        rows.append({'name': n, 'parent': parent, 'op': _op, 'in': _shape(inp),
-                     'out': _shape(out), 'tr': tr, 'fr': fr,
-                     'kind': 'conv' if isinstance(m, nn.Conv2d) else 'other'})
-
-    hooks = [m.register_forward_hook(_hook) for m in model.modules()
-             if not list(m.children()) and not isinstance(m, nn.Identity)]
-    was_training = model.training
-    model.eval()
-    try:
-        with torch.no_grad():
-            dev = next(model.parameters()).device
-            bi  = torch.zeros(1, dtype=torch.long, device=dev)
-            dff = model._new_dff(1, dev)
-            stack, ctx = model._layers(dff, model._tok_grid(bi), model._new_writer(1, dev))
-            model.readout(model._decode(ctx))
-    finally:
-        for h in hooks:
-            h.remove()
-        model.train(was_training)
-
-    # The tensor ops between modules are first-class rows too: the token REPLICATION onto the
-    # S x S grid, each layer's feedback ADD, the per-register WRITE (EMA blend), and the ADD
-    # of the --ctx_ema linout copies on the way up. A --ctx_ema linout is one conv holding K
-    # copies; it is shown as K rows, one per register, with its parameters split evenly.
-    K, S = model.n_ctx, model.S
-    H = f'{model.n_hidden}x{S}x{S}'
-    regs = ([f'DFF_{k + 1}' for k in range(K)] if K > 1 else ['DFF'])
-    def _rate(k, li):
-        if model.ctx_windows:
-            w = model.ctx_windows[k]
-            return 'replace' if w <= 1 else (f'EMA w={w:g}'
-                                             + (' warm' if getattr(args, 'ctx_warm', False) else '')
-                                             + (' adapt' if getattr(args, 'ctx_adapt', False) else ''))
-        e = (model.ema[li] if isinstance(model.ema, (list, tuple)) else model.ema)
-        return 'replace' if (e is None or e >= 1.0) else f'EMA a={e:.4g}'
-    def _op(name, op, i, o):
-        return {'name': name, 'op': op, 'in': i, 'out': o, 'tr': 0, 'fr': 0}
-    def _layer_of(name):
-        if name.startswith('deep_context.'):
-            return int(name.split('.')[1]) + 1
-        if name.startswith(('linin.', 'linout.', 'tap.')):
-            return int(name.split('.')[1])
-        return 0 if name.startswith('context.') else None
-    def _is_last(r, li):
-        if model.linout is not None:
-            return r['name'].startswith('linout.')
-        if model.tap is not None:
-            return r['name'].startswith('tap.')
-        return (li is not None and r['name'].startswith(('context.', 'deep_context.'))
-                and r['name'].split('.')[-2] == str(len(model.context.layers) - 1))
-    out, seen_in, up = [], set(), ('(token grid)' if isinstance(model.text_proj, nn.Identity)
-                                   else 'text_proj')
-    _cat_pending = []
-    for r in rows:
-        li = _layer_of(r['name'])
-        if li is not None and li not in seen_in:
-            seen_in.add(li)
-            if li > 0:
-                up = f'deep_proj.{li - 1}' if model.deep_proj is not None else f'layer {li} out'
-            if getattr(model, 'ctx_rgain', None) is not None:
-                _gp = model.ctx_rgain[li]
-                for k, g in enumerate(regs):
-                    _row = _op(f'g_{k + 1} x {g}[t-1]', f'Mul (trainable read gain, '
-                               f'{model.ctx_read_gain_kind})', H, H)
-                    _row['tr'] = _gp[k].numel()
-                    out.append(_row)
-            if getattr(model, 'ctx_cat', None) is not None and getattr(model, 'ctx_cat_in', False):
-                _srcs = [up] + [f'{g}[t-1]' for g in regs]
-                _cin = model.ctx_cat[li].in_channels
-                _w0 = _cin - len(regs) * model.n_hidden      # the input block's width
-                _ins = (f'{len(_srcs)} x {H}' if _w0 == model.n_hidden
-                        else f'{_w0}+{len(regs)}x{model.n_hidden} x{S}x{S}')
-                if getattr(model, 'ctx_cat_spatial', False):
-                    out.append(_op(', '.join(_srcs), 'Concat (spatial 2x2)', _ins,
-                                   f'{model.n_hidden}x{2 * S}x{2 * S}'))
-                else:
-                    out.append(_op(', '.join(_srcs), 'Concat (channels)', _ins, f'{_cin}x{S}x{S}'))
-                out.extend(_cat_pending)
-                _cat_pending.clear()
-            elif getattr(model, 'ctx_cat', None) is not None:
-                out.append(_op(', '.join(f'{g}[t-1]' for g in regs), 'Concat (channels)',
-                               f'{len(regs)} x {H}', f'{len(regs) * model.n_hidden}x{S}x{S}'))
-                out.extend(_cat_pending)
-                _cat_pending.clear()
-                out.append(_op(f'{up} + ctx_cat.{li}', 'Add (feedback)', f'2 x {H}', H))
-            else:
-                out.append(_op(f'{up} + ' + ' + '.join(f'{g}[t-1]' for g in regs), 'Add (feedback)',
-                               f'{len(regs) + 1} x {H}', H))
-        if r['name'].startswith('ctx_cat.'):
-            _cat_pending.append(r)          # emitted right before its layer's feedback add
-            continue
-        if r['name'].startswith('linout.') and K > 1 and model.ctx_mix == 'conv':
-            # one conv, K copies: a row per copy, each writing its own register
-            for k in range(K):
-                out.append(dict(r, name=f'{r["name"]}[{k + 1}]',
-                                op=r['op'].replace(f' x{K} copies', '') + f' -> {regs[k]}',
-                                out=H, tr=r['tr'] // K, fr=r['fr'] // K))
-        else:
-            out.append(r)
-        if r['name'] == 'tok_embed':
-            out.append(_op('(token grid)', f'Replicate 1x1 -> {S}x{S}', r['out'],
-                           f'{r["out"]}x{S}x{S}'))
-        if _is_last(r, li) and K > 1 and getattr(model, 'ctx_mix', 'conv') not in ('conv', 'none'):
-            _mx = {'sign': 'Sign flip (fixed +-1)', 'signperm': 'Permute + sign (fixed)',
-                   'hadamard': 'Sign + Hadamard (FWHT)'}[model.ctx_mix]
-            for k in range(1, K):
-                out.append(_op(f'T_{k + 1}({r["name"]})', _mx, H, H))
-        if _is_last(r, li):
-            _mix = K > 1 and getattr(model, 'ctx_mix', 'conv') not in ('conv', 'none')
-            srcs = ([f'{r["name"]}[{k + 1}]' for k in range(K)]
-                    if (K > 1 and model.linout is not None and not _mix
-                        and model.ctx_mix == 'conv') else
-                    [r['name']] + [f'T_{k + 1}({r["name"]})' for k in range(1, K)] if _mix
-                    else [r['name']] * len(regs))
-            if getattr(args, 'ctx_chain', False):      # shift register: k-1 feeds k
-                srcs = [srcs[0]] + [f'{regs[k - 1]}[t-1]' for k in range(1, len(regs))]
-            if getattr(args, 'ctx_resid', False):      # residual cascade: x - register k-1
-                if getattr(args, 'ctx_resid_mode', 'prev') == 'sum':   # x - (registers 1..k-1)
-                    srcs = [srcs[0]] + [f'{srcs[0]} - ({" + ".join(f"{regs[j]}[t]" for j in range(k))})'
-                                        for k in range(1, len(regs))]
-                else:
-                    srcs = [srcs[0]] + [f'{srcs[0]} - {regs[k - 1]}[t]' for k in range(1, len(regs))]
-            _ws = getattr(model, 'dff_write_scale', 1.0)
-            for k in range(len(regs)):
-                out.append(_op(f'{regs[k]}[t] <- {"" if _ws == 1.0 else f"{_ws:g} x "}{srcs[k]}',
-                               f'Write ({_rate(k, li)})', H, H))
-            if K > 1 and model.linout is not None and not _mix and model.ctx_mix == 'conv':
-                out.append(_op(' + '.join(srcs), 'Add (up the stack)', f'{K} x {H}', H))
-
-    w = max(len(r.get('name', '')) for r in out)
-    wo = max(len(r.get('op', '')) for r in out)
-    ws = max([len(r.get('in', '')) for r in out] + [len(r.get('out', '')) for r in out])
-    lines = [f'{"#":>3}  {"module":<{w}}  {"op":<{wo}}  {"in":>{ws}}    {"out":<{ws}}  '
-             f'{"params":>12}']
-    n = 0
-    for r in out:
-        n += 1
-        p = r['tr'] + r['fr']
-        ps = '' if not p else f'{p:,}' + (' frozen' if r['fr'] and not r['tr'] else '')
-        lines.append(f'{n:>3}  {r["name"]:<{w}}  {r["op"]:<{wo}}  {r["in"]:>{ws}} -> '
-                     f'{r["out"]:<{ws}}  {ps:>12}')
-    return lines
-
-
-if not ((args.generate or args.vis or args.altvis or args.push or args.eval)
-        and not args.verbose):
-    _g = (['── model graph (one token step, execution order; params per row, '
-           'totals in PARAMS below) ──'] + _model_graph(model))
-    print('\n'.join(_g))
-    with open(args.log, 'a') as f:
-        for line in _g:
-            print(f'INFO {line}', file=f)
-# The blend rate is invisible in the layer summaries (it adds no parameters and no shapes),
-# so state it explicitly: it is the only thing deciding how long the state remembers.
-if model.ctx_windows and not (args.generate or args.vis or args.altvis or args.push
-                              or args.eval):
-    _line = (f'--ctx_ema {args.ctx_ema}: {model.n_ctx} contexts per layer, windows '
-             + ', '.join(f'{w:g} (ema {min(1.0, 1.0 / w):.4g})' for w in model.ctx_windows)
-             + '; summed into the feedback add')
-    print(_line)
-    with open(args.log, 'a') as f:
-        print(f'INFO {_line}', file=f)
-elif model.ema is not None and (not (args.generate or args.vis or args.altvis or args.push
-                                   or args.eval) or args.verbose):
-    _lbl = getattr(model, 'dff_layers', list(range(model.n_layers)))
-    if isinstance(model.ema, (list, tuple)):
-        _txt = ('DFF blend rate per register '
-                + ', '.join(f'L{_lbl[i] + 1}={e:.4g} (~{1.0 / e:.0f} tok window)'
-                            for i, e in enumerate(model.ema)))
-        print(f'--ema_ladder {model.ema_ladder}: {_txt}')          # spec as typed
-        _line = f'--ema_ladder {model.ema_ladder}: {_txt}'
-    else:
-        _line = (f'--ema {model.ema:.4g}: every register blends '
-                 f'register + {model.ema:.4g}*(new - register) every step '
-                 f'(~{1.0 / model.ema:.0f} token window)')
-        print(_line)
-    with open(args.log, 'a') as f:
-        print(f'INFO {_line}', file=f)
-elif model.ema is None and not (args.generate or args.vis or args.altvis or args.push
-                                or args.eval):
-    print('no --ema/--ema_ladder: every register REPLACES its contents every step')
-
-if model.tap is not None and (not (args.generate or args.vis or args.altvis or args.push or args.eval)
-                              or args.verbose):
-    _tap_txt = (
-        '── tap ──\n'
-        '--tap: per layer, ContextCNN -> tap (1x1) -> DFF register, and the same tensor on\n'
-        '       to ' + ('deep_proj (1x1) -> next layer; the last layer to decoder.proj (1x1)'
-                        if model.n_layers > 1 else 'decoder.proj (1x1)') + '\n'
-        '       so the two 1x1s in series are tap then '
-        + ('deep_proj/decoder.proj' if model.n_layers > 1 else 'decoder.proj')
-        + ', tapped between.\n'
-        f'       register holds a dense signed embedding (was the sparse ReLU output); '
-        f'--init {args.init}'
-        + ('' if args.init == 'gaussian' else ' (gaussian matches a dense register better)'))
-    print(_tap_txt)
-    with open(args.log, 'a') as f:
-        for line in _tap_txt.splitlines():
-            print(f'INFO {line}', file=f)
-model = model.to(args.device)
-model.init_mode = args.init   # applies to both construction paths (--pretrained and local)
-print(f'tokenizer {args.tokenizer}: vocab {model.vocab}, embedding width {model.c_text}')
-_trainable_n = sum(p.numel() for p in model.parameters() if p.requires_grad)
-_frozen_n    = sum(p.numel() for p in model.parameters() if not p.requires_grad)
-print(_trainable_n / 1e6, 'M trainable params'
-      + (f' ({_frozen_n / 1e6:.6f} M frozen pretrained)' if _frozen_n else ''))
-
-
-def _param_summary(model):
-    """Per-module parameter counts and the total, printed once before training starts.
-
-    The torchinfo tables above are per-submodule and verbose; this is the one place that
-    says how big the model is in total and where the weights actually sit. It matters here
-    because the answer is not obvious from the flags: --linout REPLACES deep_proj, a frozen
-    pretrained embedding can outweigh everything trained, and the conv stack scales as
-    n_layers * ((depth-2)*c_context**2 + 2*n_hidden*c_context) -- n_layers * depth *
-    n_hidden**2 when --c_context is unset -- so a width change moves the total
-    quadratically. The
-    weight ROM is the thing being sized for hardware, so print it, not just infer it.
-
-    Modules are walked by NAME off the model, then anything not claimed by a named module is
-    swept into 'other' -- so the parts always sum to the total, whatever the flags did."""
-    named = [('tok_embed',    model.tok_embed),
-             ('text_proj',    model.text_proj),
-             ('context',      model.context),
-             ('deep_context', model.deep_context),
-             ('deep_proj',    model.deep_proj),
-             ('linin',        getattr(model, 'linin', None)),
-             ('ctx_read_gain', getattr(model, 'ctx_rgain', None)),
-             ('ctx_cat',      getattr(model, 'ctx_cat', None)),
-             ('ctx_read_gate', getattr(model, 'ctx_rgate', None)),
-             ('ctx_logw',     getattr(model, 'ctx_logw', None)),
-             ('linout',       model.linout),
-             ('tap',          model.tap),
-             ('dec_stack',    getattr(model, 'dec_stack', None)),
-             ('dec_tree',     getattr(model, 'dec_tree', None)),
-             ('decoder',      model.decoder),
-             ('head_norm',    getattr(model, 'head_norm', None)),
-             ('lmhead',       model.lmhead)]
-    seen, rows = set(), []
-    for name, mod in named:
-        if mod is None:
-            continue
-        tr = fr = 0
-        for prm in mod.parameters():
-            if id(prm) in seen:        # lmhead is TIED to tok_embed on GPT-Neo: count once
-                continue
-            seen.add(id(prm))
-            if prm.requires_grad: tr += prm.numel()
-            else:                 fr += prm.numel()
-        if tr or fr:
-            rows.append((name, tr, fr))
-    o_tr = o_fr = 0
-    for prm in model.parameters():
-        if id(prm) in seen:
-            continue
-        seen.add(id(prm))
-        if prm.requires_grad: o_tr += prm.numel()
-        else:                 o_fr += prm.numel()
-    if o_tr or o_fr:
-        rows.append(('other', o_tr, o_fr))
-    w = max(len(r[0]) for r in rows)
-    out = ['PARAMS  ' + f'{"module":<{w}}  {"trainable":>13}  {"frozen":>13}  {"total":>13}']
-    for name, tr, fr in rows:
-        out.append(f'PARAMS  {name:<{w}}  {tr:>13,}  {fr:>13,}  {tr + fr:>13,}')
-    t_tr = sum(r[1] for r in rows); t_fr = sum(r[2] for r in rows)
-    out.append('PARAMS  ' + '-' * (w + 46))
-    out.append(f'PARAMS  {"TOTAL":<{w}}  {t_tr:>13,}  {t_fr:>13,}  {t_tr + t_fr:>13,}')
-    out.append(f'PARAMS  total {(t_tr + t_fr) / 1e6:.3f} M '
-               f'({t_tr / 1e6:.3f} M trainable, {t_fr / 1e6:.3f} M frozen), '
-               f'weights {(t_tr + t_fr) * 4 / 2**20:.1f} MiB at fp32')
-    return '\n'.join(out)
-
-
-_psum = _param_summary(model)
-print(_psum)
-if args.log:
-    with open(args.log, 'a') as _f:
-        print(_psum, file=_f)
+# ── one-shot: push / generate / vis ───────────────────────────────────────────
 
 if args.push:
-    # one-shot: save the loaded checkpoint in HuggingFace format (model.safetensors +
-    # config.json, from PyTorchModelHubMixin) and upload it to --hub_repo, then exit.
-    # Needs a write token in the environment (huggingface-cli login, or HF_TOKEN).
     if args.load is None and args.pretrained is None:
-        print('ERROR: --push requires --load (nothing to push but random weights)')
-        raise SystemExit(1)
-    if not hasattr(model, 'push_to_hub'):
-        print('ERROR: --push requires huggingface_hub (pip install huggingface_hub)')
-        raise SystemExit(1)
+        raise SystemExit('--push requires --load (nothing to push but random weights)')
     local = os.path.basename(args.hub_repo)
     print(f'saving {args.load or args.pretrained} to ./{local} ...')
     model.to('cpu').save_pretrained(local)
     print(f'pushing to https://huggingface.co/{args.hub_repo} ...')
-    # private=None (not False) when the flag is unset: that lets the hub apply the org's
-    # default visibility for a new repo. Ignored if the repo already exists.
     model.push_to_hub(args.hub_repo, private=args.private or None)
     print('done')
     raise SystemExit(0)
 
-# ── eval ──────────────────────────────────────────────────────────────────────
-
-def _eval_source(name=None):
-    """(repo, config, split, column) for --eval, with --split/--column overriding.
-
-    `name` defaults to --dataset. It is passed explicitly by --eval_corpora, which scores a
-    run against held-out sets it was NOT trained on -- the transfer measurement."""
-    name = name or args.dataset
-    if name in _TEXT_DATASETS:
-        hf, cfg, split, col = _TEXT_DATASETS[name]
-        held = _EVAL_SPLITS.get(name, split)
-        # a triple redirects to a held-out set in another repo (see _EVAL_SPLITS)
-        if isinstance(held, tuple):
-            hf, cfg, split = held
-        else:
-            split = held
-    else:                                    # not a short name: take it as a hub repo id
-        hf, cfg, split, col = name, None, 'validation', 'text'
-    return hf, cfg, (args.split or split), (args.column or col or 'text')
-
-
-def _batched(it, n):
-    it = iter(it)
-    while True:
-        chunk = list(itertools.islice(it, n))
-        if not chunk:
-            return
-        yield chunk
-
-
-if args.eval and not args.eval_corpora:
-    # One-shot validation loss over a WHOLE split, token-weighted. --eval_corpora instead
-    # runs the exp/score.py protocol (fixed 400-doc sample, clean/median/runaway) further
-    # down, which is the number that compares to a training run's EVAL lines.
-    # One-shot validation loss. Every document is an independent batch row: its own fresh
-    # DFF state, framed by clip_text() exactly as the training loop frames a clip, and every
-    # step scored. Rows in a batch have different lengths, so short ones are padded out and
-    # their padding is dropped from the loss -- padding cannot leak between rows, since the
-    # CNN never mixes the batch dimension.
-    if args.load is None and args.pretrained is None:
-        print('WARNING: --eval without --load/--pretrained is measuring an untrained model')
-
-    from datasets import load_dataset
-
-    hf, cfg, split, col = _eval_source()
-    if args.dataset not in _EVAL_SPLITS and not args.split:
-        print(f'WARNING: no held-out split configured for "{args.dataset}"; scoring "{split}", '
-              f'which the model was trained on -- that is a training loss, not a validation '
-              f'loss. Pass --split to choose one explicitly')
-    print(f'loading {hf}' + (f' [{cfg}]' if cfg else '') + f' split {split} ...')
-    rows = load_dataset(hf, cfg, split=split, streaming=args.streaming)
-    print('dataset ready')
-    if args.examples:
-        rows = itertools.islice(rows, args.examples)
-
-    _fmt = _TEXT_FORMAT.get(args.dataset)    # corpora with no single text column (s1k)
-    _dev = next(model.parameters()).device
-    model.eval()
-
-    nll = 0.0            # summed cross-entropy over every scored step, in nats
-    ntok = nbyte = 0     # scored steps, and utf-8 bytes of the text they cover
-    nex  = 0
-    t0   = time.time()
-
-    def _report(tag):
-        # token-weighted mean over everything scored so far, not a mean of per-batch means:
-        # documents differ in length, so those are not the same number.
-        per_tok = nll / max(ntok, 1)
-        print(f'{tag} examples {nex:8d} tokens {ntok:10d} bytes {nbyte:11d} '
-              f'loss {per_tok:11.6f} ppl {math.exp(min(per_tok, 700)):12.4f} '
-              f'bpb {nll / max(nbyte, 1) / math.log(2):9.6f} '
-              f'wall {time.time() - t0:8.1f}s', flush=True)
-
-    # Length bucketing: the recurrent loop runs once per step of the *longest* row, so a
-    # batch of mixed lengths spends most of its steps on padding. Sorting a buffer of
-    # BUCKET batches by length before splitting it up cuts that waste without changing the
-    # result -- rows are independent and the loss is a sum over valid steps only.
-    BUCKET = 8
-
-    # --monitor counts scored batches, not buffers: one batch is B*T recurrent forwards and
-    # can run for minutes on cpu, so it is the smallest unit that can honestly be reported.
-    nb, last_report = 0, -1
-
-    for buf in _batched(rows, args.batch * BUCKET):
-        clips = []
-        for ex in buf:
-            text = (_fmt(ex) if _fmt is not None else ex.get(col, ex.get('text', ''))) or ''
-            if not text.strip():
-                continue
-            steps, _ = clip_text(text)        # [(x, y), ...], the training framing
-            if steps:
-                clips.append((steps, len(text.encode('utf-8'))))
-        clips.sort(key=lambda c: len(c[0]))
-
-        for chunk in _batched(clips, args.batch):
-            B = len(chunk)
-            T = max(len(s) for s, _ in chunk)
-            if args.monitor and (nb % args.monitor) == 0:
-                # announced before the work, not after: on a deep model this is the line that
-                # shows the run is alive and how much it has bitten off
-                print(f'EVAL batch {nb:8d} rows {B:4d} steps {T:6d} scoring ...', flush=True)
-            X = torch.zeros((B, T), dtype=torch.long)
-            Y = torch.zeros((B, T), dtype=torch.long)
-            M = torch.zeros((B, T), dtype=torch.bool)
-            for r, (steps, _) in enumerate(chunk):
-                X[r, :len(steps)] = torch.tensor([s[0] for s in steps], dtype=torch.long)
-                Y[r, :len(steps)] = torch.tensor([s[1] for s in steps], dtype=torch.long)
-                M[r, :len(steps)] = True
-            X, Y, M = X.to(_dev), Y.to(_dev), M.to(_dev)
-
-            model.dff = None                  # fresh context per document (see _new_dff/--init)
-            b_nll = torch.zeros((), device=_dev)
-            with torch.no_grad():
-                for t in range(T):
-                    logits, _ = model(X[:, t])            # targets=None: keep per-row losses
-                    ce = F.cross_entropy(logits, Y[:, t], reduction='none')
-                    b_nll += (ce * M[:, t]).sum()         # accumulate on device, one sync/batch
-
-            nll   += float(b_nll)
-            ntok  += int(M.sum())
-            nbyte += sum(b for _, b in chunk)
-            nex   += B
-            nb    += 1
-
-            if args.monitor and ((nb - 1) % args.monitor) == 0:
-                _report('EVAL')
-                last_report = nb
-
-    if ntok:
-        if last_report != nb:                 # skip a line that would just repeat the last
-            _report('EVAL')
-        print(f'\n{args.load or args.pretrained or "(untrained)"} '
-              f'[--tokenizer {args.tokenizer}] on {hf} [{split}]:')
-        print(f'  loss {nll / ntok:.6f} nats/token   ppl {math.exp(min(nll / ntok, 700)):.4f}')
-        # bits per byte normalizes out the tokenizer, so it is the number that compares a
-        # byte-vocabulary run against a BPE run (or against gptneo.py's transformer).
-        print(f'  bpb  {nll / nbyte / math.log(2):.6f} bits/byte '
-              f'over {nex} documents, {ntok} tokens, {nbyte} bytes')
-    else:
-        print('EVAL: no usable documents')
-
-    if not (args.generate or args.vis or args.altvis):
-        raise SystemExit(0)
-
 if args.generate:
-    # one-shot text generation: prompt = START + args.prompt, print the decoded
-    # continuation, then exit. No dataset, worker, optimizer or training loop.
-    # Same seeding as --vis and the training-loop sampler, and the same [START]+text
-    # framing the model is trained on, so the output always opens with <STX>.
     if args.load is None and args.pretrained is None:
         print('WARNING: --generate without --load/--pretrained is running an untrained model')
-    prompt = _prompt_ids()
-    if args.gen_vocab:
-        # frequencies from ~2000 streamed documents of each corpus (rank only needs counts;
-        # the eval-set builder is defined further down the file than this block)
-        from datasets import load_dataset as _ld
-        _cnt = collections.Counter()
-        for _c in ([c.strip() for c in args.eval_corpora.split(',') if c.strip()]
-                   if args.eval_corpora else [args.dataset]):
-            _repo, _cfg, _spl, _col = _TEXT_DATASETS[_c]
-            for _k, _ex in enumerate(_ld(_repo, _cfg, split=_spl, streaming=True)):
-                if _k >= 2000:
-                    break
-                _cnt.update(_tokenizer.encode(_corpus_text(_c, _ex) if _col is None
-                                              else (_ex.get(_col) or '')))
-        _V = int(model.lmhead.out_features)
-        _m = torch.zeros(_V, dtype=torch.bool)
-        def _is_word(t):
-            s_ = _tokenizer.decode([t])
-            w_ = s_[1:] if s_.startswith(' ') else s_
-            return (w_.isalpha() and w_.isascii() and (s_.startswith(' ') or w_[0].isupper())
-                    and (len(w_) >= 2 or w_ in ('a', 'A', 'I')))
-        _ranked = [t for t, _ in _cnt.most_common()]
-        if args.gen_vocab_words:
-            _ranked = [t for t in _ranked if _is_word(t)]
-        _keep = _ranked[:args.gen_vocab]
-        if args.gen_vocab_words:
-            for _p in ('.', ',', '?', '!', "'", '"', ':', ';', '\n', '\n\n'):
-                _ids = _tokenizer.encode(_p)
-                if len(_ids) == 1:
-                    _keep.append(_ids[0])
-        _m[_keep] = True
-        _m[[_tokenizer.start_id, _tokenizer.end_id]] = True
-        model.vocab_mask = _m.to(next(model.parameters()).device)
-        print(f'--gen_vocab {args.gen_vocab}: sampling restricted to the most frequent '
-              f'{len(_keep)} {"whole words + punctuation" if args.gen_vocab_words else "tokens"} '
-              f'of {sum(_cnt.values())} counted tokens', flush=True)
-        if args.gen_vocab_words:
-            print('  least frequent kept: ' + ' '.join(repr(_tokenizer.decode([t]))
-                                                     for t in _keep[args.gen_vocab - 12:args.gen_vocab]))
-    out    = model.generate(prompt, args.n, temperature=args.temperature)
-    print(_render(prompt + out))
+    prompt = _prompt_ids(args.prompt)
+    print(_render(prompt + model.generate(prompt, args.n, temperature=args.temperature)))
     raise SystemExit(0)
-
-# ── vis setup ─────────────────────────────────────────────────────────────────
-
-_vis_exit        = False
-_vis_stats_line  = 'initializing...'
-_VIS_WIN         = 180   # ticker-tape display width, in characters (display only)
-_AV_WIN          = 220   # --altvis draws a longer tape (its figure is taller, not wider)
-_VIS_HDR_PT      = 7     # header/ticker point size, both displays
-
-
-def _ticker_width_in(nchars, pt=_VIS_HDR_PT, left=0.01, slack=1.04):
-    """Figure width, in inches, that fits `nchars` monospace characters on one line.
-
-    The ticker is the widest thing either display draws and it does not wrap, so a figure
-    sized for the PANELS alone clips it -- which is what --altvis did at --n_layers 1,
-    where its width is 4*n_layers = 4 inches against a 220-character tape. DejaVu Sans
-    Mono advances 0.602 em; the margin and a little slack are added on top."""
-    return (nchars * pt * 0.602 / 72.0) / (1.0 - left) * slack
-
-
-def _vc(t):
-    """Single-token renderer for the vis ticker. Same markers as _printable(), but with
-    '$'/'\\' masked out: the ticker is drawn as matplotlib text, where those trigger
-    mathtext parsing. Byte mode renders the byte directly (no UTF-8 decode, since the
-    ticker is fed one byte at a time); BPE mode decodes the one token."""
-    if _tokenizer.is_char:
-        if t == START: return STX_TEXT
-        if t == END:   return ETX_TEXT
-        if t == NULL:  return NULL_TEXT
-        c = chr(t) if 32 <= t < 127 else DOT_TEXT
-        return DOT_TEXT if c in '$\\' else c
-    return ''.join(DOT_TEXT if c in '$\\' else c for c in _render([t]))
-
-
-class _Ticker:
-    """The --vis/--altvis text ticker. It used to append _vc(token) one token at a time,
-    which is right for byte mode and for GPT-style BPE (every token carries its own leading
-    space) but wrong for WordPiece (--tokenizer ss4k): there a token decoded ALONE has no
-    space and continuation pieces keep their '##', so the ticker read 'marialivesinde##n##ver'
-    where the log says 'maria lives in denver'. Now the current episode's ids are decoded
-    TOGETHER with _render -- the same path the GEN lines use -- and finished episodes are kept
-    as text. Byte mode keeps the per-byte rendering (the ticker is fed one byte at a time)."""
-    def __init__(self, prompt):
-        self.prompt = list(prompt)
-        self.hist, self.cur, self.chars = '', list(prompt), ''
-
-    def add(self, t):
-        if t == model.null_id:
-            return
-        if _tokenizer.is_char:
-            self.chars += _vc(t)
-        else:
-            self.cur.append(t)
-
-    def end(self):
-        self.hist = (self.hist + self._cur_text() + ETX_TEXT)[-4096:]
-        self.cur, self.chars = list(self.prompt), ''
-
-    def _cur_text(self):
-        if _tokenizer.is_char:
-            return _render(self.prompt) + self.chars
-        return _render(self.cur)
-
-    def text(self, n):
-        t = self.hist + self._cur_text()
-        return ''.join(DOT_TEXT if c in '$\\' else c for c in t)[-n:]
-
-
-if args.altvis:
-    # ── per-layer DFF map ──────────────────────────────────────────────────────
-    # An n_layers x 2 grid: top row each layer's ContextCNN INPUT, bottom row its OUTPUT.
-    # Every panel is the standard deviation ACROSS CHANNELS at each spatial position, so a
-    # panel answers "where in the SxS grid does this tensor carry variation", not "how much".
-    # A per-panel colour scale is deliberate: input and output live on different scales (the
-    # output has been through a projection), and layers differ by more than the map's shape,
-    # so a shared scale would flatten five of the six panels into noise.
-    plt.style.use('dark_background')
-    plt.ion()
-    _NL = model.n_layers
-    # 4in per layer for the panels, but never narrower than the ticker needs: at
-    # --n_layers 1 the panel rule alone gives 4 inches and the tape is cut off at ~15% of
-    # its length.
-    _av_w = max(4 * _NL, _ticker_width_in(_AV_WIN + 8))
-    # rows: the layer's input, its output, then one row per DFF register (--ctx_ema K)
-    _AVK    = model.n_ctx
-    _AVROWS = 2 + _AVK
-    _av_fig, _av_axes = plt.subplots(_AVROWS, _NL, figsize=(_av_w, 2.8 * _AVROWS + 1.6),
-                                     squeeze=False)
-    _av_fig.subplots_adjust(top=0.85, bottom=0.05, left=0.05, right=0.98,
-                            hspace=0.25, wspace=0.12)
-    # Row 3 is the REGISTER. Every register is written every step (there is no clock any
-    # more), so what this row shows is how fast the state MOVES -- which is the --ema blend
-    # rate, not a write schedule. Under --dff_every a layer may own no register at all, and
-    # its panel says so rather than showing another layer's state.
-    _sl_of = getattr(model, 'dff_slot', {c: c for c in range(_NL)})
-    _emas  = model.ema if isinstance(model.ema, (list, tuple)) else None
-    for _r in range(_AVROWS):
-        for _c in range(_NL):
-            _ax = _av_axes[_r][_c]
-            # one plain name per panel; the layer is named once, over its column
-            if _r < 2:
-                _t = (f'layer {_c + 1}\n' if (_r == 0 and _NL > 1) else '') + \
-                     ('input' if _r == 0 else 'output')
-            elif _c not in _sl_of:
-                _t = 'no DFF'
-            elif model.ctx_windows:
-                _t = f'DFF {_r - 1}: {model.ctx_windows[_r - 2]:g}-token window'
-            else:
-                _e = (_emas[_sl_of[_c]] if _emas else
-                      (model.ema if model.ema is not None else 1.0))
-                _t = f'DFF: {1.0 / _e:.3g}-token window'
-            _ax.set_title(_t, fontsize=9, pad=3)
-            _ax.set_xticks([]); _ax.set_yticks([])
-    _av_fig.text(0.05, 0.008, f'maps: std across the {model.n_hidden} channels at each of the '
-                 f'{model.S}x{model.S} positions', fontsize=8, color='0.7', va='bottom')
-    _av_imgs   = [[None] * _NL for _ in range(_AVROWS)]
-    _av_vmax   = [[None] * _NL for _ in range(_AVROWS)]   # slow-tracking scale, as --vis does
-    _av_header = _av_fig.text(0.01, 0.99, '', family='monospace', fontsize=7,
-                              va='top', ha='left')
-
-    def _av_on_key(event):
-        global _vis_exit
-        if event.key in ('x', 'X'):
-            _vis_exit = True
-    _av_fig.canvas.mpl_connect('key_press_event', _av_on_key)
-
-    def _std_map(t):
-        """[1, C, S, S] -> [S, S] std across the channel axis."""
-        return t[0].std(dim=0).detach().float().cpu().numpy()
-
-    model.eval()
-    _dev    = next(model.parameters()).device
-    _prompt = _prompt_ids()
-    _ptext  = _render(_prompt)
-    _queue  = list(_prompt)
-    _b      = _queue.pop(0)
-    _ticker = _ptext
-    _tk     = _Ticker(_prompt)
-    _nstep  = 0
-    dff     = model._new_dff(1, _dev)
-    clk     = model._new_writer(1, _dev)
-
-    while not _vis_exit:
-        rec = []
-        with torch.no_grad():
-            bi   = torch.tensor([_b], dtype=torch.long, device=_dev)
-            tok  = model._tok_grid(bi)
-            stack, new_ctx = model._layers(dff, tok, clk, record=rec)
-            dff    = [d.detach().clone() for d in stack]
-            logits = model.readout(model._decode(new_ctx))
-        _nstep += 1
-        prob = F.softmax(logits[0] / max(args.temperature, 1e-6), dim=-1)
-
-        for _r in range(_AVROWS):
-            for _c in range(_NL):
-                if _r >= 2:
-                    # register _r-2 itself, after this step's blend. A straight-through layer
-                    # has none, so its panel stays blank rather than borrowing a neighbour's.
-                    m = (_std_map(dff[_sl_of[_c]].chunk(_AVK, dim=1)[_r - 2]) if _c in _sl_of
-                         else np.zeros_like(_std_map(rec[_c]['out'])))
-                else:
-                    m = _std_map(rec[_c]['in' if _r == 0 else 'out'])
-                # ease the colour ceiling upward and let it decay, so a single spike does not
-                # permanently wash the panel out and a quiet stretch still fills the range
-                hi = float(m.max())
-                _av_vmax[_r][_c] = hi if _av_vmax[_r][_c] is None else \
-                    max(hi, 0.97 * _av_vmax[_r][_c])
-                if _av_imgs[_r][_c] is None:
-                    _av_imgs[_r][_c] = _av_axes[_r][_c].imshow(
-                        m, cmap=args.cmap, interpolation='nearest',
-                        vmin=0.0, vmax=max(_av_vmax[_r][_c], 1e-9))
-                else:
-                    _av_imgs[_r][_c].set_data(m)
-                    _av_imgs[_r][_c].set_clim(0.0, max(_av_vmax[_r][_c], 1e-9))
-
-        _av_header.set_text(
-            f'step {_nstep}   ' + '   '.join(
-                f'L{c+1} in {rec[c]["in"].std().item():6.3f} out {rec[c]["out"].std().item():6.3f} '
-                + (' '.join(f'DFF{k + 1} {r.std().item():6.3f}' for k, r in
-                            enumerate(dff[_sl_of[c]].chunk(_AVK, dim=1)))
-                   if c in _sl_of else 'no reg')
-                for c in range(_NL))
-            + '\n' + _ticker[-_AV_WIN:])
-
-        if _queue:
-            _b = _queue.pop(0)
-        else:
-            nxt = int(torch.multinomial(prob, 1).item())
-            if nxt == model.end_id:
-                _tk.end()
-                dff    = model._new_dff(1, _dev)
-                clk    = model._new_writer(1, _dev)
-                _queue = list(_prompt)
-                _b     = _queue.pop(0)
-            else:
-                _tk.add(nxt)
-                _b = nxt
-            _ticker = _tk.text(_VIS_WIN)
-
-        plt.pause(max(args.delay, 1e-3))
-        if not plt.fignum_exists(_av_fig.number):
-            break
-    raise SystemExit(0)
-
 
 if args.vis:
-    # P(next token) is drawn as a near-square grid of the whole vocabulary: exactly 16×16
-    # for the 256 bytes, and for a BPE vocabulary the smallest grid that covers it (50257
-    # → 225×224), with the leftover cells zero-padded.
-    _PROB_R = int(math.ceil(math.sqrt(model.vocab)))
-    _PROB_C = int(math.ceil(model.vocab / _PROB_R))
-
-    def _prob_grid(prob):
-        a = np.zeros(_PROB_R * _PROB_C, dtype=np.float32)
-        p = prob.detach().cpu().numpy()
-        a[:p.shape[0]] = p
-        return a.reshape(_PROB_R, _PROB_C)
-
+    import matplotlib.pyplot as plt
+    _VIS_WIN = 180                                   # ticker width in characters
     plt.style.use('dark_background')
     plt.ion()
-    # Layers run LEFT TO RIGHT, one column each. Within a column the layer OUTPUT (what goes
-    # up the stack / into the decoder) is on top and its DFF register(s) are stacked under
-    # it -- one row per --ctx_ema context, a single row otherwise. P(next token) takes a
-    # column of its own on the right, spanning every row. Each map is the std ACROSS
-    # CHANNELS at each of the S x S positions.
-    _VNL   = model.n_layers
-    _VNC   = model.n_ctx
-    _VROWS = 1 + _VNC
-    _vis_fig = plt.figure(figsize=(max(3.0 * (_VNL + 1.5), _ticker_width_in(_VIS_WIN + 5)),
-                                   2.6 * _VROWS + 1.2))
-    _vis_gs  = _vis_fig.add_gridspec(_VROWS, _VNL + 1, width_ratios=[1] * _VNL + [1.5],
-                                     top=0.84, bottom=0.04, left=0.03, right=0.98,
-                                     hspace=0.25, wspace=0.10)
-    _vis_ax_grid = [[_vis_fig.add_subplot(_vis_gs[_r, _c]) for _c in range(_VNL)]
-                    for _r in range(_VROWS)]
-    _vis_ax_prob = _vis_fig.add_subplot(_vis_gs[:, _VNL])
-    _vemas = model.ema if isinstance(model.ema, (list, tuple)) else None
-    for _c in range(_VNL):
-        for _r in range(_VROWS):
-            _ax = _vis_ax_grid[_r][_c]
-            # one plain name per panel; the layer is named once, over its column
-            if _r == 0:
-                _t = (f'layer {_c + 1}\n' if _VNL > 1 else '') + 'output'
-            elif model.ctx_windows:
-                _t = f'DFF {_r}: {model.ctx_windows[_r - 1]:g}-token window'
-            else:
-                _e = (_vemas[_c] if _vemas else (model.ema if model.ema is not None else 1.0))
-                _t = f'DFF: {1.0 / _e:.3g}-token window'
-            _ax.set_title(_t, fontsize=9, pad=3)
-            _ax.set_xticks([]); _ax.set_yticks([])
-    _vis_ax_prob.set_title('P(next token)', fontsize=9, pad=3)
-    _vis_ax_prob.set_xticks([]); _vis_ax_prob.set_yticks([])
-    _vis_fig.text(0.03, 0.008, f'maps: std across the {model.n_hidden} channels at each of the '
-                  f'{model.S}x{model.S} positions', fontsize=8, color='0.7', va='bottom')
-    _vis_img_grid  = [[None] * _VNL for _ in range(_VROWS)]
-    _vis_vmax_grid = [[None] * _VNL for _ in range(_VROWS)]   # slow-tracking colour scales
-    _vis_img_prob = None
-    _vis_header   = _vis_fig.text(0.01, 0.99, _vis_stats_line,
-                                   family='monospace', fontsize=7,
-                                   va='top', ha='left')
+    rows = 1 + model.K
+    fig = plt.figure(figsize=(max(7.5, _VIS_WIN * 7 * 0.602 / 72 * 1.05), 2.6 * rows + 1.2))
+    gs = fig.add_gridspec(rows, 2, width_ratios=[1, 1.5], top=0.84, bottom=0.04, left=0.03,
+                          right=0.98, hspace=0.25, wspace=0.10)
+    axes = [fig.add_subplot(gs[r, 0]) for r in range(rows)]
+    ax_p = fig.add_subplot(gs[:, 1])
+    for r, ax in enumerate(axes):
+        ax.set_title('output' if r == 0 else f'DFF {r}: {model.windows[r - 1]:g}-token window',
+                     fontsize=9, pad=3)
+    ax_p.set_title('P(next token)', fontsize=9, pad=3)
+    for ax in axes + [ax_p]:
+        ax.set_xticks([])
+        ax.set_yticks([])
+    fig.text(0.03, 0.008, f'maps: std across the {model.n_hidden} channels at each of the '
+             f'{model.S}x{model.S} positions', fontsize=8, color='0.7', va='bottom')
+    header = fig.text(0.01, 0.99, '', family='monospace', fontsize=7, va='top', ha='left')
+    PR = int(math.ceil(math.sqrt(model.vocab)))
+    PC = int(math.ceil(model.vocab / PR))
+    _exit = [False]
+    fig.canvas.mpl_connect('key_press_event',
+                           lambda e: _exit.__setitem__(0, _exit[0] or e.key in ('x', 'X')))
 
-    # header font is in points (fixed); scale it with window width so the monospace
-    # ticker keeps filling the same fraction of the figure when the window resizes.
-    _vis_hdr_base_pt = 7
-    _vis_w0          = _vis_fig.get_size_inches()[0] * _vis_fig.dpi
-    def _scale_header(event=None):
-        w = event.width if event is not None else _vis_w0
-        _vis_header.set_fontsize(max(_vis_hdr_base_pt * w / _vis_w0, 4.0))
-    _vis_fig.canvas.mpl_connect('resize_event', _scale_header)
-    _scale_header()
-
-    def _on_key(event):
-        global _vis_exit
-        if event.key in ('x', 'X'):
-            _vis_exit = True
-    _vis_fig.canvas.mpl_connect('key_press_event', _on_key)
-
-    # ── live text-generation visualization (no training) ───────────────────────
-    # Feed the prompt (START, plus --prompt if given) then autoregressively sample,
-    # rendering the DFF-std and P(next token) panels for every generated byte. The header
-    # shows a stats line and the generated text. Read-only: no dataset, optimizer or worker.
     model.eval()
-    _dev    = next(model.parameters()).device
-    _prompt = _prompt_ids()
-    _ptext  = _render(_prompt)  # rendered prompt, echoed at each episode start
-    _queue  = list(_prompt)   # remaining prompt tokens to inject
-    _b      = _queue.pop(0)   # current token being injected
-    _ticker = _ptext          # ticker-tape display buffer (trailing _VIS_WIN chars)
-    _tk     = _Ticker(_prompt)
-    _nstep  = 0
-    _rep    = 0               # --datarep: replicas of the current token drawn so far
-    _acc    = None            # --gen_pool mean: probabilities pooled across them
-    dff     = model._new_dff(1, _dev)
-    clk     = model._new_writer(1, _dev)   # this episode's blend state
-
-    while not _vis_exit:
+    dev = next(model.parameters()).device
+    prompt = _prompt_ids(args.prompt)
+    pending, b = list(prompt[1:]), prompt[0]
+    hist, cur = '', list(prompt)                     # finished episodes, current episode ids
+    dff = model.new_state(1, dev)
+    imgs, vmax, img_p, nstep = [None] * rows, [None] * rows, None, 0
+    while not _exit[0] and plt.fignum_exists(fig.number):
         with torch.no_grad():
-            bi   = torch.tensor([_b], dtype=torch.long, device=_dev)
-            tok  = model._tok_grid(bi)
-            # ONE model step per FRAME, at every --datarep: the replicas are exactly what
-            # this display exists to show -- the state settling within a token -- so they
-            # are drawn, not collapsed. The token only ADVANCES on the last replica, so the
-            # ticker still gains one character per token while the panels update N times.
-            _vrec  = []
-            stack, new_ctx = model._layers(dff, tok, clk, record=_vrec)  # last-layer output
-            dff    = [d.detach().clone() for d in stack]
-            logits = model.readout(model._decode(new_ctx))
-            if args.gen_pool == 'mean':                            # see --gen_pool
-                _p   = F.softmax(logits, dim=-1)
-                _acc = _p if _acc is None else _acc + _p
-        _nstep += 1
-        _rep  += 1
-        _last  = _rep >= _DATAREP
-
-        # The grid shows THIS replica's distribution as it forms; on the last replica it
-        # shows the one actually sampled from (pooled under --gen_pool mean).
-        _lg = (torch.log((_acc / _DATAREP).clamp_min(1e-20))
-               if (_last and args.gen_pool == 'mean') else logits)
-        prob = F.softmax(_lg[0] / max(args.temperature, 1e-6), dim=-1)
-
-        if not _last:
-            pass                           # thinking step: draw it, emit nothing
-        elif _queue:
-            _b = _queue.pop(0)             # still draining the prompt
+            dff, o = model.step(torch.tensor([b], device=dev), dff)
+            prob = F.softmax(model.text_dec(o)[0] / max(args.temperature, 1e-6), dim=-1)
+        nstep += 1
+        if pending:
+            b = pending.pop(0)
         else:
-            nxt = int(torch.multinomial(prob, 1).item())
-            # --n does not apply here: --vis streams forever, so an episode runs until the
-            # model emits END on its own and the next one starts from the prompt again.
-            if nxt == model.end_id:
-                _tk.end()                  # episode break: <ETX>, then the prompt again
-                dff    = model._new_dff(1, _dev)
-                clk    = model._new_writer(1, _dev)
-                _queue = list(_prompt)     # episode over: reset state, restart prompt
-                _b     = _queue.pop(0)
+            b = int(torch.multinomial(prob, 1).item())
+            if b == model.end_id:                    # episode over: reset, prompt again
+                hist = (hist + _render(cur) + ETX_TEXT)[-4096:]
+                cur, dff = list(prompt), model.new_state(1, dev)
+                pending, b = list(prompt[1:]), prompt[0]
             else:
-                _tk.add(nxt)
-                _b = nxt
-            _ticker = _tk.text(_VIS_WIN)   # slide + bound the visible window (ticker tape)
-
-        if _last:                          # token consumed: start the next one's replicas
-            _rep, _acc = 0, None
-
-        # ── render ──────────────────────────────────────────────────────────
-        prob_img    = _prob_grid(prob)                               # vocabulary → R×C grid
-        _dff_mean, _dff_std, _dff_max, _ = _dff_stats(dff)
-        _vis_header.set_text(
-            ('step {:8d}  layers {:d}  dff_std {:6.4f}  dff_max {:7.3f}  p_max {:5.3f}  T {:.2f}').format(
-                _nstep, model.n_layers, _dff_std, _dff_max,
-                float(prob.max()), args.temperature)
-            + '\n' + 'gen: ' + _ticker
-        )
-
-        for _c in range(_VNL):
-            _regs = dff[_c].chunk(_VNC, dim=1)                       # K registers, [1, C, S, S]
-            for _r in range(_VROWS):
-                _t = _vrec[_c]['out'] if _r == 0 else _regs[_r - 1]
-                m  = _t[0].std(dim=0).detach().float().cpu().numpy()  # [S, S]
-                # ease the ceiling upward, let it decay: one spike cannot wash a panel out
-                _hi = float(m.max())
-                _vm = _vis_vmax_grid[_r][_c]
-                _vm = _hi if _vm is None else max(_hi, 0.98 * _vm)
-                _vis_vmax_grid[_r][_c] = _vm
-                if _vis_img_grid[_r][_c] is None:
-                    _vis_img_grid[_r][_c] = _vis_ax_grid[_r][_c].matshow(m, cmap=args.cmap)
-                    _vis_ax_grid[_r][_c].set_xticks([]); _vis_ax_grid[_r][_c].set_yticks([])
-                else:
-                    _vis_img_grid[_r][_c].set_data(m)
-                _vis_img_grid[_r][_c].set_clim(0.0, _vm or 1e-9)
-
-        if _vis_img_prob is None:
-            _vis_img_prob = _vis_ax_prob.matshow(prob_img, cmap=args.cmap, vmin=0, vmax=1)
-            _vis_ax_prob.set_xticks([]); _vis_ax_prob.set_yticks([])
-            # overlay printable-ASCII (32..126) glyphs in white at each byte's 16×16 cell;
-            # byte b is row b//16, col b%16 (matches the prob_img reshape order). Byte mode
-            # only: a 225×224 BPE grid has cells too small for a glyph, and most tokens are
-            # multi-character anyway.
-            if _tokenizer.is_char:
-                _vis_prob_txts = [
-                    _vis_ax_prob.text(b % _PROB_C, b // _PROB_C, chr(b), color='white',
-                                      ha='center', va='center', family='monospace')
-                    for b in range(32, 127)
-                ]
-                # font size is in points (fixed), so rescale to the cell's pixel size on resize.
-                def _scale_prob_text(event=None):
-                    bb = _vis_ax_prob.get_window_extent()
-                    cell_px = min(bb.width, bb.height) / 16.0   # one of 16×16 cells
-                    pts = max(cell_px * 72.0 / _vis_fig.dpi * 0.55, 1.0)
-                    for _t in _vis_prob_txts:
-                        _t.set_fontsize(pts)
-                _vis_fig.canvas.mpl_connect('resize_event', _scale_prob_text)
-                _scale_prob_text()
-        else:
-            _vis_img_prob.set_data(prob_img)
-        _vis_img_prob.set_clim(0, float(prob_img.max()) or 1e-9)
-
-        _vis_fig.canvas.draw()        # synchronous: render every step (draw_idle coalesces
-        _vis_fig.canvas.flush_events()  # frames when sleep blocks the GUI loop → skips steps)
+                cur.append(b)
+        maps = [o] + list(dff.chunk(model.K, dim=1))
+        for r, t in enumerate(maps):
+            m = t[0].std(dim=0).float().cpu().numpy()
+            vmax[r] = float(m.max()) if vmax[r] is None else max(float(m.max()), 0.98 * vmax[r])
+            if imgs[r] is None:
+                imgs[r] = axes[r].matshow(m, cmap=args.cmap)
+            imgs[r].set_data(m)
+            imgs[r].set_clim(0.0, vmax[r] or 1e-9)
+        pg = np.zeros(PR * PC, dtype=np.float32)
+        pg[:model.vocab] = prob.cpu().numpy()
+        pg = pg.reshape(PR, PC)
+        if img_p is None:
+            img_p = ax_p.matshow(pg, cmap=args.cmap)
+        img_p.set_data(pg)
+        img_p.set_clim(0, float(pg.max()) or 1e-9)
+        ticker = ''.join(DOT_TEXT if c in '$\\' else c for c in hist + _render(cur))[-_VIS_WIN:]
+        header.set_text(f'step {nstep:8d}  dff_std {float(dff.std()):6.4f}  dff_max '
+                        f'{float(dff.abs().max()):7.3f}  p_max {float(prob.max()):5.3f}  '
+                        f'T {args.temperature:.2f}\ngen: {ticker}')
+        fig.canvas.draw()
+        fig.canvas.flush_events()
         time.sleep(args.delay)
-
     raise SystemExit(0)
 
-# ── optimizer ─────────────────────────────────────────────────────────────────
+# ── held-out eval ─────────────────────────────────────────────────────────────
+# Each held-out set is built once and reused, so successive EVAL lines differ only by the
+# weights. Every eval runs on a fresh state and restores the training state afterwards.
 
-_trainable = [p for p in model.parameters() if p.requires_grad]
-
-# --lr_mult scales the base lr per layer: layer 1 keeps base lr, each deeper layer is
-# multiplied by an extra factor of --lr_mult. Layer 1 = {tok_embed, text_proj, context};
-# deep layers 2..N = their (deep_context + deep_proj) unit; the decoder reads the last
-# layer's output, so it rides the deepest lr. Groups carry a per-group 'lr' (its initial_lr)
-# which LambdaLR then scales by the shared schedule factor. With --lr_mult 1.0 we pass the
-# flat param list so the optimizer/checkpoint layout is byte-identical to before.
-def _lr_scaled_groups(model, base_lr, mult):
-    N      = model.n_layers
-    layers = [[] for _ in range(N)]
-    layers[0] += list(model.tok_embed.parameters())
-    layers[0] += list(model.text_proj.parameters())
-    layers[0] += list(model.context.parameters())
-    if model.qproj is not None:             # --qproj read; write is frozen and filtered below
-        for li in range(N):
-            layers[li] += list(model.qproj[li].parameters())
-    if model.tap is not None:               # --tap: each conv belongs to its own layer
-        for li in range(N):
-            layers[li] += list(model.tap[li].parameters())
-    if model.deep_context is not None:
-        for li in range(N - 1):
-            layers[li + 1] += list(model.deep_context[li].parameters())
-            layers[li + 1] += list(model.deep_proj[li].parameters())
-    layers[-1] += list(model.decoder.parameters())
-    layers[-1] += list(model.head_norm.parameters())   # empty for --head_norm none/batch2d
-    layers[-1] += list(model.lmhead.parameters())      # empty for --tokenizer char (Identity)
-    # Dedupe by identity: with --tokenizer tiny* --unfreeze, lm_head.weight IS tok_embed.weight
-    # (GPT-Neo ties them), so it would otherwise land in both the first and the last group and
-    # the optimizer would reject the duplicate.
-    seen = set()
-    groups = []
-    for i, g in enumerate(layers):
-        ps = [p for p in g if p.requires_grad and id(p) not in seen]
-        seen.update(id(p) for p in ps)
-        groups.append({'params': ps, 'lr': base_lr * (mult ** i)})
-    return groups
-
-# Only build per-layer optimizer groups when lr_mult scaling is active; otherwise pass the
-# flat param list so the optimizer/checkpoint layout is byte-identical to before.
-_params = _lr_scaled_groups(model, args.lr_max, args.lr_mult) if args.lr_mult != 1.0 else _trainable
-# --linout_lr_mult / --decoder_lr_mult: pull a module out into its own group at M x lr (works
-# on top of either layout)
-def _split_group(params, mod, mult, name):
-    ids = {id(p) for p in mod.parameters()}
-    if isinstance(params[0], dict):
-        for _g in params:
-            _g['params'] = [p for p in _g['params'] if id(p) not in ids]
-        params = [g for g in params if g['params']]
-    else:
-        params = [{'params': [p for p in params if id(p) not in ids], 'lr': args.lr_max}]
-    params.append({'params': [p for p in mod.parameters() if p.requires_grad],
-                   'lr': args.lr_max * mult})
-    print(f'--{name}_lr_mult {mult}: {name} {sum(p.numel() for p in params[-1]["params"]):,} '
-          f'params at lr {args.lr_max * mult:g}', flush=True)
-    return params
-
-if args.linout_lr_mult != 1.0:
-    if model.linout is None:
-        raise SystemExit('--linout_lr_mult needs --linout')
-    _params = _split_group(_params, model.linout, args.linout_lr_mult, 'linout')
-if args.decoder_lr_mult != 1.0:
-    _params = _split_group(_params, model.decoder, args.decoder_lr_mult, 'decoder')
-if args.gate_lr_mult != 1.0:
-    # the sigmoid gates, or the plain read gains (--ctx_read_gain) when there are no gates
-    _gm = getattr(model, 'ctx_rgate', None) or getattr(model, 'ctx_rgain', None)
-    if _gm is None:
-        raise SystemExit('--gate_lr_mult needs --ctx_read_gate or --ctx_read_gain')
-    _params = _split_group(_params, _gm, args.gate_lr_mult, 'gate')
-if args.win_lr_mult != 1.0:
-    if getattr(model, 'ctx_logw', None) is None:
-        raise SystemExit('--win_lr_mult needs --ctx_learn_win')
-    _params = _split_group(_params, model.ctx_logw, args.win_lr_mult, 'win')
-
-# Per-layer summary: trainable params and lr, shown when --lr_mult scales the layers. Param
-# counts come from the same grouping as the lr scaling (layer 1 includes tok_embed/text_proj;
-# the last includes the decoder), so the columns add up to the trainable total.
-if args.lr_mult != 1.0:
-    _groups = _lr_scaled_groups(model, args.lr_max, args.lr_mult)
-    _pc  = [sum(p.numel() for p in g['params']) for g in _groups]
-    _lrs = [g['lr'] for g in _groups]
-    _yw  = max(len('layer'), 1 + len(str(len(_groups))))   # 'L' + index, vs header label
-    _pw  = max(len('params'), *(len(f'{p:,}')   for p in _pc))
-    _lw  = max(len('lr'),     *(len(f'{lr:.9f}') for lr in _lrs))
-    print(f'per-layer (lr_mult {args.lr_mult}):')
-    print(f'  {"layer":<{_yw}}  {"params":>{_pw}}  {"lr":>{_lw}}')
-    for _i in range(len(_groups)):
-        print(f'  {"L" + str(_i + 1):<{_yw}}  {_pc[_i]:>{_pw},}  {_lrs[_i]:>{_lw}.9f}')
-
-# Route lr/weight_decay/momentum to each optimizer's supported knobs: Rprop takes
-# neither weight_decay nor momentum; Adagrad takes weight_decay but no momentum.
-# --nesterov is SGD-only and needs a positive momentum -- torch raises on nesterov with
-# momentum 0, so an inapplicable flag is reported and dropped rather than left to blow up.
-# --beta1/--beta2 are adamw-only; report and drop them elsewhere rather than silently
-# ignoring a flag the caller believes is taking effect.
-_beta1 = 0.9 if args.beta1 is None else args.beta1
-_beta2 = args.momentum if args.beta2 is None else args.beta2
-if args.opt != 'adamw' and (args.beta1 is not None or args.beta2 is not None):
-    print(f'WARNING: --beta1/--beta2 apply to --opt adamw, and this run is --opt {args.opt}; '
-          f'ignored (use --momentum for sgd/rmsprop)')
-_nesterov = args.nesterov and args.opt == 'sgd' and args.momentum > 0
-if args.nesterov and not _nesterov:
-    print(f'WARNING: --nesterov ignored: it applies to --opt sgd with --momentum > 0, '
-          f'and this run is --opt {args.opt} --momentum {args.momentum}')
-if args.opt == 'sgd':
-    optimizer = torch.optim.SGD(_params, lr=args.lr_max, momentum=args.momentum,
-                                weight_decay=args.weight_decay, nesterov=_nesterov)
-elif args.opt == 'rmsprop':
-    optimizer = torch.optim.RMSprop(_params, lr=args.lr_max, alpha=args.rms_alpha,
-                                    eps=args.rms_eps, momentum=args.momentum,
-                                    weight_decay=args.weight_decay, centered=args.rms_centered)
-    print(f'rmsprop alpha {args.rms_alpha} eps {args.rms_eps} centered {args.rms_centered} '
-          f'momentum {args.momentum}', flush=True)
-elif args.opt == 'rprop':
-    optimizer = torch.optim.Rprop(_params, lr=args.lr_max)
-elif args.opt == 'adagrad':
-    optimizer = torch.optim.Adagrad(_params, lr=args.lr_max,
-                                    weight_decay=args.weight_decay)
-elif args.opt == 'adamw':
-    # --beta1/--beta2 set the moment decays directly. --momentum stays the beta2 fallback
-    # so every existing invocation and checkpoint keeps the behavior it was trained with.
-    optimizer = torch.optim.AdamW(_params, lr=args.lr_max,
-                                  betas=(_beta1, _beta2),
-                                  weight_decay=args.weight_decay)
-    print(f'adamw betas ({_beta1}, {_beta2})'
-          + ('' if args.beta2 is not None else '  [beta2 from --momentum]'))
-
-# Resume the optimizer's per-parameter state. Checkpoints did not carry it until
-# 2026-10-11, which cost nothing under plain SGD (stateless) but under RMSprop restarted
-# every running average at zero: the first steps after a --load were ~10x oversized and
-# moved held-out loss 4.99 -> 5.64 in ONE step (v369 at 536K). Only 'state' is restored;
-# param_groups keep this run's hyperparameters, and the lr is the scheduler's business.
-if args.load is not None and _start_opt[0] is not None:
-    if _start_opt[1] != args.opt:
-        print(f'optimizer state NOT restored: checkpoint trained with --opt {_start_opt[1]}, '
-              f'this run uses --opt {args.opt}', flush=True)
-    else:
-        _osd = optimizer.state_dict()
-        _n_now = [len(g['params']) for g in _osd['param_groups']]
-        _n_ck = [len(g['params']) for g in _start_opt[0]['param_groups']]
-        if _n_now != _n_ck:
-            print(f'WARNING: optimizer state NOT restored: parameter groups differ '
-                  f'(checkpoint {_n_ck}, now {_n_now})', flush=True)
-        else:
-            _osd['state'] = _start_opt[0]['state']
-            optimizer.load_state_dict(_osd)
-            # a resume that switches --rms_centered on or adds --momentum finds no
-            # grad_avg / momentum_buffer in the saved state: start those at zero
-            if args.opt == 'rmsprop':
-                for _st in optimizer.state.values():
-                    if args.rms_centered and 'grad_avg' not in _st and 'square_avg' in _st:
-                        _st['grad_avg'] = torch.zeros_like(_st['square_avg'])
-                    if args.momentum > 0 and 'momentum_buffer' not in _st and 'square_avg' in _st:
-                        _st['momentum_buffer'] = torch.zeros_like(_st['square_avg'])
-            print(f'optimizer state restored ({args.opt}, {len(_osd["state"])} tensors)',
-                  flush=True)
-elif args.load is not None and args.opt != 'sgd':
-    print(f'WARNING: {args.load} has no optimizer state; --opt {args.opt} restarts its '
-          f'running averages from zero', flush=True)
-_start_opt = None
-
-# ── scheduler ─────────────────────────────────────────────────────────────────
-# Every --schedule oscillates between --lr_min and --lr_max. LambdaLR multiplies the
-# optimizer base lr (--lr_max), so we express the absolute lr as a factor relative to it.
-_lo, _hi = args.lr_min, args.lr_max
-_warm    = max(1, args.lr_warmup)
-_period  = max(1, args.lr_period)
-
-def _lr_factor(step):
-    if args.schedule == 'const':                       # fixed lr_max
-        lr = _hi
-    elif args.schedule == 'warmup':                    # ramp lr_min -> lr_max over lr_warmup, then hold
-        # measured from the start of *this* run, not the global step: resuming a
-        # checkpoint with --schedule warmup means "ease this run back in", so the
-        # ramp restarts on every --load instead of being fast-forwarded past.
-        lr = _lo + (_hi - _lo) * min((step - _start_step) / _warm, 1.0)
-    elif args.schedule == 'step':                      # lr_min for lr_warmup steps, then lr_max
-        lr = _lo if step < _warm else _hi
-    elif args.schedule == 'linear':                    # ramp lr_min -> lr_max over lr_period, then hold
-        lr = _lo + (_hi - _lo) * min(step / _period, 1.0)
-    elif args.schedule == 'coswarm':                   # half-cosine lr_min -> lr_max over lr_period, then hold
-        lr = _lo + (_hi - _lo) * (1.0 - math.cos(math.pi * min(step / _period, 1.0))) / 2.0
-    elif args.schedule == 'triangle':                  # up over lr_warmup, down over lr_period, then hold lr_min
-        if step < _warm:
-            lr = _lo + (_hi - _lo) * (step / _warm)
-        elif step < _warm + _period:
-            lr = _hi + (_lo - _hi) * ((step - _warm) / _period)
-        else:
-            lr = _lo
-    else:                                              # cosine: cyclic lr_min <-> lr_max, lr_period per cycle
-        phase = (1.0 - math.cos(2.0 * math.pi * (step % _period) / _period)) / 2.0   # 0->1->0
-        lr = _lo + (_hi - _lo) * phase
-    return lr / _hi
-
-# "plat" is not a closed-form schedule: the lr responds to the loss curve, so it is
-# driven by _plat_update() in the training loop instead of a torch scheduler.
-_plateau = args.schedule == 'plat'
-
-# per-group floor, scaled so --lr_mult keeps its ratio as the lr decays
-_min_lrs = [args.lr_min * (_g['lr'] / _hi) for _g in optimizer.param_groups]
-
-# Loss history for the slope fit, binned one point per --checkpoint interval rather
-# than one per step. --lr_period is meant to be long (1e6 steps), and binning is
-# statistically free: the OLS slope's standard error is sigma*sqrt(12)/(T*sqrt(n)), so
-# averaging C steps into one point cuts n by C and sigma by sqrt(C) — same SE, same
-# test. It also keeps the window at ~1000 floats instead of 1e6, small enough to ride
-# along in the checkpoint so a resumed run doesn't start its window over.
-_plat_bins = max(2, _period // max(1, args.checkpoint))   # window length, in intervals
-_plat_loss = collections.deque(_start_plat or [], maxlen=_plat_bins)
-
-if _plateau and args.lr_period < 2 * args.checkpoint:
-    # the window can never be finer than one point per --checkpoint interval
-    print(f'WARNING: --lr_period {args.lr_period} < 2*--checkpoint {args.checkpoint}; '
-          f'plat fits {_plat_bins} bins = {_plat_bins * args.checkpoint} steps')
-
-def _plat_update():
-    """Fit a line to the binned loss window; decay the lr if it is not going down.
-
-    Called once per --checkpoint interval. The fit needs a full window (--lr_period
-    steps of history), and a decay clears it — that is the cooldown: a single plateau
-    cannot stack decays from overlapping windows, so the lr falls at most one
-    --lr_rate factor per --lr_period steps. A non-negative slope means the loss has
-    stalled (or is rising) across the whole window, so every group's lr is multiplied
-    by --lr_rate, floored at its --lr_min. Returns (fitted change over the window, lr,
-    decayed) for logging, or None while the window is still filling.
-    """
-    if len(_plat_loss) < _plat_bins:
-        return None
-    y     = np.asarray(_plat_loss, dtype=np.float64)
-    slope = np.polyfit(np.arange(len(y), dtype=np.float64), y, 1)[0]
-    decay = slope >= 0.0
-    if decay:
-        for _g, _min in zip(optimizer.param_groups, _min_lrs):
-            _g['lr'] = max(_min, _g['lr'] * args.lr_rate)
-        _plat_loss.clear()                    # cooldown: refill before deciding again
-    # report the fitted total change across the window (nats), not the per-bin slope:
-    # at these window sizes the slope itself is ~1e-9 and unreadable
-    return slope * (len(y) - 1), optimizer.param_groups[0]['lr'], decay
-
-scheduler = (None if _plateau else
-             torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=_lr_factor))
-
-# On resume, fast-forward the schedule to the checkpoint's step so the lr at the first
-# continued step matches where the previous run left off (LambdaLR is stateless in step).
-# Update the live optimizer lr and the scheduler's cached last_lr (what the STEP line
-# reports). "plat" has no closed form in step, so it instead picks up the lr the
-# checkpoint was saved at (its loss window still refills from scratch).
-if _plateau:
-    if _start_step and _start_lr:
-        for _g, _min in zip(optimizer.param_groups, _min_lrs):
-            _g['lr'] = max(_min, _start_lr * (_g['lr'] / _hi))
-elif _start_step:
-    scheduler.last_epoch = _start_step
-    _lrs = [_base * _lr_factor(_start_step) for _base in scheduler.base_lrs]
-    for _g, _lr in zip(optimizer.param_groups, _lrs):
-        _g['lr'] = _lr
-    scheduler._last_lr = _lrs
-
-# ── data thread ───────────────────────────────────────────────────────────────
-
-stop  = threading.Event()
-q     = queue.Queue(maxsize=args.batch)
-# One-shot modes set hf_dataset = None, and the worker immediately subscripts it. Before
-# --eval_corpora existed the legacy --eval block exited above this line so it never ran;
-# now it does, and the worker died in its thread with a TypeError traceback while the eval
-# printed correct results around it. Harmless but indistinguishable from a real failure in
-# a log, which is exactly the kind of thing that gets chased for an hour later.
-if hf_dataset is None:
-    w = None
-else:
-    w = threading.Thread(target=worker,
-                         args=[stop, q, hf_dataset, args, _mix],
-                         daemon=False)
-    w.start()
-
-# ── helpers ───────────────────────────────────────────────────────────────────
-
-# ── gradient / explosion instrumentation ──────────────────────────────────────
-
-def _gnorm(params):
-    return sum(p.grad.detach().norm(2).item() ** 2
-               for p in params if p.grad is not None) ** 0.5
-
-
-def _wnorm(params):
-    return sum(p.detach().norm(2).item() ** 2 for p in params) ** 0.5
-
-
-def _gnorm_all(model):
-    return sum(p.grad.detach().norm(2).item() ** 2
-               for p in model.parameters()
-               if p.grad is not None and p.requires_grad) ** 0.5
-
-
-def _param_groups_named(model):
-    """Trainable params split by submodule, for per-module norm reporting."""
-    g = {'emb':  list(model.tok_embed.parameters()),
-         'tprj': list(model.text_proj.parameters()),
-         'ctx':  list(model.context.parameters()),
-         'dec':  list(model.decoder.parameters())}
-    if model.deep_context is not None:   # stacked layers 2..N (--n_layers)
-        # deep_proj is None under --linout, which REPLACES it (see VLAModel.__init__). This
-        # is reached from the non-finite-loss HALT path, so crashing here loses the gradient
-        # diagnostic on exactly the runs that need it -- every --linout run that diverges.
-        g['deep'] = list(model.deep_context.parameters())
-        if model.deep_proj is not None:
-            g['deep'] += list(model.deep_proj.parameters())
-    if model.linout is not None:         # --linout: the 1x1 on the way up out of each layer
-        g['linout'] = list(model.linout.parameters())
-    if model.tap is not None:            # --tap: the 1x1 after each layer
-        g['tap'] = list(model.tap.parameters())
-    if not isinstance(model.lmhead, nn.Identity):   # pretrained tokenizer: borrowed lm_head
-        g['head'] = list(model.head_norm.parameters()) + list(model.lmhead.parameters())
-    return g
-
-
-def _diag(model):
-    return ' '.join(f'{n}:g{_gnorm(ps):.1e}/w{_wnorm(ps):.1e}'
-                    for n, ps in _param_groups_named(model).items())
-
-# ── in-training held-out eval (--eval_interval) ────────────────────────────────
-# Why this exists as well as the one-shot --eval and exp/score.py: the one-shot modes score
-# a checkpoint AFTER the fact, so a run only learns its held-out number once someone goes
-# and measures it, and the train/eval GAP -- the signal that killed both Phase 1 promotions
-# -- is invisible while the run is in flight. This puts it in the log next to the training
-# loss, on the same axis, every --eval_interval steps.
-#
-# The document set is built ONCE and reused, so successive EVAL lines differ only by the
-# weights. Rebuilding it per eval (or streaming a fresh slice each time) would make the
-# series a walk over documents as much as over training, which is exactly the confound
-# that makes an eval curve unreadable.
-
-_eval_docs_cache = {}        # corpus -> [[(x, y), ...], ...], built once per corpus
-_eval_results    = {}        # corpus -> last scored result, for the --eval_corpora table
-_eval_failed     = {}        # corpus -> True once it has raised; per corpus, not global
-_reason_cache    = {}        # benchmark -> items, built once
-_reason_failed   = {}        # benchmark -> True once it has raised
+_eval_docs_cache = {}        # corpus -> [[(x, y), ...], ...]
+_eval_results = {}           # corpus[~kind] -> last result, for --eval's table / JSON
+_eval_failed = {}            # corpus -> True once it has raised
 
 
 def _eval_corpus_names():
-    """Held-out sets to score, in order. --eval_corpora overrides; default is the training
-    corpus alone, which is what every run before --eval_corpora existed did."""
-    if args.eval_corpora:
-        return [c.strip() for c in args.eval_corpora.split(',') if c.strip()]
-    return [args.dataset]
+    return [c.strip() for c in (args.eval_corpora or args.dataset).split(',') if c.strip()]
 
 
-def _build_eval_docs(corpus=None):
-    """First --eval_docs held-out documents of `corpus`, framed as training clips."""
+def _eval_source(name):
+    """(repo, config, split, column) of a corpus's held-out set; a name not in the table is
+    taken as a hub repo id with a 'validation' split."""
+    if name not in _TEXT_DATASETS:
+        return name, None, 'validation', 'text'
+    hf, cfg, split, col = _TEXT_DATASETS[name]
+    held = _EVAL_SPLITS.get(name, split)
+    if isinstance(held, tuple):
+        hf, cfg, split = held
+    else:
+        split = held
+    return hf, cfg, split, col
+
+
+def _build_eval_docs(corpus):
+    """The first --eval_docs held-out documents of `corpus`, framed like training clips,
+    clipped to _EVAL_MAXLEN, sorted by length."""
     from datasets import load_dataset
-    corpus = corpus or args.dataset
-    if corpus == 'synth':
-        path = ensure_synth_eval(args.teacher, args.synth_eval_docs, args.synth_min,
-                                 args.synth_max, args.teacher_batch, args.teacher_temp,
-                                 args.teacher_topk, args.teacher_topp,
-                                 args.teacher_device or args.device,
-                                 args.teacher_rep_penalty)
-        print(f'eval set: loading cached synthetic held-out {path}', flush=True)
-        rows = load_dataset('json', data_files={'train': path}, split='train')
-        docs = []
-        for ex in rows:
-            steps, _ = clip_text(ex.get('text') or '')
-            if len(steps) >= _EVAL_MINLEN:
-                docs.append(steps[:_EVAL_MAXLEN])
-            if len(docs) >= args.eval_docs:
-                break
-        docs.sort(key=len)
-        print(f'eval set: {len(docs)} documents, {sum(len(d) for d in docs)} tokens',
-              flush=True)
-        return docs
     hf, cfg, split, col = _eval_source(corpus)
-    if corpus in _HASH_HOLDOUT:
-        # scan the TRAIN stream and keep only the hashed-out documents -- the complement of
-        # what _build_clip feeds the model. Streaming is fine here: the sample is small.
-        print(f'eval set: {corpus} hashed hold-out (1/{_HOLDOUT_MOD} of {hf}'
-              + (f' [{cfg}]' if cfg else '') + ') ...', flush=True)
-        if corpus in _HUB_SUBSET:
-            # must NOT go through load_dataset(repo, cfg): finephrase has 27k files and
-            # resolving them takes longer than the eval itself. Use the same local subset
-            # the trainer reads, so the hold-out is the complement of what training sees.
-            # --shards applies HERE TOO, for the same reason: with 15 fineweb shards passed
-            # to a non-streaming load_dataset, the scan read all 30.6 GB and built a full
-            # arrow cache before yielding row 0 -- minutes of stalled training at every
-            # --eval_interval, to find 100 documents. It also made the hold-out a superset
-            # of the training shard rather than its complement.
-            _f = _hub_subset_files(corpus)
-            if args.shards:
-                _f = _f[:args.shards]
-            rows = load_dataset('parquet', data_files={'train': _f}, split='train',
-                                streaming=True)
-        else:
-            # streamed regardless of --streaming (see above): this scan wants the first few
-            # thousand rows, so an arrow build over the whole corpus is pure latency. A
-            # SLICED split cannot be streamed, so those keep the non-streaming path.
-            rows = load_dataset(hf, cfg, split=split,
-                                streaming='[' not in split)
-        docs, seen = [], 0
-        for ex in rows:
-            seen += 1
-            t = _corpus_text(corpus, ex)          # same filter training applies
-            if not t.strip() or not _is_heldout(t):
-                continue
-            steps, _ = clip_text(t)
-            if len(steps) >= _eval_minlen(corpus):
-                docs.append(steps[:_EVAL_MAXLEN])
-            if len(docs) >= args.eval_docs:
-                break
-        docs.sort(key=len)
-        print(f'eval set: {len(docs)} documents, {sum(len(d) for d in docs)} tokens '
-              f'(scanned {seen})', flush=True)
-        return docs
-    if corpus not in _EVAL_SPLITS and not args.split:
-        print(f'WARNING: --eval_interval: no held-out split configured for "{corpus}"; '
-              f'scoring "{split}"'
-              + (' , which the model is TRAINING on -- that is a training loss, not a '
-                 'validation loss' if corpus == args.dataset else ''))
-    # A SLICED split ("train[-3000:]") cannot be streamed -- datasets rejects it with
-    # "Bad split". web has no validation split and its held-out IS that slice, so streaming
-    # is forced off for it regardless of --streaming. It is a download, but it is the same
-    # tail exp/score.py uses and therefore the only web number comparable to PLAN.txt.
-    # a corpus whose repo is too big to prepare in full is ALWAYS streamed here: a
-    # non-streaming load_dataset(allenai/c4, en, split='validation') builds the whole 'en'
-    # config -- 365M train documents -- to return 100 validation docs.
-    _stream = (args.streaming or corpus in _STREAM_EVAL) and '[' not in split
-    print(f'eval set: loading {hf}' + (f' [{cfg}]' if cfg else '') + f' split {split}'
-          + ('' if _stream else ' (non-streaming)') + ' ...', flush=True)
-    rows = load_dataset(hf, cfg, split=split, streaming=_stream)
-    # keyed on CORPUS, not args.dataset: this builder serves --eval_corpora, which scores
-    # corpora the run is NOT training on. Keying it on the training set applied that set's
-    # renderer to another corpus's rows -- _fmt_finephrase looking for 'rollout_results' in
-    # a pile row -- so every row rendered '' and the corpus was dropped with "0 documents".
-    # Cost the pile column of an entire 1B-token run. The hashed path above never had this
-    # bug; it has always gone through _corpus_text(corpus, ex).
-    _fmt = _TEXT_FORMAT.get(corpus)
-    docs = []
+    hashed = corpus in _HASH_HOLDOUT
+    if hashed and corpus in _HUB_SUBSET:
+        files = _hub_subset_files(corpus)
+        files = files[:args.shards] if args.shards else files    # the training subset
+        rows = load_dataset('parquet', data_files={'train': files}, split='train', streaming=True)
+    else:
+        if not hashed and corpus not in _EVAL_SPLITS:
+            print(f'WARNING: no held-out split configured for "{corpus}"; scoring "{split}"')
+        stream = (hashed or args.streaming or corpus in _STREAM_EVAL) and '[' not in split
+        rows = load_dataset(hf, cfg, split=split, streaming=stream)
+    print(f'eval set: {corpus} ({hf}' + (f' [{cfg}]' if cfg else '') +
+          (f', hashed 1/{_HOLDOUT_MOD}' if hashed else f' {split}') + ') ...', flush=True)
+    docs, seen = [], 0
     for ex in rows:
-        text = (_fmt(ex) if _fmt is not None else ex.get(col, ex.get('text', ''))) or ''
-        if not text.strip():
+        seen += 1
+        text = _corpus_text(corpus, ex) if corpus in _TEXT_DATASETS else ex.get(col, '') or ''
+        if not text.strip() or (hashed and not _is_heldout(text)):
             continue
-        steps, _ = clip_text(text)
+        steps = clip_text(text)
         if len(steps) >= _eval_minlen(corpus):
             docs.append(steps[:_EVAL_MAXLEN])
         if len(docs) >= args.eval_docs:
             break
-    # longest-first inside the chunking below wastes the least padding; rows are independent
-    # and eval-mode BatchNorm uses running stats, so grouping does not change any per-document
-    # result (batch invariance measured at 1e-4).
     docs.sort(key=len)
-    print(f'eval set: {len(docs)} documents, {sum(len(d) for d in docs)} tokens', flush=True)
+    print(f'eval set: {len(docs)} documents, {sum(len(d) for d in docs)} tokens '
+          f'(scanned {seen})', flush=True)
     return docs
 
 
-def _heldout_eval(step):
-    """Score every --eval_corpora held-out set, one tagged EVAL line each. Never raises:
-    an eval failure must not take down a training run that is otherwise healthy."""
-    for corpus in _eval_corpus_names():
-        _heldout_eval_one(step, corpus)
-    for _fn, _on in ((_facts_eval, args.eval_facts), (_chatqa_eval, args.eval_chatqa)):
-        if _on:
-            try:
-                _fn(step)
-            except Exception as e:
-                print(f'WARNING: {_fn.__name__} failed at step {step}: {e!r}', flush=True)
+def _eval_docs(corpus):
+    if corpus not in _eval_docs_cache:
+        _eval_docs_cache[corpus] = _build_eval_docs(corpus)
+    return _eval_docs_cache[corpus]
 
 
-def _heldout_eval_one(step, corpus):
-    # Failure is tracked PER CORPUS. A global disable made one bad corpus silently cancel
-    # every later one in the same call: web raised on a sliced split and c4 -- which is
-    # fine -- was never scored at all, reported as "failed" in the table.
-    if _eval_failed.get(corpus):
-        return
-    try:
-        if corpus not in _eval_docs_cache:
-            _eval_docs_cache[corpus] = _build_eval_docs(corpus)
-        docs = _eval_docs_cache[corpus]
-        if not docs:
-            print(f'WARNING: --eval_interval: no usable held-out documents for "{corpus}"; '
-                  f'skipping it')
-            _eval_docs_cache[corpus] = []
-            return
-
-        for _warm in ((0, args.eval_warm) if args.eval_warm else (0,)):
-            _score_and_report(step, corpus, docs, _warm)
-        # the quality evals: each guarded on its own, so one failing cannot cost the others
-        for _fn, _on in ((_recall_eval, args.eval_recall), (_reach_eval, args.eval_reach),
-                         (_gen_eval, args.eval_gen), (_info_eval, args.eval_info)):
-            if _on:
-                try:
-                    _fn(step, corpus, docs)
-                except Exception as e:
-                    print(f'WARNING: {_fn.__name__} failed at step {step} on "{corpus}": '
-                          f'{e!r}', flush=True)
-    except Exception as e:
-        print(f'WARNING: --eval_interval failed at step {step} on "{corpus}": {e!r}; '
-              f'disabling THAT CORPUS, others continue', flush=True)
-        _eval_failed[corpus] = True
+def _doc_tokens(d):
+    """A framed eval document as its token list, <STX> ... <ETX>."""
+    return [x for x, _ in d] + [d[-1][1]]
 
 
-def _warm_prefix(docs, g, n):
-    """The n tokens a training slot would have read just before held-out document g: the
-    preceding documents (g-1, g-2, ... cyclically), each framed <STX> ... <ETX> as in
-    training, concatenated oldest first, last n tokens kept."""
-    out, j = [], g
-    while len(out) < n:
-        j = (j - 1) % len(docs)
-        d = docs[j]
-        out = [x for x, _ in d] + [d[-1][1]] + out     # a tiny set just wraps round
-    return out[-n:]
+class _EvalState:
+    """Context manager: eval mode on a fresh state, training state and mode restored."""
+
+    def __enter__(self):
+        self.dff, self.was = model.dff, model.training
+        model.eval()
+
+    def __exit__(self, *exc):
+        model.dff = self.dff
+        model.train(self.was)
 
 
-def _score_and_report(step, corpus, docs, warm):
-    """Score `docs` (cold when warm == 0, else after `warm` tokens of preceding held-out
-    text with no reset) and print the EVAL / EVALW line."""
-    _dev = next(model.parameters()).device
-    _was_training = model.training
-    # The training context must survive the eval untouched, and the context is BOTH
-    # tensors: _init_dff() rebuilds self.dff and self.clk together whenever the batch
-    # width changes (see vla.py's "a clock belongs to a context, not to the model").
-    # Scoring at _EVAL_BATCH rows rebuilds both at that width; restoring only dff then
-    # leaves _init_dff with a matching dff, so it skips the rebuild and the next
-    # training step runs a 250-row batch against a 400-row clock. That is not a silent
-    # error -- it raised at the first step after the first eval and killed the run.
-    # try/finally, not a plain restore after the loop: the outer `except` below exists
-    # so an eval failure cannot take down a healthy training run, but a failure raised
-    # part-way through scoring would skip the restore and leave the model holding the
-    # eval-width context -- turning the guard into the very crash it is meant to absorb.
-    _saved_dff, _saved_clk = model.dff, model.clk
-    model.eval()
-    t0 = time.time()
-    per_doc = []                    # mean nats/token for each document, kept separate
-    bad_doc = []                    # per document: did ANY token exceed _EVAL_THRESH
-    _band_of = _token_bands(_dev) if (args.eval_bands and not warm) else None
-    _nb = int(_band_of.max()) + 1 if _band_of is not None else 0
-    band_sum, band_cnt = [], []     # per document x band, token-weighted (--eval_bands)
-    try:
-      with torch.no_grad():
-        for c in range(0, len(docs), _EVAL_BATCH):
-            chunk = docs[c:c + _EVAL_BATCH]
-            B = len(chunk); T = max(len(d) for d in chunk)
-            X = torch.zeros((B, T), dtype=torch.long)
-            Y = torch.zeros((B, T), dtype=torch.long)
-            M = torch.zeros((B, T), dtype=torch.bool)
-            for r, st in enumerate(chunk):
-                X[r, :len(st)] = torch.tensor([x for x, _ in st], dtype=torch.long)
-                Y[r, :len(st)] = torch.tensor([y for _, y in st], dtype=torch.long)
-                M[r, :len(st)] = True
-            X, Y, M = X.to(_dev), Y.to(_dev), M.to(_dev)
-            model.dff = None        # fresh context per document (see _new_dff/--init)
-            if warm:
-                # --eval_warm: read `warm` tokens of the preceding held-out documents,
-                # unscored and with NO reset, so the document starts from a state like
-                # the one a --no_dff_reset model trains on
-                P = torch.tensor([_warm_prefix(docs, c + r, warm) for r in range(B)],
-                                 dtype=torch.long, device=_dev)
-                for t in range(warm):
-                    model(P[:, t])
-            rs = torch.zeros(B, device=_dev)
-            bad = torch.zeros(B, dtype=torch.bool, device=_dev)
-            if _nb:
-                bsum = torch.zeros(B, _nb, device=_dev)
-                bcnt = torch.zeros(B, _nb, device=_dev)
-            for t in range(T):
-                logits, _ = model(X[:, t])
-                ce = F.cross_entropy(logits, Y[:, t], reduction='none')
-                if _nb:
-                    _oh = F.one_hot(_band_of[Y[:, t].clamp(max=_band_of.numel() - 1)],
-                                    _nb).float() * M[:, t, None]
-                    bsum += _oh * torch.where(torch.isfinite(ce), ce,
-                                              torch.full_like(ce, 1e30))[:, None]
-                    bcnt += _oh
-                # a diverged row produces inf/nan; map it to a large finite value so it
-                # is counted as runaway instead of poisoning every other row's sum
-                ce = torch.where(torch.isfinite(ce), ce, torch.full_like(ce, 1e30))
-                rs += ce * M[:, t]
-                # Runaway is ANY TOKEN over threshold, which is exactly what
-                # exp/score.py counts -- NOT "the document mean went over".  The mean
-                # criterion is far laxer and silently disagrees: at p1_pile step 5000 it
-                # reported 0.00% where score.py found 0.2%, and a web-trained checkpoint
-                # that score.py rates 26.0% runaway on pile would have read near zero.
-                # PLAN.txt treats runaway% as the primary countable metric, so an EVAL
-                # line must report the same statistic score.py does or the two cannot be
-                # compared -- and on a long run the EVAL line is the only one watching.
-                bad |= M[:, t] & (ce > _EVAL_THRESH)
-            n = M.sum(dim=1).clamp(min=1)
-            per_doc.append((rs / n).cpu().numpy())
-            bad_doc.append(bad.cpu().numpy())
-            if _nb:
-                band_sum.append(bsum.cpu().numpy()); band_cnt.append(bcnt.cpu().numpy())
-    finally:
-        model.dff, model.clk = _saved_dff, _saved_clk
-        if _was_training:
-            model.train()
-
-    per = np.concatenate(per_doc)
-    bad = np.concatenate(bad_doc)
-    clean = float(per[~bad].mean()) if (~bad).any() else float('nan')
-    # nats per CHARACTER over the clean documents: tokenizer-independent, so runs on
-    # different vocabularies (--tokenizer) can be compared. Each document's total nats
-    # (mean x tokens) over the characters of its decoded text.
-    _nt = np.array([len(d) for d in docs], dtype=np.float64)
-    _nc = np.array([max(1, len(_decode_plain(_doc_tokens(d)))) for d in docs], dtype=np.float64)
-    npc = (float((per * _nt)[~bad].sum() / _nc[~bad].sum()) if (~bad).any() else float('nan'))
-    _key = corpus if not warm else f'{corpus}~warm'
-    _eval_results[_key] = dict(
-        corpus=corpus, step=int(step), clean=clean, median=float(np.median(per)),
-        ppl=float(math.exp(min(clean, 700))) if clean == clean else None,
-        runaway_pct=100.0 * float(bad.mean()), nrun=int(bad.sum()), docs=int(len(per)),
-        tokens=int(sum(len(d) for d in docs)))
-    # clean/median/runaway, not a mean: three runaway documents out of 400 move a plain
-    # mean by nine orders of magnitude and report a healthy model as destroyed.
-    # the corpus tag is not decoration: with --eval_corpora these lines interleave, and
-    # a fit number and a transfer number are not comparable to each other.
-    d = (('EVALW' if warm else 'EVAL') + ' step {:10} corpus {:8} clean {:11.6f} ppl {:12.4f} median {:11.6f} '
-         'runaway {:6.2f}% nrun {:4d} docs {:5d} wall {:7.1f}s'
-         ).format(step, corpus, clean,
-                  math.exp(min(clean, 700)) if clean == clean else float('nan'),
-                  float(np.median(per)), 100.0 * float(bad.mean()), int(bad.sum()),
-                  len(per), time.time() - t0)
-    d += f' nats/char {npc:.4f}'
-    if warm:
-        d += f' warm {warm}'
-    print(d, flush=True)
-    with open(args.log, 'a') as f:
-        print(d, file=f)
-    if _nb and (~bad).any():
-        # token-weighted over the CLEAN documents, the same set 'clean' averages
-        bs = np.concatenate(band_sum)[~bad].sum(0)
-        bc = np.concatenate(band_cnt)[~bad].sum(0)
-        _edges = [0] + [int(e) for e in args.eval_bands.split(',') if e.strip()]
-        _lbl = [f'r{a}-{b}' for a, b in zip(_edges, _edges[1:])] + [f'r{_edges[-1]}+']
-        parts = ' '.join(f'{l} {bs[k] / bc[k]:.4f} ({100.0 * bc[k] / bc.sum():.0f}%)'
-                         if bc[k] else f'{l} n/a' for k, l in enumerate(_lbl))
-        _eval_results[f'{corpus}~bands'] = dict(zip(_lbl, (bs / np.maximum(bc, 1)).tolist()))
-        _emit(f'EVALB step {step:10} corpus {corpus:8} {parts}')
+def _batches(rows):
+    """[(inputs, targets)] -> padded (X, Y, M) device tensors per _EVAL_BATCH chunk."""
+    dev = next(model.parameters()).device
+    for c in range(0, len(rows), _EVAL_BATCH):
+        chunk = rows[c:c + _EVAL_BATCH]
+        B, T = len(chunk), max(len(xs) for xs, _ in chunk)
+        X = torch.zeros((B, T), dtype=torch.long)
+        Y = torch.zeros((B, T), dtype=torch.long)
+        M = torch.zeros((B, T), dtype=torch.bool)
+        for r, (xs, ys) in enumerate(chunk):
+            X[r, :len(xs)] = torch.tensor(xs)
+            Y[r, :len(ys)] = torch.tensor(ys)
+            M[r, :len(xs)] = True
+        yield chunk, X.to(dev), Y.to(dev), M.to(dev)
 
 
-def _emit(line):
-    print(line, flush=True)
-    with open(args.log, 'a') as f:
-        print(line, file=f)
+def _doc_rows(docs):
+    return [([x for x, _ in d], [y for _, y in d]) for d in docs]
 
 
 _band_cache = {}
+
+
 def _token_bands(dev):
-    """[V] long: each token id's --eval_bands band, from its frequency RANK over the
-    held-out text of every --eval_corpora corpus (targets only). Built once. Ids never seen
-    in that text fall in the last (rarest) band. Ranks come from held-out text rather than
-    the training stream because it is already in memory and covers every corpus scored;
-    with ~10^5-10^6 tokens the top few thousand ranks are stable."""
+    """[V] long: each token id's --eval_bands band by frequency rank over the held-out
+    targets of every eval corpus; ids never seen fall in the rarest band."""
     if 'b' not in _band_cache:
         cnt = collections.Counter()
         for c in _eval_corpus_names():
-            if c not in _eval_docs_cache:
-                _eval_docs_cache[c] = _build_eval_docs(c)
-            for d in _eval_docs_cache[c] or []:
+            for d in _eval_docs(c) or []:
                 cnt.update(y for _, y in d)
-        V = int(model.lmhead.out_features) if hasattr(model.lmhead, 'out_features') else 256
-        V = max(V, max(cnt) + 1 if cnt else 1)
+        V = max(model.vocab, max(cnt) + 1 if cnt else 1)
         edges = [int(e) for e in args.eval_bands.split(',') if e.strip()]
         band = torch.full((V,), len(edges), dtype=torch.long)
         for r, (tid, _) in enumerate(cnt.most_common()):
             band[tid] = sum(r >= e for e in edges)
         _band_cache['b'] = band
-        print(f'--eval_bands: ranks from {sum(cnt.values())} held-out tokens, '
-              f'{len(cnt)} distinct; edges {edges}', flush=True)
+        print(f'--eval_bands: ranks from {sum(cnt.values())} held-out tokens, {len(cnt)} '
+              f'distinct; edges {edges}', flush=True)
     return _band_cache['b'].to(dev)
 
 
-def _ce_seqs(seqs):
-    """Teacher-forced per-position loss for a list of token sequences, each from a fresh
-    context (like a document): returns one numpy array per sequence, entry p = loss of
-    predicting seq[p+1] after reading seq[:p+1]. The training context is saved and
-    restored exactly as in _score_and_report."""
-    return _ce_pairs([(q[:-1], q[1:]) for q in seqs])
+def _score(step, corpus, docs):
+    """EVAL (clean / median / runaway%) and EVALB (loss by frequency band) lines."""
+    t0 = time.time()
+    dev = next(model.parameters()).device
+    band_of = _token_bands(dev) if args.eval_bands else None
+    nb = int(band_of.max()) + 1 if band_of is not None else 0
+    per_doc, bad_doc, band_sum, band_cnt = [], [], [], []
+    with _EvalState(), torch.no_grad():
+        for chunk, X, Y, M in _batches(_doc_rows(docs)):
+            B, T = X.shape
+            model.dff = None
+            rs = torch.zeros(B, device=dev)
+            bad = torch.zeros(B, dtype=torch.bool, device=dev)
+            if nb:
+                bsum = torch.zeros(B, nb, device=dev)
+                bcnt = torch.zeros(B, nb, device=dev)
+            for t in range(T):
+                logits, _ = model(X[:, t])
+                ce = F.cross_entropy(logits, Y[:, t], reduction='none')
+                # a diverged row is counted as runaway rather than poisoning the sums
+                ce = torch.where(torch.isfinite(ce), ce, torch.full_like(ce, 1e30))
+                if nb:
+                    oh = F.one_hot(band_of[Y[:, t].clamp(max=band_of.numel() - 1)],
+                                   nb).float() * M[:, t, None]
+                    bsum += oh * ce[:, None]
+                    bcnt += oh
+                rs += ce * M[:, t]
+                bad |= M[:, t] & (ce > _EVAL_THRESH)     # ANY token over: exp/score.py's rule
+            per_doc.append((rs / M.sum(dim=1).clamp(min=1)).cpu().numpy())
+            bad_doc.append(bad.cpu().numpy())
+            if nb:
+                band_sum.append(bsum.cpu().numpy())
+                band_cnt.append(bcnt.cpu().numpy())
+    per, bad = np.concatenate(per_doc), np.concatenate(bad_doc)
+    clean = float(per[~bad].mean()) if (~bad).any() else float('nan')
+    # nats per character over the clean documents: comparable across tokenizers
+    nt = np.array([len(d) for d in docs], dtype=np.float64)
+    nc = np.array([max(1, len(_decode_plain(_doc_tokens(d)))) for d in docs], dtype=np.float64)
+    npc = float((per * nt)[~bad].sum() / nc[~bad].sum()) if (~bad).any() else float('nan')
+    ppl = math.exp(min(clean, 700)) if clean == clean else float('nan')
+    _eval_results[corpus] = dict(corpus=corpus, step=int(step), clean=clean,
+                                 median=float(np.median(per)), ppl=ppl,
+                                 runaway_pct=100.0 * float(bad.mean()), nrun=int(bad.sum()),
+                                 docs=int(len(per)), tokens=int(nt.sum()))
+    _emit(f'EVAL step {step:10} corpus {corpus:8} clean {clean:11.6f} ppl {ppl:12.4f} '
+          f'median {float(np.median(per)):11.6f} runaway {100.0 * float(bad.mean()):6.2f}% '
+          f'nrun {int(bad.sum()):4d} docs {len(per):5d} wall {time.time() - t0:7.1f}s '
+          f'nats/char {npc:.4f}')
+    if nb and (~bad).any():
+        bs = np.concatenate(band_sum)[~bad].sum(0)
+        bc = np.concatenate(band_cnt)[~bad].sum(0)
+        edges = [0] + [int(e) for e in args.eval_bands.split(',') if e.strip()]
+        lbl = [f'r{a}-{b}' for a, b in zip(edges, edges[1:])] + [f'r{edges[-1]}+']
+        _eval_results[f'{corpus}~bands'] = dict(zip(lbl, (bs / np.maximum(bc, 1)).tolist()))
+        _emit(f'EVALB step {step:10} corpus {corpus:8} ' + ' '.join(
+            f'{l} {bs[k] / bc[k]:.4f} ({100.0 * bc[k] / bc.sum():.0f}%)' if bc[k] else f'{l} n/a'
+            for k, l in enumerate(lbl)))
 
 
 def _ce_pairs(rows):
-    """_ce_seqs with explicit targets: rows of (inputs, targets), equal lengths, entry p =
-    loss of predicting targets[p] after reading inputs[:p+1] from a fresh context. For rows
-    whose next input is NOT the target, such as --eval_reach's spliced chunks."""
-    _dev = next(model.parameters()).device
-    _was_training = model.training
-    _saved_dff, _saved_clk = model.dff, model.clk
-    model.eval()
+    """Per-position loss for rows of (inputs, targets), each from a fresh state; losses
+    clamped to 30 nats."""
     out = []
-    try:
-      with torch.no_grad():
-        for c in range(0, len(rows), _EVAL_BATCH):
-            chunk = rows[c:c + _EVAL_BATCH]
-            B = len(chunk); T = max(len(xs) for xs, _ in chunk)
-            X = torch.zeros((B, T), dtype=torch.long)
-            Y = torch.zeros((B, T), dtype=torch.long)
-            for r, (xs, ys) in enumerate(chunk):
-                X[r, :len(xs)] = torch.tensor(xs); Y[r, :len(ys)] = torch.tensor(ys)
-            X, Y = X.to(_dev), Y.to(_dev)
+    with _EvalState(), torch.no_grad():
+        for chunk, X, Y, M in _batches(rows):
             model.dff = None
-            ce = torch.zeros(B, T, device=_dev)
-            for t in range(T):
+            ce = torch.zeros(X.shape, device=X.device)
+            for t in range(X.shape[1]):
                 logits, _ = model(X[:, t])
                 v = F.cross_entropy(logits, Y[:, t], reduction='none')
                 ce[:, t] = torch.where(torch.isfinite(v), v, torch.full_like(v, 30.0)).clamp(max=30.0)
             ce = ce.cpu().numpy()
             out += [ce[r, :len(xs)] for r, (xs, _) in enumerate(chunk)]
-    finally:
-        model.dff, model.clk = _saved_dff, _saved_clk
-        if _was_training:
-            model.train()
     return out
 
 
-_reach_plan = {}         # corpus -> fixed splice plan, built once so every eval is paired
-_REACH_CHUNKS = 4        # chunks per spliced row; the first is warm-up and not scored
+_reach_plan = {}             # corpus -> fixed splice plan, so every eval is paired
+_REACH_CHUNKS = 4            # chunks per spliced row; the first is warm-up and not scored
 
 
 def _reach_eval(step, corpus, docs):
-    """--eval_reach: exp/reach.py's splice probe. Row r is _REACH_CHUNKS chunks of P tokens,
-    each cut at a random offset from a random held-out document, with ONE reset at the row
-    start. At offset c into chunk k >= 1 the state has read k*P + c tokens, but only the
-    last c+1 belong to the current document, so
-
-        excess(c) = loss(token | spliced row) - loss(same token | its whole document)
-
-    is the cost of losing the document history older than c tokens, with warm-up held
-    constant (memtest's reset-and-feed conflated the two). Tokens whose loss is a runaway
-    (>= 20 nats) on either side are dropped and counted, not averaged in."""
-    _t0 = time.time()
+    """EVALX: rows of _REACH_CHUNKS chunks of P tokens cut from random held-out documents,
+    one reset per row. At offset c into a chunk only c+1 tokens of history belong to its
+    document, so excess(c) = loss(spliced) - loss(same token, whole document) is the value
+    of history older than c. Runaway tokens (>= 20 nats on either side) are dropped."""
+    t0 = time.time()
     P, K = args.eval_reach_period, _REACH_CHUNKS
     pool = [_doc_tokens(d) for d in docs]
     elig = [i for i, q in enumerate(pool) if len(q) >= P + 2]
@@ -7241,422 +1308,165 @@ def _reach_eval(step, corpus, docs):
         return
     if corpus not in _reach_plan:
         rng = random.Random(4321)
-        # start >= 1 skips <STX>; the last target q[st+P] stays inside the document
         _reach_plan[corpus] = [[(i, rng.randint(1, len(pool[i]) - 1 - P))
                                 for i in (rng.choice(elig) for _ in range(K))]
                                for _ in range(args.eval_reach)]
     plan = _reach_plan[corpus]
     need = sorted({i for row in plan for i, _ in row[1:]})
-    full = dict(zip(need, _ce_seqs([pool[i] for i in need])))
-    rows = [([t for i, st in row for t in pool[i][st:st + P]],
-             [t for i, st in row for t in pool[i][st + 1:st + P + 1]]) for row in plan]
-    spl = _ce_pairs(rows)
+    full = dict(zip(need, _ce_pairs([(pool[i][:-1], pool[i][1:]) for i in need])))
+    spl = _ce_pairs([([t for i, st in row for t in pool[i][st:st + P]],
+                      [t for i, st in row for t in pool[i][st + 1:st + P + 1]]) for row in plan])
     exc, cnt, bad = np.zeros(P), np.zeros(P), 0
     for r, row in enumerate(plan):
         for k in range(1, K):
             i, st = row[k]
             a, b = spl[r][k * P:(k + 1) * P], full[i][st:st + P]
             ok = (a < 20.0) & (b < 20.0)
-            exc[ok] += (a - b)[ok]; cnt[ok] += 1; bad += int((~ok).sum())
-    curve = exc / np.maximum(cnt, 1)
-    edges = [0, 1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024]
-    edges = [e for e in edges if e < P] + [P]
+            exc[ok] += (a - b)[ok]
+            cnt[ok] += 1
+            bad += int((~ok).sum())
+    edges = [e for e in (0, 1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024) if e < P] + [P]
     parts, buckets = [], {}
     for lo, hi in zip(edges, edges[1:]):
         lbl = f'c{lo}' if hi == lo + 1 else f'c{lo}-{hi - 1}'
-        v = float((exc[lo:hi]).sum() / max(cnt[lo:hi].sum(), 1))
-        buckets[lbl] = v
-        parts.append(f'{lbl} {v:+.3f}')
+        buckets[lbl] = float(exc[lo:hi].sum() / max(cnt[lo:hi].sum(), 1))
+        parts.append(f'{lbl} {buckets[lbl]:+.3f}')
     mean = float(exc.sum() / max(cnt.sum(), 1))
     tail = float(exc[64:].sum() / max(cnt[64:].sum(), 1)) if P > 64 else float('nan')
     rate = 100.0 * bad / max(bad + cnt.sum(), 1)
-    _eval_results[f'{corpus}~reach'] = dict(mean=mean, tail64=tail, runaway=rate,
-                                            curve=[float(x) for x in curve], **buckets)
-    _emit(f'EVALX step {step:10} corpus {corpus:8} P {P} rows {len(plan)} '
-          f'runaway {rate:.1f}% | mean {mean:+.4f} tail64 {tail:+.4f} | ' + ' '.join(parts)
-          + f' | wall {time.time() - _t0:.1f}s')
+    _eval_results[f'{corpus}~reach'] = dict(mean=mean, tail64=tail, runaway=rate, **buckets)
+    _emit(f'EVALX step {step:10} corpus {corpus:8} P {P} rows {len(plan)} runaway {rate:.1f}% '
+          f'| mean {mean:+.4f} tail64 {tail:+.4f} | ' + ' '.join(parts)
+          + f' | wall {time.time() - t0:.1f}s')
 
 
 def _info_eval(step, corpus, docs):
-    """--eval_info: how much the K --ctx_ema registers overlap, and what each one is worth.
-
-    Pass 1 runs N held-out documents teacher-forced and accumulates, over every valid token
-    and every grid position, the covariance of the K*C register channels (position means
-    removed, so a fixed spatial pattern does not count as shared information). From it:
-      rms      sqrt(mean channel variance) per register -- the slow ones are smaller
-      rank     participation ratio (sum l)^2 / sum l^2 of each register's eigenvalues,
-               1..C: how many dimensions it really uses; 'cat' is the same for the K
-               concatenated after scaling each to equal total variance, against the sum
-      MI ij    Gaussian mutual information, nats, from the canonical correlations of
-               registers i and j: -1/2 sum log(1 - rho^2) (a lower bound on the true MI)
-      rho1     largest canonical correlation, n>.9 how many exceed 0.9
-      TC       total correlation, sum_k logdet S_kk - logdet S
-    Small ridge (1e-4 x mean eigenvalue) on each block keeps the log-dets finite.
-    Then 2^K - 1 more passes read registers as their (per channel and position) mean
-    instead of their value -- the state still evolves -- and report the loss rise d<set>
-    (nats/token, token-weighted) over the unablated base. red ij = d ij - d i - d j: positive
-    when i and j carry the same useful information (each covers for the other)."""
-    if corpus != _eval_corpus_names()[0]:
-        return
-    K = getattr(model, 'n_ctx', 1)
-    if not getattr(model, 'ctx_windows', None) or K < 1 or model.n_dff != 1:
-        return
-    _dev = next(model.parameters()).device
+    """EVALI: how much the K registers overlap and what each is worth, on --eval_info
+    documents. Pass 1 accumulates the covariance of the K*C register channels over tokens
+    and grid positions (position means removed):
+      rms      sqrt(mean channel variance) per register
+      rank     participation ratio of each register's eigenvalues; 'cat' for the K
+               concatenated at equal total variance, against their sum
+      MI ij    Gaussian mutual information (nats) from canonical correlations
+      rho1     largest canonical correlation; n>.9 how many exceed 0.9
+      TC       Gaussian total correlation
+    Then registers are read as their mean instead of their value (each alone, then all; every
+    subset when K <= 3) and the loss rise d<set> over the base is reported; red ij = d ij -
+    d i - d j is positive when i and j carry the same useful information."""
+    K, C, S = model.K, model.n_hidden, model.S
+    D = K * C
+    dev = next(model.parameters()).device
     t0 = time.time()
     sel = docs[:args.eval_info]
-    C, S = model.n_hidden, model.S
-    D = K * C
-    _was_training = model.training
-    _saved_dff, _saved_clk = model.dff, model.clk
-    model.eval()
 
-    def _run(stats):
-        tot = torch.zeros((), dtype=torch.float64, device=_dev); ntok = 0
+    def run(stats):
+        tot, ntok = torch.zeros((), dtype=torch.float64, device=dev), 0
         if stats:
-            s2 = torch.zeros(D, D, dtype=torch.float64, device=_dev)
-            ps = torch.zeros(S * S, D, dtype=torch.float64, device=_dev)
-            wsum = torch.zeros(K, dtype=torch.float64, device=_dev)
-            gsum = torch.zeros(K, dtype=torch.float64, device=_dev)
-        for c in range(0, len(sel), _EVAL_BATCH):
-            chunk = sel[c:c + _EVAL_BATCH]
-            B = len(chunk); T = max(len(d) for d in chunk)
-            X = torch.zeros((B, T), dtype=torch.long); Y = torch.zeros((B, T), dtype=torch.long)
-            M = torch.zeros((B, T), dtype=torch.bool)
-            for r, st in enumerate(chunk):
-                X[r, :len(st)] = torch.tensor([x for x, _ in st]); M[r, :len(st)] = True
-                Y[r, :len(st)] = torch.tensor([y for _, y in st])
-            X, Y, M = X.to(_dev), Y.to(_dev), M.to(_dev)
+            s2 = torch.zeros(D, D, dtype=torch.float64, device=dev)
+            ps = torch.zeros(S * S, D, dtype=torch.float64, device=dev)
+        for chunk, X, Y, M in _batches(_doc_rows(sel)):
             model.dff = None
-            for t in range(T):
+            for t in range(X.shape[1]):
                 logits, _ = model(X[:, t])
                 m = M[:, t]
                 ce = F.cross_entropy(logits, Y[:, t], reduction='none')
                 ce = torch.where(torch.isfinite(ce), ce, torch.full_like(ce, 30.0)).clamp(max=30.0)
-                tot += (ce * m).sum().double(); ntok += int(m.sum())
-                _lw = getattr(model.clk, 'last_win', None)
-                if stats and _lw is not None:
-                    wsum += (_lw.expand(B, -1) * m[:, None]).sum(0).double()
-                _lg = getattr(model, '_last_gate', None)
-                if stats and _lg is not None:
-                    gsum += (_lg * m[:, None]).sum(0).double()
+                tot += (ce * m).sum().double()
+                ntok += int(m.sum())
                 if stats and m.any():
-                    z = model.dff[0][m].permute(0, 2, 3, 1).float()      # [b, S, S, D]
+                    z = model.dff[m].permute(0, 2, 3, 1).float()          # [b, S, S, D]
                     ps += z.sum(0).reshape(S * S, D).double()
                     z = z.reshape(-1, D)
                     s2 += (z.T @ z).double()
         out = {'loss': float(tot) / max(ntok, 1), 'ntok': ntok}
         if stats:
-            mu = ps / max(ntok, 1)                                    # [P, D] position means
+            mu = ps / max(ntok, 1)
             out['cov'] = s2 / max(ntok * S * S, 1) - mu.T @ mu / (S * S)
             out['mean'] = mu.float().T.reshape(1, D, S, S)
-            out['win'] = (wsum / max(ntok, 1)).tolist()
-            out['gate'] = (gsum / max(ntok, 1)).tolist()
         return out
 
     try:
-      with torch.no_grad():
-        base = _run(True)
-        cov = base['cov']; cov = (cov + cov.T) / 2
-        blk = [cov[i * C:(i + 1) * C, i * C:(i + 1) * C] for i in range(K)]
-        ridge = [1e-4 * float(torch.trace(b)) / C + 1e-30 for b in blk]
-        rms = [math.sqrt(max(float(torch.trace(b)) / C, 0.0)) for b in blk]
-        def _pr(m):
-            l = torch.linalg.eigvalsh(m).clamp(min=0)
-            return float(l.sum() ** 2 / (l.pow(2).sum() + 1e-300))
-        rank = [_pr(b) for b in blk]
-        sc = torch.cat([torch.full((C,), 1.0 / math.sqrt(max(float(torch.trace(b)), 1e-300)),
-                                   dtype=torch.float64, device=_dev) for b in blk])
-        rank_cat = _pr(cov * sc[:, None] * sc[None, :])
-        def _isqrt(m, r):
-            l, v = torch.linalg.eigh(m + r * torch.eye(C, dtype=m.dtype, device=m.device))
-            return (v * l.clamp(min=r).rsqrt()) @ v.T
-        W = [_isqrt(b, r) for b, r in zip(blk, ridge)]
-        mi, rho1, n9 = {}, {}, {}
-        for i in range(K):
-            for j in range(i + 1, K):
-                rho = torch.linalg.svdvals(W[i] @ cov[i * C:(i + 1) * C, j * C:(j + 1) * C] @ W[j])
-                rho = rho.clamp(max=1 - 1e-9)
-                mi[(i, j)] = float(-0.5 * torch.log1p(-rho.pow(2)).sum())
-                rho1[(i, j)] = float(rho[0]); n9[(i, j)] = int((rho > 0.9).sum())
-        rI = torch.cat([torch.full((C,), r, dtype=torch.float64, device=_dev) for r in ridge])
-        ld = lambda m: float(torch.linalg.slogdet(m)[1])
-        # Gaussian total correlation is HALF the log-det gap (as MI is -1/2 sum log(1-rho^2));
-        # before 2026-10-10 15:00 this omitted the 1/2, so older EVALI lines read 2x
-        tc = 0.5 * (sum(ld(b + r * torch.eye(C, dtype=b.dtype, device=_dev)) for b, r in zip(blk, ridge))
-                    - ld(cov + torch.diag(rI)))
-        # ablation passes: every non-empty subset of the K registers read as its mean
-        model._read_mean = base['mean'].to(_dev)
-        dl = {}
-        for r in range(1, K + 1):
-            if K > 3 and 1 < r < K:          # 2^K passes is too many: singles and all only
-                continue
-            for sub in itertools.combinations(range(K), r):
-                model._read_ablate = set(sub)
-                dl[sub] = _run(False)['loss'] - base['loss']
+        with _EvalState(), torch.no_grad():
+            base = run(True)
+            cov = base['cov']
+            cov = (cov + cov.T) / 2
+            blk = [cov[i * C:(i + 1) * C, i * C:(i + 1) * C] for i in range(K)]
+            ridge = [1e-4 * float(torch.trace(b)) / C + 1e-30 for b in blk]
+            rms = [math.sqrt(max(float(torch.trace(b)) / C, 0.0)) for b in blk]
+
+            def pr(m):
+                l = torch.linalg.eigvalsh(m).clamp(min=0)
+                return float(l.sum() ** 2 / (l.pow(2).sum() + 1e-300))
+            rank = [pr(b) for b in blk]
+            sc = torch.cat([torch.full((C,), 1.0 / math.sqrt(max(float(torch.trace(b)), 1e-300)),
+                                       dtype=torch.float64, device=dev) for b in blk])
+            rank_cat = pr(cov * sc[:, None] * sc[None, :])
+
+            def isqrt(m, r):
+                l, v = torch.linalg.eigh(m + r * torch.eye(C, dtype=m.dtype, device=m.device))
+                return (v * l.clamp(min=r).rsqrt()) @ v.T
+            W = [isqrt(b, r) for b, r in zip(blk, ridge)]
+            mi, rho1, n9 = {}, {}, {}
+            for i in range(K):
+                for j in range(i + 1, K):
+                    rho = torch.linalg.svdvals(W[i] @ cov[i * C:(i + 1) * C, j * C:(j + 1) * C] @ W[j])
+                    rho = rho.clamp(max=1 - 1e-9)
+                    mi[(i, j)] = float(-0.5 * torch.log1p(-rho.pow(2)).sum())
+                    rho1[(i, j)], n9[(i, j)] = float(rho[0]), int((rho > 0.9).sum())
+            rI = torch.cat([torch.full((C,), r, dtype=torch.float64, device=dev) for r in ridge])
+            ld = lambda m: float(torch.linalg.slogdet(m)[1])
+            tc = 0.5 * (sum(ld(b + r * torch.eye(C, dtype=b.dtype, device=dev))
+                            for b, r in zip(blk, ridge)) - ld(cov + torch.diag(rI)))
+            model._read_mean = base['mean'].to(dev)
+            dl = {}
+            for r in range(1, K + 1):
+                if K > 3 and 1 < r < K:              # 2^K passes is too many: singles and all
+                    continue
+                for sub in itertools.combinations(range(K), r):
+                    model._ablate = set(sub)
+                    dl[sub] = run(False)['loss'] - base['loss']
     finally:
-        model._read_ablate = None; model._read_mean = None
-        model.dff, model.clk = _saved_dff, _saved_clk
-        if _was_training:
-            model.train()
+        model._ablate = model._read_mean = None
 
     n = lambda sub: ''.join(str(k + 1) for k in sub)
     pairs = [(i, j) for i in range(K) for j in range(i + 1, K)]
     line = (f'EVALI step {step:10} corpus {corpus:8} docs {len(sel)} tokens {base["ntok"]} | '
-            f'win ' + '/'.join(f'{v:.1f}' for v in base['win']) + ' | '
-            + (('gate ' + '/'.join(f'{v:.3f}' for v in base['gate']) + ' | ')
-               if getattr(model, 'ctx_rgate', None) is not None else '') +
-            f'rms ' + '/'.join(f'{v:.4f}' for v in rms) +
-            ' | rank ' + '/'.join(f'{v:.1f}' for v in rank) +
-            (f' cat {rank_cat:.1f} (sum {sum(rank):.1f}) | MI ' +
-             ' '.join(f'{n(p)} {mi[p]:.1f}' for p in pairs) + f' TC {tc:.1f} | rho1 ' +
-             ' '.join(f'{n(p)} {rho1[p]:.3f}' for p in pairs) + ' n>.9 ' +
-             ' '.join(f'{n(p)} {n9[p]}' for p in pairs) if pairs else '') +
-            f' | base {base["loss"]:.4f} d ' +
-            ' '.join(f'{n(sub)} {v:+.4f}' for sub, v in dl.items()) +
-            (' | red ' + ' '.join(f'{n(p)} {dl[p] - dl[(p[0],)] - dl[(p[1],)]:+.4f}'
-                                  for p in pairs if p in dl) if pairs else '') +
-            f' | wall {time.time() - t0:.1f}s')
+            'win ' + '/'.join(f'{w:.1f}' for w in model.windows) +
+            ' | rms ' + '/'.join(f'{v:.4f}' for v in rms) +
+            ' | rank ' + '/'.join(f'{v:.1f}' for v in rank))
+    if pairs:
+        line += (f' cat {rank_cat:.1f} (sum {sum(rank):.1f}) | MI ' +
+                 ' '.join(f'{n(p)} {mi[p]:.1f}' for p in pairs) + f' TC {tc:.1f} | rho1 ' +
+                 ' '.join(f'{n(p)} {rho1[p]:.3f}' for p in pairs) + ' n>.9 ' +
+                 ' '.join(f'{n(p)} {n9[p]}' for p in pairs))
+    line += (f' | base {base["loss"]:.4f} d ' + ' '.join(f'{n(s)} {v:+.4f}' for s, v in dl.items()))
+    if pairs:
+        line += ' | red ' + ' '.join(f'{n(p)} {dl[p] - dl[(p[0],)] - dl[(p[1],)]:+.4f}'
+                                     for p in pairs if p in dl)
+    line += f' | wall {time.time() - t0:.1f}s'
     _eval_results[f'{corpus}~info'] = dict(rms=rms, rank=rank, rank_cat=rank_cat,
                                            mi={n(p): v for p, v in mi.items()}, tc=tc,
                                            base=base['loss'], d={n(k): v for k, v in dl.items()})
     _emit(line)
 
 
-def _doc_tokens(d):
-    """A framed eval document as its full token list: <STX> ... <ETX>."""
-    return [x for x, _ in d] + [d[-1][1]]
-
-
-def _recall_eval(step, corpus, docs):
-    """--eval_recall: does reading a span once make it easier to predict when it repeats?
-
-    test     <STX> A filler A      -- the second A follows its own first copy
-    control  <STX> B filler A      -- same length and layout, B a span of another document
-    gain at each gap = loss(second A | control) - loss(second A | test). The control matters:
-    the second copy sits mid-stream after unrelated filler, a harder spot than a document
-    start, so comparing it with the FIRST copy (loss right after <STX>) understates recall
-    and can even read negative. 'first' (A at the start) is still reported for scale.
-    The first token of each A is never scored (nothing could predict it)."""
-    L = args.eval_recall_len
-    gaps = [int(g) for g in args.eval_recall_gaps.split(',') if g.strip()]
-    marks = (_tokenizer.start_id, _tokenizer.end_id)
-    pool = [[t for t in _doc_tokens(d) if t not in marks] for d in docs]
-    idx = [i for i, q in enumerate(pool) if len(q) >= L][:args.eval_recall]
-    if len(idx) < 2:
-        return
-    seqs, meta = [], []
-    for g in gaps:
-        for n_, i in enumerate(idx):
-            A = pool[i][:L]
-            B = pool[idx[(n_ + len(idx) // 2) % len(idx)]][:L]     # another document's span
-            fill, j = [], i
-            while len(fill) < g:                 # filler from the following documents
-                j = (j + 1) % len(pool)
-                if j != i:
-                    fill += pool[j]
-            fill = fill[:g]
-            seqs.append([_tokenizer.start_id] + A + fill + A); meta.append((g, 'test'))
-            seqs.append([_tokenizer.start_id] + B + fill + A); meta.append((g, 'ctrl'))
-    ce = _ce_seqs(seqs)
-    first, second = [], {}
-    for (g, kind), c in zip(meta, ce):
-        s0 = L + g + 1                                    # loss index of the second A[1]
-        second.setdefault((g, kind), []).append(c[s0:s0 + L - 1].mean())
-        if kind == 'test' and g == gaps[0]:
-            first.append(c[1:L].mean())                   # A[1:] at the document start
-    f = float(np.mean(first))
-    res, parts = dict(first=f), []
-    for g in gaps:
-        t_, c_ = float(np.mean(second[(g, 'test')])), float(np.mean(second[(g, 'ctrl')]))
-        res[f'gap{g}'], res[f'gap{g}_ctrl'] = t_, c_
-        parts.append(f'gap{g} {t_:.4f} ctrl {c_:.4f} gain {c_ - t_:+.3f}')
-    _eval_results[f'{corpus}~recall'] = res
-    _emit(f'EVALR step {step:10} corpus {corpus:8} len {L} docs {len(idx)} first {f:.4f} | '
-          + ' | '.join(parts))
-
-
-# ── --eval_facts: reading-comprehension recall ────────────────────────────────
-_FACT_NAMES = ['Maria', 'Tom', 'Anna', 'James', 'Sarah', 'David', 'Laura', 'Peter', 'Emma',
-               'Daniel', 'Lucy', 'Michael', 'Julia', 'Robert', 'Grace', 'Henry', 'Alice',
-               'Frank', 'Helen', 'George', 'Rachel', 'Paul', 'Kate', 'Steven']
-_FACT_QUESTION = {'city': 'Where does {n} live?', 'job': 'What does {n} do for work?',
-                  'color': "What is {n}'s favorite color?", 'animal': 'What pet does {n} have?'}
-_FACT_ATTRS = {
-    'city':   ('{n} lives in {v}.', '{n} lives in',
-               ['Denver', 'Boston', 'Paris', 'London', 'Chicago', 'Seattle', 'Dallas', 'Berlin',
-                'Madrid', 'Tokyo', 'Toronto', 'Sydney', 'Rome', 'Dublin']),
-    'job':    ('{n} works as a {v}.', '{n} works as a',
-               ['nurse', 'baker', 'teacher', 'farmer', 'pilot', 'lawyer', 'doctor', 'driver',
-                'painter', 'chef', 'writer', 'plumber']),
-    'color':  ("{n}'s favorite color is {v}.", "{n}'s favorite color is",
-               ['red', 'blue', 'green', 'yellow', 'purple', 'orange', 'pink', 'brown', 'black',
-                'white']),
-    'animal': ('{n} has a pet {v}.', '{n} has a pet',
-               ['dog', 'cat', 'rabbit', 'horse', 'parrot', 'turtle', 'goat', 'hamster',
-                'snake', 'fish']),
-}
-_facts_items = None
-
-
-def _facts_build(n_items):
-    """Fixed items (seeded): two people, the SAME two attribute types each, all four facts
-    in a shuffled order; the question asks one person about one of the two attributes."""
-    rng = random.Random(4321)
-    items = []
-    for _ in range(n_items):
-        a, b = rng.sample(_FACT_NAMES, 2)
-        kinds = rng.sample(sorted(_FACT_ATTRS), 2)
-        val = {}
-        for k in kinds:
-            va, vb = rng.sample(_FACT_ATTRS[k][2], 2)
-            val[(a, k)], val[(b, k)] = va, vb
-        facts = [_FACT_ATTRS[k][0].format(n=n, v=val[(n, k)]) for n in (a, b) for k in kinds]
-        rng.shuffle(facts)
-        who, k = rng.choice((a, b)), rng.choice(kinds)
-        other = b if who == a else a
-        right, binder = val[(who, k)], val[(other, k)]
-        rest = [v for v in _FACT_ATTRS[k][2] if v not in (right, binder)]
-        cands = [right, binder] + rng.sample(rest, 2)
-        items.append(dict(passage=' '.join(facts), cue=_FACT_ATTRS[k][1].format(n=who),
-                          cands=cands, who=who, kind=k))      # cands[0] is the answer
-    return items
-
-
-def _facts_eval(step):
-    """--eval_facts: accuracy at each gap, plus the no-passage control."""
-    global _facts_items
-    if _facts_items is None:
-        _facts_items = _facts_build(args.eval_facts)
-    gaps = [int(g) for g in args.eval_facts_gaps.split(',') if g.strip()]
-    c0 = _eval_corpus_names()[0]
-    if c0 not in _eval_docs_cache:
-        _eval_docs_cache[c0] = _build_eval_docs(c0)
-    marks = (_tokenizer.start_id, _tokenizer.end_id)
-    pool = [[t for t in _doc_tokens(d) if t not in marks] for d in _eval_docs_cache[c0]]
-    enc = _tokenizer.encode
-    seqs, meta = [], []                  # meta: (condition, item index, candidate index, n)
-    for i, it in enumerate(_facts_items):
-        cue = enc('\n' + it['cue'])
-        cand = [enc(' ' + v) for v in it['cands']]
-        fill_all, j = [], i
-        while len(fill_all) < max(gaps):
-            j = (j + 1) % len(pool)
-            fill_all += pool[j]
-        conds = [(f'gap{g}', [_tokenizer.start_id] + enc(it['passage']) + fill_all[:g])
-                 for g in gaps] + [('nopassage', [_tokenizer.start_id])]
-        for name, pre in conds:
-            for ci, cv in enumerate(cand):
-                seqs.append(pre + cue + cv)
-                meta.append((name, i, ci, len(cv)))
-    ce = _ce_seqs(seqs)
-    score = {}
-    for (name, i, ci, n), c, q in zip(meta, ce, seqs):
-        score.setdefault((name, i), {})[ci] = -float(c[len(q) - 1 - n:len(q) - 1].sum())
-    names = [f'gap{g}' for g in gaps] + ['nopassage']
-    res, parts = {}, []
-    for name in names:
-        acc = bind = 0
-        for i in range(len(_facts_items)):
-            sc = score[(name, i)]
-            best = max(sc, key=sc.get)
-            acc += best == 0
-            bind += best == 1
-        n_ = len(_facts_items)
-        res[name] = 100.0 * acc / n_
-        parts.append(f'{name} {100.0 * acc / n_:.1f}% (binder {100.0 * bind / n_:.0f}%)')
-    _eval_results['facts'] = res
-    _emit(f'EVALF step {step:10} items {len(_facts_items)} chance 25% | ' + ' | '.join(parts))
-
-
-_chatqa_items = None
-
-
-def _chatqa_build(limit):
-    """-> {part: [(prompt_text, [answer_text, ...], gold, norm)]}, built once.
-    prompt_text ends with 'Assistant:'; answers start with a space. norm: score by mean
-    per-token log-probability (PIQA/COPA answers differ in length) instead of the sum."""
-    from datasets import load_dataset
-    global _facts_items
-    if _facts_items is None:
-        _facts_items = _facts_build(args.eval_facts or 200)
-    out = {'facts': [], 'facts_nop': [], 'piqa': [], 'copa': []}
-    for it in _facts_items:
-        q = _FACT_QUESTION[it['kind']].format(n=it['who'])
-        ans = [f" {it['cue']} {v}." for v in it['cands']]
-        out['facts'].append((f"User: {it['passage']} {q}\n\nAssistant:", ans, 0, False))
-        out['facts_nop'].append((f"User: {q}\n\nAssistant:", ans, 0, False))
-    for ex in load_dataset('baber/piqa', split='validation'):
-        out['piqa'].append((f"User: {ex['goal']}\n\nAssistant:",
-                            [' ' + ex['sol1'], ' ' + ex['sol2']], int(ex['label']), True))
-        if limit and len(out['piqa']) >= limit:
-            break
-    for ex in load_dataset('pkavumba/balanced-copa', split='test'):
-        q = {'cause': 'What was the cause?', 'effect': 'What happened as a result?'}[ex['question']]
-        out['copa'].append((f"User: {ex['premise']} {q}\n\nAssistant:",
-                            [' ' + ex['choice1'], ' ' + ex['choice2']], int(ex['label']), True))
-        if limit and len(out['copa']) >= limit:
-            break
-    return out
-
-
-def _chatqa_eval(step):
-    """--eval_chatqa: chat-format multiple choice, one EVALQ line."""
-    global _chatqa_items
-    if _chatqa_items is None:
-        _chatqa_items = _chatqa_build(args.eval_chatqa)
-    enc = _tokenizer.encode
-    seqs, meta = [], []
-    for part, items in _chatqa_items.items():
-        for i, (ptxt, ans, gold, norm) in enumerate(items):
-            pre = [_tokenizer.start_id] + enc(ptxt)
-            for ci, a in enumerate(ans):
-                av = enc(a)
-                seqs.append(pre + av)
-                meta.append((part, i, ci, len(av)))
-    ce = _ce_seqs(seqs)
-    score = {}
-    for (part, i, ci, n), c, q in zip(meta, ce, seqs):
-        lp = -float(c[len(q) - 1 - n:len(q) - 1].sum())
-        score.setdefault((part, i), {})[ci] = (lp, lp / max(n, 1))
-    res, parts = {}, []
-    for part, items in _chatqa_items.items():
-        acc = acc_n = bind = 0
-        for i, (_, ans, gold, norm) in enumerate(items):
-            sc = score[(part, i)]
-            b_sum = max(sc, key=lambda k: sc[k][0])
-            b_avg = max(sc, key=lambda k: sc[k][1])
-            acc += b_sum == gold
-            acc_n += b_avg == gold
-            bind += b_sum == 1
-        n_ = max(len(items), 1)
-        if part.startswith('facts'):
-            res[part] = 100.0 * acc / n_
-            parts.append(f'{part} {100.0 * acc / n_:.1f}% (binder {100.0 * bind / n_:.0f}%)')
-        else:
-            res[part] = 100.0 * acc_n / n_
-            parts.append(f'{part} acc {100.0 * acc / n_:.1f}% norm {100.0 * acc_n / n_:.1f}% n {n_}')
-    _eval_results['chatqa'] = res
-    _emit(f'EVALQ step {step:10} chance facts 25% piqa/copa 50% | ' + ' | '.join(parts))
-
-
 class _Judge:
-    """--eval_gen: a frozen judge LM scoring a continuation GIVEN its prompt. On the
-    training device in bf16 when that is CUDA (a 1.5B judge on the CPU took minutes per
-    eval), else on the CPU in fp32."""
+    """EVALG's frozen judge LM: bf16 on the training GPU, else fp32 on the CPU."""
+
     def __init__(self, repo):
         from transformers import AutoTokenizer, AutoModelForCausalLM
-        _md = next(model.parameters()).device
-        self.dev = _md if _md.type == 'cuda' else torch.device('cpu')
+        md = next(model.parameters()).device
+        self.dev = md if md.type == 'cuda' else torch.device('cpu')
         dt = torch.bfloat16 if self.dev.type == 'cuda' else torch.float32
         self.tok = AutoTokenizer.from_pretrained(repo)
-        self.lm = AutoModelForCausalLM.from_pretrained(repo, torch_dtype=dt).to(self.dev).eval()
-        for p_ in self.lm.parameters():
-            p_.requires_grad_(False)
+        self.lm = AutoModelForCausalLM.from_pretrained(repo, dtype=dt).to(self.dev).eval()
+        for p in self.lm.parameters():
+            p.requires_grad_(False)
         print(f'--eval_gen: judge {repo} loaded on {self.dev} ({dt})', flush=True)
 
     @torch.no_grad()
     def cond_nll(self, prompt, cont):
-        """Mean nats/token of `cont` after `prompt` (prompt tokens not scored)."""
+        """Mean nats/token of cont after prompt (prompt tokens not scored)."""
         p = self.tok(prompt).input_ids
         full = self.tok(prompt + cont, truncation=True, max_length=1024).input_ids
         if len(full) - len(p) < 2:
@@ -7669,618 +1479,252 @@ class _Judge:
 
 
 _judge = None
-_gen_anchor = {}         # corpus -> (prompts, real nats, shuffled nats), computed once
-
-
-def _rep_stats(text):
-    """rep1 (as GENSCORE: max of word- and char-level top-share) and distinct-2."""
-    w = text.split()
-    ch = [c for c in text if not c.isspace()]
-    rep1 = max(max(collections.Counter(w).values()) / len(w) if w else 0.0,
-               max(collections.Counter(ch).values()) / len(ch) if ch else 0.0)
-    bg = list(zip(w, w[1:]))
-    d2 = len(set(bg)) / len(bg) if bg else 0.0
-    return rep1, d2
+_gen_anchor = {}             # corpus -> [(prompt ids, prompt text, real nats, shuffled nats)]
 
 
 def _gen_eval(step, corpus, docs):
-    """--eval_gen: prompted continuations scored by the judge against matched anchors."""
+    """EVALG: continue held-out prompts; the judge scores the continuation given the prompt,
+    against the document's real continuation (floor) and its words shuffled (ceiling)."""
     global _judge
-    _t0 = time.time()
+    t0 = time.time()
     if _judge is None:
         _judge = _Judge(args.eval_gen_judge)
     P, C = args.eval_gen_prompt, args.eval_gen_len
     if corpus not in _gen_anchor:
-        rng = random.Random(1234)
-        items = []
+        rng, items = random.Random(1234), []
         for d in docs:
             q = _doc_tokens(d)
             if len(q) < 1 + P + C:
                 continue
-            prompt = q[:1 + P]
-            ptxt = _decode_plain(prompt)
-            real = _decode_plain(q[1 + P:1 + P + C])
-            sw = real.split(); rng.shuffle(sw)
+            ptxt, real = _decode_plain(q[:1 + P]), _decode_plain(q[1 + P:1 + P + C])
+            sw = real.split()
+            rng.shuffle(sw)
             a, b = _judge.cond_nll(ptxt, real), _judge.cond_nll(ptxt, ' ' + ' '.join(sw))
             if a is not None and b is not None:
-                items.append((prompt, ptxt, a, b))
+                items.append((q[:1 + P], ptxt, a, b))
             if len(items) >= args.eval_gen:
                 break
         _gen_anchor[corpus] = items
-    items = _gen_anchor[corpus]
-    if not items:
-        return
-    _was_training = model.training
     g_n, r_n, s_n, reps, d2s = [], [], [], [], []
-    try:
-        with torch.random.fork_rng(devices=[next(model.parameters()).device]
-                                   if next(model.parameters()).is_cuda else []):
-            for prompt, ptxt, a, b in items:
-                out = model.generate(prompt, C, temperature=args.temperature)
-                if _tokenizer.end_id in out:              # one continuation, not a new doc
-                    out = out[:out.index(_tokenizer.end_id)]
-                ctxt = _decode_plain(out)
-                n = _judge.cond_nll(ptxt, ctxt) if ctxt.strip() else None
-                if n is None:
-                    continue
-                r1, d2 = _rep_stats(ctxt)
-                g_n.append(n); r_n.append(a); s_n.append(b); reps.append(r1); d2s.append(d2)
-    finally:
-        if _was_training:
-            model.train()
+    dev = next(model.parameters()).device
+    with _EvalState(), torch.random.fork_rng(devices=[dev] if dev.type == 'cuda' else []):
+        for prompt, ptxt, a, b in _gen_anchor[corpus]:
+            out = model.generate(prompt, C, temperature=args.temperature)
+            if _tokenizer.end_id in out:                  # one continuation, not a new doc
+                out = out[:out.index(_tokenizer.end_id)]
+            ctxt = _decode_plain(out)
+            n = _judge.cond_nll(ptxt, ctxt) if ctxt.strip() else None
+            if n is None:
+                continue
+            w = ctxt.split()
+            bg = list(zip(w, w[1:]))
+            g_n.append(n); r_n.append(a); s_n.append(b)
+            reps.append(_rep1(ctxt)); d2s.append(len(set(bg)) / len(bg) if bg else 0.0)
     if not g_n:
         return
-    g, r, s_ = float(np.mean(g_n)), float(np.mean(r_n)), float(np.mean(s_n))
-    flu = 100.0 * (s_ - g) / (s_ - r) if s_ > r else float('nan')
-    _eval_results[f'{corpus}~gen'] = dict(nats=g, real=r, shuf=s_, fluency=flu,
+    g, r, s = float(np.mean(g_n)), float(np.mean(r_n)), float(np.mean(s_n))
+    flu = 100.0 * (s - g) / (s - r) if s > r else float('nan')
+    _eval_results[f'{corpus}~gen'] = dict(nats=g, real=r, shuf=s, fluency=flu,
                                           rep1=float(np.mean(reps)), distinct2=float(np.mean(d2s)))
     _emit(f'EVALG step {step:10} corpus {corpus:8} prompts {len(g_n)} nats {g:.4f} '
-          f'real {r:.4f} shuf {s_:.4f} fluency {flu:.1f}% rep1 {np.mean(reps):.3f} '
-          f'distinct2 {np.mean(d2s):.3f} wall {time.time() - _t0:.1f}s')
+          f'real {r:.4f} shuf {s:.4f} fluency {flu:.1f}% rep1 {np.mean(reps):.3f} '
+          f'distinct2 {np.mean(d2s):.3f} wall {time.time() - t0:.1f}s')
 
 
-# ── zero-shot multiple-choice reasoning eval (--reason_eval) ──────────────────
-# Held-out LOSS cannot measure the thing this project now wants. If the goal is a model
-# that REASONS and looks obscure facts up, then loss on a factual corpus actively rewards
-# the opposite: a model that memorised Wikipedia scores better than one that reasons. So
-# reasoning needs its own metric, scored the standard zero-shot way.
-#
-# Each item is a context plus N candidate continuations. Every candidate is scored by the
-# summed log-probability of its tokens given the context, and the argmax is the answer.
-#   acc       argmax of the TOTAL log-probability
-#   acc_norm  argmax of the PER-TOKEN mean -- the headline, because it does not penalise
-#             long candidates. Chance is 1/N: 25% for the 4-way sets, 50% for winogrande.
-#
-# winogrande is the purest test of the hypothesis: resolving "Sarah was a better surgeon
-# than Maria so _ got the easier cases" needs plausibility judgement and no retrievable
-# fact. arc_easy/obqa are grade-school SCIENCE and do lean on knowledge, so a low score
-# there is ambiguous -- it may mean the model cannot reason, or simply does not know.
-_REASON_BENCH = {
-    'arc_easy':   ('allenai/ai2_arc', 'ARC-Easy', 'validation'),
-    'arc_chal':   ('allenai/ai2_arc', 'ARC-Challenge', 'validation'),
-    'obqa':       ('allenai/openbookqa', 'main', 'validation'),
-    'winogrande': ('allenai/winogrande', 'winogrande_xs', 'validation'),
-    # everyday common sense, with headroom for small models (lm-eval-harness formats):
-    'piqa':       ('baber/piqa', None, 'validation'),           # physical, 2-way, 1838 items
-    'hellaswag':  ('Rowan/hellaswag', None, 'validation'),      # scene continuation, 4-way
-    'copa':       ('pkavumba/balanced-copa', None, 'test'),     # cause/effect, 2-way, 500
-}
-
-
-def _hs_clean(t):
-    """HellaSwag's WikiHow text carries [title]/[step] markup; strip it as lm-eval does."""
-    t = t.strip().replace(' [title]', '. ')
-    t = re.sub(r'\[.*?\]', '', t)
-    return t.replace('  ', ' ')
-
-
-def _mc_items(bench, limit=0):
-    """-> [(context, [candidate, ...], gold_index)]. One shape for every benchmark."""
-    from datasets import load_dataset
-    repo, cfg, split = _REASON_BENCH[bench]
-    rows = load_dataset(repo, cfg, split=split)
-    out = []
-    for ex in rows:
-        if bench == 'winogrande':
-            # Standard partial evaluation: substitute the option into the blank and score
-            # the text AFTER it. Scoring the whole sentence would compare candidates that
-            # differ only in a shared prefix, which measures the option's unigram frequency
-            # more than the resolution.
-            sent = ex['sentence']
-            if '_' not in sent:
-                continue
-            pre, post = sent.split('_', 1)
-            cands = [pre + ex['option1'], pre + ex['option2']]
-            # context differs per candidate here, so carry the pair and score `post`
-            out.append((cands, [post, post], int(ex['answer']) - 1))
-        elif bench == 'piqa':
-            out.append((f"Question: {ex['goal']}\nAnswer:",
-                        [' ' + ex['sol1'], ' ' + ex['sol2']], int(ex['label'])))
-        elif bench == 'hellaswag':
-            ctx = ex['ctx_a'] + ' ' + ex['ctx_b'].capitalize()
-            out.append((_hs_clean(ex['activity_label'] + ': ' + ctx),
-                        [' ' + _hs_clean(e) for e in ex['endings']], int(ex['label'])))
-        elif bench == 'copa':
-            # "The man turned on the faucet therefore water flowed from the spout."
-            conn = {'cause': 'because', 'effect': 'therefore'}[ex['question']]
-            low = lambda c: c[0].lower() + c[1:]
-            out.append((ex['premise'].rstrip('.') + ' ' + conn,
-                        [' ' + low(ex['choice1']), ' ' + low(ex['choice2'])], int(ex['label'])))
-        else:
-            q = ex.get('question') or ex.get('question_stem') or ''
-            ch = ex['choices']
-            texts, labels = ch['text'], ch['label']
-            key = ex['answerKey']
-            if key not in labels:
-                continue
-            out.append((q, [' ' + t for t in texts], labels.index(key)))
-        if limit and len(out) >= limit:
-            break
-    return out
-
-
-def _reason_eval(step):
-    """Score every --reason_eval benchmark and log one MC line each. Never raises."""
-    for bench in [b.strip() for b in (args.reason_eval or '').split(',') if b.strip()]:
-        if _reason_failed.get(bench):
+def _heldout_eval(step):
+    """Every eval corpus: EVAL/EVALB, then EVALX, EVALG, and EVALI (first corpus only).
+    Failures are reported and never take the training run down."""
+    for i, corpus in enumerate(_eval_corpus_names()):
+        if _eval_failed.get(corpus):
             continue
         try:
-            if bench not in _reason_cache:
-                _reason_cache[bench] = _mc_items(bench, args.reason_docs)
-            items = _reason_cache[bench]
-            _dev = next(model.parameters()).device
-            was = model.training
-            _saved_dff, _saved_clk = model.dff, model.clk
-            model.eval()
-            t0 = time.time()
-            try:
-                rows, owner = [], []
-                for qi, (ctx, cands, gold) in enumerate(items):
-                    for ci, cand in enumerate(cands):
-                        c = ctx[ci] if isinstance(ctx, list) else ctx
-                        cid = [_tokenizer.start_id] + _tokenizer.encode(c)
-                        aid = _tokenizer.encode(cand)
-                        if not aid:
-                            aid = [_tokenizer.end_id]
-                        rows.append((cid, aid))
-                        owner.append((qi, ci))
-                tot = np.zeros(len(rows)); cnt = np.zeros(len(rows))
-                with torch.no_grad():
-                    for s0 in range(0, len(rows), _EVAL_BATCH):
-                        chunk = rows[s0:s0 + _EVAL_BATCH]
-                        B = len(chunk)
-                        T = max(len(c) + len(a) for c, a in chunk)
-                        X = torch.zeros((B, T), dtype=torch.long)
-                        Y = torch.zeros((B, T), dtype=torch.long)
-                        M = torch.zeros((B, T), dtype=torch.bool)
-                        for r, (c, a) in enumerate(chunk):
-                            seq = c + a
-                            X[r, :len(seq) - 1] = torch.tensor(seq[:-1])
-                            Y[r, :len(seq) - 1] = torch.tensor(seq[1:])
-                            # score ONLY the candidate's own tokens
-                            M[r, len(c) - 1:len(seq) - 1] = True
-                        X, Y, M = X.to(_dev), Y.to(_dev), M.to(_dev)
-                        model.dff = None
-                        acc = torch.zeros(B, device=_dev)
-                        for t in range(T):
-                            # --datarep: N steps per token, scored on the last replica --
-                            # the same contract training and generate() use
-                            for _ in range(_DATAREP):
-                                lg, _ = model(X[:, t])
-                            lp = -F.cross_entropy(lg, Y[:, t], reduction='none')
-                            lp = torch.where(torch.isfinite(lp), lp, torch.full_like(lp, -1e30))
-                            acc += lp * M[:, t]
-                        tot[s0:s0 + B] = acc.cpu().numpy()
-                        cnt[s0:s0 + B] = M.sum(dim=1).clamp(min=1).cpu().numpy()
-            finally:
-                model.dff, model.clk = _saved_dff, _saved_clk
-                if was:
-                    model.train()
-            nq = len(items)
-            best_t = [None] * nq; best_n = [None] * nq
-            for i, (qi, ci) in enumerate(owner):
-                if best_t[qi] is None or tot[i] > best_t[qi][1]:
-                    best_t[qi] = (ci, tot[i])
-                nrm = tot[i] / cnt[i]
-                if best_n[qi] is None or nrm > best_n[qi][1]:
-                    best_n[qi] = (ci, nrm)
-            golds = [g for _, _, g in items]
-            a1 = float(np.mean([best_t[i][0] == golds[i] for i in range(nq)]))
-            a2 = float(np.mean([best_n[i][0] == golds[i] for i in range(nq)]))
-            nch = len(items[0][1])
-            d = ('MC   step {:10} bench {:11} acc {:6.4f} acc_norm {:6.4f} '
-                 'chance {:6.4f} n {:5d} wall {:6.1f}s'
-                 ).format(step, bench, a1, a2, 1.0 / max(nch, 1), nq, time.time() - t0)
-            print(d, flush=True)
-            with open(args.log, 'a') as f:
-                print(d, file=f)
+            docs = _eval_docs(corpus)
+            if not docs:
+                print(f'WARNING: no usable held-out documents for "{corpus}"; skipping it')
+                continue
+            _score(step, corpus, docs)
         except Exception as e:
-            print(f'WARNING: --reason_eval "{bench}" failed at step {step}: {e!r}; '
-                  f'disabling that benchmark', flush=True)
-            _reason_failed[bench] = True
+            print(f'WARNING: eval failed at step {step} on "{corpus}": {e!r}; disabling it',
+                  flush=True)
+            _eval_failed[corpus] = True
+            continue
+        for fn, on in ((_reach_eval, args.eval_reach), (_gen_eval, args.eval_gen),
+                       (_info_eval, args.eval_info and i == 0)):
+            if on:
+                try:
+                    fn(step, corpus, docs)
+                except Exception as e:
+                    print(f'WARNING: {fn.__name__} failed at step {step} on "{corpus}": {e!r}',
+                          flush=True)
 
 
-# ── one-shot protocol eval (--eval --eval_corpora) ────────────────────────────
-# Offline scoring of a checkpoint against any number of held-out sets, using EXACTLY the
-# measurement the training loop writes as EVAL lines: the same 400-document sample, the same
-# clean/median/runaway definition, the same per-token runaway criterion exp/score.py uses.
-# That is the point -- a number produced here is directly comparable to a run's own EVAL
-# curve and to every other checkpoint scored this way, which the whole-split --eval is not
-# (it is token-weighted over a different, much larger set).
-#
-#   python vla.py --eval --load checkpoint/foo.pt --eval_corpora c4,pile,web --streaming
-#
-# Note on c4 for a gpt2-teacher run: GPT-2 was trained on WebText, NOT on C4 (C4 is T5's
-# corpus). The open replication of WebText is Skylion007/openwebtext == --dataset web, so
-# `web` is the closer probe of what a gpt2 teacher's text resembles; c4 is a second,
-# independent crawl-derived corpus and is useful precisely because it is NOT that.
-if args.eval and args.eval_corpora:
+if args.eval:
     if args.load is None and args.pretrained is None:
         print('WARNING: --eval without --load/--pretrained is measuring an untrained model')
-    print(f'protocol eval: {args.eval_docs} docs, minlen {_EVAL_MINLEN}, maxlen '
-          f'{_EVAL_MAXLEN}, runaway >{_EVAL_THRESH} nats on ANY token', flush=True)
     _heldout_eval(_start_step)
-    if args.reason_eval:
-        _reason_eval(_start_step)
-
-    _ck = args.load or args.pretrained or '(untrained)'
-    print(f'\n{"="*86}\nPROTOCOL EVAL  {_ck}  step {_start_step}\n{"="*86}')
+    ck = args.load or args.pretrained or '(untrained)'
+    print(f'\n{"=" * 86}\nPROTOCOL EVAL  {ck}  step {_start_step}\n{"=" * 86}')
     print(f'{"corpus":10} {"clean":>10} {"ppl":>11} {"median":>10} {"runaway%":>9} '
           f'{"nrun":>5} {"docs":>6} {"tokens":>9}')
     print('-' * 86)
-    for _c in _eval_corpus_names():
-        r = _eval_results.get(_c)
+    for c in _eval_corpus_names():
+        r = _eval_results.get(c)
         if r is None:
-            print(f'{_c:10} {"(failed or empty -- see WARNING above)":>50}')
-            continue
-        for _k, _lbl in ((_c, _c), (f'{_c}~warm', f'{_c} warm')):
-            r = _eval_results.get(_k)
-            if r is None:
-                continue
-            print(f'{_lbl:10} {r["clean"]:10.4f} {r["ppl"]:11.2f} {r["median"]:10.4f} '
+            print(f'{c:10} {"(failed or empty -- see WARNING above)":>50}')
+        else:
+            print(f'{c:10} {r["clean"]:10.4f} {r["ppl"]:11.2f} {r["median"]:10.4f} '
                   f'{r["runaway_pct"]:9.2f} {r["nrun"]:5d} {r["docs"]:6d} {r["tokens"]:9d}')
     print('-' * 86)
-    # Corpora are NOT comparable to each other: each has its own information floor (pile
-    # unigram 7.9470 vs web 7.5732), so a lower number on one corpus does not mean the model
-    # is better there. Compare a corpus against ITSELF across checkpoints.
-    print('note: compare a corpus across checkpoints, never across corpora -- each has its'
-          '\n      own floor (pile unigram 7.9470, web 7.5732; pile bigram 6.3511, web 5.8279)')
+    print('note: compare a corpus across checkpoints, never across corpora')
     if args.eval_json:
-        with open(args.eval_json, 'w') as _f:
-            json.dump({'checkpoint': _ck, 'step': int(_start_step),
-                       'eval_docs': args.eval_docs, 'minlen': _EVAL_MINLEN,
-                       'maxlen': _EVAL_MAXLEN, 'thresh': _EVAL_THRESH,
-                       'results': _eval_results}, _f, indent=1)
+        with open(args.eval_json, 'w') as f:
+            json.dump({'checkpoint': ck, 'step': int(_start_step), 'eval_docs': args.eval_docs,
+                       'minlen': _EVAL_MINLEN, 'maxlen': _EVAL_MAXLEN, 'thresh': _EVAL_THRESH,
+                       'results': _eval_results}, f, indent=1)
         print(f'wrote {args.eval_json}')
     raise SystemExit(0)
 
+# ── optimizer / schedule ──────────────────────────────────────────────────────
+
+_trainable = [p for p in model.parameters() if p.requires_grad]
+optimizer = torch.optim.SGD(_trainable, lr=args.lr_max, momentum=args.momentum,
+                            weight_decay=args.weight_decay)
+if _loaded_ckpt is not None and _loaded_ckpt.get('optimizer'):
+    osd = optimizer.state_dict()
+    ck = _loaded_ckpt['optimizer']
+    if [len(g['params']) for g in ck['param_groups']] == [len(g['params']) for g in osd['param_groups']]:
+        osd['state'] = ck['state']
+        optimizer.load_state_dict(osd)
+        print(f'optimizer state restored ({len(osd["state"])} tensors)', flush=True)
+    else:
+        print('WARNING: optimizer state NOT restored: parameter groups differ', flush=True)
+_loaded_ckpt = None
+
+
+def _lr_factor(step):
+    """lr / lr_max at a global step."""
+    if args.schedule == 'const':
+        return 1.0
+    f = (1.0 - math.cos(math.pi * min(step / max(1, args.lr_period), 1.0))) / 2.0
+    return (args.lr_min + (args.lr_max - args.lr_min) * f) / args.lr_max
+
+
+scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=_lr_factor)
+if _start_step:              # resume: fast-forward the schedule to the checkpoint's step
+    scheduler.last_epoch = _start_step
+    lrs = [base * _lr_factor(_start_step) for base in scheduler.base_lrs]
+    for g, lr in zip(optimizer.param_groups, lrs):
+        g['lr'] = lr
+    scheduler._last_lr = lrs
 
 # ── training loop ─────────────────────────────────────────────────────────────
 
+stop = threading.Event()
+q = queue.Queue(maxsize=args.batch)
+w = threading.Thread(target=worker, args=(stop, q, hf_dataset))
+w.start()
+
+
+def _grad_norm():
+    return sum(p.grad.detach().norm(2).item() ** 2
+               for p in model.parameters() if p.grad is not None and p.requires_grad) ** 0.5
+
+
+def _save(i, n_examples):
+    if not all(torch.isfinite(t).all() for t in model.state_dict().values()
+               if t.is_floating_point()):
+        print(f'WARNING: non-finite params at step {i}; skipping checkpoint save')
+        return
+    log = open(args.log).read() if os.path.exists(args.log) else ''
+    torch.save({'saved_args': vars(args), 'state_dict': model.state_dict(), 'log': log,
+                'step': i, 'examples': n_examples, 'lr': optimizer.param_groups[0]['lr'],
+                'optimizer': optimizer.state_dict()}, args.save)
+
+
 larr, garr = [], []
-carr = []             # --clip: 1.0 on steps whose grad norm hit the limit
-varr = []             # --vocab_slots: per-step loss over the vocab slots alone
-i = _start_step        # continue the step count from the resumed checkpoint (0 if fresh)
-# cumulative count of training examples (one <STX>..<ETX> clip) begun, over all slots;
-# a slot's flag is True on the step it emits its <STX>, so summing flags counts examples.
-n_examples = _start_exs
-_plat_sum, _plat_n = 0.0, 0    # running mean of this interval's losses, for the plat bin
-# --gen_interval 0 keeps the pre-flag behaviour: one GEN sample per --checkpoint interval.
-_gen_interval = args.gen_interval or args.checkpoint
-_w_ctx  = collections.deque(maxlen=60)   # --gen_warm: slot 0's last 60 input tokens
-_w_next = None                           # ... and the token it reads next
-
-# --preroll: throw away batches until the stream produces its first <ETX>. Cheap —
-# it only drains the queue, no forward/backward — and it costs one clip's worth of
-# tokens. Slots all begin their first clip together on step 0, so until the first
-# clip ends the batch is `--batch` copies of the same opening; training through that
-# is a correlated batch at the point the run is most sensitive to it. The first <ETX>
-# is the shortest clip in the batch ending: from there each slot sits at a different
-# offset in a different story and slots reload at staggered steps.
-if args.preroll:
-    _pre = 0
-    while True:
-        _, _y_list, _ = q.get()
-        _pre += 1
-        if model.end_id in _y_list:   # a slot just emitted the <ETX> target ending its clip
-            break
-    print(f'preroll: discarded {_pre} steps ({_pre * args.batch:,} tokens) '
-          f'to reach the first <ETX>')
-
+i, n_examples = _start_step, _start_exs
 try:
     while True:
-        # ── checkpoint / generation sample ───────────────────────────────────
-        if (i % args.checkpoint) == 0:
-            # --schedule plat: bin this interval's losses, then take one lr decision from
-            # the slope over the whole window (see _plat_update). Ahead of the save below,
-            # so the checkpoint carries the post-decision lr and window.
-            if _plateau:
-                if _plat_n:
-                    _plat_loss.append(_plat_sum / _plat_n)
-                _plat_sum, _plat_n = 0.0, 0
-                _pu = _plat_update()
-                if _pu is not None:
-                    d = ('PLAT step {:10} fit {:+12.6f} lr {:10.9f} bins {}/{} {}'
-                         ).format(i, _pu[0], _pu[1], len(_plat_loss), _plat_bins,
-                                  'DECAY' if _pu[2] else 'hold')
-                    print(d)
-                    with open(args.log, 'a') as f:
-                        print(d, file=f)
+        if i % args.checkpoint == 0:
+            _save(i, n_examples)
+            te, tt = _text_drain()
+            if te:
+                _emit(f'TEXT step {i:10} examples {te} tokens {tt} epoch {args.dataset}={_epoch[0]}')
 
-            _finite = all(torch.isfinite(p).all() for p in model.state_dict().values()
-                          if p.is_floating_point())
-            if _finite:
-                # Embed the cumulative log so a later --load can prepend it and chart.py
-                # sees one uninterrupted sequence across resumes. args.log already begins
-                # with any log carried in from the checkpoint we resumed from.
-                _log_text = ''
-                if args.log and args.log != os.devnull and os.path.exists(args.log):
-                    with open(args.log) as _lf:
-                        _log_text = _lf.read()
-                # 'lr'/'plat' carry --schedule plat across a resume: it has no closed form
-                # to fast-forward, so it picks up the lr it was saved at and keeps filling
-                # the same binned loss window instead of starting it over.
-                torch.save({'saved_args': vars(args), 'state_dict': model.state_dict(),
-                            'log': _log_text, 'step': i, 'examples': n_examples,
-                            'lr': optimizer.param_groups[0]['lr'],
-                            'optimizer': optimizer.state_dict(),
-                            'plat': list(_plat_loss) if _plateau else None}, args.save)
-            else:
-                print(f'WARNING: non-finite params at step {i}; skipping checkpoint save')
-
-            # text throughput for this checkpoint interval (examples/tokens consumed).
-            # Stays in THIS block, not the generation block below: _text_drain() resets the
-            # counters it reports, so draining it on the (faster) generation interval would
-            # silently rescale every TEXT line. exp/watch.sh also triggers off 'TEXT step',
-            # i.e. off checkpoints, which is what it is meant to track.
-            # --refresh: the stall detector's state, on the checkpoint cadence. The verdict
-            # itself only exists at an epoch boundary, which can be tens of thousands of
-            # steps apart at --subsample 10000, so this reports the epoch-so-far mean and the
-            # last verdict in between -- enough to see the detector converging toward still
-            # rather than only learning about it when it fires.
-            if args.refresh and not args.refresh_every:
-                _mu, _ns, _nl, _lastv, _hold = _stab_peek()
-                _lv = ('none yet' if _lastv is None else
-                       f'{_lastv[0]:+.{args.refresh_r}f} (abs {_lastv[1]:.{args.refresh_r}f})')
-                _ref = (f'eps {args.refresh_eps:g}' if args.refresh_mode == 'abs' else
-                        'best ' + ('none' if _stab_best[0] is None
-                                   else f'{_stab_best[0]:.{args.refresh_r}f}'))
-                _tl = (f'TRIGGER step {i:10} mean_std {_mu:.4f} samples {_ns} layers {_nl} '
-                       f'last_sum_delta {_lv} {args.refresh_mode} {_ref} '
-                       f'still {_hold}/{args.refresh_hold}')
-                print(_tl)
-                with open(args.log, 'a') as f:
-                    print(_tl, file=f)
-
-            _te, _tt, _ = _text_drain()      # sample is read separately, see _text_peek
-            if _te:
-                d = f'TEXT step {i:10} examples {_te} tokens {_tt}'
-                _ep = _epoch_report()          # passes over the corpus; the clock of a
-                if _ep:                        # closed-corpus run, 'wdef=1' until it wraps
-                    d += f' epoch {_ep}'
-                print(d)
-                with open(args.log, 'a') as f:
-                    print(d, file=f)
-
-        # ── held-out eval ─────────────────────────────────────────────────────
-        # after the save, so the EVAL line in the log describes the weights that were just
-        # written to disk and can be re-derived from that checkpoint with exp/score.py.
-        # Skipped at step 0 (like exp/watch.sh's report): it would score the UNTRAINED model,
-        # which is ln(vocab) by construction and already known -- measured 10.8221 against a
-        # ln(50304) = 10.8258 ceiling. It is not free: 400 documents is ~137s on a 4090, and
-        # it lands before the first training step, so the run looks hung for over two minutes
-        # at every start with nothing in the log moving.
-        if args.eval_interval and i > 0 and (i % args.eval_interval) == 0:
+        # after the save, so an EVAL line describes weights that exist on disk; not at step
+        # 0, where it would only measure ln(vocab)
+        if args.eval_interval and i > 0 and i % args.eval_interval == 0:
             _heldout_eval(i)
-            if args.reason_eval:
-                _reason_eval(i)
 
-        # ── generation sample ─────────────────────────────────────────────────
-        # own interval: text has repeatedly overturned what the scalars said (a model called
-        # "bigram-level with zero semantics" was writing grammatical clauses), and sampling
-        # 200 tokens is cheap next to writing 30M parameters to disk.
-        if (i % _gen_interval) == 0:
-            model.eval()
-            # generate() runs on a LOCAL dff/clock (see Model.generate), so sampling several
-            # prompts here cannot perturb the training state -- only cost time, and a batch-1
-            # 200-token sample is trivial next to --gen_interval training steps.
+        if args.gen_interval and i % args.gen_interval == 0:
             lines = []
-            for _p in (_gen_prompt_list() if args.gen_cold else []):
-                prompt = _prompt_ids(_p)
-                out    = model.generate(prompt, _GEN_SAMPLE, temperature=args.temperature)
-                lines.append(f'GEN step {i:10} [{_p or ("<NULL>" if args.gen_null else "<STX>")}]: {_render(prompt + out)}')
-                if _gen_scorer is not None:
-                    # score the DECODED generation, not the rendered line: _render escapes
-                    # whitespace and inserts <STX>/<ETX>, none of which is text the model
-                    # produced, and all of which the reference would be scoring instead.
-                    _txt = _decode_plain(out)
-                    _sc  = _gen_scorer.score(_txt)
-                    if _sc:
-                        lines.append(f'GENSCORE step {i:10} [{_p or ("<NULL>" if args.gen_null else "<STX>")}]: {_sc}')
-            if args.gen_warm and model.dff is not None and _w_next is not None:
-                # --gen_warm: slot 0's live state, copied -- the training context is untouched
-                _dev = next(model.parameters()).device
-                _wd  = [d[0:1].clone() for d in model.dff]
-                _wc  = model._new_writer(1, _dev)
-                if _wc is not None and model.clk is not None:
-                    _wc.t = model.clk.t[0:1].clone()
-                _wo = model.generate_from_state(_wd, _wc, _w_next, _GEN_SAMPLE,
-                                                temperature=args.temperature)
-                lines.append(f'GENW step {i:10} [slot 0]: {_render(list(_w_ctx) + [_w_next])}'
-                             f' \033[1m⟹\033[0m {_render(_wo)}')   # bold arrow (ANSI)
-                if _gen_scorer is not None:
-                    # the CONTINUATION only: the real context before ⟹ is corpus text, and
-                    # scoring it would credit the model for text it did not write
-                    _sc = _gen_scorer.score(_decode_plain(_wo))
-                    if _sc:
-                        lines.append(f'GENSCORE step {i:10} [slot 0]: {_sc}')
-            _tsample, _vsample = _text_peek()  # recent corpus / per-pool vocab training text
-            _vw = max([len(k) for k in _vsample] + [6])
-            for _k in sorted(_vsample):            # every curriculum file, every report
-                lines.append(f'TXT-{_k:<{_vw}}: {_printable(_sample_window(_vsample[_k]))}')
-            if _tsample:
-                lines.append(f'TXT-{"SAMPLE":<{_vw}}: {_printable(_sample_window(_tsample))}')
-            print('\n' + '\n'.join(lines) + '\n')
-            with open(args.log, 'a') as f:
-                print('\n' + '\n'.join(lines) + '\n', file=f)
+            for p in dict.fromkeys(['', args.prompt]):
+                prompt = _prompt_ids(p)
+                out = model.generate(prompt, _GEN_SAMPLE, temperature=args.temperature)
+                lines.append(f'GEN step {i:10} [{p or STX_TEXT}]: {_render(prompt + out)}')
+                sc = _gen_scorer.score(_decode_plain(out)) if _gen_scorer else ''
+                if sc:
+                    lines.append(f'GENSCORE step {i:10} [{p or STX_TEXT}]: {sc}')
+            with _text_lock:
+                sample = _text_stats['sample']
+            if sample:
+                lines.append(f'TXT-SAMPLE: {_printable(_sample_window(sample))}')
+            _emit('\n' + '\n'.join(lines) + '\n')
 
-        # ── fetch batch ───────────────────────────────────────────────────────
         x_list, y_list, flag_list = q.get()
         n_examples += sum(flag_list)
-        x    = torch.tensor(x_list,    dtype=torch.long).to(args.device)
-        y    = torch.tensor(y_list,    dtype=torch.long).to(args.device)
+        x = torch.tensor(x_list, dtype=torch.long).to(args.device)
+        y = torch.tensor(y_list, dtype=torch.long).to(args.device)
         flag = torch.tensor(flag_list, dtype=torch.bool).to(args.device)
-        if args.no_dff_reset:
-            flag = None          # --no_dff_reset: <STX> stays in the stream, the state carries on
-        if args.gen_warm:        # slot 0's recent input, and the token it reads next
-            _w_ctx.append(int(x_list[0]))
-            _w_next = int(y_list[0])
 
-        # ── train step ────────────────────────────────────────────────────────
-        dff_prev = model.dff                                    # save pre-step DFF
+        dff_prev = model.dff
         model.train()
-        if args.refresh and not args.refresh_every:
-            _stab_step[0] += 1     # --refresh: sample cadence, counted in TRAINING steps
         logits, loss = model(x, targets=y, flag=flag)
-
-        # ── instrumentation: the vocab channel's loss, separately from the corpus ──────
-        # The batch loss is dominated by the 249 corpus slots, so a single vocab slot is
-        # invisible in it -- 0.4% of the mean. This is what says whether the channel is
-        # being learned at all, and it is free: reduction='none' over the logits the
-        # training forward already produced, no second forward and no gradient. There is no
-        # loss_corpus column because the loss column already IS it to within that 0.4%.
-        if _N_VOCAB:
-            with torch.no_grad():
-                _per = F.cross_entropy(logits, y.long(), reduction='none')
-                varr.append(float(_per[:_N_VOCAB].mean()))
-
-        # halt immediately on non-finite loss — do NOT backward/step/save, so the
-        # last good checkpoint on disk is preserved.
-        if not torch.isfinite(loss):
-            print(f'\n*** HALT: non-finite loss at step {i} ***')
-            print(f'  loss     = {loss.item()}')
-            print(f'  dff_max  = {_dff_absmax(model.dff)}')
-            print(f'  logit_max= {logits.detach().abs().max().item()}')
-            print(f'  grads(prev step): {_diag(model)}')
+        if not torch.isfinite(loss):         # keep the last good checkpoint on disk
+            print(f'\n*** HALT: non-finite loss at step {i}: {loss.item()} dff_max '
+                  f'{float(model.dff.abs().max())} logit_max {float(logits.detach().abs().max())}')
             break
-
         loss.backward()
-
-        # --clip rescales every gradient so the global norm is at most args.clip.
-        # clip_grad_norm_ returns the norm measured BEFORE clipping, which is exactly what
-        # _gnorm_all would have reported, so the logged grad column means the same thing
-        # whether clipping is on or off -- and the non-finite halt below still sees the real
-        # pre-clip norm rather than the zeros clipping would leave behind.
-        if args.clip > 0:
-            total_norm = float(torch.nn.utils.clip_grad_norm_(_trainable, args.clip))
-            carr.append(1.0 if total_norm > args.clip else 0.0)
-        else:
-            total_norm = _gnorm_all(model)                     # grad norm BEFORE the step
-        garr.append(total_norm)
-
-        # halt before the optimizer corrupts weights if grads went non-finite
-        if not math.isfinite(total_norm):
-            print(f'\n*** HALT: non-finite grad at step {i} ***')
-            print(f'  dff_max  = {_dff_absmax(model.dff)}')
-            print(f'  logit_max= {logits.detach().abs().max().item()}')
-            print(f'  per-module g(rad)/w(eight): {_diag(model)}')
+        gnorm = _grad_norm()
+        garr.append(gnorm)
+        if not math.isfinite(gnorm):
+            print(f'\n*** HALT: non-finite grad at step {i}')
             break
-
         optimizer.step()
-        model.dff = dff_prev                                    # restore so eval recomputes same step
+        # recompute this step's state with the updated weights (eval-mode BatchNorm), so the
+        # state carried forward is the one the model would compute at inference
+        model.dff = dff_prev
         model.eval()
         with torch.no_grad():
-            _, _ = model(x, targets=y, flag=flag)              # recompute DFF using updated model
+            model(x, flag=flag)
 
-        # ── monitor ───────────────────────────────────────────────────────────
         larr.append(loss.item())
-        if _plateau:
-            _plat_sum, _plat_n = _plat_sum + larr[-1], _plat_n + 1   # binned at --checkpoint
+        if i % args.monitor == 0:
+            flat = model.dff.reshape(-1)
+            _emit(('STEP {:10} wall {} loss {:12.9f} grad {:12.6f} lr {:10.9f} dff_mean {:12.5f} '
+                   'dff_std {:12.5f} dff_max {:11.3f} batch {:6d} examples {:12d} epoch {:10.3f}'
+                   ).format(i, datetime.datetime.now(), np.mean(larr[-args.monitor:]),
+                            np.mean(garr[-args.monitor:]), optimizer.param_groups[0]['lr'],
+                            flat.mean().item(), flat.std().item(), flat.abs().max().item(),
+                            args.batch, n_examples, float(_epoch[0])))
+            del larr[:-args.monitor], garr[:-args.monitor]   # keep host RAM flat
 
-        if (i % args.monitor) == 0:
-            _dmean, _dstd, _dmax, _dzero = _dff_stats(model.dff)
-            # batch is logged per step, not just in the ARGS line: a run resumed from a
-            # checkpoint at a different --batch appends to a new log, so chart.py needs the
-            # batch size that produced each point (loss/grad both scale with it).
-            # The epoch column reports the VOCAB channel's own passes when that channel
-            # exists: it is the finite, repeating stream, and the corpus alongside it is
-            # effectively infinite (fineweb pins at 1 forever), so its passes are the only
-            # epoch number that means anything in such a run. Without a vocab channel the
-            # column is the corpus epoch, exactly as before.
-            _ep_name, _ep_val = (('epoch_vocab', _epoch_vocab()) if _N_VOCAB
-                                 else ('epoch', _epoch_num()))
-            s = ('STEP {:10} wall {} loss {:12.9f} grad {:12.6f} '
-                 'lr {:10.9f} dff_mean {:12.5f} dff_std {:12.5f} dff_max {:11.3f} '
-                 'batch {:6d} examples {:12d} {} {:10.3f}').format(
-                i, datetime.datetime.now(),
-                np.mean(larr[-args.monitor:]),
-                np.mean(garr[-args.monitor:]),
-                optimizer.param_groups[0]['lr'],
-                _dmean, _dstd, _dmax, args.batch, n_examples, _ep_name, _ep_val,
-            )
-            # --ctx_ema: effective window (1/rate) of each register at this step's write,
-            # mean and spread over the batch rows (rows sit at different document positions)
-            _lg = getattr(model, '_last_gate', None)
-            if _lg is not None:   # compact: '.489' -- a gate is in (0, 1)
-                _f = lambda v: f'{v:.3f}'.lstrip('0') or '0'
-                s += ' gate ' + '/'.join(_f(v) for v in _lg.float().mean(0).tolist())
-                s += ' sd ' + '/'.join(_f(v) for v in _lg.float().std(0).tolist())
-            # win only when the rates actually move (--ctx_warm/--ctx_adapt); fixed rates
-            # would print the --ctx_ema windows every line
-            _lw = (getattr(model.clk, 'last_win', None)
-                   if model.clk is not None and (getattr(args, 'ctx_warm', False)
-                                                 or getattr(args, 'ctx_adapt', False)
-                                                 or getattr(args, 'ctx_learn_win', False)) else None)
-            if _lw is not None:
-                _lw = _lw.float().expand(-1, _lw.shape[1])
-                # one named column per register (win1, win2, ...) so chart.py can plot them;
-                # fixed width (windows run 0.5..4096) so the columns do not jitter as they move
-                s += ''.join(f' win{k + 1} {v:6.1f}' for k, v in enumerate(_lw.mean(0).tolist()))
-                if _lw.shape[0] > 1:      # per-row rates only (--ctx_warm/--ctx_adapt)
-                    s += ''.join(f' sd{k + 1} {v:.1f}' for k, v in enumerate(_lw.std(0).tolist()))
-            # appended only when clipping is on, so logs from non-clip runs stay byte-identical
-            # (chart.py looks fields up by name and defaults a missing one to 0.0)
-            if args.clip > 0:
-                s += ' clipped {:8.5f}'.format(float(np.mean(carr[-args.monitor:])) if carr else 0.0)
-            # loss_vocab / loss_corpus: the same monitor-window mean the loss column uses,
-            # split by slot group. Present only under --vocab_slots, so logs from every
-            # other run stay byte-identical (chart.py looks fields up by name).
-            if _N_VOCAB and varr:
-                s += ' loss_vocab {:12.9f}'.format(float(np.mean(varr[-args.monitor:])))
-            print(s)
-            with open(args.log, 'a') as f:
-                print(s, file=f)
-
-            # bound monitor history so host RAM stays flat over long runs (these are
-            # only ever read as [-monitor:]; without this they grow once per step forever)
-            for _a in (larr, garr, carr, varr):
-                if len(_a) > args.monitor:
-                    del _a[:-args.monitor]
-
-        if not _plateau:            # plat drives the lr from the checkpoint block instead
-            scheduler.step()
+        scheduler.step()
         optimizer.zero_grad()
         i += 1
-
-        if args.run_steps is not None and (i - _start_step) >= args.run_steps:
-            break   # --run_steps caps steps for this invocation, not the global count
-
+        if args.run_steps is not None and i - _start_step >= args.run_steps:
+            break
 except KeyboardInterrupt:
     pass
-
-# ── shutdown ──────────────────────────────────────────────────────────────────
 
 print('\nSTOPPING THREADS')
 stop.set()
 while not q.empty():
     q.get()
-if w is not None:            # one-shot modes never started a worker (see above)
-    w.join()
+w.join()
 print('EXIT MAIN')
-
-# Hard-exit after our work is flushed. Streaming datasets keep native aiohttp
-# threads alive whose teardown races Python finalization (PyGILState_Release
-# crash); os._exit skips finalization entirely. Everything is already saved.
-import sys
-sys.stdout.flush(); sys.stderr.flush()
+# Hard exit: streaming datasets keep native threads whose teardown can crash Python's
+# finalization. Everything is already saved.
+sys.stdout.flush()
+sys.stderr.flush()
 os._exit(0)
