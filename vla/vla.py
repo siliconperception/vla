@@ -220,8 +220,13 @@ parser.add_argument('--gen_images', default=8, type=int, metavar='N',
                     help='image models: caption N fixed held-out images at every GEN (GENI/REF '
                          'lines and the --gen_vis panel); 0 = off')
 parser.add_argument('--gen_vis', default=True, action=argparse.BooleanOptionalAction,
-                    help='show the GEN image captions as a panel of images in one window, '
-                         'redrawn at every GEN, and save it as <log>.gen.png')
+                    help='image models: a window (top-left quarter of the screen) showing the '
+                         'GEN image captions, redrawn at every GEN; also saved as <log>.gen.png')
+parser.add_argument('--sample_vis', default=True, action=argparse.BooleanOptionalAction,
+                    help='image models: a window (top-right quarter) showing one training '
+                         'image example recorded after every GEN -- the image, its caption, '
+                         'and the crop seen at each token with that token; also saved as '
+                         '<log>.sample.png')
 # periodic held-out eval
 parser.add_argument('--eval_interval', default=20000, type=int,
                     help='held-out EVAL every N steps (0 = off)')
@@ -378,70 +383,127 @@ def _emit(line, stdout=True):
 _emit(f'ARGS {args}', stdout=False)
 
 
-def _gen_viewer(inbox, png, show, parent):
-    """--gen_vis, in its own process so the window stays responsive between GEN steps:
-    draws each (step, [(image, title, caption, reference)]) message into the same figure,
-    saves it to png, and exits when the trainer does."""
+def _viewer(inbox, stem, show, parent):
+    """--gen_vis / --sample_vis, in their own process so the windows stay responsive between
+    GEN steps. Two windows side by side across the top half of the screen (the bottom half
+    is left for the log): GEN captions top-left, the training sample top-right. Each message
+    redraws its window in place and saves it as <stem>.gen.png / <stem>.sample.png. Exits
+    when the trainer does."""
     import textwrap
+    if show:
+        os.environ['QT_QPA_PLATFORM'] = 'xcb'         # XWayland: Qt may position windows
     import matplotlib
     if not show:
         matplotlib.use('Agg')
     import matplotlib.pyplot as plt
-    plt.style.use('dark_background')                 # the same look as --vis
+    plt.style.use('dark_background')                  # the same look as --vis
+    plt.rcParams['text.parse_math'] = False           # generated text may contain '$'
     plt.ion()
-    fig = None
-    while os.getppid() == parent:
-        try:
-            msg = inbox.get(timeout=0.1)
-        except queue.Empty:
-            if fig is not None and show:
-                if plt.fignum_exists(fig.number):
-                    fig.canvas.flush_events()
-                else:
-                    fig = None                         # closed by the user: reopen next GEN
-            continue
-        if msg is None:
-            return
-        step, items = msg
+    figs = {}
+    slot = {'gen': 0, 'sample': 1}
+    title = {'gen': 'GEN captions', 'sample': 'TRAIN sample'}
+    cut = lambda t, n: t if len(t) <= n else t[:n - 3] + '...'
+
+    def figure(kind):
+        fig = figs.get(kind)
+        if fig is not None and (not show or plt.fignum_exists(fig.number)):
+            fig.clf()
+            return fig
+        fig = figs[kind] = plt.figure(figsize=(12.45, 6.6), dpi=100)    # a quarter screen
+        fig.canvas.manager.set_window_title(f'{title[kind]} -- {args.log}')
+        if show:
+            plt.show(block=False)
+            try:                                      # top half, side by side
+                win = fig.canvas.manager.window
+                g = win.screen().availableGeometry()
+                w, h = g.width() // 2, g.height() // 2 - 40
+                win.setGeometry(g.x() + slot[kind] * w, g.y(), w, h)
+            except Exception:
+                pass
+        return fig
+
+    def draw_gen(fig, step, items):
         cols = min(4, len(items))
         rows = math.ceil(len(items) / cols)
-        if fig is None:
-            fig = plt.figure(figsize=(4.4 * cols, 5.4 * rows))
-            fig.canvas.manager.set_window_title(f'GEN captions -- {args.log}')
-            if show:
-                plt.show(block=False)
-        fig.clf()
-        gs = fig.add_gridspec(2 * rows, cols, height_ratios=[3, 1.5] * rows, left=0.01,
+        gs = fig.add_gridspec(2 * rows, cols, height_ratios=[3, 1.6] * rows, left=0.01,
                               right=0.99, top=0.93, bottom=0.01, wspace=0.06, hspace=0.12)
-        for k, (img, title, cap, ref) in enumerate(items):
+        for k, (img, name, cap, ref) in enumerate(items):
             r, c = divmod(k, cols)
             ax = fig.add_subplot(gs[2 * r, c])
             ax.imshow(img)
             ax.set_axis_off()
-            ax.set_title(title, fontsize=9)
+            ax.set_title(name, fontsize=7)
             tx = fig.add_subplot(gs[2 * r + 1, c])
             tx.set_axis_off()
-            cut = lambda t, n: t if len(t) <= n else t[:n - 3] + '...'
-            tx.text(0, 1, textwrap.fill(cut(cap, 300), 58), va='top', fontsize=8,
+            tx.text(0, 1, textwrap.fill(cut(cap, 180), 52), va='top', fontsize=6.5,
                     color='white', transform=tx.transAxes, clip_on=True)
-            tx.text(0, 0, textwrap.fill('REF: ' + cut(ref, 200), 58), va='bottom', fontsize=8,
+            tx.text(0, 0, textwrap.fill('REF: ' + cut(ref, 160), 52), va='bottom', fontsize=6.5,
                     color='limegreen', transform=tx.transAxes, clip_on=True)
-        fig.suptitle(f'GEN step {step}   {args.log}', family='monospace', fontsize=9)
-        if png:
-            fig.savefig(png, dpi=72)
-        if show:
-            fig.canvas.draw()
-            fig.canvas.flush_events()
+        fig.suptitle(f'GEN step {step}   {args.log}', family='monospace', fontsize=8)
+
+    def draw_sample(fig, step, img, name, crops, toks):
+        """The full image and caption, then one cell per token: the 224x224 crop the model
+        saw at that step, labelled with the token it was reading."""
+        n = len(crops)
+        cols = max(1, min(n, math.ceil(math.sqrt(n * 2.2))))
+        rows = math.ceil(n / cols)
+        gs = fig.add_gridspec(2, 2, height_ratios=[1, 2.6], width_ratios=[1, 2.4], left=0.01,
+                              right=0.99, top=0.93, bottom=0.04, wspace=0.03, hspace=0.06)
+        ax = fig.add_subplot(gs[0, 0])
+        ax.imshow(img)
+        ax.set_axis_off()
+        ax.set_title(name, fontsize=7)
+        tx = fig.add_subplot(gs[0, 1])
+        tx.set_axis_off()
+        tx.text(0, 1, textwrap.fill(cut(''.join(toks[1:]), 600), 110), va='top', fontsize=7,
+                color='limegreen', transform=tx.transAxes, clip_on=True)
+        sub = gs[1, :].subgridspec(rows, cols, wspace=0.04, hspace=0.35)
+        fs = max(4.5, min(7.0, 70.0 / cols))
+        for k, (crop, tok) in enumerate(zip(crops, toks)):
+            a = fig.add_subplot(sub[k // cols, k % cols])
+            a.imshow(crop)
+            a.set_xticks([])
+            a.set_yticks([])
+            a.set_xlabel(tok.replace(' ', '·') or '∅', fontsize=fs, labelpad=1,
+                         family='monospace')
+        fig.suptitle(f'TRAIN sample step {step}   {n} tokens   {args.log}', family='monospace',
+                     fontsize=8)
+
+    while os.getppid() == parent:
+        try:
+            msg = inbox.get(timeout=0.1)
+        except queue.Empty:
+            if show:
+                for kind, fig in list(figs.items()):
+                    if plt.fignum_exists(fig.number):
+                        fig.canvas.flush_events()
+                    else:
+                        del figs[kind]                # closed by the user: reopen next time
+            continue
+        if msg is None:
+            return
+        kind = msg[0]
+        try:
+            fig = figure(kind)
+            (draw_gen if kind == 'gen' else draw_sample)(fig, *msg[1:])
+            if stem:
+                fig.savefig(f'{stem}.{kind}.png', dpi=100)
+            if show:
+                fig.canvas.draw()
+                fig.canvas.flush_events()
+        except Exception as e:                        # never lose the viewer to one panel
+            print(f'viewer: {kind} panel failed: {e!r}', flush=True)
 
 
 _gen_inbox = _gen_proc = None
 
-if not _ONESHOT and args.gen_vis and args.gen_images and args.image_encoder != 'none':
+if (not _ONESHOT and args.image_encoder != 'none'
+        and ((args.gen_vis and args.gen_images) or args.sample_vis)):
     import multiprocessing
     _ctx = multiprocessing.get_context('fork')     # before CUDA and the data threads exist
-    _gen_inbox = _ctx.Queue(maxsize=2)
-    _gen_proc = _ctx.Process(target=_gen_viewer, daemon=True, args=(
-        _gen_inbox, None if args.log == os.devnull else args.log + '.gen.png',
+    _gen_inbox = _ctx.Queue(maxsize=4)
+    _gen_proc = _ctx.Process(target=_viewer, daemon=True, args=(
+        _gen_inbox, None if args.log == os.devnull else args.log,
         bool(os.environ.get('DISPLAY') or os.environ.get('WAYLAND_DISPLAY')), os.getpid()))
     _gen_proc.start()
 
@@ -947,7 +1009,7 @@ class _ImageSource:
         pf = self.pq.ParquetFile(f)
         with self.lock:
             g = self.rng.randrange(pf.metadata.num_row_groups)
-        rows = pf.read_row_group(g, columns=['image', 'id', self.cap]).to_pylist()
+        rows = pf.read_row_group(g, columns=['image', 'id', 'class', self.cap]).to_pylist()
         rows = [r for r in rows if not _id_heldout(r['id'])]
         with self.lock:
             self.pool.extend(rows)
@@ -1014,7 +1076,7 @@ def worker(stop, q, datasets):
     """Per corpus, builder threads turn documents (and images) into clips on that corpus's
     queue; this loop advances every slot one token per step and puts (x_list, y_list,
     start_flags, new_images) on q. Slots are assigned to corpora in _MIX order; new_images
-    lists (row, uint8 image) for image rows that started a new example this step."""
+    lists (row, (uint8 image, name)) for image rows that started a new example this step."""
     clip_qs = {}
 
     def text_builder(name, ds, cq):
@@ -1043,7 +1105,8 @@ def worker(stop, q, datasets):
 
         def build():
             text, row = src.next()
-            return (text, _decode_image(row)) if text else None
+            name = f'{(row.get("class") or "").split(",")[0]}  ({row["id"]})'
+            return (text, (_decode_image(row), name)) if text else None
         return build
 
     def run(name, build, cq):
@@ -2067,9 +2130,9 @@ def _gen_lines(i):
             lines.append(f'REF  step {i:10} [{iid}]: {_printable(cap[:400])}')
             panel.append((_eval_imgs[c][k].permute(1, 2, 0).numpy(),
                           f'{cls.split(",")[0]}  ({iid})', _decode_plain(out), cap))
-    if panel and _gen_inbox is not None:
+    if panel and _gen_inbox is not None and args.gen_vis:
         try:
-            _gen_inbox.put_nowait((i, panel))
+            _gen_inbox.put_nowait(('gen', i, panel))
         except queue.Full:
             pass                                  # viewer busy: skip this panel
     with _text_lock:
@@ -2078,6 +2141,48 @@ def _gen_lines(i):
         lab = 'SAMPLE' if n == (_text_names or [None])[0] else n
         lines.append(f'TXT-{lab}: {_printable(_sample_window(smp))}')
     return lines
+
+
+def _thumb(x, side):
+    """uint8 [3, h, w] (GPU) -> uint8 HWC numpy with its longer side `side`."""
+    s = side / max(x.shape[1:])
+    size = (max(1, round(x.shape[1] * s)), max(1, round(x.shape[2] * s)))
+    t = F.interpolate(x[None].float(), size=size, mode='area')[0]
+    return t.round().clamp(0, 255).byte().permute(1, 2, 0).cpu().numpy()
+
+
+_sample = None                # --sample_vis: {'row', 'rec'} while recording one example
+_img_name = {}                # bank index -> 'class (id)' of the image it holds
+_IMG_MEAN_T = torch.tensor(_IMG_MEAN, device=args.device).view(3, 1, 1)
+_IMG_STD_T = torch.tensor(_IMG_STD, device=args.device).view(3, 1, 1)
+
+
+def _record_sample(i, x_list, flag_list, views):
+    """--sample_vis: from the next start of an example on the recorded row until the next
+    one, keep each step's crop (as the encoder saw it) and the token read with it; then send
+    the example to the viewer."""
+    global _sample
+    r = _sample['row']
+    j = _bank_of[r]
+    if flag_list[r]:
+        if _sample['rec'] is not None:                # the recorded example just ended
+            rec = _sample['rec']
+            try:
+                _gen_inbox.put_nowait(('sample', rec['step'], rec['img'], rec['name'],
+                                       rec['crops'], rec['toks']))
+            except queue.Full:
+                pass
+            _sample = None
+            return
+        h, w = int(img_hw[j, 0]), int(img_hw[j, 1])
+        _sample['rec'] = {'step': i, 'img': _thumb(img_bank[j, :, :h, :w], 360),
+                          'name': _img_name.get(j, ''), 'crops': [], 'toks': []}
+    rec = _sample['rec']
+    if rec is not None and len(rec['crops']) < 160:
+        crop = ((views[j] * _IMG_STD_T + _IMG_MEAN_T) * 255.0).clamp(0, 255)
+        rec['crops'].append(_thumb(crop, 96))
+        rec['toks'].append(_tokenizer.decode([x_list[r]]) if x_list[r] != model.start_id
+                           else STX_TEXT)
 
 
 larr, garr = [], []
@@ -2102,6 +2207,8 @@ try:
 
         if args.gen_interval and i % args.gen_interval == 0:
             _emit('\n' + '\n'.join(_gen_lines(i)) + '\n')
+            if _gen_inbox is not None and args.sample_vis and _IMAGE_ROWS:
+                _sample = {'row': _IMAGE_ROWS[0], 'rec': None}     # record the next example
 
         x_list, y_list, flag_list, new_imgs = q.get()
         n_examples += sum(flag_list)
@@ -2110,12 +2217,16 @@ try:
         flag = torch.tensor(flag_list, dtype=torch.bool).to(args.device)
         img = None
         if _IMAGE_ROWS:
-            for r, im in new_imgs:
+            for r, (im, name) in new_imgs:
                 j = _bank_of[r]
                 img_bank[j, :, :im.shape[1], :im.shape[2]] = im.to(args.device, non_blocking=True)
                 img_hw[j, 0], img_hw[j, 1] = im.shape[1], im.shape[2]
+                _img_name[j] = name
+            views = _views(img_bank, img_hw)
             img = torch.zeros(len(x_list), model.img_width, model.S, model.S, device=args.device)
-            img[_img_rows] = model.image_grid(_views(img_bank, img_hw))
+            img[_img_rows] = model.image_grid(views)
+            if _sample is not None:
+                _record_sample(i, x_list, flag_list, views)
 
         dff_prev = model.dff
         model.train()
