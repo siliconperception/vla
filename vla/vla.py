@@ -11,9 +11,8 @@
 #
 # Images: a frozen ResNet-50 turns a 224x224 crop of the image into a [2048, 7, 7] feature map
 # that is concatenated with the token grid. An image-caption example is the caption alone,
-# the image being the prompt: the first step reads no token, only the image, and predicts the
-# first word; no <STX>/<ETX> (--caption_frame restores them). The image is present at every
-# token, seen through a fresh random 224x224 crop each token:
+# the image being the prompt; the image is present at every token, seen through a fresh
+# random 224x224 crop each token:
 # a close-up at native resolution (only an image with a side under 224 is scaled up, uniformly,
 # to fill the crop) or, for --full_crops of them, a full view of the whole image scaled so its
 # shorter side is 224; text-only rows get a zero image map.
@@ -44,14 +43,17 @@ import torch ; print('torch', torch.__version__)
 import torch.nn as nn
 from torch.nn import functional as F
 
-STX_TEXT = '<STX>'          # how the document-start token renders
-ETX_TEXT = '<ETX>'          # how the document-end token renders
+NUL_TEXT = '<NUL>'          # how _NULL renders where it is named (GEN prompts, sample panel)
 DOT_TEXT = '\xb7'           # how any other unprintable character renders
 _ESCAPES = {'\n': '\\n', '\t': '\\t', '\r': '\\r'}
 
 _GEN_SAMPLE = 200           # tokens in each periodic GEN sample (--n is for --generate)
-_GENI_LEN = 100             # token cap on each GENI caption (unframed captions have no END)
-_NULL = -1                  # input id for "no token": the token grid is zero (unframed captions)
+_GENI_LEN = 100             # token cap on each GENI caption
+# Every example -- a text document or an image caption -- is <NUL> then its tokens: the first
+# step reads _NULL, "no token", a zero token grid (just as text rows read a zero image grid),
+# and predicts the first token; the state resets there. There are no START/END tokens, so the
+# model never predicts the end of an example and generation is one continuous stream.
+_NULL = -1
 
 # Held-out eval protocol constants (exp/score.py and PLAN.txt's reference table use the same
 # selection). Pinned, not exposed: changing one makes EVAL lines incomparable with history.
@@ -96,17 +98,12 @@ _TOKENIZERS = {
 
 
 class HFTokenizer:
-    """A pretrained BPE tokenizer. GPT-NeoX/Neo have one <|endoftext|> id, so START and END
-    are the same token and a clip is [EOT] text [EOT]."""
+    """A pretrained BPE tokenizer (its vocabulary, embedding and lm_head are borrowed)."""
 
     def __init__(self, repo, vocab_size):
         from transformers import AutoTokenizer
         self.tok = AutoTokenizer.from_pretrained(repo)
         self.tok.model_max_length = int(1e12)   # recurrent: no context window, never truncate
-        eot = self.tok.eos_token_id
-        self.end_id = eot if eot is not None else self.tok.bos_token_id
-        bos = self.tok.bos_token_id
-        self.start_id = bos if bos is not None else self.end_id
         self.vocab_size = vocab_size            # the embedding's rows, not len(tokenizer)
 
     def encode(self, text): return self.tok.encode(text, add_special_tokens=False)
@@ -122,28 +119,14 @@ def _printable(s):
 
 
 def _decode_plain(ids):
-    """Token ids -> plain text with the framing markers dropped (what a judge LM reads)."""
-    body = [t for t in ids if t >= 0 and t not in (_tokenizer.start_id, _tokenizer.end_id)]
+    """Token ids -> plain text, _NULL dropped (what a judge LM reads)."""
+    body = [t for t in ids if t >= 0]
     return _tokenizer.decode(body) if body else ''
 
 
 def _render(ids):
-    """Token ids -> display text. The marker shows as <STX> when it opens the sequence,
-    <ETX> at the end, and <ETX><STX> at a document boundary in the middle."""
-    out, run = [], []
-    ids = [t for t in ids if t >= 0]                  # _NULL (an unframed caption's first step)
-    for n, t in enumerate(ids):
-        if t in (_tokenizer.start_id, _tokenizer.end_id):
-            if run:
-                out.append(_printable(_tokenizer.decode(run)))
-                run = []
-            out.append(STX_TEXT if n == 0 else
-                       ETX_TEXT + STX_TEXT if n < len(ids) - 1 else ETX_TEXT)
-        else:
-            run.append(t)
-    if run:
-        out.append(_printable(_tokenizer.decode(run)))
-    return ''.join(out)
+    """Token ids -> one-line display text, _NULL dropped."""
+    return _printable(_decode_plain(ids))
 
 
 # ── args ──────────────────────────────────────────────────────────────────────
@@ -175,7 +158,13 @@ parser.add_argument('--dec_width',  default=256,  type=int, help='text decoder t
 parser.add_argument('--bn_momentum', default=0.1, type=float,
                     help='ContextCNN BatchNorm running-statistics momentum (0 = cumulative)')
 parser.add_argument('--init',       default='zero', choices=['zero', 'gaussian', 'relu'],
-                    help='DFF register value at every document start')
+                    help='DFF register value at every example start (see --carry)')
+parser.add_argument('--carry',      default='', metavar='KINDS',
+                    help='example kinds whose rows CARRY the DFF registers into the next example '
+                         'instead of resetting them to --init at its first (<NUL>) step: "text", '
+                         '"image" (captioned images) or "text,image"; default none, every example '
+                         'starts fresh. Training only: eval rows hold one example each and '
+                         'generation is a single stream')
 parser.add_argument('--image_encoder', default=None, choices=['none'] + sorted(_IMAGE_ENCODERS),
                     help='frozen image encoder whose feature map joins the input concat; '
                          'default: resnet50 if --mix or --eval_corpora names an image corpus, '
@@ -192,13 +181,6 @@ parser.add_argument('--full_crops', default=0.5, type=float, metavar='P',
                          'random offset along the longer side, no padding; the rest are '
                          'native-resolution close-ups. Resuming a checkpoint from before this '
                          'option keeps 0 unless the flag is given')
-parser.add_argument('--caption_frame', default=False, action=argparse.BooleanOptionalAction,
-                    help='frame image captions like documents, <STX> caption <ETX>, with the '
-                         'centred full view on <STX>. Default (--no-caption_frame): the image is '
-                         'the prompt -- the first step reads no token, only the image, and '
-                         'predicts the first word; no <STX>, no <ETX>. Text documents are always '
-                         'framed. Resuming a checkpoint from before this option keeps framing '
-                         'unless the flag is given')
 parser.add_argument('--image',      default=None, metavar='PATH',
                     help='--generate/--vis: condition on this image (caption it)')
 parser.add_argument('--shards',     default=None, type=int, help='load only the first N parquet shards')
@@ -266,7 +248,7 @@ parser.add_argument('--eval_reach', default=0,    type=int, metavar='N',
 parser.add_argument('--eval_reach_period', default=256, type=int, metavar='P')
 # one-shot modes (no training)
 parser.add_argument('--generate',   default=False, action='store_true',
-                    help='load, generate --n tokens from <STX>+--prompt, print, exit')
+                    help='load, generate --n tokens from <NUL>+--prompt, print, exit')
 parser.add_argument('--n',          default=200,  type=int, help='--generate length')
 parser.add_argument('--eval',       default=False, action='store_true',
                     help='load, run the held-out eval protocol (EVAL lines + table), exit')
@@ -353,8 +335,6 @@ if args.load:
             setattr(args, k, _saved[k])
     if 'full_crops' not in _saved and not any(a.startswith('--full_crops') for a in sys.argv):
         args.full_crops = 0.0         # trained before full views existed: keep its crops
-    if 'caption_frame' not in _saved and not any('caption_frame' in a for a in sys.argv):
-        args.caption_frame = True     # trained before unframed captions existed
     _start_step = int(_loaded_ckpt.get('step', 0))
     _start_exs = int(_loaded_ckpt.get('examples', 0))
     _start_exs_by = dict(_loaded_ckpt.get('examples_by', {}))
@@ -663,14 +643,12 @@ def _bank(imgs, device):
     return bank, hw, fit
 
 
-def _views(bank, hw, fit, gen=None, start=None):
+def _views(bank, hw, fit, gen=None):
     """One random 224x224 crop per image, normalized for the encoder: a native-resolution
     close-up copied pixel for pixel (images are at least 224 on each side, see _prep_image)
     or, with probability --full_crops, a full view -- the whole image scaled so its shorter
-    side is 224, at a random offset along the longer side (see _fit). start: bool [N], rows
-    reading <STX>; with --full_crops > 0 they always get the centred full view, so an example
-    opens on the whole image. gen: a torch.Generator on the bank's device, for reproducible
-    crops (eval)."""
+    side is 224, at a random offset along the longer side (see _fit). gen: a torch.Generator
+    on the bank's device, for reproducible crops (eval)."""
     N, dev = bank.shape[0], bank.device
     ar = torch.arange(_IMG_IN, device=dev)
     rows = torch.arange(N, device=dev)[:, None, None]
@@ -681,13 +659,9 @@ def _views(bank, hw, fit, gen=None, start=None):
     if args.full_crops > 0:                       # skipped at 0, keeping the old random stream
         L = hw[:, 2].long()
         of = (torch.rand(N, device=dev, generator=gen) * (L - _IMG_IN + 1)).long()
-        if start is not None and args.caption_frame:
-            of = torch.where(start, (L - _IMG_IN) // 2, of)
         full = fit[rows, :, ar[None, :, None], (of[:, None] + ar)[:, None, :]]
         full = torch.where((H > W)[:, None, None, None], full.transpose(1, 2), full)
         pick = torch.rand(N, device=dev, generator=gen) < args.full_crops
-        if start is not None and args.caption_frame:
-            pick = pick | start
         x = torch.where(pick[:, None, None, None], full, x)
     x = x.permute(0, 3, 1, 2).float() / 255.0                           # [N, 3, 224, 224]
     mean = torch.tensor(_IMG_MEAN, device=dev).view(1, 3, 1, 1)
@@ -734,7 +708,6 @@ class VLAModel(nn.Module, _HubMixin):
         self.init_mode = init
         self.vocab, self.c_text = lm.config.vocab_size, lm.config.hidden_size
         self.tok = HFTokenizer(repo, self.vocab)
-        self.start_id, self.end_id = self.tok.start_id, self.tok.end_id
 
         self.tok_embed = lm.get_input_embeddings()                      # frozen
         self.context = ContextCNN(c_context, depth, kernel, bn_momentum)
@@ -869,19 +842,15 @@ class VLAModel(nn.Module, _HubMixin):
 
     @torch.no_grad()
     def generate(self, prompt_ids, n_tokens, temperature=1.0, image=None):
-        """Sample n_tokens after prompt_ids on a private state. An END is kept in the output
-        and, if the budget is not filled, the state resets and the prompt is fed again, as
-        at a training document boundary (at most 20 sequences). Short only on NaN/Inf.
-        image: uint8 [3, h, w], seen through a fresh random 224x224 crop every token (as
-        in training); None = text-only."""
+        """Sample n_tokens after prompt_ids (opened with _NULL, see _prompt_ids) on a private
+        state; short only on NaN/Inf. image: uint8 [3, h, w], seen through a fresh random
+        224x224 crop every token (as in training); None = text-only."""
         self.eval()
         dev = next(self.parameters()).device
         bank = _bank([image], dev) if image is not None else None
 
         def feed(b, dff):
-            img = (self.image_grid(_views(*bank, start=torch.tensor([b == self.start_id],
-                                                                    device=dev)))
-                   if bank is not None else None)
+            img = self.image_grid(_views(*bank)) if bank is not None else None
             new, o = self.step(torch.tensor([b], device=dev), dff, img)
             logits = self.text_dec(o)
             if not (new.isfinite().all() and logits.isfinite().all()):
@@ -889,24 +858,18 @@ class VLAModel(nn.Module, _HubMixin):
                 return None, None
             return logits, new
 
-        out = []
-        for _ in range(20):
-            dff, logits = self.new_state(1, dev), None
-            for b in prompt_ids:
-                logits, dff = feed(b, dff)
-                if logits is None:
-                    return out
-            while len(out) < n_tokens:
-                prob = F.softmax(logits[0] / max(temperature, 1e-6), dim=-1)
-                b = torch.multinomial(prob, 1).item()
-                out.append(b)
-                if b == self.end_id:
-                    break
-                logits, dff = feed(b, dff)
-                if logits is None:
-                    return out
-            if len(out) >= n_tokens:
-                break
+        out, dff, logits = [], self.new_state(1, dev), None
+        for b in prompt_ids:
+            logits, dff = feed(b, dff)
+            if logits is None:
+                return out
+        while len(out) < n_tokens:
+            prob = F.softmax(logits[0] / max(temperature, 1e-6), dim=-1)
+            b = torch.multinomial(prob, 1).item()
+            out.append(b)
+            logits, dff = feed(b, dff)
+            if logits is None:
+                return out
         return out
 
 
@@ -1038,26 +1001,9 @@ def _make_iter(ds, streaming, seed, shuffle=True):
 
 
 def clip_text(text):
-    """A document as (input, target) pairs over [START] tokens [END]."""
-    full = [_tokenizer.start_id] + _tokenizer.encode(text) + [_tokenizer.end_id]
-    return [(full[i], full[i + 1]) for i in range(len(full) - 1)]
-
-
-def clip_caption(text):
-    """An image caption as (input, target) pairs. Unframed (default): the image is the prompt,
-    so the first step reads _NULL (no token) and predicts the first word, and nothing follows
-    the last word. --caption_frame: framed like a document (clip_text)."""
-    if args.caption_frame:
-        return clip_text(text)
+    """A document or caption as (input, target) pairs over [_NULL] tokens."""
     full = [_NULL] + _tokenizer.encode(text)
     return [(full[i], full[i + 1]) for i in range(len(full) - 1)]
-
-
-def _image_prompt(text=''):
-    """The prompt when an image is given: [_NULL] + text unframed, else as _prompt_ids."""
-    if args.caption_frame:
-        return _prompt_ids(text)
-    return [_NULL] + (_tokenizer.encode(text) if text else [])
 
 
 def _id_heldout(key):
@@ -1205,7 +1151,7 @@ def worker(stop, q, datasets):
                 continue
             if got is None:
                 continue
-            steps = (clip_caption if name in _IMAGE_DATASETS else clip_text)(got[0])
+            steps = clip_text(got[0])
             _text_tally(name, len(steps), got[0])
             while not stop.is_set():
                 try:
@@ -1401,8 +1347,8 @@ if not _ONESHOT or args.verbose:
 
 
 def _prompt_ids(text=''):
-    """A prompt as ids, opened with START like every training document."""
-    return [_tokenizer.start_id] + (_tokenizer.encode(text) if text else [])
+    """A prompt as ids, opened with _NULL like every training example."""
+    return [_NULL] + (_tokenizer.encode(text) if text else [])
 
 
 def _rep1(text):
@@ -1511,7 +1457,7 @@ if args.push:
 if args.generate:
     if args.load is None and args.pretrained is None:
         print('WARNING: --generate without --load/--pretrained is running an untrained model')
-    prompt = _image_prompt(args.prompt) if _image is not None else _prompt_ids(args.prompt)
+    prompt = _prompt_ids(args.prompt)
     print(_render(prompt + model.generate(prompt, args.n, temperature=args.temperature,
                                           image=_image)))
     raise SystemExit(0)
@@ -1554,17 +1500,15 @@ if args.vis:
 
     model.eval()
     dev = next(model.parameters()).device
-    prompt = _image_prompt(args.prompt) if _image is not None else _prompt_ids(args.prompt)
+    prompt = _prompt_ids(args.prompt)
     pending, b = list(prompt[1:]), prompt[0]
-    hist, cur = '', list(prompt)                     # finished episodes, current episode ids
+    cur = list(prompt)                               # ids so far (the ticker's tail)
     dff = model.new_state(1, dev)
     bank = _bank([_image], dev) if _image is not None else None
     imgs, vmax, img_p, nstep = [None] * rows, [None] * rows, None, 0
     while not _exit[0] and plt.fignum_exists(fig.number):
         with torch.no_grad():
-            img = (model.image_grid(_views(*bank, start=torch.tensor([b == model.start_id],
-                                                                     device=dev)))
-                   if bank is not None else None)
+            img = model.image_grid(_views(*bank)) if bank is not None else None
             dff, o = model.step(torch.tensor([b], device=dev), dff, img)
             prob = F.softmax(model.text_dec(o)[0] / max(args.temperature, 1e-6), dim=-1)
         nstep += 1
@@ -1572,12 +1516,7 @@ if args.vis:
             b = pending.pop(0)
         else:
             b = int(torch.multinomial(prob, 1).item())
-            if b == model.end_id:                    # episode over: reset, prompt again
-                hist = (hist + _render(cur) + ETX_TEXT)[-4096:]
-                cur, dff = list(prompt), model.new_state(1, dev)
-                pending, b = list(prompt[1:]), prompt[0]
-            else:
-                cur.append(b)
+            cur = (cur + [b])[-2 * _VIS_WIN:]
         maps = [o] + list(dff.chunk(model.K, dim=1))
         for r, t in enumerate(maps):
             m = t[0].std(dim=0).float().cpu().numpy()
@@ -1593,7 +1532,7 @@ if args.vis:
             img_p = ax_p.matshow(pg, cmap=args.cmap)
         img_p.set_data(pg)
         img_p.set_clim(0, float(pg.max()) or 1e-9)
-        ticker = ''.join(DOT_TEXT if c in '$\\' else c for c in hist + _render(cur))[-_VIS_WIN:]
+        ticker = ''.join(DOT_TEXT if c in '$\\' else c for c in _render(cur))[-_VIS_WIN:]
         header.set_text(f'step {nstep:8d}  dff_std {float(dff.std()):6.4f}  dff_max '
                         f'{float(dff.abs().max()):7.3f}  p_max {float(prob.max()):5.3f}  '
                         f'T {args.temperature:.2f}\ngen: {ticker}')
@@ -1644,7 +1583,7 @@ def _build_image_eval(corpus):
         for r in rows.to_pylist():
             cap = (r[cfg['caption']] or '').strip()
             if cap and _id_heldout(r['id']):
-                items.append((clip_caption(cap)[:_EVAL_MAXLEN], _decode_image(r),
+                items.append((clip_text(cap)[:_EVAL_MAXLEN], _decode_image(r),
                               (r['id'], r['class'], cap)))
                 break
         if len(items) >= args.eval_docs:
@@ -1701,7 +1640,7 @@ def _eval_docs(corpus):
 
 
 def _doc_tokens(d):
-    """A framed eval document as its token list, <STX> ... <ETX>."""
+    """An eval document as its token list, _NULL first."""
     return [x for x, _ in d] + [d[-1][1]]
 
 
@@ -1783,8 +1722,7 @@ def _score(step, corpus, docs, imgs=None, tag=None):
                 bsum = torch.zeros(B, nb, device=dev)
                 bcnt = torch.zeros(B, nb, device=dev)
             for t in range(T):
-                img = (model.image_grid(_views(*bank, gen, start=X[:, t] == model.start_id))
-                       if bank is not None else None)
+                img = model.image_grid(_views(*bank, gen)) if bank is not None else None
                 logits, _ = model(X[:, t], img=img)
                 ce = F.cross_entropy(logits, Y[:, t], reduction='none')
                 # a diverged row is counted as runaway rather than poisoning the sums
@@ -2063,8 +2001,6 @@ def _gen_eval(step, corpus, docs):
     with _EvalState(), torch.random.fork_rng(devices=[dev] if dev.type == 'cuda' else []):
         for prompt, ptxt, a, b in _gen_anchor[corpus]:
             out = model.generate(prompt, C, temperature=args.temperature)
-            if _tokenizer.end_id in out:                  # one continuation, not a new doc
-                out = out[:out.index(_tokenizer.end_id)]
             ctxt = _decode_plain(out)
             n = _judge.cond_nll(ptxt, ctxt) if ctxt.strip() else None
             if n is None:
@@ -2202,6 +2138,12 @@ for _n, _k in _MIX:
     _rows_of.setdefault(_n, []).extend(range(_r, _r + _k))
     _r += _k
 _text_names = [n for n in _rows_of if n not in _IMAGE_DATASETS]
+# --carry: rows whose example kind keeps its registers across example boundaries
+_carry = {k.strip() for k in args.carry.split(',') if k.strip()}
+if _carry - {'text', 'image'}:
+    raise SystemExit(f'--carry {args.carry}: kinds are text and image')
+_carry_row = torch.tensor([('image' if n in _IMAGE_DATASETS else 'text') in _carry
+                           for n, k in _MIX for _ in range(k)], device=args.device)
 
 
 def _grad_norm():
@@ -2222,17 +2164,17 @@ def _save(i, n_examples):
 
 
 def _gen_lines(i):
-    """GEN samples (text-only, from <STX> and --prompt), captions of --gen_images held-out
+    """GEN samples (text-only, from <NUL> and --prompt), captions of --gen_images held-out
     images per image eval corpus for the --gen_vis panel (one GENI/REF pair of them in the
     log), and a recent training text per corpus."""
     lines = []
     for p in dict.fromkeys(['', args.prompt]):
         prompt = _prompt_ids(p)
         out = model.generate(prompt, _GEN_SAMPLE, temperature=args.temperature)
-        lines.append(f'GEN step {i:10} [{p or STX_TEXT}]: {_render(prompt + out)}')
+        lines.append(f'GEN step {i:10} [{p or NUL_TEXT}]: {_render(prompt + out)}')
         sc = _gen_scorer.score(_decode_plain(out)) if _gen_scorer else ''
         if sc:
-            lines.append(f'GENSCORE step {i:10} [{p or STX_TEXT}]: {sc}')
+            lines.append(f'GENSCORE step {i:10} [{p or NUL_TEXT}]: {sc}')
     panel = []
     for c in _eval_corpus_names():
         if c not in _IMAGE_DATASETS or model.img_enc is None or not args.gen_images:
@@ -2247,10 +2189,9 @@ def _gen_lines(i):
         ks = random.Random(f'{c}:{blk}').sample(range(n), min(n, args.gen_images))
         logk = ks[(i // args.gen_interval) % len(ks)] if args.gen_interval else ks[0]
         for k in ks if args.gen_vis and _gen_inbox is not None else [logk]:
-            prompt = _image_prompt()
+            prompt = _prompt_ids()
             out = model.generate(prompt, _GENI_LEN, temperature=args.temperature,
                                  image=_eval_imgs[c][k])
-            out = out[:out.index(model.end_id) + 1] if model.end_id in out else out
             iid, cls, cap = _eval_meta[c][k]
             if k == logk:
                 lines.append(f'GENI step {i:10} [{iid} {cls.split(",")[0]}]: '
@@ -2309,8 +2250,7 @@ def _record_sample(i, x_list, flag_list, views):
     if rec is not None and len(rec['crops']) < 160:
         crop = ((views[j] * _IMG_STD_T + _IMG_MEAN_T) * 255.0).clamp(0, 255)
         rec['crops'].append(_thumb(crop, 96))
-        rec['toks'].append(STX_TEXT if x_list[r] == model.start_id else
-                           '∅' if x_list[r] < 0 else _tokenizer.decode([x_list[r]]))
+        rec['toks'].append(NUL_TEXT if x_list[r] < 0 else _tokenizer.decode([x_list[r]]))
 
 
 larr, garr = [], []
@@ -2379,7 +2319,7 @@ try:
                 j = _bank_of[r]
                 _bank_put(img_bank, img_hw, img_fit, j, im.to(args.device, non_blocking=True))
                 _img_name[j] = name
-            views = _views(img_bank, img_hw, img_fit, start=flag[_img_rows])
+            views = _views(img_bank, img_hw, img_fit)
             img = torch.zeros(len(x_list), model.img_width, model.S, model.S, device=args.device)
             img[_img_rows] = model.image_grid(views)
             if _sample is not None:
@@ -2387,7 +2327,7 @@ try:
 
         dff_prev = model.dff
         model.train()
-        logits, loss = model(x, targets=y, flag=flag, img=img)
+        logits, loss = model(x, targets=y, flag=flag & ~_carry_row, img=img)
         if not torch.isfinite(loss):         # keep the last good checkpoint on disk
             print(f'\n*** HALT: non-finite loss at step {i}: {loss.item()} dff_max '
                   f'{float(model.dff.abs().max())} logit_max {float(logits.detach().abs().max())}')
@@ -2433,6 +2373,9 @@ try:
             break
 except KeyboardInterrupt:
     pass
+except BaseException:
+    stop.set()      # else the non-daemon worker keeps a crashed run alive and longrun waits forever
+    raise
 
 print('\nSTOPPING THREADS')
 stop.set()
