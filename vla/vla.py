@@ -10,8 +10,10 @@
 # through a frozen, borrowed lm_head. No attention, no positional encoding.
 #
 # Images: a frozen ResNet-50 turns a 224x224 crop of the image into a [2048, 7, 7] feature map
-# that is concatenated with the token grid. An image-caption example is <STX> caption <ETX>
-# with the image present at every token, seen through a fresh random 224x224 crop each token:
+# that is concatenated with the token grid. An image-caption example is the caption alone,
+# the image being the prompt: the first step reads no token, only the image, and predicts the
+# first word; no <STX>/<ETX> (--caption_frame restores them). The image is present at every
+# token, seen through a fresh random 224x224 crop each token:
 # a close-up at native resolution (only an image with a side under 224 is scaled up, uniformly,
 # to fill the crop) or, for --full_crops of them, a full view of the whole image scaled so its
 # shorter side is 224; text-only rows get a zero image map.
@@ -48,6 +50,8 @@ DOT_TEXT = '\xb7'           # how any other unprintable character renders
 _ESCAPES = {'\n': '\\n', '\t': '\\t', '\r': '\\r'}
 
 _GEN_SAMPLE = 200           # tokens in each periodic GEN sample (--n is for --generate)
+_GENI_LEN = 100             # token cap on each GENI caption (unframed captions have no END)
+_NULL = -1                  # input id for "no token": the token grid is zero (unframed captions)
 
 # Held-out eval protocol constants (exp/score.py and PLAN.txt's reference table use the same
 # selection). Pinned, not exposed: changing one makes EVAL lines incomparable with history.
@@ -119,7 +123,7 @@ def _printable(s):
 
 def _decode_plain(ids):
     """Token ids -> plain text with the framing markers dropped (what a judge LM reads)."""
-    body = [t for t in ids if t not in (_tokenizer.start_id, _tokenizer.end_id)]
+    body = [t for t in ids if t >= 0 and t not in (_tokenizer.start_id, _tokenizer.end_id)]
     return _tokenizer.decode(body) if body else ''
 
 
@@ -127,6 +131,7 @@ def _render(ids):
     """Token ids -> display text. The marker shows as <STX> when it opens the sequence,
     <ETX> at the end, and <ETX><STX> at a document boundary in the middle."""
     out, run = [], []
+    ids = [t for t in ids if t >= 0]                  # _NULL (an unframed caption's first step)
     for n, t in enumerate(ids):
         if t in (_tokenizer.start_id, _tokenizer.end_id):
             if run:
@@ -187,6 +192,13 @@ parser.add_argument('--full_crops', default=0.5, type=float, metavar='P',
                          'random offset along the longer side, no padding; the rest are '
                          'native-resolution close-ups. Resuming a checkpoint from before this '
                          'option keeps 0 unless the flag is given')
+parser.add_argument('--caption_frame', default=False, action=argparse.BooleanOptionalAction,
+                    help='frame image captions like documents, <STX> caption <ETX>, with the '
+                         'centred full view on <STX>. Default (--no-caption_frame): the image is '
+                         'the prompt -- the first step reads no token, only the image, and '
+                         'predicts the first word; no <STX>, no <ETX>. Text documents are always '
+                         'framed. Resuming a checkpoint from before this option keeps framing '
+                         'unless the flag is given')
 parser.add_argument('--image',      default=None, metavar='PATH',
                     help='--generate/--vis: condition on this image (caption it)')
 parser.add_argument('--shards',     default=None, type=int, help='load only the first N parquet shards')
@@ -341,6 +353,8 @@ if args.load:
             setattr(args, k, _saved[k])
     if 'full_crops' not in _saved and not any(a.startswith('--full_crops') for a in sys.argv):
         args.full_crops = 0.0         # trained before full views existed: keep its crops
+    if 'caption_frame' not in _saved and not any('caption_frame' in a for a in sys.argv):
+        args.caption_frame = True     # trained before unframed captions existed
     _start_step = int(_loaded_ckpt.get('step', 0))
     _start_exs = int(_loaded_ckpt.get('examples', 0))
     _start_exs_by = dict(_loaded_ckpt.get('examples_by', {}))
@@ -667,12 +681,12 @@ def _views(bank, hw, fit, gen=None, start=None):
     if args.full_crops > 0:                       # skipped at 0, keeping the old random stream
         L = hw[:, 2].long()
         of = (torch.rand(N, device=dev, generator=gen) * (L - _IMG_IN + 1)).long()
-        if start is not None:
+        if start is not None and args.caption_frame:
             of = torch.where(start, (L - _IMG_IN) // 2, of)
         full = fit[rows, :, ar[None, :, None], (of[:, None] + ar)[:, None, :]]
         full = torch.where((H > W)[:, None, None, None], full.transpose(1, 2), full)
         pick = torch.rand(N, device=dev, generator=gen) < args.full_crops
-        if start is not None:
+        if start is not None and args.caption_frame:
             pick = pick | start
         x = torch.where(pick[:, None, None, None], full, x)
     x = x.permute(0, 3, 1, 2).float() / 255.0                           # [N, 3, 224, 224]
@@ -794,8 +808,9 @@ class VLAModel(nn.Module, _HubMixin):
         """The input grids, in self.in_widths order: the RMS-normalized token embedding
         broadcast over the grid, then (image model) the image grid, zeros where img is None."""
         B = idx.shape[0]
-        tok = self.tok_embed(idx)
+        tok = self.tok_embed(idx.clamp(min=0))
         tok = tok * torch.rsqrt(tok.pow(2).mean(dim=1, keepdim=True) + 1e-12)
+        tok = tok.masked_fill((idx < 0)[:, None], 0.0)      # _NULL: no token, a zero grid
         grids = [tok.view(B, self.c_text, 1, 1).expand(-1, -1, self.S, self.S)]
         if self.img_width:
             grids.append(img if img is not None else
@@ -1028,6 +1043,23 @@ def clip_text(text):
     return [(full[i], full[i + 1]) for i in range(len(full) - 1)]
 
 
+def clip_caption(text):
+    """An image caption as (input, target) pairs. Unframed (default): the image is the prompt,
+    so the first step reads _NULL (no token) and predicts the first word, and nothing follows
+    the last word. --caption_frame: framed like a document (clip_text)."""
+    if args.caption_frame:
+        return clip_text(text)
+    full = [_NULL] + _tokenizer.encode(text)
+    return [(full[i], full[i + 1]) for i in range(len(full) - 1)]
+
+
+def _image_prompt(text=''):
+    """The prompt when an image is given: [_NULL] + text unframed, else as _prompt_ids."""
+    if args.caption_frame:
+        return _prompt_ids(text)
+    return [_NULL] + (_tokenizer.encode(text) if text else [])
+
+
 def _id_heldout(key):
     """Image corpora: the held-out 1/_HOLDOUT_MOD, by a hash of the example id."""
     return zlib.crc32(key.encode('utf-8', 'ignore')) % _HOLDOUT_MOD == 0
@@ -1173,7 +1205,7 @@ def worker(stop, q, datasets):
                 continue
             if got is None:
                 continue
-            steps = clip_text(got[0])
+            steps = (clip_caption if name in _IMAGE_DATASETS else clip_text)(got[0])
             _text_tally(name, len(steps), got[0])
             while not stop.is_set():
                 try:
@@ -1479,7 +1511,7 @@ if args.push:
 if args.generate:
     if args.load is None and args.pretrained is None:
         print('WARNING: --generate without --load/--pretrained is running an untrained model')
-    prompt = _prompt_ids(args.prompt)
+    prompt = _image_prompt(args.prompt) if _image is not None else _prompt_ids(args.prompt)
     print(_render(prompt + model.generate(prompt, args.n, temperature=args.temperature,
                                           image=_image)))
     raise SystemExit(0)
@@ -1522,7 +1554,7 @@ if args.vis:
 
     model.eval()
     dev = next(model.parameters()).device
-    prompt = _prompt_ids(args.prompt)
+    prompt = _image_prompt(args.prompt) if _image is not None else _prompt_ids(args.prompt)
     pending, b = list(prompt[1:]), prompt[0]
     hist, cur = '', list(prompt)                     # finished episodes, current episode ids
     dff = model.new_state(1, dev)
@@ -1612,7 +1644,7 @@ def _build_image_eval(corpus):
         for r in rows.to_pylist():
             cap = (r[cfg['caption']] or '').strip()
             if cap and _id_heldout(r['id']):
-                items.append((clip_text(cap)[:_EVAL_MAXLEN], _decode_image(r),
+                items.append((clip_caption(cap)[:_EVAL_MAXLEN], _decode_image(r),
                               (r['id'], r['class'], cap)))
                 break
         if len(items) >= args.eval_docs:
@@ -2215,8 +2247,8 @@ def _gen_lines(i):
         ks = random.Random(f'{c}:{blk}').sample(range(n), min(n, args.gen_images))
         logk = ks[(i // args.gen_interval) % len(ks)] if args.gen_interval else ks[0]
         for k in ks if args.gen_vis and _gen_inbox is not None else [logk]:
-            prompt = _prompt_ids()
-            out = model.generate(prompt, _GEN_SAMPLE, temperature=args.temperature,
+            prompt = _image_prompt()
+            out = model.generate(prompt, _GENI_LEN, temperature=args.temperature,
                                  image=_eval_imgs[c][k])
             out = out[:out.index(model.end_id) + 1] if model.end_id in out else out
             iid, cls, cap = _eval_meta[c][k]
@@ -2277,8 +2309,8 @@ def _record_sample(i, x_list, flag_list, views):
     if rec is not None and len(rec['crops']) < 160:
         crop = ((views[j] * _IMG_STD_T + _IMG_MEAN_T) * 255.0).clamp(0, 255)
         rec['crops'].append(_thumb(crop, 96))
-        rec['toks'].append(_tokenizer.decode([x_list[r]]) if x_list[r] != model.start_id
-                           else STX_TEXT)
+        rec['toks'].append(STX_TEXT if x_list[r] == model.start_id else
+                           '∅' if x_list[r] < 0 else _tokenizer.decode([x_list[r]]))
 
 
 larr, garr = [], []
