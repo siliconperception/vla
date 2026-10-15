@@ -234,6 +234,11 @@ parser.add_argument('--eval_interval', default=20000, type=int,
                     help='held-out EVAL every N steps (0 = off)')
 parser.add_argument('--eval_corpora', default=None, help='comma-separated; default --dataset')
 parser.add_argument('--eval_docs',  default=400,  type=int, help='held-out documents per corpus')
+parser.add_argument('--eval_warm',  default=1024, type=int, metavar='T',
+                    help='EVAL of a corpus whose kind is in --carry (its registers never reset in '
+                         'training): each row first reads earlier held-out documents of the set '
+                         '(with their images), unscored and without resets, for about T tokens, '
+                         'and the scored document continues from that state; 0 = fresh start')
 parser.add_argument('--eval_bands', default='1024,8192', metavar='R1,R2,...',
                     help='EVALB: held-out loss split by target-token frequency rank ("" = off)')
 parser.add_argument('--eval_info',  default=0,    type=int, metavar='N',
@@ -268,6 +273,9 @@ parser.add_argument('--revision',   default=None, help='--pretrained: branch, ta
 parser.add_argument('--verbose',    default=False, action='store_true',
                     help='print the model graph and parameter table in one-shot modes too')
 args = parser.parse_args()
+_carry = {k.strip() for k in args.carry.split(',') if k.strip()}    # example kinds, --carry
+if _carry - {'text', 'image'}:
+    raise SystemExit(f'--carry {args.carry}: kinds are text and image')
 
 _ONESHOT = args.generate or args.eval or args.vis or args.push
 
@@ -1169,6 +1177,7 @@ def worker(stop, q, datasets):
 
     names = [n for n, k in _MIX for _ in range(k)]
     slots = [_Slot() for _ in names]
+    stagger = random.Random(args.seed)
     while not stop.is_set():
         new_imgs = []
         for r, slot in enumerate(slots):
@@ -1179,7 +1188,14 @@ def worker(stop, q, datasets):
                     if stop.is_set():
                         return
                     continue
+                first = not slot.steps
                 slot.load(steps)
+                if first and len(steps) > 1:
+                    # Stagger: rows that all start together (step 0, a resume) all read <NUL> on
+                    # a zero state -- identical inputs (an image adds nothing through its
+                    # zero-initialized block), so BatchNorm divides by a zero variance and the
+                    # first update explodes (v402: grad 4e9, never recovered).
+                    slot.pos = stagger.randrange(len(steps))
                 if img is not None:
                     new_imgs.append((r, img))
         flags = [slot.pos == 0 for slot in slots]
@@ -1701,10 +1717,16 @@ def _token_bands(dev):
 def _score(step, corpus, docs, imgs=None, tag=None):
     """EVAL (clean / median / runaway%) and EVALB (loss by frequency band) lines, tagged
     `tag` (default corpus). imgs: one image per doc, seen through a fresh random crop every
-    token from a fixed-seed generator, so successive evals see the same crops."""
+    token from a fixed-seed generator, so successive evals see the same crops. A corpus whose
+    kind is in --carry is warm-started (--eval_warm): row r first reads documents r-W..r-1,
+    W = ceil(--eval_warm / mean doc length), unscored and without resets."""
     tag = tag or corpus
     t0 = time.time()
     dev = next(model.parameters()).device
+    n = len(docs)
+    kind = 'image' if corpus in _IMAGE_DATASETS else 'text'
+    W = (min(n - 1, math.ceil(args.eval_warm / (sum(len(d) for d in docs) / n)))
+         if args.eval_warm > 0 and kind in _carry and n > 1 else 0)
     band_of = _token_bands(dev) if args.eval_bands else None
     nb = int(band_of.max()) + 1 if band_of is not None else 0
     per_doc, bad_doc, band_sum, band_cnt = [], [], [], []
@@ -1714,8 +1736,18 @@ def _score(step, corpus, docs, imgs=None, tag=None):
         for chunk, X, Y, M in _batches(_doc_rows(docs)):
             B, T = X.shape
             bank = _bank(imgs[c:c + B], dev) if imgs is not None else None
-            c += B
+            c0, c = c, c + B
             model.dff = None
+            for j in range(W, 0, -1):                    # warm-up: earlier documents, unscored
+                idx = [(c0 + r - j) % n for r in range(B)]
+                _, WX, _, WM = next(_batches(_doc_rows([docs[k] for k in idx])))
+                wbank = _bank([imgs[k] for k in idx], dev) if imgs is not None else None
+                for t in range(WX.shape[1]):
+                    img = model.image_grid(_views(*wbank, gen)) if wbank is not None else None
+                    prev = model.dff
+                    model(WX[:, t], img=img)
+                    if prev is not None:                 # a finished row's padding: hold state
+                        model.dff = torch.where(WM[:, t, None, None, None], model.dff, prev)
             rs = torch.zeros(B, device=dev)
             bad = torch.zeros(B, dtype=torch.bool, device=dev)
             if nb:
@@ -1753,7 +1785,7 @@ def _score(step, corpus, docs, imgs=None, tag=None):
     _emit(f'EVAL step {step:10} corpus {tag:8} clean {clean:11.6f} ppl {ppl:12.4f} '
           f'median {float(np.median(per)):11.6f} runaway {100.0 * float(bad.mean()):6.2f}% '
           f'nrun {int(bad.sum()):4d} docs {len(per):5d} wall {time.time() - t0:7.1f}s '
-          f'nats/char {npc:.4f}')
+          f'nats/char {npc:.4f}' + (f' warm {W}' if W else ''))
     if nb and (~bad).any():
         bs = np.concatenate(band_sum)[~bad].sum(0)
         bc = np.concatenate(band_cnt)[~bad].sum(0)
@@ -2139,9 +2171,6 @@ for _n, _k in _MIX:
     _r += _k
 _text_names = [n for n in _rows_of if n not in _IMAGE_DATASETS]
 # --carry: rows whose example kind keeps its registers across example boundaries
-_carry = {k.strip() for k in args.carry.split(',') if k.strip()}
-if _carry - {'text', 'image'}:
-    raise SystemExit(f'--carry {args.carry}: kinds are text and image')
 _carry_row = torch.tensor([('image' if n in _IMAGE_DATASETS else 'text') in _carry
                            for n, k in _MIX for _ in range(k)], device=args.device)
 
