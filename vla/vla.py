@@ -1494,7 +1494,16 @@ if args.vis:
     gs = fig.add_gridspec(rows, 2, width_ratios=[1, 1.5], top=0.84, bottom=0.04, left=0.03,
                           right=0.98, hspace=0.25, wspace=0.10)
     axes = [fig.add_subplot(gs[r, 0]) for r in range(rows)]
-    ax_p = fig.add_subplot(gs[:, 1])
+    if _image is not None:                           # the prompt image above P(next token)
+        ki = max(1, rows // 3)
+        ax_i = fig.add_subplot(gs[:ki, 1])
+        ax_i.imshow(_image.permute(1, 2, 0).numpy())
+        ax_i.set_axis_off()
+        ax_i.set_title(f'image  {os.path.basename(args.image)}  '
+                       f'({_image.shape[2]}x{_image.shape[1]})', fontsize=9, pad=3)
+        ax_p = fig.add_subplot(gs[ki:, 1])
+    else:
+        ax_p = fig.add_subplot(gs[:, 1])
     for r, ax in enumerate(axes):
         ax.set_title('output' if r == 0 else f'DFF {r}: {model.windows[r - 1]:g}-token window',
                      fontsize=9, pad=3)
