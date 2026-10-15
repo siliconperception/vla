@@ -982,7 +982,10 @@ def _id_heldout(key):
 
 
 def _decode_image(row):
-    from PIL import Image
+    from PIL import Image, PngImagePlugin
+    # Some PNGs carry metadata chunks over Pillow's 1 MB decompression cap (ValueError
+    # "Decompressed data too large"); the text is ignored, so allow it rather than drop the image.
+    PngImagePlugin.MAX_TEXT_CHUNK = 64 << 20
     im = row['image']                    # encoded bytes (or an HF image struct)
     return _prep_image(Image.open(io.BytesIO(im['bytes'] if isinstance(im, dict) else im)))
 
