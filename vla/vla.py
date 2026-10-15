@@ -647,12 +647,14 @@ def _bank(imgs, device):
     return bank, hw, fit
 
 
-def _views(bank, hw, fit, gen=None):
+def _views(bank, hw, fit, gen=None, start=None):
     """One random 224x224 crop per image, normalized for the encoder: a native-resolution
     close-up copied pixel for pixel (images are at least 224 on each side, see _prep_image)
     or, with probability --full_crops, a full view -- the whole image scaled so its shorter
-    side is 224, at a random offset along the longer side (see _fit). gen: a torch.Generator
-    on the bank's device, for reproducible crops (eval)."""
+    side is 224, at a random offset along the longer side (see _fit). start: bool [N], rows
+    reading <STX>; with --full_crops > 0 they always get the centred full view, so an example
+    opens on the whole image. gen: a torch.Generator on the bank's device, for reproducible
+    crops (eval)."""
     N, dev = bank.shape[0], bank.device
     ar = torch.arange(_IMG_IN, device=dev)
     rows = torch.arange(N, device=dev)[:, None, None]
@@ -663,9 +665,13 @@ def _views(bank, hw, fit, gen=None):
     if args.full_crops > 0:                       # skipped at 0, keeping the old random stream
         L = hw[:, 2].long()
         of = (torch.rand(N, device=dev, generator=gen) * (L - _IMG_IN + 1)).long()
+        if start is not None:
+            of = torch.where(start, (L - _IMG_IN) // 2, of)
         full = fit[rows, :, ar[None, :, None], (of[:, None] + ar)[:, None, :]]
         full = torch.where((H > W)[:, None, None, None], full.transpose(1, 2), full)
         pick = torch.rand(N, device=dev, generator=gen) < args.full_crops
+        if start is not None:
+            pick = pick | start
         x = torch.where(pick[:, None, None, None], full, x)
     x = x.permute(0, 3, 1, 2).float() / 255.0                           # [N, 3, 224, 224]
     mean = torch.tensor(_IMG_MEAN, device=dev).view(1, 3, 1, 1)
@@ -856,7 +862,9 @@ class VLAModel(nn.Module, _HubMixin):
         bank = _bank([image], dev) if image is not None else None
 
         def feed(b, dff):
-            img = self.image_grid(_views(*bank)) if bank is not None else None
+            img = (self.image_grid(_views(*bank, start=torch.tensor([b == self.start_id],
+                                                                    device=dev)))
+                   if bank is not None else None)
             new, o = self.step(torch.tensor([b], device=dev), dff, img)
             logits = self.text_dec(o)
             if not (new.isfinite().all() and logits.isfinite().all()):
@@ -1494,7 +1502,9 @@ if args.vis:
     imgs, vmax, img_p, nstep = [None] * rows, [None] * rows, None, 0
     while not _exit[0] and plt.fignum_exists(fig.number):
         with torch.no_grad():
-            img = model.image_grid(_views(*bank)) if bank is not None else None
+            img = (model.image_grid(_views(*bank, start=torch.tensor([b == model.start_id],
+                                                                     device=dev)))
+                   if bank is not None else None)
             dff, o = model.step(torch.tensor([b], device=dev), dff, img)
             prob = F.softmax(model.text_dec(o)[0] / max(args.temperature, 1e-6), dim=-1)
         nstep += 1
@@ -1713,7 +1723,8 @@ def _score(step, corpus, docs, imgs=None, tag=None):
                 bsum = torch.zeros(B, nb, device=dev)
                 bcnt = torch.zeros(B, nb, device=dev)
             for t in range(T):
-                img = model.image_grid(_views(*bank, gen)) if bank is not None else None
+                img = (model.image_grid(_views(*bank, gen, start=X[:, t] == model.start_id))
+                       if bank is not None else None)
                 logits, _ = model(X[:, t], img=img)
                 ce = F.cross_entropy(logits, Y[:, t], reduction='none')
                 # a diverged row is counted as runaway rather than poisoning the sums
@@ -2277,7 +2288,7 @@ try:
                 j = _bank_of[r]
                 _bank_put(img_bank, img_hw, img_fit, j, im.to(args.device, non_blocking=True))
                 _img_name[j] = name
-            views = _views(img_bank, img_hw, img_fit)
+            views = _views(img_bank, img_hw, img_fit, start=flag[_img_rows])
             img = torch.zeros(len(x_list), model.img_width, model.S, model.S, device=args.device)
             img[_img_rows] = model.image_grid(views)
             if _sample is not None:
