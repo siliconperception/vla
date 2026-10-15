@@ -216,6 +216,12 @@ parser.add_argument('--gen_score',  default=None, nargs='?', const='EleutherAI/p
                          'words shuffled (0%%); read it with rep1, never alone')
 parser.add_argument('--prompt',     default='', help='extra GEN prompt; prompt for --generate/--vis')
 parser.add_argument('--temperature', default=1.0, type=float, help='sampling temperature')
+parser.add_argument('--gen_images', default=8, type=int, metavar='N',
+                    help='image models: caption N fixed held-out images at every GEN (GENI/REF '
+                         'lines and the --gen_vis panel); 0 = off')
+parser.add_argument('--gen_vis', default=True, action=argparse.BooleanOptionalAction,
+                    help='show the GEN image captions as a panel of images in one window, '
+                         'redrawn at every GEN, and save it as <log>.gen.png')
 # periodic held-out eval
 parser.add_argument('--eval_interval', default=20000, type=int,
                     help='held-out EVAL every N steps (0 = off)')
@@ -370,6 +376,74 @@ def _emit(line, stdout=True):
 
 
 _emit(f'ARGS {args}', stdout=False)
+
+
+def _gen_viewer(inbox, png, show, parent):
+    """--gen_vis, in its own process so the window stays responsive between GEN steps:
+    draws each (step, [(image, title, caption, reference)]) message into the same figure,
+    saves it to png, and exits when the trainer does."""
+    import textwrap
+    import matplotlib
+    if not show:
+        matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+    plt.style.use('dark_background')                 # the same look as --vis
+    plt.ion()
+    fig = None
+    while os.getppid() == parent:
+        try:
+            msg = inbox.get(timeout=0.1)
+        except queue.Empty:
+            if fig is not None and show:
+                if plt.fignum_exists(fig.number):
+                    fig.canvas.flush_events()
+                else:
+                    fig = None                         # closed by the user: reopen next GEN
+            continue
+        if msg is None:
+            return
+        step, items = msg
+        cols = min(4, len(items))
+        rows = math.ceil(len(items) / cols)
+        if fig is None:
+            fig = plt.figure(figsize=(4.4 * cols, 5.4 * rows))
+            fig.canvas.manager.set_window_title(f'GEN captions -- {args.log}')
+            if show:
+                plt.show(block=False)
+        fig.clf()
+        gs = fig.add_gridspec(2 * rows, cols, height_ratios=[3, 1.5] * rows, left=0.01,
+                              right=0.99, top=0.93, bottom=0.01, wspace=0.06, hspace=0.12)
+        for k, (img, title, cap, ref) in enumerate(items):
+            r, c = divmod(k, cols)
+            ax = fig.add_subplot(gs[2 * r, c])
+            ax.imshow(img)
+            ax.set_axis_off()
+            ax.set_title(title, fontsize=9)
+            tx = fig.add_subplot(gs[2 * r + 1, c])
+            tx.set_axis_off()
+            cut = lambda t, n: t if len(t) <= n else t[:n - 3] + '...'
+            tx.text(0, 1, textwrap.fill(cut(cap, 300), 58), va='top', fontsize=8,
+                    color='white', transform=tx.transAxes, clip_on=True)
+            tx.text(0, 0, textwrap.fill('REF: ' + cut(ref, 200), 66), va='bottom', fontsize=7,
+                    color='0.6', transform=tx.transAxes, clip_on=True)
+        fig.suptitle(f'GEN step {step}   {args.log}', family='monospace', fontsize=9)
+        if png:
+            fig.savefig(png, dpi=72)
+        if show:
+            fig.canvas.draw()
+            fig.canvas.flush_events()
+
+
+_gen_inbox = _gen_proc = None
+
+if not _ONESHOT and args.gen_vis and args.gen_images and args.image_encoder != 'none':
+    import multiprocessing
+    _ctx = multiprocessing.get_context('fork')     # before CUDA and the data threads exist
+    _gen_inbox = _ctx.Queue(maxsize=2)
+    _gen_proc = _ctx.Process(target=_gen_viewer, daemon=True, args=(
+        _gen_inbox, None if args.log == os.devnull else args.log + '.gen.png',
+        bool(os.environ.get('DISPLAY') or os.environ.get('WAYLAND_DISPLAY')), os.getpid()))
+    _gen_proc.start()
 
 # ── model ─────────────────────────────────────────────────────────────────────
 
@@ -1966,8 +2040,9 @@ def _save(i, n_examples):
 
 
 def _gen_lines(i):
-    """GEN samples (text-only, from <STX> and --prompt), GENI captions of two fixed held-out
-    images per image eval corpus with their reference, and a recent training text per corpus."""
+    """GEN samples (text-only, from <STX> and --prompt), GENI captions of --gen_images fixed
+    held-out images per image eval corpus with their reference (also sent to the --gen_vis
+    panel), and a recent training text per corpus."""
     lines = []
     for p in dict.fromkeys(['', args.prompt]):
         prompt = _prompt_ids(p)
@@ -1976,11 +2051,13 @@ def _gen_lines(i):
         sc = _gen_scorer.score(_decode_plain(out)) if _gen_scorer else ''
         if sc:
             lines.append(f'GENSCORE step {i:10} [{p or STX_TEXT}]: {sc}')
+    panel = []
     for c in _eval_corpus_names():
-        if c not in _IMAGE_DATASETS or model.img_enc is None:
+        if c not in _IMAGE_DATASETS or model.img_enc is None or not args.gen_images:
             continue
         n = len(_eval_docs(c))
-        for k in sorted({n // 3, (2 * n) // 3}) if n else []:
+        for k in sorted({int((j + 0.5) * n / args.gen_images) for j in range(args.gen_images)}
+                        if n else []):
             prompt = _prompt_ids()
             out = model.generate(prompt, _GEN_SAMPLE, temperature=args.temperature,
                                  image=_eval_imgs[c][k])
@@ -1988,6 +2065,13 @@ def _gen_lines(i):
             iid, cls, cap = _eval_meta[c][k]
             lines.append(f'GENI step {i:10} [{iid} {cls.split(",")[0]}]: {_render(prompt + out)}')
             lines.append(f'REF  step {i:10} [{iid}]: {_printable(cap[:400])}')
+            panel.append((_eval_imgs[c][k].permute(1, 2, 0).numpy(),
+                          f'{cls.split(",")[0]}  ({iid})', _decode_plain(out), cap))
+    if panel and _gen_inbox is not None:
+        try:
+            _gen_inbox.put_nowait((i, panel))
+        except queue.Full:
+            pass                                  # viewer busy: skip this panel
     with _text_lock:
         samples = {n: st['sample'] for n, st in _text_stats.items() if st['sample']}
     for n, smp in samples.items():
@@ -2085,6 +2169,8 @@ except KeyboardInterrupt:
 
 print('\nSTOPPING THREADS')
 stop.set()
+if _gen_proc is not None:
+    _gen_proc.terminate()
 while not q.empty():
     q.get()
 w.join()
