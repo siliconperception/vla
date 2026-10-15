@@ -424,8 +424,8 @@ def _gen_viewer(inbox, png, show, parent):
             cut = lambda t, n: t if len(t) <= n else t[:n - 3] + '...'
             tx.text(0, 1, textwrap.fill(cut(cap, 300), 58), va='top', fontsize=8,
                     color='white', transform=tx.transAxes, clip_on=True)
-            tx.text(0, 0, textwrap.fill('REF: ' + cut(ref, 200), 66), va='bottom', fontsize=7,
-                    color='0.6', transform=tx.transAxes, clip_on=True)
+            tx.text(0, 0, textwrap.fill('REF: ' + cut(ref, 200), 58), va='bottom', fontsize=8,
+                    color='limegreen', transform=tx.transAxes, clip_on=True)
         fig.suptitle(f'GEN step {step}   {args.log}', family='monospace', fontsize=9)
         if png:
             fig.savefig(png, dpi=72)

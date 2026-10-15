@@ -63,21 +63,22 @@ if __name__ == '__main__':
     os.makedirs(args.out, exist_ok=True)
     files = sorted(s.rfilename for s in HfApi().dataset_info(REPO).siblings
                    if s.rfilename.endswith('.parquet'))
-    # Worker PROCESSES that exit after a few shards: a long-lived thread pool grew to 58 GB
-    # of host RAM (HfFileSystem/pyarrow buffers) and was OOM-killed at ~1,700 shards.
+    # Worker PROCESSES, in waves of a fresh pool per 8 shards per worker: a long-lived thread
+    # pool grew to 58 GB of host RAM (HfFileSystem/pyarrow buffers) and was OOM-killed, and
+    # max_tasks_per_child deadlocks in Python 3.12's ProcessPoolExecutor.
     todo = [(i, f, args.out, args.groups) for i, f in enumerate(files)
             if not os.path.exists(os.path.join(args.out, f'train-{i:05d}.parquet'))]
     print(f'{len(files) - len(todo)} shards already done, {len(todo)} to go', flush=True)
     t0, rows, done, failed = time.time(), 0, 0, []
-    with cf.ProcessPoolExecutor(args.workers, max_tasks_per_child=8,
-                                mp_context=multiprocessing.get_context('spawn')) as ex:
-        for i, n in ex.map(one, todo):
-            done += 1
-            if n < 0:
-                failed.append(i)
-            rows += max(n, 0)
-            if done % 100 == 0:
-                print(f'{done}/{len(todo)} shards, {rows} new rows, {time.time() - t0:.0f}s',
-                      flush=True)
+    wave = 8 * args.workers
+    for w0 in range(0, len(todo), wave):
+        with cf.ProcessPoolExecutor(args.workers,
+                                    mp_context=multiprocessing.get_context('spawn')) as ex:
+            for i, n in ex.map(one, todo[w0:w0 + wave]):
+                done += 1
+                if n < 0:
+                    failed.append(i)
+                rows += max(n, 0)
+        print(f'{done}/{len(todo)} shards, {rows} new rows, {time.time() - t0:.0f}s', flush=True)
     print(f'DONE {done} shards, {rows} new rows, failed {failed}, {time.time() - t0:.0f}s')
     sys.exit(1 if failed else 0)
