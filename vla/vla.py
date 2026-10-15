@@ -11,8 +11,9 @@
 #
 # Images: a frozen ResNet-50 turns a 224x224 crop of the image into a [2048, 7, 7] feature map
 # that is concatenated with the token grid. An image-caption example is <STX> caption <ETX>
-# with the image present at every token, seen through a fresh random 224x224 crop at native
-# resolution (never rescaled) each token; text-only rows get a zero image map.
+# with the image present at every token, seen through a fresh random 224x224 crop each token
+# (native resolution; only an image with a side under 224 is scaled up, uniformly, to fill the
+# crop); text-only rows get a zero image map.
 #
 # Built to be extended: the input side is a LIST of grids concatenated in front of ctx_cat, and
 # the text readout is a self-contained decoder module that other decoders (e.g. actions) can
@@ -452,10 +453,15 @@ class ImageEncoder(nn.Module):
 
 
 def _prep_image(img):
-    """PIL image -> uint8 [3, h, w] at native resolution (never rescaled); a side longer than
-    _IMG_BANK keeps its central _IMG_BANK pixels."""
+    """PIL image -> uint8 [3, h, w] at native resolution, except that an image with a side
+    under _IMG_IN is scaled up uniformly (pixel aspect 1:1) until its shorter side is _IMG_IN,
+    so every crop is filled. A side longer than _IMG_BANK keeps its central _IMG_BANK pixels."""
     img = img.convert('RGB')
     w, h = img.size
+    if min(w, h) < _IMG_IN:
+        s = _IMG_IN / min(w, h)
+        w, h = max(_IMG_IN, round(w * s)), max(_IMG_IN, round(h * s))
+        img = img.resize((w, h), 3)                     # 3 = BICUBIC
     x0, y0 = max(0, (w - _IMG_BANK) // 2), max(0, (h - _IMG_BANK) // 2)
     img = img.crop((x0, y0, x0 + min(w, _IMG_BANK), y0 + min(h, _IMG_BANK)))
     return torch.from_numpy(np.asarray(img).copy()).permute(2, 0, 1)
@@ -473,27 +479,20 @@ def _bank(imgs, device):
 
 
 def _views(bank, hw, gen=None):
-    """One random 224x224 crop per image at native resolution, normalized for the encoder.
-    An image narrower or shorter than 224 lands at a random position inside the crop, and
-    the rest of the crop is the mean color (0 after normalization). gen: a torch.Generator
-    on the bank's device, for reproducible crops (eval)."""
+    """One random 224x224 crop per image (images are at least 224 on each side, see
+    _prep_image), copied pixel for pixel and normalized for the encoder. gen: a
+    torch.Generator on the bank's device, for reproducible crops (eval)."""
     N, dev = bank.shape[0], bank.device
     ar = torch.arange(_IMG_IN, device=dev)
-
-    def offsets(n):                      # n [N] image side -> crop start, may be negative
-        lo, hi = (n - _IMG_IN).clamp(max=0), (n - _IMG_IN).clamp(min=0)
-        return lo + (torch.rand(N, device=dev, generator=gen) * (hi - lo + 1)).long()
-
     H, W = hw[:, 0].long(), hw[:, 1].long()
-    yy, xx = offsets(H)[:, None] + ar, offsets(W)[:, None] + ar          # [N, 224] each
+    oy = (torch.rand(N, device=dev, generator=gen) * (H - _IMG_IN + 1)).long()
+    ox = (torch.rand(N, device=dev, generator=gen) * (W - _IMG_IN + 1)).long()
     x = bank[torch.arange(N, device=dev)[:, None, None], :,
-             yy.clamp(0, _IMG_BANK - 1)[:, :, None], xx.clamp(0, _IMG_BANK - 1)[:, None, :]]
+             (oy[:, None] + ar)[:, :, None], (ox[:, None] + ar)[:, None, :]]
     x = x.permute(0, 3, 1, 2).float() / 255.0                           # [N, 3, 224, 224]
     mean = torch.tensor(_IMG_MEAN, device=dev).view(1, 3, 1, 1)
     std = torch.tensor(_IMG_STD, device=dev).view(1, 3, 1, 1)
-    inside = (((yy >= 0) & (yy < H[:, None]))[:, :, None] &
-              ((xx >= 0) & (xx < W[:, None]))[:, None, :])               # [N, 224, 224]
-    return (x - mean) / std * inside[:, None]
+    return (x - mean) / std
 
 
 # PyTorchModelHubMixin adds save_pretrained/push_to_hub/from_pretrained (--push,

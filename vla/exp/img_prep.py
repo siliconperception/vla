@@ -25,29 +25,25 @@ from huggingface_hub import HfApi, HfFileSystem
 REPO = 'gmongaras/Imagenet21K_Recaption'
 COLS = ['image', 'id', 'class', 'recaption']
 
-ap = argparse.ArgumentParser()
-ap.add_argument('--groups', type=int, default=2, help='row groups sampled per shard')
-ap.add_argument('--out', default='/data/imagenet21k_recap')
-ap.add_argument('--workers', type=int, default=32)
-args = ap.parse_args()
-os.makedirs(args.out, exist_ok=True)
-
-files = sorted(s.rfilename for s in HfApi().dataset_info(REPO).siblings
-               if s.rfilename.endswith('.parquet'))
-fs = HfFileSystem()
+fs = None
 
 
-def one(i):
-    dst = os.path.join(args.out, f'train-{i:05d}.parquet')
+def one(job):
+    i, fname, out, groups = job
+    global fs
+    if fs is None:
+        fs = HfFileSystem()
+    dst = os.path.join(out, f'train-{i:05d}.parquet')
     if os.path.exists(dst):
         return i, 0
     for attempt in range(8):
         try:
-            pf = pq.ParquetFile(fs.open(f'datasets/{REPO}/{files[i]}', block_size=8 << 20))
-            G = pf.metadata.num_row_groups
-            picks = sorted({min(G - 1, round((j + 0.5) * G / args.groups - 0.5))
-                            for j in range(args.groups)})
-            t = pa.concat_tables([pf.read_row_group(g, columns=COLS) for g in picks])
+            with fs.open(f'datasets/{REPO}/{fname}', block_size=8 << 20) as fh:
+                pf = pq.ParquetFile(fh)
+                G = pf.metadata.num_row_groups
+                picks = sorted({min(G - 1, round((j + 0.5) * G / groups - 0.5))
+                                for j in range(groups)})
+                t = pa.concat_tables([pf.read_row_group(g, columns=COLS) for g in picks])
             pq.write_table(t, dst + '.tmp', row_group_size=100)
             os.replace(dst + '.tmp', dst)
             return i, t.num_rows
@@ -57,15 +53,31 @@ def one(i):
     return i, -1
 
 
-t0, rows, done, failed = time.time(), 0, 0, []
-with cf.ThreadPoolExecutor(args.workers) as ex:
-    for i, n in ex.map(one, range(len(files))):
-        done += 1
-        if n < 0:
-            failed.append(i)
-        rows += max(n, 0)
-        if done % 100 == 0:
-            print(f'{done}/{len(files)} shards, {rows} new rows, {time.time() - t0:.0f}s',
-                  flush=True)
-print(f'DONE {done} shards, {rows} new rows, failed {failed}, {time.time() - t0:.0f}s')
-sys.exit(1 if failed else 0)
+if __name__ == '__main__':
+    import multiprocessing
+    ap = argparse.ArgumentParser()
+    ap.add_argument('--groups', type=int, default=2, help='row groups sampled per shard')
+    ap.add_argument('--out', default='/data/imagenet21k_recap')
+    ap.add_argument('--workers', type=int, default=32)
+    args = ap.parse_args()
+    os.makedirs(args.out, exist_ok=True)
+    files = sorted(s.rfilename for s in HfApi().dataset_info(REPO).siblings
+                   if s.rfilename.endswith('.parquet'))
+    # Worker PROCESSES that exit after a few shards: a long-lived thread pool grew to 58 GB
+    # of host RAM (HfFileSystem/pyarrow buffers) and was OOM-killed at ~1,700 shards.
+    todo = [(i, f, args.out, args.groups) for i, f in enumerate(files)
+            if not os.path.exists(os.path.join(args.out, f'train-{i:05d}.parquet'))]
+    print(f'{len(files) - len(todo)} shards already done, {len(todo)} to go', flush=True)
+    t0, rows, done, failed = time.time(), 0, 0, []
+    with cf.ProcessPoolExecutor(args.workers, max_tasks_per_child=8,
+                                mp_context=multiprocessing.get_context('spawn')) as ex:
+        for i, n in ex.map(one, todo):
+            done += 1
+            if n < 0:
+                failed.append(i)
+            rows += max(n, 0)
+            if done % 100 == 0:
+                print(f'{done}/{len(todo)} shards, {rows} new rows, {time.time() - t0:.0f}s',
+                      flush=True)
+    print(f'DONE {done} shards, {rows} new rows, failed {failed}, {time.time() - t0:.0f}s')
+    sys.exit(1 if failed else 0)
