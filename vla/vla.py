@@ -326,6 +326,7 @@ _FIXED_ARCH = dict(n_layers=1, linout=True, linout_kernel=1, linin=False, ctx_mi
 _loaded_ckpt = None
 _start_step = 0
 _start_exs = 0
+_start_exs_by = {}            # corpus -> examples trained, for the STEP ex_/ep_ columns
 if args.pretrained and args.load:
     print(f'--pretrained overrides --load {args.load}')
     args.load = None
@@ -342,6 +343,7 @@ if args.load:
         args.full_crops = 0.0         # trained before full views existed: keep its crops
     _start_step = int(_loaded_ckpt.get('step', 0))
     _start_exs = int(_loaded_ckpt.get('examples', 0))
+    _start_exs_by = dict(_loaded_ckpt.get('examples_by', {}))
 
 
 def _upgrade_state_dict(sd):
@@ -1216,6 +1218,23 @@ if not _ONESHOT:
         if name not in _IMAGE_DATASETS:
             hf_datasets[name] = _load_corpus(name, args.streaming, args.shards)
     print('datasets ready')
+
+
+def _corpus_size(name):
+    """Training examples in one pass over a corpus, for the STEP ep_ columns; None if unknown
+    (streaming). An image corpus is counted as its file count times the rows of its first file
+    (exp/img_prep.py writes the same number per file -- reading every footer takes minutes),
+    less the held-out 1/_HOLDOUT_MOD."""
+    if name in _IMAGE_DATASETS:
+        import pyarrow.parquet as pq
+        files = sorted(glob.glob(os.path.join(_IMAGE_DATASETS[name]['dir'], '*.parquet')))
+        if not files:
+            return None
+        return len(files) * pq.ParquetFile(files[0]).metadata.num_rows * (1 - 1 / _HOLDOUT_MOD)
+    try:
+        return len(hf_datasets[name]['train']) or None
+    except (KeyError, TypeError):
+        return None
 
 # ── build / load the model ────────────────────────────────────────────────────
 
@@ -2156,7 +2175,8 @@ def _save(i, n_examples):
         return
     log = open(args.log).read() if os.path.exists(args.log) else ''
     torch.save({'saved_args': vars(args), 'state_dict': model.state_dict(), 'log': log,
-                'step': i, 'examples': n_examples, 'lr': optimizer.param_groups[0]['lr'],
+                'step': i, 'examples': n_examples, 'examples_by': dict(_n_by),
+                'lr': optimizer.param_groups[0]['lr'],
                 'optimizer': optimizer.state_dict()}, args.save)
 
 
@@ -2255,6 +2275,34 @@ def _record_sample(i, x_list, flag_list, views):
 larr, garr = [], []
 carr = {n: [] for n in _rows_of} if len(_rows_of) > 1 else {}
 i, n_examples = _start_step, _start_exs
+_n_by = {n: int(_start_exs_by.get(n, 0)) for n in _rows_of}     # examples trained per corpus
+# STEP columns ex_t/ep_t (text corpora pooled) and ex_i/ep_i (image corpora pooled): examples
+# trained and passes over the data (examples / corpus size; a streaming text corpus, whose
+# size is unknown, reports its reshuffle count instead)
+_kinds = [(k, ns, [_corpus_size(n) for n in ns]) for k, ns in
+          (('t', _text_names), ('i', [n for n in _rows_of if n in _IMAGE_DATASETS])) if ns]
+
+
+def _abbr(n):
+    """A count in 6 characters: 9999, 437.4K, 2.544M, 25.44M, 254.4M, 2.544G."""
+    if n < 10000:
+        return f'{n:6d}'
+    for div, unit in ((1e3, 'K'), (1e6, 'M'), (1e9, 'G')):
+        v = n / div
+        if v < 999.95 or unit == 'G':
+            return f'{v:.{3 if v < 9.9995 else 2 if v < 99.995 else 1}f}{unit}'.rjust(6)
+
+
+def _ex_ep():
+    out = ''
+    for k, ns, sizes in _kinds:
+        ex = sum(_n_by[n] for n in ns)
+        ep = (ex / sum(sizes) if all(sizes) else
+              float(sum(_epoch[n] for n in ns)) / len(ns))
+        out += f' ex_{k} {_abbr(ex)} ep_{k} {ep:6.3f}'
+    return out
+
+
 try:
     while True:
         if i % args.checkpoint == 0:
@@ -2279,6 +2327,8 @@ try:
 
         x_list, y_list, flag_list, new_imgs = q.get()
         n_examples += sum(flag_list)
+        for n, rows in _rows_of.items():
+            _n_by[n] += sum(flag_list[r] for r in rows)
         x = torch.tensor(x_list, dtype=torch.long).to(args.device)
         y = torch.tensor(y_list, dtype=torch.long).to(args.device)
         flag = torch.tensor(flag_list, dtype=torch.bool).to(args.device)
@@ -2324,12 +2374,11 @@ try:
         if i % args.monitor == 0:
             flat = model.dff.reshape(-1)
             line = ('STEP {:10} wall {} loss {:12.9f} grad {:12.6f} lr {:10.9f} dff_mean {:12.5f} '
-                    'dff_std {:12.5f} dff_max {:11.3f} batch {:6d} examples {:12d} epoch {:10.3f}'
+                    'dff_std {:12.5f} dff_max {:11.3f}'
                     ).format(i, datetime.datetime.now(), np.mean(larr[-args.monitor:]),
                              np.mean(garr[-args.monitor:]), optimizer.param_groups[0]['lr'],
-                             flat.mean().item(), flat.std().item(), flat.abs().max().item(),
-                             args.batch, n_examples,
-                             float(_epoch[_text_names[0]]) if _text_names else 1.0)
+                             flat.mean().item(), flat.std().item(), flat.abs().max().item())
+            line += _ex_ep()
             line += ''.join(f' loss_{n} {np.mean(a[-args.monitor:]):12.9f}' for n, a in carr.items())
             _emit(line)
             del larr[:-args.monitor], garr[:-args.monitor]   # keep host RAM flat

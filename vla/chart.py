@@ -53,7 +53,7 @@ batch_size=0
 # Parse each numeric field by name so the layout is robust to the date/time tokens
 # and to optional mix-mode fields.
 _FIELDS = ['batch', 'loss', 'grad', 'lr', 'dff_mean', 'dff_std', 'dff_max', 'dff_zeros',
-           'a_std', 'i_std', 'epoch']
+           'a_std', 'i_std', 'epoch', 'ep_t']
 _NUM    = r'(-?[\d.]+(?:[eE][-+]?\d+)?)'
 
 # GENSCORE lines carry the fluency of the periodic generation samples, scored by the frozen
@@ -167,7 +167,8 @@ step = d['step']
 loss = d['loss']
 grad = d['grad']
 lr   = d['lr']
-epoch = d['epoch']
+# STEP lines since 2026-10-15 carry ep_t (passes over the text corpora) instead of epoch
+epoch = d['epoch'] if d['epoch'].any() else d['ep_t']
 gs_step, gs_nats = d['gs_step'], d['gs_nats']
 ev = d['ev']
 if ev:
