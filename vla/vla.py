@@ -9,14 +9,20 @@
 # missed, at its own rate 1/W_k. The text decoder reads the layer output to next-token logits
 # through a frozen, borrowed lm_head. No attention, no positional encoding.
 #
-# Built to be extended: the input side is a LIST of grids concatenated in front of ctx_cat
-# (more embeddings, a frozen image encoder), and the text readout is a self-contained decoder
-# module that other decoders (e.g. actions) can sit beside.
+# Images: a frozen ResNet-50 turns a 224x224 view of the image into a [2048, 7, 7] feature map
+# that is concatenated with the token grid. An image-caption example is <STX> caption <ETX>
+# with the image present at every token, seen through a fresh random crop each token; text-only
+# rows get a zero image map.
+#
+# Built to be extended: the input side is a LIST of grids concatenated in front of ctx_cat, and
+# the text readout is a self-contained decoder module that other decoders (e.g. actions) can
+# sit beside.
 
 import argparse
 import collections
 import datetime
 import glob
+import io
 import itertools
 import json
 import math
@@ -24,7 +30,6 @@ import os
 import queue
 import random
 import re
-import subprocess
 import sys
 import threading
 import time
@@ -52,7 +57,22 @@ _EVAL_THRESH = 20.0         # a document with ANY token above this many nats is 
 
 
 def _eval_minlen(corpus):
+    if corpus in _IMAGE_DATASETS:
+        return 1                    # captions are short; every held-out caption counts
     return _EVAL_MINLEN_SHORT.get(corpus, _EVAL_MINLEN)
+
+
+# Image-caption corpora: a local directory of parquet files (see exp/img_prep.py) with an
+# encoded 'image', an 'id' and the caption column.
+_IMAGE_DATASETS = {
+    'imagenet21k': dict(dir='/data/imagenet21k_recap', caption='recaption'),
+}
+
+_IMAGE_ENCODERS = {'resnet50': 'timm/resnet50.a1_in1k'}   # frozen; [3,224,224] -> [2048,7,7]
+_IMG_BANK = 256             # images are stored with their longer side at this many pixels
+_IMG_IN = 224               # encoder input side
+_IMG_MEAN = (0.485, 0.456, 0.406)
+_IMG_STD = (0.229, 0.224, 0.225)
 
 
 # ── tokenizer ─────────────────────────────────────────────────────────────────
@@ -149,8 +169,21 @@ parser.add_argument('--bn_momentum', default=0.1, type=float,
                     help='ContextCNN BatchNorm running-statistics momentum (0 = cumulative)')
 parser.add_argument('--init',       default='zero', choices=['zero', 'gaussian', 'relu'],
                     help='DFF register value at every document start')
+parser.add_argument('--image_encoder', default=None, choices=['none'] + sorted(_IMAGE_ENCODERS),
+                    help='frozen image encoder whose feature map joins the input concat; '
+                         'default: resnet50 if --mix or --eval_corpora names an image corpus, '
+                         'else none')
 # data
 parser.add_argument('--dataset',    default='smolfwedu', help='training corpus (see _TEXT_DATASETS)')
+parser.add_argument('--mix',        default=None, metavar='NAME:FRAC,...',
+                    help='several corpora, each given an exact share of the --batch slots '
+                         '(largest remainder), e.g. smolfwedu:0.5,imagenet21k:0.5. Overrides '
+                         '--dataset. Image corpora: see _IMAGE_DATASETS')
+parser.add_argument('--crop_scale', default='0.25,1', metavar='LO,HI',
+                    help='image views: each token a random crop covering LO..HI of the image '
+                         'area (aspect jitter 3/4..4/3), resized to 224x224')
+parser.add_argument('--image',      default=None, metavar='PATH',
+                    help='--generate/--vis: condition on this image (caption it)')
 parser.add_argument('--shards',     default=None, type=int, help='load only the first N parquet shards')
 parser.add_argument('--streaming',  default=False, action='store_true')
 parser.add_argument('--shuffle',    default=True, action=argparse.BooleanOptionalAction,
@@ -230,7 +263,36 @@ _ONESHOT = args.generate or args.eval or args.vis or args.push
 # ── checkpoint ────────────────────────────────────────────────────────────────
 
 _ARCH_ARGS = ('context', 'n_hidden', 'c_context', 'depth', 'kernel', 'tokenizer', 'ctx_ema',
-              'ctx_read_norm', 'dec_tree_kernels', 'dec_width', 'bn_momentum', 'init')
+              'ctx_read_norm', 'dec_tree_kernels', 'dec_width', 'bn_momentum', 'init',
+              'image_encoder')
+
+
+def _parse_mix():
+    """[(corpus, slots)] summing to --batch: --mix shares by largest remainder, else --dataset."""
+    if not args.mix:
+        return [(args.dataset, args.batch)]
+    names, w = [], []
+    for part in args.mix.split(','):
+        n, _, f = part.partition(':')
+        names.append(n.strip())
+        w.append(float(f) if f else 1.0)
+    exact = [x / sum(w) * args.batch for x in w]
+    cnt = [int(e) for e in exact]
+    for i in sorted(range(len(names)), key=lambda i: exact[i] - cnt[i], reverse=True):
+        if sum(cnt) < args.batch:
+            cnt[i] += 1
+    if 0 in cnt:
+        raise SystemExit(f'--mix {args.mix}: {names[cnt.index(0)]} gets 0 of {args.batch} slots')
+    return list(zip(names, cnt))
+
+
+_MIX = _parse_mix()          # batch rows are assigned to corpora in this order
+_IMAGE_ROWS = [r for r, (n, k) in enumerate(_MIX) for _ in range(k)]
+_IMAGE_ROWS = [r for r, ci in enumerate(_IMAGE_ROWS) if _MIX[ci][0] in _IMAGE_DATASETS]
+_crop_lo, _crop_hi = (float(v) for v in args.crop_scale.split(','))
+if args.image_encoder is None:     # on --load the checkpoint's value replaces this
+    _names = [n for n, _ in _MIX] + (args.eval_corpora or '').split(',')
+    args.image_encoder = 'resnet50' if any(n.strip() in _IMAGE_DATASETS for n in _names) else 'none'
 
 # Checkpoints from before this rewrite carry every option the old script had. Those listed
 # here are now fixed behaviour, so a checkpoint is loadable only if it used these values,
@@ -363,6 +425,82 @@ class TextDecoder(nn.Module):
         return self.lmhead(self.pool(self.proj(x)).squeeze(-1).squeeze(-1))
 
 
+class ImageEncoder(nn.Module):
+    """Frozen pretrained ResNet-50 trunk (timm weights, torchvision layout): normalized
+    [N, 3, 224, 224] -> [N, 2048, 7, 7], run in bf16, always in eval mode."""
+
+    def __init__(self, name):
+        super().__init__()
+        import torchvision
+        from huggingface_hub import hf_hub_download
+        from safetensors.torch import load_file
+        net = torchvision.models.resnet50()
+        net.load_state_dict(load_file(hf_hub_download(_IMAGE_ENCODERS[name], 'model.safetensors')))
+        self.net = nn.Sequential(*list(net.children())[:-2]).to(memory_format=torch.channels_last)
+        self.width = 2048
+        for p in self.parameters():
+            p.requires_grad_(False)
+        self.eval()
+
+    def train(self, mode=True):
+        return super().train(False)
+
+    @torch.no_grad()
+    def forward(self, x):
+        if x.is_cuda and '_fast' not in self.__dict__:
+            # ~1.6x on the ResNet. Kept out of the module registry, so it adds no state_dict keys
+            self.__dict__['_fast'] = torch.compile(self.net)
+        net = self.__dict__['_fast'] if x.is_cuda else self.net
+        with torch.autocast(x.device.type, dtype=torch.bfloat16, enabled=x.is_cuda):
+            return net(x.contiguous(memory_format=torch.channels_last)).float()
+
+
+def _prep_image(img):
+    """PIL image -> uint8 [3, h, w] with the longer side _IMG_BANK (aspect kept)."""
+    img.draft('RGB', (_IMG_BANK, _IMG_BANK))              # JPEG: decode at reduced scale
+    img = img.convert('RGB')
+    w, h = img.size
+    s = _IMG_BANK / max(w, h)
+    img = img.resize((max(1, round(w * s)), max(1, round(h * s))), 3)   # 3 = BICUBIC
+    return torch.from_numpy(np.asarray(img).copy()).permute(2, 0, 1)
+
+
+def _bank(imgs, device):
+    """uint8 [3, h, w] images -> (bank [N, 3, _IMG_BANK, _IMG_BANK] uint8, sizes [N, 2] (h, w)),
+    each image in the top-left corner of its canvas."""
+    bank = torch.zeros(len(imgs), 3, _IMG_BANK, _IMG_BANK, dtype=torch.uint8)
+    hw = torch.zeros(len(imgs), 2)
+    for i, im in enumerate(imgs):
+        bank[i, :, :im.shape[1], :im.shape[2]] = im
+        hw[i] = torch.tensor(im.shape[1:])
+    return bank.to(device), hw.to(device)
+
+
+def _views(bank, hw, random_crop=True):
+    """One 224x224 view per image, normalized for the encoder, in a single grid_sample.
+    random_crop: area share U(--crop_scale), aspect jitter 3/4..4/3, uniform position;
+    otherwise the whole image."""
+    N, dev = bank.shape[0], bank.device
+    H, W = hw[:, 0], hw[:, 1]
+    if random_crop:
+        s = torch.empty(N, device=dev).uniform_(_crop_lo, _crop_hi)
+        r = torch.empty(N, device=dev).uniform_(math.log(3 / 4), math.log(4 / 3)).exp()
+        cw, ch = (W * (s * r).sqrt()).clamp(max=W), (H * (s / r).sqrt()).clamp(max=H)
+        cx = cw / 2 + torch.rand(N, device=dev) * (W - cw)
+        cy = ch / 2 + torch.rand(N, device=dev) * (H - ch)
+    else:
+        cw, ch, cx, cy = W, H, W / 2, H / 2
+    theta = torch.zeros(N, 2, 3, device=dev)
+    theta[:, 0, 0], theta[:, 0, 2] = cw / _IMG_BANK, 2 * cx / _IMG_BANK - 1
+    theta[:, 1, 1], theta[:, 1, 2] = ch / _IMG_BANK, 2 * cy / _IMG_BANK - 1
+    grid = F.affine_grid(theta, [N, 3, _IMG_IN, _IMG_IN], align_corners=False)
+    x = F.grid_sample(bank.float() / 255.0, grid, mode='bilinear', padding_mode='border',
+                      align_corners=False)
+    mean = torch.tensor(_IMG_MEAN, device=dev).view(1, 3, 1, 1)
+    std = torch.tensor(_IMG_STD, device=dev).view(1, 3, 1, 1)
+    return (x - mean) / std
+
+
 # PyTorchModelHubMixin adds save_pretrained/push_to_hub/from_pretrained (--push,
 # --pretrained) and records the __init__ kwargs as the hub config.
 try:
@@ -377,6 +515,7 @@ class VLAModel(nn.Module, _HubMixin):
     [B, K*n_hidden, S, S] tensor (self.dff, detached every step: gradient horizon 1 token).
 
     step:  inputs   token grid                                        [c_text, S, S]
+                    image feature map (zeros for text-only rows)      [2048, S, S]
            read     K registers, each scaled to RMS --ctx_read_norm   K x [n_hidden, S, S]
            x      = ctx_cat(concat(inputs, reads))                    [c_context, S, S]
            o      = linout(ContextCNN(x))                             [n_hidden, S, S]
@@ -386,7 +525,8 @@ class VLAModel(nn.Module, _HubMixin):
 
     def __init__(self, S=8, n_hidden=512, c_context=384, depth=8, kernel=3,
                  tokenizer='pythia31m', windows=(256, 64, 16, 4, 1), read_norm=1.0,
-                 dec_kernels=(3, 3, 3), dec_width=256, bn_momentum=0.1, init='zero'):
+                 dec_kernels=(3, 3, 3), dec_width=256, bn_momentum=0.1, init='zero',
+                 image_encoder='none'):
         super().__init__()
         from transformers import AutoModelForCausalLM
         repo = _TOKENIZERS[tokenizer]
@@ -410,16 +550,21 @@ class VLAModel(nn.Module, _HubMixin):
             p.requires_grad_(False)
 
         # ctx_cat reads [input grids..., registers...]. It starts as [I, I, ..., I] onto the
-        # first outputs each block fits, i.e. the plain sum of the sources.
-        self.in_widths = [self.c_text]                    # one entry per input grid
+        # first outputs each block fits, i.e. the plain sum of the sources -- except the image
+        # block, which starts at zero, so an image model starts out as the text-only function
+        # and learns to read the image.
+        self.image_encoder = image_encoder or 'none'
+        self.img_width = 2048 if self.image_encoder != 'none' else 0
+        self.in_widths = [self.c_text] + ([self.img_width] if self.img_width else [])
         widths = self.in_widths + [n_hidden] * self.K
         self.ctx_cat = nn.Conv2d(sum(widths), c_context, 1)
         with torch.no_grad():
             self.ctx_cat.weight.zero_()
             o = 0
-            for w in widths:
-                n = min(w, c_context)
-                self.ctx_cat.weight[:n, o:o + n, 0, 0] = torch.eye(n)
+            for i, w in enumerate(widths):
+                if not (self.img_width and i == 1):
+                    n = min(w, c_context)
+                    self.ctx_cat.weight[:n, o:o + n, 0, 0] = torch.eye(n)
                 o += w
             self.ctx_cat.bias.zero_()
 
@@ -429,6 +574,8 @@ class VLAModel(nn.Module, _HubMixin):
             self.linout.weight.copy_(
                 nn.init.orthogonal_(torch.empty(n_hidden, c_context)).view(n_hidden, c_context, 1, 1))
             self.linout.bias.zero_()
+
+        self.img_enc = ImageEncoder(self.image_encoder) if self.img_width else None   # frozen
 
         self.register_buffer('ctx_read_rms', torch.zeros(self.K))       # 0 = not measured yet
         self.register_buffer('rate', torch.tensor([min(1.0, 1.0 / w) for w in self.windows]),
@@ -455,12 +602,25 @@ class VLAModel(nn.Module, _HubMixin):
             return torch.randn(shape, device=device).relu()
         return torch.zeros(shape, device=device)
 
-    def _inputs(self, idx):
+    def image_grid(self, views):
+        """Encoder views [N, 3, 224, 224] -> image grid [N, 2048, S, S], each position
+        RMS-normalized over channels (as the token embedding is)."""
+        f = self.img_enc(views)
+        if f.shape[-1] != self.S:
+            f = F.adaptive_avg_pool2d(f, self.S)
+        return f * torch.rsqrt(f.pow(2).mean(dim=1, keepdim=True) + 1e-12)
+
+    def _inputs(self, idx, img):
         """The input grids, in self.in_widths order: the RMS-normalized token embedding
-        broadcast over the grid."""
+        broadcast over the grid, then (image model) the image grid, zeros where img is None."""
+        B = idx.shape[0]
         tok = self.tok_embed(idx)
         tok = tok * torch.rsqrt(tok.pow(2).mean(dim=1, keepdim=True) + 1e-12)
-        return [tok.view(idx.shape[0], self.c_text, 1, 1).expand(-1, -1, self.S, self.S)]
+        grids = [tok.view(B, self.c_text, 1, 1).expand(-1, -1, self.S, self.S)]
+        if self.img_width:
+            grids.append(img if img is not None else
+                         tok.new_zeros(B, self.img_width, self.S, self.S))
+        return grids
 
     def _read(self, dff):
         """The K registers as ctx_cat reads them."""
@@ -490,37 +650,42 @@ class VLAModel(nn.Module, _HubMixin):
             new.append(p + self.rate[k] * (inp - p))
         return torch.cat(new, dim=1)
 
-    def step(self, idx, dff):
+    def step(self, idx, dff, img=None):
         """One token for every row: -> (new registers, layer output). No detach."""
-        x = self.ctx_cat(torch.cat(self._inputs(idx) + self._read(dff), dim=1))
+        x = self.ctx_cat(torch.cat(self._inputs(idx, img) + self._read(dff), dim=1))
         o = self.linout(self.context(x))
         return self._write(o, dff), o
 
-    def forward(self, idx, targets=None, flag=None):
+    def forward(self, idx, targets=None, flag=None, img=None):
         """idx [B] current tokens; targets [B] next tokens or None; flag [B] rows starting a
-        document (their registers reset). Advances self.dff by one step."""
+        document (their registers reset); img [B, 2048, S, S] image grid or None (zeros).
+        Advances self.dff by one step."""
         B, dev = idx.shape[0], idx.device
         if self.dff is None or self.dff.shape[0] != B or self.dff.device != dev:
             self.dff = self.new_state(B, dev)
         if flag is not None and flag.any():
             self.dff = self.dff.clone()
             self.dff[flag] = self.new_state(int(flag.sum()), dev)
-        new, o = self.step(idx, self.dff)
+        new, o = self.step(idx, self.dff, img)
         self.dff = new.detach().clone()
         logits = self.text_dec(o)
         loss = F.cross_entropy(logits, targets.long()) if targets is not None else None
         return logits, loss
 
     @torch.no_grad()
-    def generate(self, prompt_ids, n_tokens, temperature=1.0):
+    def generate(self, prompt_ids, n_tokens, temperature=1.0, image=None):
         """Sample n_tokens after prompt_ids on a private state. An END is kept in the output
         and, if the budget is not filled, the state resets and the prompt is fed again, as
-        at a training document boundary (at most 20 sequences). Short only on NaN/Inf."""
+        at a training document boundary (at most 20 sequences). Short only on NaN/Inf.
+        image: uint8 [3, h, w], seen through a fresh random view every token (as in
+        training); None = text-only."""
         self.eval()
         dev = next(self.parameters()).device
+        bank = _bank([image], dev) if image is not None else None
 
         def feed(b, dff):
-            new, o = self.step(torch.tensor([b], device=dev), dff)
+            img = self.image_grid(_views(*bank)) if bank is not None else None
+            new, o = self.step(torch.tensor([b], device=dev), dff, img)
             logits = self.text_dec(o)
             if not (new.isfinite().all() and logits.isfinite().all()):
                 print('generate: NaN/Inf')
@@ -681,27 +846,81 @@ def clip_text(text):
     return [(full[i], full[i + 1]) for i in range(len(full) - 1)]
 
 
-# Worker -> training-loop tallies: documents/tokens since the last TEXT line, the latest
-# document (TXT-SAMPLE), the first few documents (GENSCORE anchors), and the corpus epoch.
+def _id_heldout(key):
+    """Image corpora: the held-out 1/_HOLDOUT_MOD, by a hash of the example id."""
+    return zlib.crc32(key.encode('utf-8', 'ignore')) % _HOLDOUT_MOD == 0
+
+
+def _decode_image(row):
+    from PIL import Image
+    im = row['image']                    # encoded bytes (or an HF image struct)
+    return _prep_image(Image.open(io.BytesIO(im['bytes'] if isinstance(im, dict) else im)))
+
+
+class _ImageSource:
+    """Random training rows of a local image-caption corpus. Each source shard holds only a
+    few classes, so whole row groups of random files are poured into a pool of rows and
+    rows are drawn from the pool at random: at any time the draws mix ~POOL/100 shards."""
+    POOL = 4000
+
+    def __init__(self, name, seed):
+        import pyarrow.parquet as pq
+        self.pq, cfg = pq, _IMAGE_DATASETS[name]
+        self.files = sorted(glob.glob(os.path.join(cfg['dir'], '*.parquet')))
+        if not self.files:
+            raise SystemExit(f'{name}: no parquet files in {cfg["dir"]} (see exp/img_prep.py)')
+        self.cap, self.rng = cfg['caption'], random.Random(seed)
+        self.pool, self.lock = [], threading.Lock()
+        print(f'{name}: {len(self.files)} local parquet files in {cfg["dir"]}', flush=True)
+
+    def _fill(self):
+        with self.lock:
+            f = self.rng.choice(self.files)
+        pf = self.pq.ParquetFile(f)
+        with self.lock:
+            g = self.rng.randrange(pf.metadata.num_row_groups)
+        rows = pf.read_row_group(g, columns=['image', 'id', self.cap]).to_pylist()
+        rows = [r for r in rows if not _id_heldout(r['id'])]
+        with self.lock:
+            self.pool.extend(rows)
+
+    def next(self):
+        """-> (caption, image row)."""
+        while True:
+            with self.lock:
+                if len(self.pool) >= self.POOL:
+                    i = self.rng.randrange(len(self.pool))
+                    row, self.pool[i] = self.pool[i], self.pool[-1]
+                    self.pool.pop()
+                    return (row[self.cap] or '').strip(), row
+            self._fill()
+
+
+# Worker -> training-loop tallies, per corpus: documents/tokens since the last TEXT line, the
+# latest document (TXT lines) and epochs; plus the first text documents (GENSCORE anchors).
 _text_lock = threading.Lock()
-_text_stats = {'examples': 0, 'tokens': 0, 'sample': '', 'anchor': []}
-_epoch = [1]
+_text_stats = {n: {'examples': 0, 'tokens': 0, 'sample': ''} for n, _ in _MIX}
+_anchors = []
+_epoch = {n: 1 for n, _ in _MIX}
 
 
-def _text_tally(n_tokens, sample):
+def _text_tally(name, n_tokens, sample):
     with _text_lock:
-        _text_stats['examples'] += 1
-        _text_stats['tokens'] += n_tokens
-        _text_stats['sample'] = sample
-        if len(_text_stats['anchor']) < 24:
-            _text_stats['anchor'].append(sample)
+        st = _text_stats[name]
+        st['examples'] += 1
+        st['tokens'] += n_tokens
+        st['sample'] = sample
+        if name not in _IMAGE_DATASETS and len(_anchors) < 24:
+            _anchors.append(sample)
 
 
 def _text_drain():
+    """-> {corpus: (examples, tokens)} since the last call."""
     with _text_lock:
-        e, t = _text_stats['examples'], _text_stats['tokens']
-        _text_stats['examples'] = _text_stats['tokens'] = 0
-    return e, t
+        out = {n: (st['examples'], st['tokens']) for n, st in _text_stats.items()}
+        for st in _text_stats.values():
+            st['examples'] = st['tokens'] = 0
+    return out
 
 
 def _sample_window(text, n=240):
@@ -723,66 +942,96 @@ class _Slot:
         self.steps, self.pos = steps, 0
 
 
-def worker(stop, q, ds):
-    """Builder threads tokenize documents into a clip queue; this loop advances every slot
-    one token per step and puts (x_list, y_list, start_flags) on q."""
-    it, lock = [_make_iter(ds, args.streaming, args.seed, args.shuffle)], threading.Lock()
+def worker(stop, q, datasets):
+    """Per corpus, builder threads turn documents (and images) into clips on that corpus's
+    queue; this loop advances every slot one token per step and puts (x_list, y_list,
+    start_flags, new_images) on q. Slots are assigned to corpora in _MIX order; new_images
+    lists (row, uint8 image) for image rows that started a new example this step."""
+    clip_qs = {}
 
-    def next_example():
-        with lock:
-            try:
-                return next(it[0])
-            except StopIteration:
-                _epoch[0] += 1
-                print(f'EPOCH {args.dataset} -> {_epoch[0]} (reshuffle seed '
-                      f'{args.seed + _epoch[0]})', flush=True)
-                it[0] = _make_iter(ds, args.streaming, args.seed + _epoch[0], args.shuffle)
-                return next(it[0])
+    def text_builder(name, ds, cq):
+        it, lock = [_make_iter(ds, args.streaming, args.seed, args.shuffle)], threading.Lock()
 
-    clip_q = queue.Queue(maxsize=2 * max(1, args.workers))
+        def next_example():
+            with lock:
+                try:
+                    return next(it[0])
+                except StopIteration:
+                    _epoch[name] += 1
+                    print(f'EPOCH {name} -> {_epoch[name]} (reshuffle seed '
+                          f'{args.seed + _epoch[name]})', flush=True)
+                    it[0] = _make_iter(ds, args.streaming, args.seed + _epoch[name], args.shuffle)
+                    return next(it[0])
 
-    def builder():
+        def build():
+            text = _corpus_text(name, next_example())
+            if not text or (name in _HASH_HOLDOUT and _is_heldout(text)):
+                return None
+            return text, None
+        return build
+
+    def image_builder(name, cq):
+        src = _ImageSource(name, args.seed)
+
+        def build():
+            text, row = src.next()
+            return (text, _decode_image(row)) if text else None
+        return build
+
+    def run(name, build, cq):
         while not stop.is_set():
             try:
-                text = _corpus_text(args.dataset, next_example())
+                got = build()
             except Exception as e:
-                print(f'builder: {e}')
+                print(f'builder {name}: {e!r}')
                 continue
-            if not text or (args.dataset in _HASH_HOLDOUT and _is_heldout(text)):
+            if got is None:
                 continue
-            steps = clip_text(text)
-            _text_tally(len(steps), text)
+            steps = clip_text(got[0])
+            _text_tally(name, len(steps), got[0])
             while not stop.is_set():
                 try:
-                    clip_q.put(steps, timeout=0.5)
+                    cq.put((steps, got[1]), timeout=0.5)
                     break
                 except queue.Full:
                     pass
 
-    for _ in range(max(1, args.workers)):
-        threading.Thread(target=builder, daemon=True).start()
+    for name in dict.fromkeys(n for n, _ in _MIX):
+        cq = clip_qs[name] = queue.Queue(maxsize=2 * max(1, args.workers))
+        build = (image_builder(name, cq) if name in _IMAGE_DATASETS
+                 else text_builder(name, datasets[name], cq))
+        for _ in range(max(1, args.workers)):
+            threading.Thread(target=run, args=(name, build, cq), daemon=True).start()
 
-    slots = [_Slot() for _ in range(args.batch)]
+    names = [n for n, k in _MIX for _ in range(k)]
+    slots = [_Slot() for _ in names]
     while not stop.is_set():
-        for slot in slots:
+        new_imgs = []
+        for r, slot in enumerate(slots):
             while slot.pos >= len(slot.steps):
                 try:
-                    slot.load(clip_q.get(timeout=0.5))
+                    steps, img = clip_qs[names[r]].get(timeout=0.5)
                 except queue.Empty:
                     if stop.is_set():
                         return
+                    continue
+                slot.load(steps)
+                if img is not None:
+                    new_imgs.append((r, img))
         flags = [slot.pos == 0 for slot in slots]
         xy = [slot.steps[slot.pos] for slot in slots]
         for slot in slots:
             slot.pos += 1
-        q.put(([x for x, _ in xy], [y for _, y in xy], flags))
+        q.put(([x for x, _ in xy], [y for _, y in xy], flags, new_imgs))
 
 
-hf_dataset = None
+hf_datasets = {}
 if not _ONESHOT:
-    print('loading dataset...')
-    hf_dataset = _load_corpus(args.dataset, args.streaming, args.shards)
-    print('dataset ready')
+    print('loading datasets...')
+    for name in dict.fromkeys(n for n, _ in _MIX):
+        if name not in _IMAGE_DATASETS:
+            hf_datasets[name] = _load_corpus(name, args.streaming, args.shards)
+    print('datasets ready')
 
 # ── build / load the model ────────────────────────────────────────────────────
 
@@ -794,6 +1043,7 @@ if args.pretrained:
     args.context, args.n_hidden, args.c_context = model.S, model.n_hidden, model.c_context
     args.ctx_ema = ','.join(f'{w:g}' for w in model.windows)
     args.ctx_read_norm, args.init = model.read_norm, model.init_mode
+    args.image_encoder = model.image_encoder
     _emit(f'ARGS (pretrained) {args}')
 else:
     model = VLAModel(S=args.context, n_hidden=args.n_hidden, c_context=args.c_context,
@@ -801,7 +1051,8 @@ else:
                      windows=[float(w) for w in str(args.ctx_ema).split(',') if w.strip()],
                      read_norm=args.ctx_read_norm,
                      dec_kernels=[int(k) for k in str(args.dec_tree_kernels).split(',') if k.strip()],
-                     dec_width=args.dec_width, bn_momentum=args.bn_momentum, init=args.init)
+                     dec_width=args.dec_width, bn_momentum=args.bn_momentum, init=args.init,
+                     image_encoder=args.image_encoder)
     if _loaded_ckpt is not None:
         model.load_state_dict(_upgrade_state_dict(_loaded_ckpt['state_dict']))
 model = model.to(args.device)
@@ -830,8 +1081,9 @@ def _model_graph(model):
               else type(m).__name__)
         rows.append(dict(name=n, op=op, inp=shape(inp), out=shape(out), tr=tr, fr=fr))
 
-    hooks = [m.register_forward_hook(hook) for m in model.modules()
-             if not list(m.children()) and not isinstance(m, nn.Identity)]
+    hooks = [m.register_forward_hook(hook) for n, m in model.named_modules()
+             if not list(m.children()) and not isinstance(m, nn.Identity)
+             and not n.startswith('img_enc')]
     was = model.training
     model.eval()
     try:
@@ -851,6 +1103,11 @@ def _model_graph(model):
     for r in rows:
         if r['name'] == 'ctx_cat':
             srcs = ['(token grid)'] + [f'{g}[t-1]' for g in regs]
+            if model.img_enc is not None:
+                out.append(dict(name='img_enc -> (image grid)', op=f'ResNet-50 (frozen), RMSnorm',
+                                inp=f'3x{_IMG_IN}x{_IMG_IN}', out=f'{model.img_width}x{S}x{S}', tr=0,
+                                fr=sum(p.numel() for p in model.img_enc.parameters())))
+                srcs.insert(1, '(image grid)')
             out.append(dict(name=', '.join(srcs), op='Concat (channels)',
                             inp=f'{"+".join(map(str, model.in_widths))}+{model.K}x{model.n_hidden} x{S}x{S}',
                             out=r['inp'], tr=0, fr=0))
@@ -956,7 +1213,7 @@ class _GenScorer:
         if self.floor is not None:
             return True
         with _text_lock:
-            docs = [d for d in _text_stats['anchor'] if len(d.split()) >= 24][:12]
+            docs = [d for d in _anchors if len(d.split()) >= 24][:12]
         if len(docs) < 4:
             return False
         rng = random.Random(1234)
@@ -996,6 +1253,13 @@ class _GenScorer:
 
 _gen_scorer = _GenScorer(args.gen_score) if args.gen_score else None
 
+_image = None                 # --image, as uint8 [3, h, w]
+if args.image:
+    if model.img_enc is None:
+        raise SystemExit('--image needs a model with an image encoder')
+    from PIL import Image
+    _image = _prep_image(Image.open(args.image))
+
 # ── one-shot: push / generate / vis ───────────────────────────────────────────
 
 if args.push:
@@ -1013,7 +1277,8 @@ if args.generate:
     if args.load is None and args.pretrained is None:
         print('WARNING: --generate without --load/--pretrained is running an untrained model')
     prompt = _prompt_ids(args.prompt)
-    print(_render(prompt + model.generate(prompt, args.n, temperature=args.temperature)))
+    print(_render(prompt + model.generate(prompt, args.n, temperature=args.temperature,
+                                          image=_image)))
     raise SystemExit(0)
 
 if args.vis:
@@ -1049,10 +1314,12 @@ if args.vis:
     pending, b = list(prompt[1:]), prompt[0]
     hist, cur = '', list(prompt)                     # finished episodes, current episode ids
     dff = model.new_state(1, dev)
+    bank = _bank([_image], dev) if _image is not None else None
     imgs, vmax, img_p, nstep = [None] * rows, [None] * rows, None, 0
     while not _exit[0] and plt.fignum_exists(fig.number):
         with torch.no_grad():
-            dff, o = model.step(torch.tensor([b], device=dev), dff)
+            img = model.image_grid(_views(*bank)) if bank is not None else None
+            dff, o = model.step(torch.tensor([b], device=dev), dff, img)
             prob = F.softmax(model.text_dec(o)[0] / max(args.temperature, 1e-6), dim=-1)
         nstep += 1
         if pending:
@@ -1094,12 +1361,15 @@ if args.vis:
 # weights. Every eval runs on a fresh state and restores the training state afterwards.
 
 _eval_docs_cache = {}        # corpus -> [[(x, y), ...], ...]
+_eval_imgs = {}              # image corpus -> [uint8 image] aligned with its eval docs
+_eval_meta = {}              # image corpus -> [(id, class, caption)] aligned likewise
 _eval_results = {}           # corpus[~kind] -> last result, for --eval's table / JSON
 _eval_failed = {}            # corpus -> True once it has raised
 
 
 def _eval_corpus_names():
-    return [c.strip() for c in (args.eval_corpora or args.dataset).split(',') if c.strip()]
+    names = args.eval_corpora.split(',') if args.eval_corpora else dict.fromkeys(n for n, _ in _MIX)
+    return [c.strip() for c in names if c.strip()]
 
 
 def _eval_source(name):
@@ -1116,10 +1386,38 @@ def _eval_source(name):
     return hf, cfg, split, col
 
 
+def _build_image_eval(corpus):
+    """--eval_docs held-out captions of an image corpus, one from each of --eval_docs files
+    spread over the (synset-sorted) shards, with their images; sorted by length."""
+    import pyarrow.parquet as pq
+    cfg = _IMAGE_DATASETS[corpus]
+    files = sorted(glob.glob(os.path.join(cfg['dir'], '*.parquet')))
+    items = []
+    for f in files[::max(1, len(files) // max(1, args.eval_docs))]:
+        rows = pq.ParquetFile(f).read_row_group(0, columns=['image', 'id', 'class', cfg['caption']])
+        for r in rows.to_pylist():
+            cap = (r[cfg['caption']] or '').strip()
+            if cap and _id_heldout(r['id']):
+                items.append((clip_text(cap)[:_EVAL_MAXLEN], _decode_image(r),
+                              (r['id'], r['class'], cap)))
+                break
+        if len(items) >= args.eval_docs:
+            break
+    items.sort(key=lambda it: len(it[0]))
+    _eval_imgs[corpus] = [it[1] for it in items]
+    _eval_meta[corpus] = [it[2] for it in items]
+    docs = [it[0] for it in items]
+    print(f'eval set: {corpus} {len(docs)} held-out captions with images from {len(files)} '
+          f'files, {sum(len(d) for d in docs)} tokens', flush=True)
+    return docs
+
+
 def _build_eval_docs(corpus):
     """The first --eval_docs held-out documents of `corpus`, framed like training clips,
     clipped to _EVAL_MAXLEN, sorted by length."""
     from datasets import load_dataset
+    if corpus in _IMAGE_DATASETS:
+        return _build_image_eval(corpus)
     hf, cfg, split, col = _eval_source(corpus)
     hashed = corpus in _HASH_HOLDOUT
     if hashed and corpus in _HUB_SUBSET:
@@ -1215,16 +1513,30 @@ def _token_bands(dev):
     return _band_cache['b'].to(dev)
 
 
-def _score(step, corpus, docs):
-    """EVAL (clean / median / runaway%) and EVALB (loss by frequency band) lines."""
+def _image_grids(imgs, random_crop=False):
+    """Image grids for a list of uint8 images (whole-image views by default), in chunks."""
+    dev = next(model.parameters()).device
+    out = []
+    for i in range(0, len(imgs), 100):
+        out.append(model.image_grid(_views(*_bank(imgs[i:i + 100], dev), random_crop)))
+    return torch.cat(out)
+
+
+def _score(step, corpus, docs, imgs=None, tag=None):
+    """EVAL (clean / median / runaway%) and EVALB (loss by frequency band) lines, tagged
+    `tag` (default corpus). imgs: one image per doc, seen whole at every token."""
+    tag = tag or corpus
     t0 = time.time()
     dev = next(model.parameters()).device
     band_of = _token_bands(dev) if args.eval_bands else None
     nb = int(band_of.max()) + 1 if band_of is not None else 0
     per_doc, bad_doc, band_sum, band_cnt = [], [], [], []
     with _EvalState(), torch.no_grad():
+        c = 0
         for chunk, X, Y, M in _batches(_doc_rows(docs)):
             B, T = X.shape
+            img = _image_grids(imgs[c:c + B]) if imgs is not None else None
+            c += B
             model.dff = None
             rs = torch.zeros(B, device=dev)
             bad = torch.zeros(B, dtype=torch.bool, device=dev)
@@ -1232,7 +1544,7 @@ def _score(step, corpus, docs):
                 bsum = torch.zeros(B, nb, device=dev)
                 bcnt = torch.zeros(B, nb, device=dev)
             for t in range(T):
-                logits, _ = model(X[:, t])
+                logits, _ = model(X[:, t], img=img)
                 ce = F.cross_entropy(logits, Y[:, t], reduction='none')
                 # a diverged row is counted as runaway rather than poisoning the sums
                 ce = torch.where(torch.isfinite(ce), ce, torch.full_like(ce, 1e30))
@@ -1255,11 +1567,11 @@ def _score(step, corpus, docs):
     nc = np.array([max(1, len(_decode_plain(_doc_tokens(d)))) for d in docs], dtype=np.float64)
     npc = float((per * nt)[~bad].sum() / nc[~bad].sum()) if (~bad).any() else float('nan')
     ppl = math.exp(min(clean, 700)) if clean == clean else float('nan')
-    _eval_results[corpus] = dict(corpus=corpus, step=int(step), clean=clean,
+    _eval_results[tag] = dict(corpus=tag, step=int(step), clean=clean,
                                  median=float(np.median(per)), ppl=ppl,
                                  runaway_pct=100.0 * float(bad.mean()), nrun=int(bad.sum()),
                                  docs=int(len(per)), tokens=int(nt.sum()))
-    _emit(f'EVAL step {step:10} corpus {corpus:8} clean {clean:11.6f} ppl {ppl:12.4f} '
+    _emit(f'EVAL step {step:10} corpus {tag:8} clean {clean:11.6f} ppl {ppl:12.4f} '
           f'median {float(np.median(per)):11.6f} runaway {100.0 * float(bad.mean()):6.2f}% '
           f'nrun {int(bad.sum()):4d} docs {len(per):5d} wall {time.time() - t0:7.1f}s '
           f'nats/char {npc:.4f}')
@@ -1268,8 +1580,8 @@ def _score(step, corpus, docs):
         bc = np.concatenate(band_cnt)[~bad].sum(0)
         edges = [0] + [int(e) for e in args.eval_bands.split(',') if e.strip()]
         lbl = [f'r{a}-{b}' for a, b in zip(edges, edges[1:])] + [f'r{edges[-1]}+']
-        _eval_results[f'{corpus}~bands'] = dict(zip(lbl, (bs / np.maximum(bc, 1)).tolist()))
-        _emit(f'EVALB step {step:10} corpus {corpus:8} ' + ' '.join(
+        _eval_results[f'{tag}~bands'] = dict(zip(lbl, (bs / np.maximum(bc, 1)).tolist()))
+        _emit(f'EVALB step {step:10} corpus {tag:8} ' + ' '.join(
             f'{l} {bs[k] / bc[k]:.4f} ({100.0 * bc[k] / bc.sum():.0f}%)' if bc[k] else f'{l} n/a'
             for k, l in enumerate(lbl)))
 
@@ -1532,15 +1844,22 @@ def _gen_eval(step, corpus, docs):
 
 
 def _heldout_eval(step):
-    """Every eval corpus: EVAL/EVALB, then EVALX, EVALG, and EVALI (first corpus only).
-    Failures are reported and never take the training run down."""
-    for i, corpus in enumerate(_eval_corpus_names()):
+    """Every eval corpus: EVAL/EVALB, then for text corpora EVALX, EVALG and EVALI (first
+    text corpus only). An image corpus is scored with its images and again blind (image grid
+    zeroed); the gap is what the model takes from the image. Failures are reported and
+    never take the training run down."""
+    text = [c for c in _eval_corpus_names() if c not in _IMAGE_DATASETS]
+    for corpus in _eval_corpus_names():
         if _eval_failed.get(corpus):
             continue
         try:
             docs = _eval_docs(corpus)
             if not docs:
                 print(f'WARNING: no usable held-out documents for "{corpus}"; skipping it')
+                continue
+            if corpus in _IMAGE_DATASETS:
+                _score(step, corpus, docs, _eval_imgs[corpus])
+                _score(step, corpus, docs, tag=f'{corpus}-blind')
                 continue
             _score(step, corpus, docs)
         except Exception as e:
@@ -1549,7 +1868,7 @@ def _heldout_eval(step):
             _eval_failed[corpus] = True
             continue
         for fn, on in ((_reach_eval, args.eval_reach), (_gen_eval, args.eval_gen),
-                       (_info_eval, args.eval_info and i == 0)):
+                       (_info_eval, args.eval_info and corpus == text[0])):
             if on:
                 try:
                     fn(step, corpus, docs)
@@ -1563,18 +1882,19 @@ if args.eval:
         print('WARNING: --eval without --load/--pretrained is measuring an untrained model')
     _heldout_eval(_start_step)
     ck = args.load or args.pretrained or '(untrained)'
-    print(f'\n{"=" * 86}\nPROTOCOL EVAL  {ck}  step {_start_step}\n{"=" * 86}')
-    print(f'{"corpus":10} {"clean":>10} {"ppl":>11} {"median":>10} {"runaway%":>9} '
+    print(f'\n{"=" * 93}\nPROTOCOL EVAL  {ck}  step {_start_step}\n{"=" * 93}')
+    print(f'{"corpus":17} {"clean":>10} {"ppl":>11} {"median":>10} {"runaway%":>9} '
           f'{"nrun":>5} {"docs":>6} {"tokens":>9}')
-    print('-' * 86)
-    for c in _eval_corpus_names():
+    print('-' * 93)
+    for c in [k for n in _eval_corpus_names()
+              for k in ((n, f'{n}-blind') if n in _IMAGE_DATASETS else (n,))]:
         r = _eval_results.get(c)
         if r is None:
-            print(f'{c:10} {"(failed or empty -- see WARNING above)":>50}')
+            print(f'{c:17} {"(failed or empty -- see WARNING above)":>50}')
         else:
-            print(f'{c:10} {r["clean"]:10.4f} {r["ppl"]:11.2f} {r["median"]:10.4f} '
+            print(f'{c:17} {r["clean"]:10.4f} {r["ppl"]:11.2f} {r["median"]:10.4f} '
                   f'{r["runaway_pct"]:9.2f} {r["nrun"]:5d} {r["docs"]:6d} {r["tokens"]:9d}')
-    print('-' * 86)
+    print('-' * 93)
     print('note: compare a corpus across checkpoints, never across corpora')
     if args.eval_json:
         with open(args.eval_json, 'w') as f:
@@ -1621,8 +1941,24 @@ if _start_step:              # resume: fast-forward the schedule to the checkpoi
 
 stop = threading.Event()
 q = queue.Queue(maxsize=args.batch)
-w = threading.Thread(target=worker, args=(stop, q, hf_dataset))
+w = threading.Thread(target=worker, args=(stop, q, hf_datasets))
 w.start()
+
+# Image rows: each holds its current image in a GPU canvas, and every step a fresh random
+# view of it goes through the encoder. Text rows get a zero image grid.
+_img_rows = torch.tensor(_IMAGE_ROWS, dtype=torch.long, device=args.device)
+_bank_of = {r: j for j, r in enumerate(_IMAGE_ROWS)}
+img_bank = torch.zeros(len(_IMAGE_ROWS), 3, _IMG_BANK, _IMG_BANK, dtype=torch.uint8,
+                       device=args.device)
+img_hw = torch.full((len(_IMAGE_ROWS), 2), float(_IMG_BANK), device=args.device)
+if _IMAGE_ROWS and model.img_enc is None:
+    raise SystemExit('--mix has an image corpus but the model has no image encoder')
+# rows of each corpus, for the per-corpus loss columns of a mixed run
+_rows_of, _r = {}, 0
+for _n, _k in _MIX:
+    _rows_of.setdefault(_n, []).extend(range(_r, _r + _k))
+    _r += _k
+_text_names = [n for n in _rows_of if n not in _IMAGE_DATASETS]
 
 
 def _grad_norm():
@@ -1641,15 +1977,51 @@ def _save(i, n_examples):
                 'optimizer': optimizer.state_dict()}, args.save)
 
 
+def _gen_lines(i):
+    """GEN samples (text-only, from <STX> and --prompt), GENI captions of two fixed held-out
+    images per image eval corpus with their reference, and a recent training text per corpus."""
+    lines = []
+    for p in dict.fromkeys(['', args.prompt]):
+        prompt = _prompt_ids(p)
+        out = model.generate(prompt, _GEN_SAMPLE, temperature=args.temperature)
+        lines.append(f'GEN step {i:10} [{p or STX_TEXT}]: {_render(prompt + out)}')
+        sc = _gen_scorer.score(_decode_plain(out)) if _gen_scorer else ''
+        if sc:
+            lines.append(f'GENSCORE step {i:10} [{p or STX_TEXT}]: {sc}')
+    for c in _eval_corpus_names():
+        if c not in _IMAGE_DATASETS or model.img_enc is None:
+            continue
+        n = len(_eval_docs(c))
+        for k in sorted({n // 3, (2 * n) // 3}) if n else []:
+            prompt = _prompt_ids()
+            out = model.generate(prompt, _GEN_SAMPLE, temperature=args.temperature,
+                                 image=_eval_imgs[c][k])
+            out = out[:out.index(model.end_id) + 1] if model.end_id in out else out
+            iid, cls, cap = _eval_meta[c][k]
+            lines.append(f'GENI step {i:10} [{iid} {cls.split(",")[0]}]: {_render(prompt + out)}')
+            lines.append(f'REF  step {i:10} [{iid}]: {_printable(cap[:400])}')
+    with _text_lock:
+        samples = {n: st['sample'] for n, st in _text_stats.items() if st['sample']}
+    for n, smp in samples.items():
+        lab = 'SAMPLE' if n == (_text_names or [None])[0] else n
+        lines.append(f'TXT-{lab}: {_printable(_sample_window(smp))}')
+    return lines
+
+
 larr, garr = [], []
+carr = {n: [] for n in _rows_of} if len(_rows_of) > 1 else {}
 i, n_examples = _start_step, _start_exs
 try:
     while True:
         if i % args.checkpoint == 0:
             _save(i, n_examples)
-            te, tt = _text_drain()
+            counts = _text_drain()
+            te, tt = sum(e for e, _ in counts.values()), sum(t for _, t in counts.values())
             if te:
-                _emit(f'TEXT step {i:10} examples {te} tokens {tt} epoch {args.dataset}={_epoch[0]}')
+                ep = ' '.join(f'{n}={_epoch[n]}' for n in _text_names)
+                per = (' | ' + ' '.join(f'{n} {e}/{t}' for n, (e, t) in counts.items())
+                       if len(counts) > 1 else '')
+                _emit(f'TEXT step {i:10} examples {te} tokens {tt} epoch {ep}{per}')
 
         # after the save, so an EVAL line describes weights that exist on disk; not at step
         # 0, where it would only measure ln(vocab)
@@ -1657,29 +2029,25 @@ try:
             _heldout_eval(i)
 
         if args.gen_interval and i % args.gen_interval == 0:
-            lines = []
-            for p in dict.fromkeys(['', args.prompt]):
-                prompt = _prompt_ids(p)
-                out = model.generate(prompt, _GEN_SAMPLE, temperature=args.temperature)
-                lines.append(f'GEN step {i:10} [{p or STX_TEXT}]: {_render(prompt + out)}')
-                sc = _gen_scorer.score(_decode_plain(out)) if _gen_scorer else ''
-                if sc:
-                    lines.append(f'GENSCORE step {i:10} [{p or STX_TEXT}]: {sc}')
-            with _text_lock:
-                sample = _text_stats['sample']
-            if sample:
-                lines.append(f'TXT-SAMPLE: {_printable(_sample_window(sample))}')
-            _emit('\n' + '\n'.join(lines) + '\n')
+            _emit('\n' + '\n'.join(_gen_lines(i)) + '\n')
 
-        x_list, y_list, flag_list = q.get()
+        x_list, y_list, flag_list, new_imgs = q.get()
         n_examples += sum(flag_list)
         x = torch.tensor(x_list, dtype=torch.long).to(args.device)
         y = torch.tensor(y_list, dtype=torch.long).to(args.device)
         flag = torch.tensor(flag_list, dtype=torch.bool).to(args.device)
+        img = None
+        if _IMAGE_ROWS:
+            for r, im in new_imgs:
+                j = _bank_of[r]
+                img_bank[j, :, :im.shape[1], :im.shape[2]] = im.to(args.device, non_blocking=True)
+                img_hw[j, 0], img_hw[j, 1] = im.shape[1], im.shape[2]
+            img = torch.zeros(len(x_list), model.img_width, model.S, model.S, device=args.device)
+            img[_img_rows] = model.image_grid(_views(img_bank, img_hw))
 
         dff_prev = model.dff
         model.train()
-        logits, loss = model(x, targets=y, flag=flag)
+        logits, loss = model(x, targets=y, flag=flag, img=img)
         if not torch.isfinite(loss):         # keep the last good checkpoint on disk
             print(f'\n*** HALT: non-finite loss at step {i}: {loss.item()} dff_max '
                   f'{float(model.dff.abs().max())} logit_max {float(logits.detach().abs().max())}')
@@ -1696,18 +2064,28 @@ try:
         model.dff = dff_prev
         model.eval()
         with torch.no_grad():
-            model(x, flag=flag)
+            model(x, flag=flag, img=img)
 
         larr.append(loss.item())
+        if carr:
+            with torch.no_grad():
+                ce = F.cross_entropy(logits.detach(), y, reduction='none')
+                for n, rows in _rows_of.items():
+                    carr[n].append(float(ce[rows].mean()))
         if i % args.monitor == 0:
             flat = model.dff.reshape(-1)
-            _emit(('STEP {:10} wall {} loss {:12.9f} grad {:12.6f} lr {:10.9f} dff_mean {:12.5f} '
-                   'dff_std {:12.5f} dff_max {:11.3f} batch {:6d} examples {:12d} epoch {:10.3f}'
-                   ).format(i, datetime.datetime.now(), np.mean(larr[-args.monitor:]),
-                            np.mean(garr[-args.monitor:]), optimizer.param_groups[0]['lr'],
-                            flat.mean().item(), flat.std().item(), flat.abs().max().item(),
-                            args.batch, n_examples, float(_epoch[0])))
+            line = ('STEP {:10} wall {} loss {:12.9f} grad {:12.6f} lr {:10.9f} dff_mean {:12.5f} '
+                    'dff_std {:12.5f} dff_max {:11.3f} batch {:6d} examples {:12d} epoch {:10.3f}'
+                    ).format(i, datetime.datetime.now(), np.mean(larr[-args.monitor:]),
+                             np.mean(garr[-args.monitor:]), optimizer.param_groups[0]['lr'],
+                             flat.mean().item(), flat.std().item(), flat.abs().max().item(),
+                             args.batch, n_examples,
+                             float(_epoch[_text_names[0]]) if _text_names else 1.0)
+            line += ''.join(f' loss_{n} {np.mean(a[-args.monitor:]):12.9f}' for n, a in carr.items())
+            _emit(line)
             del larr[:-args.monitor], garr[:-args.monitor]   # keep host RAM flat
+            for a in carr.values():
+                del a[:-args.monitor]
 
         scheduler.step()
         optimizer.zero_grad()
