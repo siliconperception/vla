@@ -217,8 +217,9 @@ parser.add_argument('--gen_score',  default=None, nargs='?', const='EleutherAI/p
 parser.add_argument('--prompt',     default='', help='extra GEN prompt; prompt for --generate/--vis')
 parser.add_argument('--temperature', default=1.0, type=float, help='sampling temperature')
 parser.add_argument('--gen_images', default=8, type=int, metavar='N',
-                    help='image models: caption N fixed held-out images at every GEN (GENI/REF '
-                         'lines and the --gen_vis panel); 0 = off')
+                    help='image models: caption N held-out images at every GEN for the --gen_vis '
+                         'panel, a new random set every --eval_interval steps; the log gets one '
+                         'GENI/REF pair per GEN, taking the set in turn; 0 = off')
 parser.add_argument('--gen_vis', default=True, action=argparse.BooleanOptionalAction,
                     help='image models: a window (top-left quarter of the screen) showing the '
                          'GEN image captions, redrawn at every GEN; also saved as <log>.gen.png')
@@ -2106,9 +2107,9 @@ def _save(i, n_examples):
 
 
 def _gen_lines(i):
-    """GEN samples (text-only, from <STX> and --prompt), GENI captions of --gen_images fixed
-    held-out images per image eval corpus with their reference (also sent to the --gen_vis
-    panel), and a recent training text per corpus."""
+    """GEN samples (text-only, from <STX> and --prompt), captions of --gen_images held-out
+    images per image eval corpus for the --gen_vis panel (one GENI/REF pair of them in the
+    log), and a recent training text per corpus."""
     lines = []
     for p in dict.fromkeys(['', args.prompt]):
         prompt = _prompt_ids(p)
@@ -2122,15 +2123,24 @@ def _gen_lines(i):
         if c not in _IMAGE_DATASETS or model.img_enc is None or not args.gen_images:
             continue
         n = len(_eval_docs(c))
-        for k in sorted({int((j + 0.5) * n / args.gen_images) for j in range(args.gen_images)}
-                        if n else []):
+        if not n:
+            continue
+        # a new random set of held-out images every --eval_interval steps, keyed by the step
+        # block alone so a resume redraws the same set and runs see the same images at the
+        # same step; the log gets one pair per GEN, cycling through the set
+        blk = i // args.eval_interval if args.eval_interval else 0
+        ks = random.Random(f'{c}:{blk}').sample(range(n), min(n, args.gen_images))
+        logk = ks[(i // args.gen_interval) % len(ks)] if args.gen_interval else ks[0]
+        for k in ks if args.gen_vis and _gen_inbox is not None else [logk]:
             prompt = _prompt_ids()
             out = model.generate(prompt, _GEN_SAMPLE, temperature=args.temperature,
                                  image=_eval_imgs[c][k])
             out = out[:out.index(model.end_id) + 1] if model.end_id in out else out
             iid, cls, cap = _eval_meta[c][k]
-            lines.append(f'GENI step {i:10} [{iid} {cls.split(",")[0]}]: {_render(prompt + out)}')
-            lines.append(f'REF  step {i:10} [{iid}]: {_printable(cap[:400])}')
+            if k == logk:
+                lines.append(f'GENI step {i:10} [{iid} {cls.split(",")[0]}]: '
+                             f'{_render(prompt + out)}')
+                lines.append(f'REF  step {i:10} [{iid}]: {_printable(cap[:400])}')
             panel.append((_eval_imgs[c][k].permute(1, 2, 0).numpy(),
                           f'{cls.split(",")[0]}  ({iid})', _decode_plain(out), cap))
     if panel and _gen_inbox is not None and args.gen_vis:
