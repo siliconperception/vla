@@ -9,10 +9,10 @@
 # missed, at its own rate 1/W_k. The text decoder reads the layer output to next-token logits
 # through a frozen, borrowed lm_head. No attention, no positional encoding.
 #
-# Images: a frozen ResNet-50 turns a 224x224 view of the image into a [2048, 7, 7] feature map
+# Images: a frozen ResNet-50 turns a 224x224 crop of the image into a [2048, 7, 7] feature map
 # that is concatenated with the token grid. An image-caption example is <STX> caption <ETX>
-# with the image present at every token, seen through a fresh random crop each token; text-only
-# rows get a zero image map.
+# with the image present at every token, seen through a fresh random 224x224 crop at native
+# resolution (never rescaled) each token; text-only rows get a zero image map.
 #
 # Built to be extended: the input side is a LIST of grids concatenated in front of ctx_cat, and
 # the text readout is a self-contained decoder module that other decoders (e.g. actions) can
@@ -69,8 +69,8 @@ _IMAGE_DATASETS = {
 }
 
 _IMAGE_ENCODERS = {'resnet50': 'timm/resnet50.a1_in1k'}   # frozen; [3,224,224] -> [2048,7,7]
-_IMG_BANK = 256             # images are stored with their longer side at this many pixels
-_IMG_IN = 224               # encoder input side
+_IMG_BANK = 1024            # image canvas side; larger images keep their central 1024x1024
+_IMG_IN = 224               # crop side = encoder input side
 _IMG_MEAN = (0.485, 0.456, 0.406)
 _IMG_STD = (0.229, 0.224, 0.225)
 
@@ -179,9 +179,6 @@ parser.add_argument('--mix',        default=None, metavar='NAME:FRAC,...',
                     help='several corpora, each given an exact share of the --batch slots '
                          '(largest remainder), e.g. smolfwedu:0.5,imagenet21k:0.5. Overrides '
                          '--dataset. Image corpora: see _IMAGE_DATASETS')
-parser.add_argument('--crop_scale', default='0.25,1', metavar='LO,HI',
-                    help='image views: each token a random crop covering LO..HI of the image '
-                         'area (aspect jitter 3/4..4/3), resized to 224x224')
 parser.add_argument('--image',      default=None, metavar='PATH',
                     help='--generate/--vis: condition on this image (caption it)')
 parser.add_argument('--shards',     default=None, type=int, help='load only the first N parquet shards')
@@ -289,7 +286,6 @@ def _parse_mix():
 _MIX = _parse_mix()          # batch rows are assigned to corpora in this order
 _IMAGE_ROWS = [r for r, (n, k) in enumerate(_MIX) for _ in range(k)]
 _IMAGE_ROWS = [r for r, ci in enumerate(_IMAGE_ROWS) if _MIX[ci][0] in _IMAGE_DATASETS]
-_crop_lo, _crop_hi = (float(v) for v in args.crop_scale.split(','))
 if args.image_encoder is None:     # on --load the checkpoint's value replaces this
     _names = [n for n, _ in _MIX] + (args.eval_corpora or '').split(',')
     args.image_encoder = 'resnet50' if any(n.strip() in _IMAGE_DATASETS for n in _names) else 'none'
@@ -456,12 +452,12 @@ class ImageEncoder(nn.Module):
 
 
 def _prep_image(img):
-    """PIL image -> uint8 [3, h, w] with the longer side _IMG_BANK (aspect kept)."""
-    img.draft('RGB', (_IMG_BANK, _IMG_BANK))              # JPEG: decode at reduced scale
+    """PIL image -> uint8 [3, h, w] at native resolution (never rescaled); a side longer than
+    _IMG_BANK keeps its central _IMG_BANK pixels."""
     img = img.convert('RGB')
     w, h = img.size
-    s = _IMG_BANK / max(w, h)
-    img = img.resize((max(1, round(w * s)), max(1, round(h * s))), 3)   # 3 = BICUBIC
+    x0, y0 = max(0, (w - _IMG_BANK) // 2), max(0, (h - _IMG_BANK) // 2)
+    img = img.crop((x0, y0, x0 + min(w, _IMG_BANK), y0 + min(h, _IMG_BANK)))
     return torch.from_numpy(np.asarray(img).copy()).permute(2, 0, 1)
 
 
@@ -476,29 +472,28 @@ def _bank(imgs, device):
     return bank.to(device), hw.to(device)
 
 
-def _views(bank, hw, random_crop=True):
-    """One 224x224 view per image, normalized for the encoder, in a single grid_sample.
-    random_crop: area share U(--crop_scale), aspect jitter 3/4..4/3, uniform position;
-    otherwise the whole image."""
+def _views(bank, hw, gen=None):
+    """One random 224x224 crop per image at native resolution, normalized for the encoder.
+    An image narrower or shorter than 224 lands at a random position inside the crop, and
+    the rest of the crop is the mean color (0 after normalization). gen: a torch.Generator
+    on the bank's device, for reproducible crops (eval)."""
     N, dev = bank.shape[0], bank.device
-    H, W = hw[:, 0], hw[:, 1]
-    if random_crop:
-        s = torch.empty(N, device=dev).uniform_(_crop_lo, _crop_hi)
-        r = torch.empty(N, device=dev).uniform_(math.log(3 / 4), math.log(4 / 3)).exp()
-        cw, ch = (W * (s * r).sqrt()).clamp(max=W), (H * (s / r).sqrt()).clamp(max=H)
-        cx = cw / 2 + torch.rand(N, device=dev) * (W - cw)
-        cy = ch / 2 + torch.rand(N, device=dev) * (H - ch)
-    else:
-        cw, ch, cx, cy = W, H, W / 2, H / 2
-    theta = torch.zeros(N, 2, 3, device=dev)
-    theta[:, 0, 0], theta[:, 0, 2] = cw / _IMG_BANK, 2 * cx / _IMG_BANK - 1
-    theta[:, 1, 1], theta[:, 1, 2] = ch / _IMG_BANK, 2 * cy / _IMG_BANK - 1
-    grid = F.affine_grid(theta, [N, 3, _IMG_IN, _IMG_IN], align_corners=False)
-    x = F.grid_sample(bank.float() / 255.0, grid, mode='bilinear', padding_mode='border',
-                      align_corners=False)
+    ar = torch.arange(_IMG_IN, device=dev)
+
+    def offsets(n):                      # n [N] image side -> crop start, may be negative
+        lo, hi = (n - _IMG_IN).clamp(max=0), (n - _IMG_IN).clamp(min=0)
+        return lo + (torch.rand(N, device=dev, generator=gen) * (hi - lo + 1)).long()
+
+    H, W = hw[:, 0].long(), hw[:, 1].long()
+    yy, xx = offsets(H)[:, None] + ar, offsets(W)[:, None] + ar          # [N, 224] each
+    x = bank[torch.arange(N, device=dev)[:, None, None], :,
+             yy.clamp(0, _IMG_BANK - 1)[:, :, None], xx.clamp(0, _IMG_BANK - 1)[:, None, :]]
+    x = x.permute(0, 3, 1, 2).float() / 255.0                           # [N, 3, 224, 224]
     mean = torch.tensor(_IMG_MEAN, device=dev).view(1, 3, 1, 1)
     std = torch.tensor(_IMG_STD, device=dev).view(1, 3, 1, 1)
-    return (x - mean) / std
+    inside = (((yy >= 0) & (yy < H[:, None]))[:, :, None] &
+              ((xx >= 0) & (xx < W[:, None]))[:, None, :])               # [N, 224, 224]
+    return (x - mean) / std * inside[:, None]
 
 
 # PyTorchModelHubMixin adds save_pretrained/push_to_hub/from_pretrained (--push,
@@ -677,8 +672,8 @@ class VLAModel(nn.Module, _HubMixin):
         """Sample n_tokens after prompt_ids on a private state. An END is kept in the output
         and, if the budget is not filled, the state resets and the prompt is fed again, as
         at a training document boundary (at most 20 sequences). Short only on NaN/Inf.
-        image: uint8 [3, h, w], seen through a fresh random view every token (as in
-        training); None = text-only."""
+        image: uint8 [3, h, w], seen through a fresh random 224x224 crop every token (as
+        in training); None = text-only."""
         self.eval()
         dev = next(self.parameters()).device
         bank = _bank([image], dev) if image is not None else None
@@ -1513,18 +1508,10 @@ def _token_bands(dev):
     return _band_cache['b'].to(dev)
 
 
-def _image_grids(imgs, random_crop=False):
-    """Image grids for a list of uint8 images (whole-image views by default), in chunks."""
-    dev = next(model.parameters()).device
-    out = []
-    for i in range(0, len(imgs), 100):
-        out.append(model.image_grid(_views(*_bank(imgs[i:i + 100], dev), random_crop)))
-    return torch.cat(out)
-
-
 def _score(step, corpus, docs, imgs=None, tag=None):
     """EVAL (clean / median / runaway%) and EVALB (loss by frequency band) lines, tagged
-    `tag` (default corpus). imgs: one image per doc, seen whole at every token."""
+    `tag` (default corpus). imgs: one image per doc, seen through a fresh random crop every
+    token from a fixed-seed generator, so successive evals see the same crops."""
     tag = tag or corpus
     t0 = time.time()
     dev = next(model.parameters()).device
@@ -1533,9 +1520,10 @@ def _score(step, corpus, docs, imgs=None, tag=None):
     per_doc, bad_doc, band_sum, band_cnt = [], [], [], []
     with _EvalState(), torch.no_grad():
         c = 0
+        gen = torch.Generator(device=dev).manual_seed(1234)
         for chunk, X, Y, M in _batches(_doc_rows(docs)):
             B, T = X.shape
-            img = _image_grids(imgs[c:c + B]) if imgs is not None else None
+            bank = _bank(imgs[c:c + B], dev) if imgs is not None else None
             c += B
             model.dff = None
             rs = torch.zeros(B, device=dev)
@@ -1544,6 +1532,7 @@ def _score(step, corpus, docs, imgs=None, tag=None):
                 bsum = torch.zeros(B, nb, device=dev)
                 bcnt = torch.zeros(B, nb, device=dev)
             for t in range(T):
+                img = model.image_grid(_views(*bank, gen)) if bank is not None else None
                 logits, _ = model(X[:, t], img=img)
                 ce = F.cross_entropy(logits, Y[:, t], reduction='none')
                 # a diverged row is counted as runaway rather than poisoning the sums
@@ -1945,7 +1934,7 @@ w = threading.Thread(target=worker, args=(stop, q, hf_datasets))
 w.start()
 
 # Image rows: each holds its current image in a GPU canvas, and every step a fresh random
-# view of it goes through the encoder. Text rows get a zero image grid.
+# 224x224 crop of it goes through the encoder. Text rows get a zero image grid.
 _img_rows = torch.tensor(_IMAGE_ROWS, dtype=torch.long, device=args.device)
 _bank_of = {r: j for j, r in enumerate(_IMAGE_ROWS)}
 img_bank = torch.zeros(len(_IMAGE_ROWS), 3, _IMG_BANK, _IMG_BANK, dtype=torch.uint8,
