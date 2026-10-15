@@ -426,19 +426,19 @@ def _viewer(inbox, stem, show, parent):
     def draw_gen(fig, step, items):
         cols = min(4, len(items))
         rows = math.ceil(len(items) / cols)
-        gs = fig.add_gridspec(2 * rows, cols, height_ratios=[3, 1.6] * rows, left=0.01,
-                              right=0.99, top=0.93, bottom=0.01, wspace=0.06, hspace=0.12)
+        gs = fig.add_gridspec(2 * rows, cols, height_ratios=[2.6, 2.2] * rows, left=0.01,
+                              right=0.99, top=0.93, bottom=0.01, wspace=0.06, hspace=0.2)
         for k, (img, name, cap, ref) in enumerate(items):
             r, c = divmod(k, cols)
             ax = fig.add_subplot(gs[2 * r, c])
             ax.imshow(img)
             ax.set_axis_off()
-            ax.set_title(name, fontsize=7)
+            ax.set_title(name, fontsize=8)
             tx = fig.add_subplot(gs[2 * r + 1, c])
             tx.set_axis_off()
-            tx.text(0, 1, textwrap.fill(cut(cap, 180), 52), va='top', fontsize=6.5,
+            tx.text(0, 1, textwrap.fill(cut(cap, 150), 42), va='top', fontsize=8,
                     color='white', transform=tx.transAxes, clip_on=True)
-            tx.text(0, 0, textwrap.fill('REF: ' + cut(ref, 160), 52), va='bottom', fontsize=6.5,
+            tx.text(0, 0, textwrap.fill('REF: ' + cut(ref, 130), 42), va='bottom', fontsize=8,
                     color='limegreen', transform=tx.transAxes, clip_on=True)
         fig.suptitle(f'GEN step {step}   {args.log}', family='monospace', fontsize=8)
 
@@ -453,19 +453,18 @@ def _viewer(inbox, stem, show, parent):
         ax = fig.add_subplot(gs[0, 0])
         ax.imshow(img)
         ax.set_axis_off()
-        ax.set_title(name, fontsize=7)
+        ax.set_title(name, fontsize=8)
         tx = fig.add_subplot(gs[0, 1])
         tx.set_axis_off()
-        tx.text(0, 1, textwrap.fill(cut(''.join(toks[1:]), 600), 110), va='top', fontsize=7,
+        tx.text(0, 1, textwrap.fill(cut(''.join(toks[1:]), 600), 110), va='top', fontsize=8,
                 color='limegreen', transform=tx.transAxes, clip_on=True)
         sub = gs[1, :].subgridspec(rows, cols, wspace=0.04, hspace=0.35)
-        fs = max(4.5, min(7.0, 70.0 / cols))
         for k, (crop, tok) in enumerate(zip(crops, toks)):
             a = fig.add_subplot(sub[k // cols, k % cols])
             a.imshow(crop)
             a.set_xticks([])
             a.set_yticks([])
-            a.set_xlabel(tok.replace(' ', '·') or '∅', fontsize=fs, labelpad=1,
+            a.set_xlabel(tok.replace(' ', '·') or '∅', fontsize=8, labelpad=1,
                          family='monospace')
         fig.suptitle(f'TRAIN sample step {step}   {n} tokens   {args.log}', family='monospace',
                      fontsize=8)
