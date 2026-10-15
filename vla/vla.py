@@ -11,9 +11,10 @@
 #
 # Images: a frozen ResNet-50 turns a 224x224 crop of the image into a [2048, 7, 7] feature map
 # that is concatenated with the token grid. An image-caption example is <STX> caption <ETX>
-# with the image present at every token, seen through a fresh random 224x224 crop each token
-# (native resolution; only an image with a side under 224 is scaled up, uniformly, to fill the
-# crop); text-only rows get a zero image map.
+# with the image present at every token, seen through a fresh random 224x224 crop each token:
+# a close-up at native resolution (only an image with a side under 224 is scaled up, uniformly,
+# to fill the crop) or, for --full_crops of them, a full view of the whole image scaled so its
+# shorter side is 224; text-only rows get a zero image map.
 #
 # Built to be extended: the input side is a LIST of grids concatenated in front of ctx_cat, and
 # the text readout is a self-contained decoder module that other decoders (e.g. actions) can
@@ -180,6 +181,12 @@ parser.add_argument('--mix',        default=None, metavar='NAME:FRAC,...',
                     help='several corpora, each given an exact share of the --batch slots '
                          '(largest remainder), e.g. smolfwedu:0.5,imagenet21k:0.5. Overrides '
                          '--dataset. Image corpora: see _IMAGE_DATASETS')
+parser.add_argument('--full_crops', default=0.5, type=float, metavar='P',
+                    help='share of image crops that are full views: the whole image scaled '
+                         '(aspect kept) so its shorter side is 224, cropped to 224x224 at a '
+                         'random offset along the longer side, no padding; the rest are '
+                         'native-resolution close-ups. Resuming a checkpoint from before this '
+                         'option keeps 0 unless the flag is given')
 parser.add_argument('--image',      default=None, metavar='PATH',
                     help='--generate/--vis: condition on this image (caption it)')
 parser.add_argument('--shards',     default=None, type=int, help='load only the first N parquet shards')
@@ -331,6 +338,8 @@ if args.load:
     for k in _ARCH_ARGS:
         if k in _saved:
             setattr(args, k, _saved[k])
+    if 'full_crops' not in _saved and not any(a.startswith('--full_crops') for a in sys.argv):
+        args.full_crops = 0.0         # trained before full views existed: keep its crops
     _start_step = int(_loaded_ckpt.get('step', 0))
     _start_exs = int(_loaded_ckpt.get('examples', 0))
 
@@ -603,28 +612,61 @@ def _prep_image(img):
     return torch.from_numpy(np.asarray(img).copy()).permute(2, 0, 1)
 
 
+def _fit(im):
+    """uint8 [3, h, w] -> uint8 [3, _IMG_IN, L]: the whole image scaled (antialiased, aspect
+    kept) so its shorter side is _IMG_IN, stored with the long side across -- a tall image is
+    transposed -- and L capped at _IMG_BANK by keeping the centre."""
+    if im.shape[1] > im.shape[2]:
+        im = im.transpose(1, 2)
+    h, w = im.shape[1:]
+    L = max(_IMG_IN, round(w * _IMG_IN / h))
+    x = F.interpolate(im[None].float(), size=(_IMG_IN, L), mode='bilinear', antialias=True,
+                      align_corners=False)[0].round().clamp(0, 255).to(torch.uint8)
+    c = max(0, (L - _IMG_BANK) // 2)
+    return x[:, :, c:c + _IMG_BANK]
+
+
+def _bank_put(bank, hw, fit, j, im):
+    """Load image im (uint8 [3, h, w], on the bank's device) into slot j: native pixels in the
+    top-left of bank[j], its full view (see _fit) in fit[j], and hw[j] = (h, w, full-view L)."""
+    h, w = im.shape[1:]
+    bank[j, :, :h, :w] = im
+    f = _fit(im)
+    fit[j, :, :, :f.shape[2]] = f
+    hw[j, 0], hw[j, 1], hw[j, 2] = h, w, f.shape[2]
+
+
 def _bank(imgs, device):
-    """uint8 [3, h, w] images -> (bank [N, 3, _IMG_BANK, _IMG_BANK] uint8, sizes [N, 2] (h, w)),
-    each image in the top-left corner of its canvas."""
-    bank = torch.zeros(len(imgs), 3, _IMG_BANK, _IMG_BANK, dtype=torch.uint8)
-    hw = torch.zeros(len(imgs), 2)
-    for i, im in enumerate(imgs):
-        bank[i, :, :im.shape[1], :im.shape[2]] = im
-        hw[i] = torch.tensor(im.shape[1:])
-    return bank.to(device), hw.to(device)
+    """uint8 [3, h, w] images -> (bank [N, 3, _IMG_BANK, _IMG_BANK] uint8, sizes [N, 3]
+    (h, w, L), full views [N, 3, _IMG_IN, _IMG_BANK] uint8), the arguments of _views."""
+    bank = torch.zeros(len(imgs), 3, _IMG_BANK, _IMG_BANK, dtype=torch.uint8, device=device)
+    fit = torch.zeros(len(imgs), 3, _IMG_IN, _IMG_BANK, dtype=torch.uint8, device=device)
+    hw = torch.zeros(len(imgs), 3, device=device)
+    for j, im in enumerate(imgs):
+        _bank_put(bank, hw, fit, j, im.to(device))
+    return bank, hw, fit
 
 
-def _views(bank, hw, gen=None):
-    """One random 224x224 crop per image (images are at least 224 on each side, see
-    _prep_image), copied pixel for pixel and normalized for the encoder. gen: a
-    torch.Generator on the bank's device, for reproducible crops (eval)."""
+def _views(bank, hw, fit, gen=None):
+    """One random 224x224 crop per image, normalized for the encoder: a native-resolution
+    close-up copied pixel for pixel (images are at least 224 on each side, see _prep_image)
+    or, with probability --full_crops, a full view -- the whole image scaled so its shorter
+    side is 224, at a random offset along the longer side (see _fit). gen: a torch.Generator
+    on the bank's device, for reproducible crops (eval)."""
     N, dev = bank.shape[0], bank.device
     ar = torch.arange(_IMG_IN, device=dev)
+    rows = torch.arange(N, device=dev)[:, None, None]
     H, W = hw[:, 0].long(), hw[:, 1].long()
     oy = (torch.rand(N, device=dev, generator=gen) * (H - _IMG_IN + 1)).long()
     ox = (torch.rand(N, device=dev, generator=gen) * (W - _IMG_IN + 1)).long()
-    x = bank[torch.arange(N, device=dev)[:, None, None], :,
-             (oy[:, None] + ar)[:, :, None], (ox[:, None] + ar)[:, None, :]]
+    x = bank[rows, :, (oy[:, None] + ar)[:, :, None], (ox[:, None] + ar)[:, None, :]]
+    if args.full_crops > 0:                       # skipped at 0, keeping the old random stream
+        L = hw[:, 2].long()
+        of = (torch.rand(N, device=dev, generator=gen) * (L - _IMG_IN + 1)).long()
+        full = fit[rows, :, ar[None, :, None], (of[:, None] + ar)[:, None, :]]
+        full = torch.where((H > W)[:, None, None, None], full.transpose(1, 2), full)
+        pick = torch.rand(N, device=dev, generator=gen) < args.full_crops
+        x = torch.where(pick[:, None, None, None], full, x)
     x = x.permute(0, 3, 1, 2).float() / 255.0                           # [N, 3, 224, 224]
     mean = torch.tensor(_IMG_MEAN, device=dev).view(1, 3, 1, 1)
     std = torch.tensor(_IMG_STD, device=dev).view(1, 3, 1, 1)
@@ -2078,7 +2120,9 @@ _img_rows = torch.tensor(_IMAGE_ROWS, dtype=torch.long, device=args.device)
 _bank_of = {r: j for j, r in enumerate(_IMAGE_ROWS)}
 img_bank = torch.zeros(len(_IMAGE_ROWS), 3, _IMG_BANK, _IMG_BANK, dtype=torch.uint8,
                        device=args.device)
-img_hw = torch.full((len(_IMAGE_ROWS), 2), float(_IMG_BANK), device=args.device)
+img_fit = torch.zeros(len(_IMAGE_ROWS), 3, _IMG_IN, _IMG_BANK, dtype=torch.uint8,
+                      device=args.device)
+img_hw = torch.full((len(_IMAGE_ROWS), 3), float(_IMG_BANK), device=args.device)
 if _IMAGE_ROWS and model.img_enc is None:
     raise SystemExit('--mix has an image corpus but the model has no image encoder')
 # rows of each corpus, for the per-corpus loss columns of a mixed run
@@ -2231,10 +2275,9 @@ try:
         if _IMAGE_ROWS:
             for r, (im, name) in new_imgs:
                 j = _bank_of[r]
-                img_bank[j, :, :im.shape[1], :im.shape[2]] = im.to(args.device, non_blocking=True)
-                img_hw[j, 0], img_hw[j, 1] = im.shape[1], im.shape[2]
+                _bank_put(img_bank, img_hw, img_fit, j, im.to(args.device, non_blocking=True))
                 _img_name[j] = name
-            views = _views(img_bank, img_hw)
+            views = _views(img_bank, img_hw, img_fit)
             img = torch.zeros(len(x_list), model.img_width, model.S, model.S, device=args.device)
             img[_img_rows] = model.image_grid(views)
             if _sample is not None:
