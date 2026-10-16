@@ -234,11 +234,7 @@ parser.add_argument('--eval_interval', default=20000, type=int,
                     help='held-out EVAL every N steps (0 = off)')
 parser.add_argument('--eval_corpora', default=None, help='comma-separated; default --dataset')
 parser.add_argument('--eval_docs',  default=400,  type=int, help='held-out documents per corpus')
-parser.add_argument('--eval_warm',  default=1024, type=int, metavar='T',
-                    help='EVAL of a corpus whose kind is in --carry (its registers never reset in '
-                         'training): each row first reads earlier held-out documents of the set '
-                         '(with their images), unscored and without resets, for about T tokens, '
-                         'and the scored document continues from that state; 0 = fresh start')
+parser.add_argument('--eval_warm',  default=0, type=int, help=argparse.SUPPRESS)  # removed; accepted so old command lines still parse
 parser.add_argument('--eval_bands', default='1024,8192', metavar='R1,R2,...',
                     help='EVALB: held-out loss split by target-token frequency rank ("" = off)')
 parser.add_argument('--eval_info',  default=0,    type=int, metavar='N',
@@ -1717,16 +1713,11 @@ def _token_bands(dev):
 def _score(step, corpus, docs, imgs=None, tag=None):
     """EVAL (clean / median / runaway%) and EVALB (loss by frequency band) lines, tagged
     `tag` (default corpus). imgs: one image per doc, seen through a fresh random crop every
-    token from a fixed-seed generator, so successive evals see the same crops. A corpus whose
-    kind is in --carry is warm-started (--eval_warm): row r first reads documents r-W..r-1,
-    W = ceil(--eval_warm / mean doc length), unscored and without resets."""
+    token from a fixed-seed generator, so successive evals see the same crops.
+    Every row starts from zeroed registers, whatever --carry says."""
     tag = tag or corpus
     t0 = time.time()
     dev = next(model.parameters()).device
-    n = len(docs)
-    kind = 'image' if corpus in _IMAGE_DATASETS else 'text'
-    W = (min(n - 1, math.ceil(args.eval_warm / (sum(len(d) for d in docs) / n)))
-         if args.eval_warm > 0 and kind in _carry and n > 1 else 0)
     band_of = _token_bands(dev) if args.eval_bands else None
     nb = int(band_of.max()) + 1 if band_of is not None else 0
     per_doc, bad_doc, band_sum, band_cnt = [], [], [], []
@@ -1736,18 +1727,8 @@ def _score(step, corpus, docs, imgs=None, tag=None):
         for chunk, X, Y, M in _batches(_doc_rows(docs)):
             B, T = X.shape
             bank = _bank(imgs[c:c + B], dev) if imgs is not None else None
-            c0, c = c, c + B
+            c += B
             model.dff = None
-            for j in range(W, 0, -1):                    # warm-up: earlier documents, unscored
-                idx = [(c0 + r - j) % n for r in range(B)]
-                _, WX, _, WM = next(_batches(_doc_rows([docs[k] for k in idx])))
-                wbank = _bank([imgs[k] for k in idx], dev) if imgs is not None else None
-                for t in range(WX.shape[1]):
-                    img = model.image_grid(_views(*wbank, gen)) if wbank is not None else None
-                    prev = model.dff
-                    model(WX[:, t], img=img)
-                    if prev is not None:                 # a finished row's padding: hold state
-                        model.dff = torch.where(WM[:, t, None, None, None], model.dff, prev)
             rs = torch.zeros(B, device=dev)
             bad = torch.zeros(B, dtype=torch.bool, device=dev)
             if nb:
@@ -1785,7 +1766,7 @@ def _score(step, corpus, docs, imgs=None, tag=None):
     _emit(f'EVAL step {step:10} corpus {tag:8} clean {clean:11.6f} ppl {ppl:12.4f} '
           f'median {float(np.median(per)):11.6f} runaway {100.0 * float(bad.mean()):6.2f}% '
           f'nrun {int(bad.sum()):4d} docs {len(per):5d} wall {time.time() - t0:7.1f}s '
-          f'nats/char {npc:.4f}' + (f' warm {W}' if W else ''))
+          f'nats/char {npc:.4f}')
     if nb and (~bad).any():
         bs = np.concatenate(band_sum)[~bad].sum(0)
         bc = np.concatenate(band_cnt)[~bad].sum(0)
