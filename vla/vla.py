@@ -2287,6 +2287,8 @@ def _record_sample(i, x_list, flag_list, views):
     rec = _sample['rec']
     if rec is not None and len(rec['crops']) < 160:
         crop = ((views[j] * _IMG_STD_T + _IMG_MEAN_T) * 255.0).clamp(0, 255)
+        if x_list[r] < 0:                 # <NUL> blinks: the model saw no image, show black
+            crop = torch.zeros_like(crop)
         rec['crops'].append(_thumb(crop, 96))
         rec['toks'].append(NUL_TEXT if x_list[r] < 0 else _tokenizer.decode([x_list[r]]))
 
