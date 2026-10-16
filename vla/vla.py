@@ -73,8 +73,10 @@ def _eval_minlen(corpus):
 # Image-caption corpora: a local directory of parquet files (see exp/img_prep.py,
 # exp/caption_prep.py) with an encoded 'image', an 'id', a 'class' and the caption column.
 _IMAGE_DATASETS = {
-    'imagenet21k': dict(dir='/data/imagenet21k_recap', caption='recaption'),   # synthetic
+    'imagenet21k': dict(dir='/data/imagenet21k_recap', caption='recaption',    # synthetic
+                        eval_group0=True),   # its eval set reads only row group 0 per file
     'redcaps':     dict(dir='/data/redcaps5m', caption='caption'),     # Reddit post titles
+    'redcaps25':   dict(dir='/data/redcaps5m_25', caption='caption'),  # its first 25 shards
     'coco':        dict(dir='/data/coco_captions', caption='caption'), # 5 human captions/image
 }
 
@@ -161,14 +163,13 @@ parser.add_argument('--bn_momentum', default=0.1, type=float,
                     help='ContextCNN BatchNorm running-statistics momentum (0 = cumulative)')
 parser.add_argument('--init',       default='zero', choices=['zero', 'gaussian', 'relu'],
                     help='DFF register value at every example start (see --continuous)')
-parser.add_argument('--continuous', '--carry', dest='continuous', default='', metavar='KINDS',
+parser.add_argument('--continuous', default='', metavar='KINDS',
                     help='example kinds whose rows run CONTINUOUSLY: the DFF registers flow on into '
                          'the next example instead of resetting to --init at its first (<NUL>) '
                          'step -- the regime of continuous inference and training in an embodied '
                          'agent, which never gets a reset. "text", "image" (captioned images) or '
                          '"text,image"; default none, every example starts fresh. Training only: '
-                         'eval rows hold one example each and generation is a single stream. '
-                         '(--carry is the old name, kept so running jobs can restart)')
+                         'eval rows hold one example each and generation is a single stream')
 parser.add_argument('--image_encoder', default=None, choices=['none'] + sorted(_IMAGE_ENCODERS),
                     help='frozen image encoder whose feature map joins the input concat; '
                          'default: resnet50 if --mix or --eval_corpora names an image corpus, '
@@ -1587,19 +1588,26 @@ def _eval_source(name):
 
 
 def _build_image_eval(corpus):
-    """--eval_docs held-out captions of an image corpus, one from each of --eval_docs files
-    spread over the (synset-sorted) shards, with their images; sorted by length."""
+    """--eval_docs held-out captions of an image corpus with their images, sorted by length:
+    the first held-out row of each of --eval_docs files spread over the (sorted) shards, or,
+    when there are fewer files, the first ceil(--eval_docs / files) of every file.
+    eval_group0 corpora look only in row group 0 (their eval set as first defined)."""
     import pyarrow.parquet as pq
     cfg = _IMAGE_DATASETS[corpus]
     files = sorted(glob.glob(os.path.join(cfg['dir'], '*.parquet')))
     items = []
+    per = max(1, math.ceil(args.eval_docs / max(1, len(files))))
     for f in files[::max(1, len(files) // max(1, args.eval_docs))]:
-        rows = pq.ParquetFile(f).read_row_group(0, columns=['image', 'id', 'class', cfg['caption']])
-        for r in rows.to_pylist():
-            cap = (r[cfg['caption']] or '').strip()
-            if cap and _id_heldout(r['id']):
-                items.append((clip_text(cap)[:_EVAL_MAXLEN], _decode_image(r),
-                              (r['id'], r['class'], cap)))
+        pf, got = pq.ParquetFile(f), 0
+        for g in range(1 if cfg.get('eval_group0') else pf.metadata.num_row_groups):
+            for r in pf.read_row_group(g, columns=['image', 'id', 'class',
+                                                   cfg['caption']]).to_pylist():
+                cap = (r[cfg['caption']] or '').strip()
+                if cap and _id_heldout(r['id']) and got < per:
+                    items.append((clip_text(cap)[:_EVAL_MAXLEN], _decode_image(r),
+                                  (r['id'], r['class'], cap)))
+                    got += 1
+            if got >= per or len(items) >= args.eval_docs:
                 break
         if len(items) >= args.eval_docs:
             break
