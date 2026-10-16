@@ -71,14 +71,27 @@ def _eval_minlen(corpus):
 
 
 # Image-caption corpora: a local directory of parquet files (see exp/img_prep.py,
-# exp/caption_prep.py) with an encoded 'image', an 'id', a 'class' and the caption column.
+# exp/caption_prep.py) with an encoded 'image', an 'id', a 'class' and the caption column(s).
 _IMAGE_DATASETS = {
     'imagenet21k': dict(dir='/data/imagenet21k_recap', caption='recaption',    # synthetic
                         eval_group0=True),   # its eval set reads only row group 0 per file
     'redcaps':     dict(dir='/data/redcaps5m', caption='caption'),     # Reddit post titles
     'redcaps25':   dict(dir='/data/redcaps5m_25', caption='caption'),  # its first 25 shards
     'coco':        dict(dir='/data/coco_captions', caption='caption'), # 5 human captions/image
+    # Wikipedia images: one example = the human caption, a newline, the Gemini description
+    'wit':         dict(dir='/data/wit_1m_recap', caption=('caption', 'gemini_caption')),
 }
+
+
+def _caption_cols(cfg):
+    """An image corpus's caption column(s), as a list."""
+    c = cfg['caption']
+    return [c] if isinstance(c, str) else list(c)
+
+
+def _caption_of(row, cfg):
+    """The example text of a row: its caption columns' non-empty values, one per line."""
+    return '\n'.join(t for t in ((row[c] or '').strip() for c in _caption_cols(cfg)) if t)
 
 _IMAGE_ENCODERS = {'resnet50': 'timm/resnet50.a1_in1k'}   # frozen; [3,224,224] -> [2048,7,7]
 _IMG_BANK = 1024            # image canvas side; larger images keep their central 1024x1024
@@ -1040,7 +1053,7 @@ class _ImageSource:
         self.files = sorted(glob.glob(os.path.join(cfg['dir'], '*.parquet')))
         if not self.files:
             raise SystemExit(f'{name}: no parquet files in {cfg["dir"]} (see exp/img_prep.py)')
-        self.cap, self.rng = cfg['caption'], random.Random(seed)
+        self.cfg, self.rng = cfg, random.Random(seed)
         self.pool, self.lock = [], threading.Lock()
         print(f'{name}: {len(self.files)} local parquet files in {cfg["dir"]}', flush=True)
 
@@ -1050,7 +1063,8 @@ class _ImageSource:
         pf = self.pq.ParquetFile(f)
         with self.lock:
             g = self.rng.randrange(pf.metadata.num_row_groups)
-        rows = pf.read_row_group(g, columns=['image', 'id', 'class', self.cap]).to_pylist()
+        rows = pf.read_row_group(g, columns=['image', 'id', 'class',
+                                             *_caption_cols(self.cfg)]).to_pylist()
         rows = [r for r in rows if not _id_heldout(r['id'])]
         with self.lock:
             self.pool.extend(rows)
@@ -1063,7 +1077,7 @@ class _ImageSource:
                     i = self.rng.randrange(len(self.pool))
                     row, self.pool[i] = self.pool[i], self.pool[-1]
                     self.pool.pop()
-                    return (row[self.cap] or '').strip(), row
+                    return _caption_of(row, self.cfg), row
             self._fill()
 
 
@@ -1601,8 +1615,8 @@ def _build_image_eval(corpus):
         pf, got = pq.ParquetFile(f), 0
         for g in range(1 if cfg.get('eval_group0') else pf.metadata.num_row_groups):
             for r in pf.read_row_group(g, columns=['image', 'id', 'class',
-                                                   cfg['caption']]).to_pylist():
-                cap = (r[cfg['caption']] or '').strip()
+                                                   *_caption_cols(cfg)]).to_pylist():
+                cap = _caption_of(r, cfg)
                 if cap and _id_heldout(r['id']) and got < per:
                     items.append((clip_text(cap)[:_EVAL_MAXLEN], _decode_image(r),
                                   (r['id'], r['class'], cap)))
