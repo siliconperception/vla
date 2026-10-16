@@ -50,8 +50,9 @@ _ESCAPES = {'\n': '\\n', '\t': '\\t', '\r': '\\r'}
 _GEN_SAMPLE = 200           # tokens in each periodic GEN sample (--n is for --generate)
 _GENI_LEN = 100             # token cap on each GENI caption
 # Every example -- a text document or an image caption -- is <NUL> then its tokens: the first
-# step reads _NULL, "no token", a zero token grid (just as text rows read a zero image grid),
-# and predicts the first token; the state resets there. There are no START/END tokens, so the
+# step reads _NULL, a "blink": a zero token grid AND a zero image grid for every row, text or
+# image, and predicts the first token (so a caption's first token is predicted before its image
+# is seen). The state resets there unless --continuous covers the example's kind. There are no START/END tokens, so the
 # model never predicts the end of an example and generation is one continuous stream.
 _NULL = -1
 
@@ -807,8 +808,11 @@ class VLAModel(nn.Module, _HubMixin):
         tok = tok.masked_fill((idx < 0)[:, None], 0.0)      # _NULL: no token, a zero grid
         grids = [tok.view(B, self.c_text, 1, 1).expand(-1, -1, self.S, self.S)]
         if self.img_width:
-            grids.append(img if img is not None else
-                         tok.new_zeros(B, self.img_width, self.S, self.S))
+            if img is None:
+                img = tok.new_zeros(B, self.img_width, self.S, self.S)
+            else:      # <NUL> is a blink: no token AND no image, the registers carry on
+                img = img.masked_fill((idx < 0)[:, None, None, None], 0.0)
+            grids.append(img)
         return grids
 
     def _read(self, dff):
@@ -1206,9 +1210,8 @@ def worker(stop, q, datasets):
                 slot.load(steps)
                 if first and len(steps) > 1:
                     # Stagger: rows that all start together (step 0, a resume) all read <NUL> on
-                    # a zero state -- identical inputs (an image adds nothing through its
-                    # zero-initialized block), so BatchNorm divides by a zero variance and the
-                    # first update explodes (v402: grad 4e9, never recovered).
+                    # a zero state -- identical inputs (<NUL> blanks the image too), so
+                    # BatchNorm divides by a zero variance and the first update explodes (v402: grad 4e9, never recovered).
                     slot.pos = stagger.randrange(len(steps))
                 if img is not None:
                     new_imgs.append((r, img))
