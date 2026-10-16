@@ -49,6 +49,7 @@ _ESCAPES = {'\n': '\\n', '\t': '\\t', '\r': '\\r'}
 
 _GEN_SAMPLE = 200           # tokens in each periodic GEN sample (--n is for --generate)
 _GENI_LEN = 100             # token cap on each GENI caption
+_SAMPLE_CELLS = 10          # crop thumbnails in the TRAIN sample window (<NUL> + 9 tokens)
 # Every example -- a text document or an image caption -- is <NUL> then its tokens: the first
 # step reads _NULL, a "blink": a zero token grid AND a zero image grid for every row, text or
 # image, and predicts the first token (so a caption's first token is predicted before its image
@@ -474,10 +475,12 @@ def _viewer(inbox, stem, show, parent):
 
     def draw_sample(fig, step, img, name, crops, toks):
         """The full image and caption, then one cell per token: the 224x224 crop the model
-        saw at that step, labelled with the token it was reading."""
-        n = len(crops)
-        cols = max(1, min(n, math.ceil(math.sqrt(n * 2.2))))
-        rows = math.ceil(n / cols)
+        saw at that step, labelled with the token it was reading (the first _SAMPLE_CELLS)."""
+        n = len(toks)
+        crops = crops[:_SAMPLE_CELLS]
+        m = len(crops)
+        cols = max(1, min(m, math.ceil(math.sqrt(m * 2.2))))
+        rows = math.ceil(m / cols)
         gs = fig.add_gridspec(2, 2, height_ratios=[1, 2.6], width_ratios=[1, 2.4], left=0.01,
                               right=0.99, top=0.93, bottom=0.04, wspace=0.03, hspace=0.06)
         ax = fig.add_subplot(gs[0, 0])
