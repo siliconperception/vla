@@ -70,10 +70,12 @@ def _eval_minlen(corpus):
     return _EVAL_MINLEN_SHORT.get(corpus, _EVAL_MINLEN)
 
 
-# Image-caption corpora: a local directory of parquet files (see exp/img_prep.py) with an
-# encoded 'image', an 'id' and the caption column.
+# Image-caption corpora: a local directory of parquet files (see exp/img_prep.py,
+# exp/caption_prep.py) with an encoded 'image', an 'id', a 'class' and the caption column.
 _IMAGE_DATASETS = {
-    'imagenet21k': dict(dir='/data/imagenet21k_recap', caption='recaption'),
+    'imagenet21k': dict(dir='/data/imagenet21k_recap', caption='recaption'),   # synthetic
+    'redcaps':     dict(dir='/data/redcaps5m', caption='caption'),     # Reddit post titles
+    'coco':        dict(dir='/data/coco_captions', caption='caption'), # 5 human captions/image
 }
 
 _IMAGE_ENCODERS = {'resnet50': 'timm/resnet50.a1_in1k'}   # frozen; [3,224,224] -> [2048,7,7]
@@ -2203,11 +2205,11 @@ def _gen_lines(i):
                                  image=_eval_imgs[c][k])
             iid, cls, cap = _eval_meta[c][k]
             if k == logk:
-                lines.append(f'GENI step {i:10} [{iid} {cls.split(",")[0]}]: '
+                lines.append(f'GENI step {i:10} [{iid}{" " if cls else ""}{cls.split(",")[0]}]: '
                              f'{_render(prompt + out)}')
                 lines.append(f'REF  step {i:10} [{iid}]: {_printable(cap[:400])}')
             panel.append((_eval_imgs[c][k].permute(1, 2, 0).numpy(),
-                          f'{cls.split(",")[0]}  ({iid})', _decode_plain(out), cap))
+                          (f'{cls.split(",")[0]}  ({iid})' if cls else iid), _decode_plain(out), cap))
     if panel and _gen_inbox is not None and args.gen_vis:
         try:
             _gen_inbox.put_nowait(('gen', i, panel))
