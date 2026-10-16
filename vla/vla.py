@@ -2379,7 +2379,7 @@ try:
         model.dff = dff_prev
         model.eval()
         with torch.no_grad():
-            model(x, flag=flag, img=img)
+            model(x, flag=flag & ~_continuous_row, img=img)
 
         larr.append(loss.item())
         if carr:
