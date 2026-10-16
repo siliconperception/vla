@@ -9,11 +9,16 @@ image (encoded bytes), id, class, caption.
   coco     jxie/coco_captions: COCO 2014 (Karpathy train/val/test), one row per human caption,
            5 per image. id = coco<cocoid>, so vla.py's id-hash held-out split keeps all five
            captions of an image on the same side. class = ''.
+  wit      askoepke/wit_1m_recaptioned (wit_1m/, 100 x 10K rows): English Wikipedia images
+           (short side ~225 px) with BOTH captions: caption = the human Wikipedia caption
+           ('original_caption', median 7 words), gemini_caption = a dense Gemini description
+           (median ~480 words); also url. id = wit<shard>_<row>. class = ''.
 
 Resumable: finished outputs are skipped; a shard is written to .tmp and renamed when done.
 
     python exp/caption_prep.py redcaps --out /data/redcaps5m --workers 8
     python exp/caption_prep.py coco --out /data/coco_captions --workers 8
+    python exp/caption_prep.py wit --out /data/wit_1m_recap --workers 8
 """
 import argparse
 import concurrent.futures as cf
@@ -27,9 +32,13 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 from huggingface_hub import HfApi, HfFileSystem
 
-REPOS = {'redcaps': 'wusize/redcaps5m_resized', 'coco': 'jxie/coco_captions'}
+REPOS = {'redcaps': 'wusize/redcaps5m_resized', 'coco': 'jxie/coco_captions',
+         'wit': 'askoepke/wit_1m_recaptioned'}
 SCHEMA = pa.schema([('image', pa.binary()), ('id', pa.string()), ('class', pa.string()),
                     ('caption', pa.string())])
+SCHEMAS = {'redcaps': SCHEMA, 'coco': SCHEMA,
+           'wit': pa.schema(list(SCHEMA) + [('gemini_caption', pa.string()), ('url', pa.string())])}
+PREFIX = {'wit': 'wit_1m/'}       # only these repo files (wit: not the 1,024-row wit_1024/)
 GROUP = 100
 
 fs = None
@@ -63,6 +72,18 @@ def coco_rows(fh, i):
                 yield (im['bytes'] if isinstance(im, dict) else im), f"coco{r['cocoid']}", '', cap
 
 
+def wit_rows(fh, i):
+    pf = pq.ParquetFile(fh)
+    k = 0
+    for g in range(pf.metadata.num_row_groups):
+        for r in pf.read_row_group(g).to_pylist():
+            cap = (r['original_caption'] or '').strip()
+            gem = (r['gemini_caption'] or '').strip()
+            if r['image'] and (cap or gem):
+                yield r['image'], f'wit{i:03d}_{k:05d}', '', cap, gem, r['url'] or ''
+            k += 1
+
+
 def one(job):
     src, repo, i, fname, out = job
     global fs
@@ -71,21 +92,22 @@ def one(job):
     dst = os.path.join(out, f'train-{i:05d}.parquet')
     if os.path.exists(dst):
         return i, 0
-    gen = redcaps_rows if src == 'redcaps' else coco_rows
+    gen = {'redcaps': redcaps_rows, 'coco': coco_rows, 'wit': wit_rows}[src]
+    schema = SCHEMAS[src]
     for attempt in range(8):
         try:
             n, buf = 0, []
             with fs.open(f'datasets/{repo}/{fname}', block_size=8 << 20) as fh, \
-                    pq.ParquetWriter(dst + '.tmp', SCHEMA) as w:
+                    pq.ParquetWriter(dst + '.tmp', schema) as w:
                 for row in gen(fh, i):
                     buf.append(row)
                     if len(buf) == GROUP:
                         w.write_table(pa.Table.from_pylist(
-                            [dict(zip(SCHEMA.names, r)) for r in buf], SCHEMA), GROUP)
+                            [dict(zip(schema.names, r)) for r in buf], schema), GROUP)
                         n, buf = n + len(buf), []
                 if buf:
                     w.write_table(pa.Table.from_pylist(
-                        [dict(zip(SCHEMA.names, r)) for r in buf], SCHEMA), GROUP)
+                        [dict(zip(schema.names, r)) for r in buf], schema), GROUP)
                     n += len(buf)
             os.replace(dst + '.tmp', dst)
             return i, n
@@ -106,7 +128,7 @@ if __name__ == '__main__':
     os.makedirs(args.out, exist_ok=True)
     ext = '.tar' if args.source == 'redcaps' else '.parquet'
     files = sorted(s.rfilename for s in HfApi().dataset_info(repo).siblings
-                   if s.rfilename.endswith(ext))
+                   if s.rfilename.endswith(ext) and s.rfilename.startswith(PREFIX.get(args.source, '')))
     todo = [(args.source, repo, i, f, args.out) for i, f in enumerate(files)
             if not os.path.exists(os.path.join(args.out, f'train-{i:05d}.parquet'))]
     print(f'{repo}: {len(files)} shards, {len(files) - len(todo)} done, {len(todo)} to go',
