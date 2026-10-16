@@ -160,13 +160,15 @@ parser.add_argument('--dec_width',  default=256,  type=int, help='text decoder t
 parser.add_argument('--bn_momentum', default=0.1, type=float,
                     help='ContextCNN BatchNorm running-statistics momentum (0 = cumulative)')
 parser.add_argument('--init',       default='zero', choices=['zero', 'gaussian', 'relu'],
-                    help='DFF register value at every example start (see --carry)')
-parser.add_argument('--carry',      default='', metavar='KINDS',
-                    help='example kinds whose rows CARRY the DFF registers into the next example '
-                         'instead of resetting them to --init at its first (<NUL>) step: "text", '
-                         '"image" (captioned images) or "text,image"; default none, every example '
-                         'starts fresh. Training only: eval rows hold one example each and '
-                         'generation is a single stream')
+                    help='DFF register value at every example start (see --continuous)')
+parser.add_argument('--continuous', '--carry', dest='continuous', default='', metavar='KINDS',
+                    help='example kinds whose rows run CONTINUOUSLY: the DFF registers flow on into '
+                         'the next example instead of resetting to --init at its first (<NUL>) '
+                         'step -- the regime of continuous inference and training in an embodied '
+                         'agent, which never gets a reset. "text", "image" (captioned images) or '
+                         '"text,image"; default none, every example starts fresh. Training only: '
+                         'eval rows hold one example each and generation is a single stream. '
+                         '(--carry is the old name, kept so running jobs can restart)')
 parser.add_argument('--image_encoder', default=None, choices=['none'] + sorted(_IMAGE_ENCODERS),
                     help='frozen image encoder whose feature map joins the input concat; '
                          'default: resnet50 if --mix or --eval_corpora names an image corpus, '
@@ -270,9 +272,9 @@ parser.add_argument('--revision',   default=None, help='--pretrained: branch, ta
 parser.add_argument('--verbose',    default=False, action='store_true',
                     help='print the model graph and parameter table in one-shot modes too')
 args = parser.parse_args()
-_carry = {k.strip() for k in args.carry.split(',') if k.strip()}    # example kinds, --carry
-if _carry - {'text', 'image'}:
-    raise SystemExit(f'--carry {args.carry}: kinds are text and image')
+_continuous = {k.strip() for k in args.continuous.split(',') if k.strip()}   # example kinds
+if _continuous - {'text', 'image'}:
+    raise SystemExit(f'--continuous {args.continuous}: kinds are text and image')
 
 _ONESHOT = args.generate or args.eval or args.vis or args.push
 
@@ -1715,7 +1717,7 @@ def _score(step, corpus, docs, imgs=None, tag=None):
     """EVAL (clean / median / runaway%) and EVALB (loss by frequency band) lines, tagged
     `tag` (default corpus). imgs: one image per doc, seen through a fresh random crop every
     token from a fixed-seed generator, so successive evals see the same crops.
-    Every row starts from zeroed registers, whatever --carry says."""
+    Every row starts from zeroed registers, whatever --continuous says."""
     tag = tag or corpus
     t0 = time.time()
     dev = next(model.parameters()).device
@@ -2152,8 +2154,8 @@ for _n, _k in _MIX:
     _rows_of.setdefault(_n, []).extend(range(_r, _r + _k))
     _r += _k
 _text_names = [n for n in _rows_of if n not in _IMAGE_DATASETS]
-# --carry: rows whose example kind keeps its registers across example boundaries
-_carry_row = torch.tensor([('image' if n in _IMAGE_DATASETS else 'text') in _carry
+# --continuous: rows whose example kind keeps its registers across example boundaries
+_continuous_row = torch.tensor([('image' if n in _IMAGE_DATASETS else 'text') in _continuous
                            for n, k in _MIX for _ in range(k)], device=args.device)
 
 
@@ -2338,7 +2340,7 @@ try:
 
         dff_prev = model.dff
         model.train()
-        logits, loss = model(x, targets=y, flag=flag & ~_carry_row, img=img)
+        logits, loss = model(x, targets=y, flag=flag & ~_continuous_row, img=img)
         if not torch.isfinite(loss):         # keep the last good checkpoint on disk
             print(f'\n*** HALT: non-finite loss at step {i}: {loss.item()} dff_max '
                   f'{float(model.dff.abs().max())} logit_max {float(logits.detach().abs().max())}')
