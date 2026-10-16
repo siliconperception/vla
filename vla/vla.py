@@ -234,7 +234,6 @@ parser.add_argument('--eval_interval', default=20000, type=int,
                     help='held-out EVAL every N steps (0 = off)')
 parser.add_argument('--eval_corpora', default=None, help='comma-separated; default --dataset')
 parser.add_argument('--eval_docs',  default=400,  type=int, help='held-out documents per corpus')
-parser.add_argument('--eval_warm',  default=0, type=int, help=argparse.SUPPRESS)  # removed; accepted so old command lines still parse
 parser.add_argument('--eval_bands', default='1024,8192', metavar='R1,R2,...',
                     help='EVALB: held-out loss split by target-token frequency rank ("" = off)')
 parser.add_argument('--eval_info',  default=0,    type=int, metavar='N',
