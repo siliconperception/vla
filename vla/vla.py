@@ -2289,7 +2289,8 @@ def _record_sample(i, x_list, flag_list, views):
             return
         h, w = int(img_hw[j, 0]), int(img_hw[j, 1])
         _sample['rec'] = {'step': i, 'img': _thumb(img_bank[j, :, :h, :w], 360),
-                          'name': _img_name.get(j, ''), 'crops': [], 'toks': []}
+                          'name': f"{_img_name.get(j, '')}   {h}x{w} px",     # cropped from
+                          'crops': [], 'toks': []}
     rec = _sample['rec']
     if rec is not None and len(rec['crops']) < 160:
         crop = ((views[j] * _IMG_STD_T + _IMG_MEAN_T) * 255.0).clamp(0, 255)
