@@ -2381,7 +2381,7 @@ try:
                              np.mean(garr[-args.monitor:]), optimizer.param_groups[0]['lr'],
                              flat.mean().item(), flat.std().item(), flat.abs().max().item())
             line += _ex_ep()
-            line += ''.join(f' loss_{n} {np.mean(a[-args.monitor:]):12.9f}' for n, a in carr.items())
+            line += ''.join(f' loss_{n} {np.mean(a[-args.monitor:]):6.3f}' for n, a in carr.items())
             _emit(line)
             del larr[:-args.monitor], garr[:-args.monitor]   # keep host RAM flat
             for a in carr.values():
