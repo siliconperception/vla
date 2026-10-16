@@ -83,7 +83,7 @@ _IMAGE_DATASETS = {
     'wit':         dict(dir='/data/wit_1m_recap', caption=('caption', 'gemini_caption')),
     # wit filtered (exp/wit_score.py, exp/wit_filter.py): fineweb-edu classifier >= 2.5 on
     # the example text AND CLIP ViT-L/14 image-vs-human-caption >= 0.25
-    'witq':        dict(dir='/data/wit_1m_edu', caption=('caption', 'gemini_caption')),
+    'witq':        dict(dir='/data/witq', caption=('caption', 'gemini_caption')),
 }
 
 

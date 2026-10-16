@@ -6,7 +6,7 @@ groups of 100, all columns, ids unchanged so vla.py's id-hash held-out split is 
     edu  >= --min_edu   (fineweb-edu classifier on caption + Gemini description)
     clip >= --min_clip  (CLIP ViT-L/14 image vs human caption; rows without one are dropped)
 
-    python exp/wit_filter.py --min_edu 2.5 --min_clip 0.25 --out /data/wit_1m_edu
+    python exp/wit_filter.py --min_edu 2.5 --min_clip 0.25 --out /data/witq
 """
 import argparse
 import os
