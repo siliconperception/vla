@@ -371,6 +371,11 @@ parser.add_argument('--min_p',      default=None, type=float, metavar='P',
                     help='sample only words with at least P x the top word\'s probability: in '
                          'generation and for --inner_voice\'s own tokens in training and eval '
                          '(0 = the full distribution). Saved and restored like --clock_hz')
+parser.add_argument('--voice_drop', default=None, type=float, metavar='P',
+                    help='--inner_voice: on a random P of silent ticks the model\'s own word is '
+                         'not fed back (the input stays _PAD, no word) -- in training, eval, '
+                         'video generation and the live player, where a dropped word is not '
+                         'shown. Saved and restored like --clock_hz')
 parser.add_argument('--fluency_target', default=0.0, type=float, metavar='PCT',
                     help='with --gen_score and --min_p: after each GEN sample from <NUL>, move '
                          '--min_p so its GENSCORE fluency averages PCT (above it: the text is '
@@ -493,12 +498,13 @@ if args.load:
     _start_step = int(_loaded_ckpt.get('step', 0))
     _start_exs = int(_loaded_ckpt.get('examples', 0))
     _start_exs_by = dict(_loaded_ckpt.get('examples_by', {}))
-    for k in ('clock_hz', 'ctx_tau', 'vision_hz', 'inner_voice', 'min_p'):     # restored unless given
+    for k in ('clock_hz', 'ctx_tau', 'vision_hz', 'inner_voice', 'min_p', 'voice_drop'):     # restored unless given
         if getattr(args, k) is None:
             setattr(args, k, _saved.get(k))
 args.clock_hz = float(args.clock_hz or 0)
 args.inner_voice = bool(args.inner_voice)
 args.min_p = float(args.min_p or 0)
+args.voice_drop = float(args.voice_drop or 0)
 if args.inner_voice and not args.clock_hz:
     raise SystemExit('--inner_voice needs --clock_hz')
 if args.ctx_tau:
@@ -1304,9 +1310,15 @@ class VLAModel(nn.Module, _HubMixin):
             logits, dff = feed(b, dff)
             if logits is None:
                 return out
-        while len(out) < n_tokens:
+        drop = args.voice_drop if args.inner_voice and video is not None else 0.0
+        for _ in range(n_tokens):                 # one tick each
             prob = F.softmax(logits[0] / max(temperature, 1e-6), dim=-1)
             b = torch.multinomial(_min_p(prob), 1).item()
+            if drop and random.random() < drop:   # --voice_drop: not said, not fed back
+                logits, dff = feed(_PAD, dff)
+                if logits is None:
+                    return out
+                continue
             out.append(b)
             if stop_chars and b != _NUL_ID and len(_decode_plain(out)) >= stop_chars:
                 return out
@@ -2363,8 +2375,9 @@ def _video_live():
                         else:
                             prob = F.softmax(logits[0] / max(args.temperature, 1e-6), dim=-1)
                             b = torch.multinomial(_min_p(prob), 1).item()
-                            if b == _NUL_ID:            # --clock_hz: nothing said this tick
-                                b = _PAD
+                            if b == _NUL_ID or (args.inner_voice and args.voice_drop and
+                                                random.random() < args.voice_drop):
+                                b = _PAD                # nothing said this tick
                             else:
                                 gen_ids.append(b)
                         img, aud = clip.grids(model, [clip.at(pos)], dev)
@@ -2787,7 +2800,10 @@ def _score(step, corpus, docs, imgs=None, tag=None, clips=None):
                             [v.ai[min(t, last[r])] for r, v in enumerate(cb)], device=dev))
                 xt = X[:, t]
                 if args.inner_voice and own is not None:   # after a silent tick: its own token
-                    xt = torch.where(xt == _PAD, own, xt)
+                    fb = xt == _PAD
+                    if args.voice_drop:
+                        fb &= torch.rand(xt.shape, device=dev, generator=gen) >= args.voice_drop
+                    xt = torch.where(fb, own, xt)
                 logits, _ = model(xt, img=img, aud=aud)
                 if args.inner_voice:
                     own = torch.multinomial(_min_p(F.softmax(logits.float(), dim=-1)), 1,
@@ -3742,10 +3758,11 @@ try:
         dff_prev = model.dff
         model.train()
         if args.inner_voice:         # after a silent tick the input is the model's own token
-            if _own is not None:
-                x = torch.where(x == _PAD, _own, x)
-            elif (x == _PAD).any():
-                x = torch.where(x == _PAD, torch.zeros_like(x), x)   # (a resumed run's first step)
+            if _own is not None:     # (none at a resumed run's first step: _PAD stays)
+                fb = x == _PAD
+                if args.voice_drop:  # --voice_drop: some silent ticks keep _PAD (no word)
+                    fb &= torch.rand(x.shape, device=x.device) >= args.voice_drop
+                x = torch.where(fb, _own, x)
         logits, _ = model(x, flag=flag & ~_continuous_row, img=img, aud=aud)
         ce_all = F.cross_entropy(logits, y, reduction='none')
         if args.inner_voice:
