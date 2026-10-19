@@ -50,7 +50,7 @@ NUL_TEXT = '<NUL>'          # how _NULL renders where it is named (GEN prompts, 
 DOT_TEXT = '\xb7'           # how any other unprintable character renders
 _ESCAPES = {'\n': '\\n', '\t': '\\t', '\r': '\\r'}
 
-_GEN_SAMPLE = 200           # tokens in each periodic GEN sample (--n is for --generate)
+_GEN_SAMPLE = 300           # tokens in each periodic GEN sample (--n is for --generate)
 _GENI_LEN = 100             # token cap on each GENI caption
 _SAMPLE_CELLS = 10          # crop thumbnails in the TRAIN sample window (<NUL> + 9 tokens)
 # Every example -- a text document or an image caption -- is <NUL> then its tokens: the first
@@ -59,6 +59,12 @@ _SAMPLE_CELLS = 10          # crop thumbnails in the TRAIN sample window (<NUL> 
 # is seen). The state resets there unless --continuous covers the example's kind. There are no START/END tokens, so the
 # model never predicts the end of an example and generation is one continuous stream.
 _NULL = -1
+_PAD = -2                    # --clock_hz: a tick where nothing was said -- no token (a zero token
+                             # grid) but, unlike the _NULL blink, the picture and sound stay on
+_NUL_ID = None               # --clock_hz: the output id of <NUL> (the tokenizer's first unused
+                             # embedding row), bound when the model is built; None = no <NUL> head
+_SIL = None                  # --clock_hz: the target of a tick where nothing was said -- _NUL_ID
+                             # with a <NUL> head, else -100 (--inner_voice: no loss on that tick)
 
 # Held-out eval protocol constants (exp/score.py and PLAN.txt's reference table use the same
 # selection). Pinned, not exposed: changing one makes EVAL lines incomparable with history.
@@ -122,6 +128,8 @@ _VIDEO_DATASETS = {
 }                           # valor: deprecated 2026-10-17 (25k short clips, over-repeated)
 _VID_EVAL_CLIPS = 64        # held-out videos per video eval corpus (decoded frames stay in RAM) ...
 _VID_EVAL_MAXLEN = 512      # ... each its opening window of at most this many tokens
+_VID_EVAL_SPAN = 120.0      # ... (--clock_hz: of at most this many seconds)
+_VID_EVAL_MINTOK = 20       # ... with at least this many caption tokens
 _VID_MAXTOK = 2048          # a longer video example is a random window of whole events ...
 _VID_MAXSPAN = 600.0        # ... that also spans at most this many seconds of media
 _AUD_RATE = 12.5            # Mimi frames per second
@@ -171,9 +179,17 @@ def _printable(s):
 
 
 def _decode_plain(ids):
-    """Token ids -> plain text, _NULL dropped (what a judge LM reads)."""
-    body = [t for t in ids if t >= 0]
+    """Token ids -> plain text, _NULL / _PAD / <NUL> dropped (what a judge LM reads)."""
+    body = [t for t in ids if t >= 0 and t != _NUL_ID]
     return _tokenizer.decode(body) if body else ''
+
+
+def _min_p(prob):
+    """--min_p: zero every word below min_p x the most likely word's probability (sampling
+    from the rest; torch.multinomial renormalizes)."""
+    if args.min_p:
+        prob = prob * (prob >= args.min_p * prob.max(dim=-1, keepdim=True).values)
+    return prob
 
 
 def _render(ids):
@@ -281,7 +297,9 @@ parser.add_argument('--device',     default=None)
 # checkpoint / log
 parser.add_argument('--load',       default=None, help='resume from a checkpoint')
 parser.add_argument('--save',       default='checkpoint.pt')
-parser.add_argument('--checkpoint', default=4000, type=int, help='save every N steps')
+parser.add_argument('--checkpoint', default=None, type=int,
+                    help='save every N steps (default: --eval_interval, so every EVAL describes '
+                         'weights on disk; 4000 without eval)')
 parser.add_argument('--log',        default=None)
 parser.add_argument('--monitor',    default=100,  type=int, help='STEP line every N steps')
 # periodic generation
@@ -326,6 +344,40 @@ parser.add_argument('--eval_reach_period', default=256, type=int, metavar='P')
 parser.add_argument('--generate',   default=False, action='store_true',
                     help='load, generate --n tokens from <NUL>+--prompt, print, exit')
 parser.add_argument('--n',          default=200,  type=int, help='--generate length')
+parser.add_argument('--clock_hz',   default=None, type=float, metavar='R',
+                    help='video corpora run on a fixed clock: one step per 1/R s tick, the '
+                         'target a caption token or <NUL> (0 / unset: one step per caption '
+                         'token). Saved with the checkpoint and restored unless given')
+parser.add_argument('--ctx_tau',    default=None, metavar='SECONDS',
+                    help='--clock_hz: register windows in seconds for all but the last '
+                         '(plain-copy) register, e.g. 64,16,4,1 -> --ctx_ema of tau*R...,1; '
+                         'saved and restored like --clock_hz')
+parser.add_argument('--vision_hz',  default=None, type=float, metavar='V',
+                    help='--clock_hz: the picture refreshes at V Hz and is held in between '
+                         '(default: every stored frame; FineVideo frames are stored at 2 fps, so '
+                         'training cannot refresh faster than that). Saved and restored')
+parser.add_argument('--max_lag',    default=2.0, type=float, metavar='S',
+                    help='--clock_hz: caption tokens wait in a FIFO for free ticks; an activity '
+                         'line that would start more than S seconds late is dropped (speech is '
+                         'never dropped)')
+parser.add_argument('--nul_weight', default=0.2, type=float,
+                    help='--clock_hz: loss weight of <NUL> targets (caption tokens weigh 1)')
+parser.add_argument('--inner_voice', default=None, action='store_true',
+                    help='--clock_hz without <NUL>: a tick with no caption token has no target '
+                         '(no loss) and the model\'s own sampled token from it is the next '
+                         'input, so the text free-runs between captions as at inference. Saved '
+                         'and restored like --clock_hz')
+parser.add_argument('--min_p',      default=None, type=float, metavar='P',
+                    help='sample only words with at least P x the top word\'s probability: in '
+                         'generation and for --inner_voice\'s own tokens in training and eval '
+                         '(0 = the full distribution). Saved and restored like --clock_hz')
+parser.add_argument('--fluency_target', default=0.0, type=float, metavar='PCT',
+                    help='with --gen_score and --min_p: after each GEN sample from <NUL>, move '
+                         '--min_p so its GENSCORE fluency averages PCT (above it: the text is '
+                         'too predictable, lower --min_p; below: raise it). 0 = fixed --min_p')
+parser.add_argument('--fluency_gain', default=0.5, type=float, metavar='G',
+                    help='--fluency_target: log(min_p) moves by G x (target - fluency)/100 per '
+                         'GEN sample')
 parser.add_argument('--video',      default=None, metavar='FILE|eval',
                     help='--generate: play FILE live in a window with its sound while the model '
                          'captions it from <NUL>+--prompt, looping with a <NUL> between plays; '
@@ -359,6 +411,8 @@ parser.add_argument('--revision',   default=None, help='--pretrained: branch, ta
 parser.add_argument('--verbose',    default=False, action='store_true',
                     help='print the model graph and parameter table in one-shot modes too')
 args = parser.parse_args()
+if args.checkpoint is None:
+    args.checkpoint = args.eval_interval or 4000
 _continuous = {k.strip() for k in args.continuous.split(',') if k.strip()}   # example kinds
 if _continuous - {'text', 'image', 'video'}:
     raise SystemExit(f'--continuous {args.continuous}: kinds are text, image and video')
@@ -439,6 +493,19 @@ if args.load:
     _start_step = int(_loaded_ckpt.get('step', 0))
     _start_exs = int(_loaded_ckpt.get('examples', 0))
     _start_exs_by = dict(_loaded_ckpt.get('examples_by', {}))
+    for k in ('clock_hz', 'ctx_tau', 'vision_hz', 'inner_voice', 'min_p'):     # restored unless given
+        if getattr(args, k) is None:
+            setattr(args, k, _saved.get(k))
+args.clock_hz = float(args.clock_hz or 0)
+args.inner_voice = bool(args.inner_voice)
+args.min_p = float(args.min_p or 0)
+if args.inner_voice and not args.clock_hz:
+    raise SystemExit('--inner_voice needs --clock_hz')
+if args.ctx_tau:
+    if not args.clock_hz:
+        raise SystemExit('--ctx_tau needs --clock_hz')
+    args.ctx_ema = ','.join(f'{float(t) * args.clock_hz:g}' for t in str(args.ctx_tau).split(',')
+                            if t.strip()) + ',1'
 
 
 def _upgrade_state_dict(sd):
@@ -669,7 +736,7 @@ def _viewer(inbox, stem, show, parent):
                          family='monospace', pad=2)
             ax.set_xlabel(f't={t:.1f}s', fontsize=8, labelpad=1, color='0.7')
         spec_ax(fig.add_subplot(gs[2]), spec, ext, [c[1] for c in cells])
-        fig.suptitle(f'TRAIN video step {step}   {name}   {n} tokens   {args.log}',
+        fig.suptitle(f'TRAIN video step {step}   {name}   {n}   {args.log}',
                      family='monospace', fontsize=8)
 
     draw = {'gen': draw_gen, 'sample': draw_sample, 'imagine': draw_imagine,
@@ -745,7 +812,7 @@ class TextDecoder(nn.Module):
     shrinks the grid, the last conv maps to the embedding width, whatever grid remains is
     average-pooled, and the borrowed (frozen) lm_head produces the logits."""
 
-    def __init__(self, c_in, S, kernels, width, lmhead):
+    def __init__(self, c_in, S, kernels, width, lmhead, nul_id=None):
         super().__init__()
         red = sum(k - 1 for k in kernels)
         if not kernels or min(kernels) < 1 or red > S - 1:
@@ -757,11 +824,26 @@ class TextDecoder(nn.Module):
                                   for i, k in enumerate(kernels[:-1]))
         self.pool = nn.AvgPool2d(S - red) if S - red > 1 else nn.Identity()
         self.lmhead = lmhead
+        # --clock_hz: <NUL> is the first embedding row the tokenizer never uses. Those rows of
+        # the frozen lm_head were never trained, so its logit gets its own trainable head and
+        # the other unused rows are masked off.
+        self.nul_id = nul_id
+        if nul_id is not None:
+            self.nul = nn.Linear(lmhead.in_features, 1)
+            nn.init.zeros_(self.nul.weight)
+            nn.init.zeros_(self.nul.bias)
 
     def forward(self, x):
         for conv in self.tree:
             x = conv(x)
-        return self.lmhead(self.pool(self.proj(x)).squeeze(-1).squeeze(-1))
+        h = self.pool(self.proj(x)).squeeze(-1).squeeze(-1)
+        logits = self.lmhead(h)
+        if self.nul_id is not None:
+            k = self.nul_id
+            logits = torch.cat([logits[:, :k], self.nul(h).to(logits.dtype),
+                                logits.new_full((logits.shape[0], logits.shape[1] - k - 1), -1e4)],
+                               dim=1)
+        return logits
 
 
 class ImageEncoder(nn.Module):
@@ -912,6 +994,7 @@ class _VideoClip:
         self.frames, self.lat, self.codes, self.fi, self.ai = frames, lat, codes, fi, ai
         self.fps, self.t0, self.rate, self.meta = fps, t0, rate, meta
         self.see, self.hear = see, hear
+        self.phase = 0.0 if args.clock_hz else 0.5     # tick k at t0 + k/R; token k mid-slot
 
     def variant(self, see, hear):
         v = copy.copy(self)
@@ -920,7 +1003,7 @@ class _VideoClip:
 
     def at(self, k):
         """(fi, ai) for generation step k: the media time of the k-th token at self.rate."""
-        t = self.t0 + (k + 0.5) / max(self.rate, 1e-6)
+        t = self.t0 + (k + self.phase) / max(self.rate, 1e-6)
         fi = min(self.frames.shape[0] - 1, max(0, int((t - self.t0) * self.fps)))
         return fi, min(self.lat.shape[1], int((t - self.t0) * _AUD_RATE) + self.ai[0])
 
@@ -1021,7 +1104,7 @@ class VLAModel(nn.Module, _HubMixin):
     def __init__(self, S=8, n_hidden=512, c_context=384, depth=8, kernel=3,
                  tokenizer='pythia31m', windows=(256, 64, 16, 4, 1), read_norm=1.0,
                  dec_kernels=(3, 3, 3), dec_width=256, bn_momentum=0.1, init='zero',
-                 image_encoder='none', audio_encoder='none'):
+                 image_encoder='none', audio_encoder='none', nul_head=False):
         super().__init__()
         from transformers import AutoModelForCausalLM
         repo = _TOKENIZERS[tokenizer]
@@ -1038,8 +1121,10 @@ class VLAModel(nn.Module, _HubMixin):
 
         self.tok_embed = lm.get_input_embeddings()                      # frozen
         self.context = ContextCNN(c_context, depth, kernel, bn_momentum)
+        self.nul_id = len(self.tok.tok) if nul_head and len(self.tok.tok) < self.vocab else None
         self.text_dec = TextDecoder(n_hidden, S, list(dec_kernels), dec_width,
-                                    lm.get_output_embeddings())         # lm_head frozen
+                                    lm.get_output_embeddings(),         # lm_head frozen
+                                    nul_id=self.nul_id)
         for p in self.pretrained_params():
             p.requires_grad_(False)
 
@@ -1121,19 +1206,19 @@ class VLAModel(nn.Module, _HubMixin):
         B = idx.shape[0]
         tok = self.tok_embed(idx.clamp(min=0))
         tok = tok * torch.rsqrt(tok.pow(2).mean(dim=1, keepdim=True) + 1e-12)
-        tok = tok.masked_fill((idx < 0)[:, None], 0.0)      # _NULL: no token, a zero grid
+        tok = tok.masked_fill((idx < 0)[:, None], 0.0)      # _NULL / _PAD: a zero token grid
         grids = [tok.view(B, self.c_text, 1, 1).expand(-1, -1, self.S, self.S)]
         if self.img_width:
             if img is None:
                 img = tok.new_zeros(B, self.img_width, self.S, self.S)
             else:      # <NUL> is a blink: no token AND no image, the registers carry on
-                img = img.masked_fill((idx < 0)[:, None, None, None], 0.0)
+                img = img.masked_fill((idx == _NULL)[:, None, None, None], 0.0)
             grids.append(img)
         if self.aud_width:
             if aud is None:
                 aud = tok.new_zeros(B, self.aud_width, self.S, self.S)
-            else:      # ... and no sound
-                aud = aud.masked_fill((idx < 0)[:, None, None, None], 0.0)
+            else:      # ... and no sound (a _PAD tick keeps both)
+                aud = aud.masked_fill((idx == _NULL)[:, None, None, None], 0.0)
             grids.append(aud)
         return grids
 
@@ -1188,12 +1273,14 @@ class VLAModel(nn.Module, _HubMixin):
         return logits, loss
 
     @torch.no_grad()
-    def generate(self, prompt_ids, n_tokens, temperature=1.0, image=None, video=None):
+    def generate(self, prompt_ids, n_tokens, temperature=1.0, image=None, video=None,
+                 stop_chars=None):
         """Sample n_tokens after prompt_ids (opened with _NULL, see _prompt_ids) on a private
         state; short only on NaN/Inf. image: uint8 [3, h, w], seen through a fresh random
         224x224 crop every token (as in training); None = text-only. video: a _VideoClip,
         played at its own token rate (see _VideoClip.at); its frames and/or sound may be
-        None (blind / deaf)."""
+        None (blind / deaf). stop_chars: stop early once the text (<NUL> dropped) is that
+        many characters long."""
         self.eval()
         dev = next(self.parameters()).device
         bank = _bank([image], dev) if image is not None else None
@@ -1219,9 +1306,11 @@ class VLAModel(nn.Module, _HubMixin):
                 return out
         while len(out) < n_tokens:
             prob = F.softmax(logits[0] / max(temperature, 1e-6), dim=-1)
-            b = torch.multinomial(prob, 1).item()
+            b = torch.multinomial(_min_p(prob), 1).item()
             out.append(b)
-            logits, dff = feed(b, dff)
+            if stop_chars and b != _NUL_ID and len(_decode_plain(out)) >= stop_chars:
+                return out
+            logits, dff = feed(_PAD if b == _NUL_ID else b, dff)
             if logits is None:
                 return out
         return out
@@ -1447,6 +1536,60 @@ def _timed_tokens(ev, toks, k0=0, maxtok=1 << 30, maxspan=math.inf):
     return ids[:maxtok], times[:maxtok]
 
 
+def _clocked_example(row, rng=None, maxspan=_VID_MAXSPAN):
+    """--clock_hz R: a video row -> (text, media) with one step per tick of 1/R s over a window
+    of at most maxspan seconds (the whole video, or from a random event's start with rng).
+    Caption tokens are scheduled as in _video_example (speech where just heard, an activity
+    line at its start) and wait in a FIFO for the first free tick at or after that time; an
+    activity line that would start more than --max_lag s late is dropped. Every other tick's
+    target is <NUL>. Step k's input is the previous target (_PAD after a <NUL>, the _NULL
+    blink at k = 0) and it sees the frame on screen and the Mimi frames heard at t0 + k/R."""
+    R, frames = args.clock_hz, row['frames']
+    if not frames:
+        return None
+    fps = float(row['fps'])
+    codes = np.frombuffer(row['codes'], dtype='<i2').reshape(32, -1)
+    ev = _video_events(row)
+    dur = float(row.get('duration') or 0) or len(frames) / fps
+    ta = 0.0
+    if rng is not None and dur > maxspan and ev:
+        ta = max(0.0, min(ev[rng.randrange(len(ev))][0], dur - maxspan))
+    tb = min(dur, ta + maxspan)
+    n = int((tb - ta) * R)
+    if n < 2:
+        return None
+    tgt, nxt, dropped = [_SIL] * n, 0, 0
+    for (s, e, kind, _), tk in zip(ev, _event_tokens(ev)):
+        if not ta <= s < tb:
+            continue
+        if kind != 'say' and ta + nxt / R - s > args.max_lag:
+            dropped += len(tk)
+            continue
+        for m in range(len(tk)):
+            t = s + (e - s) * (m + 1) / len(tk) if kind == 'say' else s
+            k = max(math.ceil((t - ta) * R - 1e-9), nxt)
+            if k >= n:
+                break
+            tgt[k], nxt = tk[m], k + 1
+    ids = [y for y in tgt if y != _SIL]
+    if not ids:
+        return None
+    V = min(args.vision_hz or fps, fps)      # picture refresh: held between refreshes
+    fabs = [min(len(frames) - 1, int(math.floor((ta + k / R) * V + 1e-9) / V * fps + 1e-9))
+            for k in range(n)]
+    aabs = [min(codes.shape[1], int((ta + k / R) * _AUD_RATE)) for k in range(n)]
+    f0, a0 = fabs[0], max(0, aabs[0] - 64)
+    xs = [_NULL] + [_PAD if y == _SIL else y for y in tgt[:-1]]
+    text = _tokenizer.decode(ids)
+    media = dict(jpegs=frames[f0:max(fabs) + 1], codes=np.ascontiguousarray(codes[:, a0:max(aabs)]),
+                 off=rng.random() if rng is not None else 0.5,     # crop offset, per example
+                 fi=[f - f0 for f in fabs], ai=[a - a0 for a in aabs], fps=fps,
+                 t0=ta, t1=tb, text=text, n=n, f0=f0, a0=a0, clock=R, dropped=dropped,
+                 name=f'{row["id"]}  {row.get("category") or ""}'.strip(),
+                 steps=list(zip(xs, tgt)))
+    return text, media
+
+
 def _video_example(row, rng=None, maxtok=_VID_MAXTOK, maxspan=_VID_MAXSPAN):
     """A video row -> (text, steps, media) for one token-clocked example. Events become lines
     of text in time order (speech segments in double quotes); a video longer than maxtok
@@ -1459,6 +1602,8 @@ def _video_example(row, rng=None, maxtok=_VID_MAXTOK, maxspan=_VID_MAXSPAN):
     sees the frame on screen and the Mimi frames heard by that time. media: the window's JPEG
     frames and codes plus, per step, fi (frame index into them) and ai (Mimi frames heard,
     relative to the codes kept)."""
+    if args.clock_hz:
+        return _clocked_example(row, rng, maxspan)
     ev = _video_events(row)
     if not ev:
         return None
@@ -1741,11 +1886,25 @@ else:
                      read_norm=args.ctx_read_norm,
                      dec_kernels=[int(k) for k in str(args.dec_tree_kernels).split(',') if k.strip()],
                      dec_width=args.dec_width, bn_momentum=args.bn_momentum, init=args.init,
-                     image_encoder=args.image_encoder, audio_encoder=args.audio_encoder)
+                     image_encoder=args.image_encoder, audio_encoder=args.audio_encoder,
+                     nul_head=not args.inner_voice and (
+                         bool(args.clock_hz) or (_loaded_ckpt is not None and
+                                                 'text_dec.nul.weight' in _loaded_ckpt['state_dict'])))
     if _loaded_ckpt is not None:
-        model.load_state_dict(_upgrade_state_dict(_loaded_ckpt['state_dict']))
+        missing, unexpected = model.load_state_dict(_upgrade_state_dict(_loaded_ckpt['state_dict']),
+                                                    strict=False)
+        bad = [k for k in missing if not k.startswith('text_dec.nul.')] + \
+              [k for k in unexpected if not (args.inner_voice and k.startswith('text_dec.nul.'))]
+        if bad:
+            raise SystemExit(f'{args.load} does not fit this model: {bad[:6]}')
+        if missing:
+            print('text_dec.nul (the <NUL> logit) is new: zero-initialized', flush=True)
+        if unexpected:
+            print('--inner_voice: the checkpoint\'s <NUL> logit (text_dec.nul) is dropped', flush=True)
 model = model.to(args.device)
 _tokenizer = model.tok
+_NUL_ID = model.nul_id
+_SIL = _NUL_ID if _NUL_ID is not None else -100
 
 
 def _model_graph(model):
@@ -1884,6 +2043,7 @@ class _GenScorer:
         self.repo, self.ref, self.tok = repo, None, None
         self.floor = self.ceil = None
         self.failed = False
+        self.pct = None             # the last score()'s fluency (%), None if it had none
 
     def _load(self):
         if self.ref is not None or self.failed:
@@ -1932,6 +2092,7 @@ class _GenScorer:
 
     def score(self, text):
         """-> 'nats 4.812 fluency 63% rep1 0.07', or '' if unavailable."""
+        self.pct = None
         self._load()
         text = text.strip()
         if self.failed or len(text) < 16:
@@ -1944,6 +2105,7 @@ class _GenScorer:
         if not self._anchor():
             return f'nats {n:.3f} fluency n/a (no anchors yet) rep1 {rep1:.2f}'
         pct = 100.0 * (self.ceil - n) / (self.ceil - self.floor)
+        self.pct = pct
         return f'nats {n:.3f} fluency {max(-999.0, min(999.0, pct)):.0f}% rep1 {rep1:.2f}'
 
 
@@ -1996,10 +2158,10 @@ def _ff_audio(path, rate, ch):
     return np.frombuffer(a, np.float32).reshape(-1, ch)
 
 
-def _ff_frames2(path):
-    """The model's view of a video file: 2 fps frames, short side 224, centre crops, uint8
-    [F, 3, 224, 224] (as exp/video_prep.py stores them and _build_video_eval crops them)."""
-    vf = "fps=2,scale='if(gt(iw,ih),-2,224)':'if(gt(iw,ih),224,-2)'"
+def _ff_frames2(path, fps=2.0):
+    """The model's view of a video file: frames at `fps` (2, as exp/video_prep.py stores
+    them, unless --vision_hz), short side 224, centre crops, uint8 [F, 3, 224, 224]."""
+    vf = f"fps={fps:g},scale='if(gt(iw,ih),-2,224)':'if(gt(iw,ih),224,-2)'"
     r = subprocess.run(['ffmpeg', '-nostdin', '-v', 'error', '-i', path, '-an', '-vf', vf,
                         '-q:v', '3', '-f', 'image2pipe', '-c:v', 'mjpeg', '-'],
                        capture_output=True, stdin=subprocess.DEVNULL).stdout
@@ -2087,21 +2249,29 @@ def _video_live():
         frames = torch.stack([_crop224(im) for im in _decode_jpegs(jp, 'cpu')])
         codes = torch.from_numpy(np.frombuffer(row['codes'], '<i2').reshape(32, -1).copy())
         dur = float(row['duration'])
-        ref_ids, ref_times = _timed_tokens(_video_events(row), _event_tokens(_video_events(row)))
-        rate = len(ref_ids) / max(dur, 1e-3)
+        if args.clock_hz:        # the reference as training places it: tokens on free ticks
+            ys = [y for _, y in _clocked_example(row, None, math.inf)[1]['steps']]
+            at = [k for k, y in enumerate(ys) if y != _SIL]
+            ref_ids, ref_times = [ys[k] for k in at], [k / args.clock_hz for k in at]
+            rate = args.clock_hz
+        else:
+            ref_ids, ref_times = _timed_tokens(_video_events(row), _event_tokens(_video_events(row)))
+            rate = len(ref_ids) / max(dur, 1e-3)
         name = f'{row["id"]}  {row.get("category") or ""}  (held-out FineVideo)'
     else:
         path = args.video
         if not os.path.exists(path):
             raise SystemExit(f'--video: no such file {path}')
         print(f'--video: preparing {path} (2 fps frames, Mimi codes) ...', flush=True)
-        frames = _ff_frames2(path)
+        vfps = args.vision_hz or 2.0
+        frames = _ff_frames2(path, vfps)
         codes = model.aud_enc.codes(_ff_audio(path, 24000, 1)[:, 0], dev)
-        dur, rate, name = _ff_json(path)[3], args.video_rate, os.path.basename(path)
+        dur, rate, name = _ff_json(path)[3], args.clock_hz or args.video_rate, os.path.basename(path)
     if len(frames) == 0:
         raise SystemExit('--video: no frames')
     lat = model.aud_enc.latents(codes, dev)
-    clip = _VideoClip(frames, lat, codes, [0], [0], 2.0, 0.0, rate, (name, '', ''))
+    clip = _VideoClip(frames, lat, codes, [0], [0], 2.0 if args.video == 'eval' else vfps, 0.0,
+                      rate, (name, '', ''))
     # what the window shows and plays: the original file, else the 2 fps frames and the sound
     # Mimi decodes from the codes
     wav = f'/dev/shm/vla_live_{os.getpid()}.wav'
@@ -2119,7 +2289,8 @@ def _video_live():
         raw = [im.permute(1, 2, 0).numpy() for im in _decode_jpegs(row['frames'], 'cpu')]
     has_sound = os.path.getsize(wav) > 1000 and codes.shape[-1] > 0
     dur = dur or len(frames) / 2.0
-    print(f'--video: {name}: {dur:.1f} s at {fps:.2f} fps, captioned at {rate:.2f} tokens/s'
+    print(f'--video: {name}: {dur:.1f} s at {fps:.2f} fps, '
+          f'{"one step per tick at %g Hz" % rate if args.clock_hz else "captioned at %.2f tokens/s" % rate}'
           f'{"" if has_sound else " (no sound)"}; x closes', flush=True)
 
     plt.style.use('dark_background')
@@ -2186,13 +2357,16 @@ def _video_live():
                     break
                 # the model: every token due by now, each at its own media time
                 with torch.no_grad():
-                    while (pos + 0.5) / rate <= t:
+                    while (pos + clip.phase) / rate <= t:
                         if pending:
                             b = pending.pop(0)
                         else:
                             prob = F.softmax(logits[0] / max(args.temperature, 1e-6), dim=-1)
-                            b = torch.multinomial(prob, 1).item()
-                            gen_ids.append(b)
+                            b = torch.multinomial(_min_p(prob), 1).item()
+                            if b == _NUL_ID:            # --clock_hz: nothing said this tick
+                                b = _PAD
+                            else:
+                                gen_ids.append(b)
                         img, aud = clip.grids(model, [clip.at(pos)], dev)
                         dff, o = model.step(torch.tensor([b], device=dev), dff, img, aud)
                         logits = model.text_dec(o)
@@ -2305,7 +2479,7 @@ if args.vis:
         if pending:
             b = pending.pop(0)
         else:
-            b = int(torch.multinomial(prob, 1).item())
+            b = int(torch.multinomial(_min_p(prob), 1).item())
             cur = (cur + [b])[-2 * _VIS_WIN:]
         maps = [o] + list(dff.chunk(model.K, dim=1))
         for r, t in enumerate(maps):
@@ -2425,8 +2599,9 @@ def _build_video_eval(corpus):
                 if not bounds[g] <= k < bounds[g + 1] or len(items) >= want:
                     continue
                 r = rows[k - bounds[g]]
-                ex = _video_example(r, None, maxtok=min(_EVAL_MAXLEN, _VID_EVAL_MAXLEN))
-                if ex is None:
+                ex = _video_example(r, None, maxtok=min(_EVAL_MAXLEN, _VID_EVAL_MAXLEN),
+                                    maxspan=_VID_EVAL_SPAN if args.clock_hz else _VID_MAXSPAN)
+                if ex is None or sum(y != _SIL for _, y in ex[1]['steps']) < _VID_EVAL_MINTOK:
                     continue
                 text, m = ex
                 frames = torch.stack([_crop224(im) for im in _decode_jpegs(m['jpegs'], 'cpu')])
@@ -2435,7 +2610,8 @@ def _build_video_eval(corpus):
                 span = max(m['t1'] - m['t0'], 1e-3)
                 ref = ' '.join(t for _, _, _, t in json.loads(r['events']))
                 items.append((m['steps'], _VideoClip(frames, lat, m['codes'], m['fi'], m['ai'],
-                                                     m['fps'], m['t0'], m['n'] / span,
+                                                     m['fps'], m['t0'],
+                                                     args.clock_hz or m['n'] / span,
                                                      (r['id'], r.get('category') or '', ref))))
     items.sort(key=lambda it: len(it[0]))
     _eval_vids[corpus] = [it[1] for it in items]
@@ -2560,11 +2736,18 @@ def _score(step, corpus, docs, imgs=None, tag=None, clips=None):
     band_of = _token_bands(dev) if args.eval_bands else None
     nb = int(band_of.max()) + 1 if band_of is not None else 0
     per_doc, bad_doc, band_sum, band_cnt = [], [], [], []
+    nul = dict(ce=0.0, n=0, p_tok=0.0, n_tok=0, p_nul=0.0)    # --clock_hz: the <NUL> targets
     with _EvalState(), torch.no_grad():
         c = 0
         gen = torch.Generator(device=dev).manual_seed(1234)
         for chunk, X, Y, M in _batches(_doc_rows(docs)):
             B, T = X.shape
+            # every loss below is over caption tokens only; <NUL> targets are summed apart
+            Mn = M & (Y == _NUL_ID) if _NUL_ID is not None else None
+            if Mn is not None:
+                M = M & ~Mn
+            M = M & (Y >= 0)                 # --inner_voice: a silent tick (-100) has no target
+            own = None                       # --inner_voice: the token sampled at the last tick
             bank = _bank(imgs[c:c + B], dev) if imgs is not None else None
             cb = clips[c:c + B] if clips is not None else None
             c += B
@@ -2576,6 +2759,7 @@ def _score(step, corpus, docs, imgs=None, tag=None, clips=None):
                     for r, v in enumerate(cb):
                         lat[r, :, :v.lat.shape[1]] = v.lat
                 last = [len(v.fi) - 1 for v in cb]
+                shown, grid = [-1] * B, None     # the encoder runs only when a frame changes
             model.dff = None
             rs = torch.zeros(B, device=dev)
             bad = torch.zeros(B, dtype=torch.bool, device=dev)
@@ -2587,17 +2771,39 @@ def _score(step, corpus, docs, imgs=None, tag=None, clips=None):
                 aud = None
                 if cb is not None:
                     if see:
-                        img = model.image_grid(_norm_u8(torch.stack(
-                            [v.frames[v.fi[min(t, last[r])]] for r, v in enumerate(cb)]).to(dev)))
+                        fis = [v.fi[min(t, last[r])] for r, v in enumerate(cb)]
+                        ch = [r for r in range(B) if fis[r] != shown[r]]
+                        if ch:
+                            g = model.image_grid(_norm_u8(torch.stack(
+                                [cb[r].frames[fis[r]] for r in ch]).to(dev)))
+                            if grid is None:
+                                grid = g.new_zeros((B,) + tuple(g.shape[1:]))
+                            grid[ch] = g
+                            for r in ch:
+                                shown[r] = fis[r]
+                        img = grid
                     if hear:
                         aud = model.audio_grid(lat, torch.tensor(
                             [v.ai[min(t, last[r])] for r, v in enumerate(cb)], device=dev))
-                logits, _ = model(X[:, t], img=img, aud=aud)
+                xt = X[:, t]
+                if args.inner_voice and own is not None:   # after a silent tick: its own token
+                    xt = torch.where(xt == _PAD, own, xt)
+                logits, _ = model(xt, img=img, aud=aud)
+                if args.inner_voice:
+                    own = torch.multinomial(_min_p(F.softmax(logits.float(), dim=-1)), 1,
+                                            generator=gen)[:, 0]
                 ce = F.cross_entropy(logits, Y[:, t], reduction='none')
                 # a diverged row is counted as runaway rather than poisoning the sums
                 ce = torch.where(torch.isfinite(ce), ce, torch.full_like(ce, 1e30))
+                if Mn is not None:
+                    pn = F.softmax(logits.float(), dim=-1)[:, _NUL_ID]
+                    nul['ce'] += float((ce.clamp(max=30) * Mn[:, t]).sum())
+                    nul['n'] += int(Mn[:, t].sum())
+                    nul['p_nul'] += float((pn * Mn[:, t]).sum())
+                    nul['p_tok'] += float((pn * M[:, t]).sum())
+                    nul['n_tok'] += int(M[:, t].sum())
                 if nb:
-                    oh = F.one_hot(band_of[Y[:, t].clamp(max=band_of.numel() - 1)],
+                    oh = F.one_hot(band_of[Y[:, t].clamp(0, band_of.numel() - 1)],
                                    nb).float() * M[:, t, None]
                     bsum += oh * ce[:, None]
                     bcnt += oh
@@ -2611,7 +2817,7 @@ def _score(step, corpus, docs, imgs=None, tag=None, clips=None):
     per, bad = np.concatenate(per_doc), np.concatenate(bad_doc)
     clean = float(per[~bad].mean()) if (~bad).any() else float('nan')
     # nats per character over the clean documents: comparable across tokenizers
-    nt = np.array([len(d) for d in docs], dtype=np.float64)
+    nt = np.array([sum(y != _SIL for _, y in d) for d in docs], dtype=np.float64)
     nc = np.array([max(1, len(_decode_plain(_doc_tokens(d)))) for d in docs], dtype=np.float64)
     npc = float((per * nt)[~bad].sum() / nc[~bad].sum()) if (~bad).any() else float('nan')
     ppl = math.exp(min(clean, 700)) if clean == clean else float('nan')
@@ -2623,6 +2829,15 @@ def _score(step, corpus, docs, imgs=None, tag=None, clips=None):
           f'median {float(np.median(per)):11.6f} runaway {100.0 * float(bad.mean()):6.2f}% '
           f'nrun {int(bad.sum()):4d} docs {len(per):5d} wall {time.time() - t0:7.1f}s '
           f'nats/char {npc:.4f}')
+    if nul['n']:
+        # EVALN: the <NUL> targets' loss, and the mean P(<NUL>) the model gives on ticks whose
+        # target is <NUL> (want ~1) and on ticks whose target is a caption token (want ~0)
+        _eval_results[f'{tag}~nul'] = dict(ce=nul['ce'] / nul['n'], p_nul=nul['p_nul'] / nul['n'],
+                                           p_tok=nul['p_tok'] / max(1, nul['n_tok']),
+                                           nul_frac=nul['n'] / (nul['n'] + nul['n_tok']))
+        _emit(f'EVALN step {step:10} corpus {tag:8} nul_ce {nul["ce"] / nul["n"]:9.6f} '
+              f'P(nul|nul) {nul["p_nul"] / nul["n"]:.4f} P(nul|tok) '
+              f'{nul["p_tok"] / max(1, nul["n_tok"]):.4f} nul {100 * nul["n"] / (nul["n"] + nul["n_tok"]):.1f}%')
     if nb and (~bad).any():
         bs = np.concatenate(band_sum)[~bad].sum(0)
         bc = np.concatenate(band_cnt)[~bad].sum(0)
@@ -3039,6 +3254,10 @@ _vid_rows = torch.tensor(_VIDEO_ROWS, dtype=torch.long, device=args.device)
 _vid_of = {r: j for j, r in enumerate(_VIDEO_ROWS)}
 _VID_CAP = int(_VID_MAXSPAN * _AUD_RATE) + 256         # Mimi frames a row's buffer holds
 vid_cur = torch.zeros(len(_VIDEO_ROWS), 3, _IMG_IN, _IMG_IN, dtype=torch.uint8, device=args.device)
+_own = None                  # --inner_voice: each row's token sampled at the last step (its next input
+                             # after a silent tick)
+vid_grid = None              # the frozen encoder's grid of vid_cur, recomputed only for rows whose
+                             # frame changed (frames are held between 2 fps updates)
 vid_lat = (torch.zeros(len(_VIDEO_ROWS), _AUD_DIM, _VID_CAP, dtype=torch.float16, device=args.device)
            if _VIDEO_ROWS and model.aud_width else None)
 if _VIDEO_ROWS and model.img_enc is None:
@@ -3074,6 +3293,12 @@ def _gen_lines(i):
         lines.append(f'GEN step {i:10} [{p or NUL_TEXT}]: {_render(prompt + out)}')
         sc = _gen_scorer.score(_decode_plain(out)) if _gen_scorer else ''
         if sc:
+            if args.fluency_target and not p and _gen_scorer.pct is not None:
+                # --fluency_target: integral control of log(min_p) on this sample's fluency
+                err = (args.fluency_target - max(-100.0, min(300.0, _gen_scorer.pct))) / 100.0
+                args.min_p = min(0.9, max(1e-4, (args.min_p or 0.1) * math.exp(args.fluency_gain * err)))
+            if args.min_p:
+                sc += f' min_p {args.min_p:.4f}'
             lines.append(f'GENSCORE step {i:10} [{p or NUL_TEXT}]: {sc}')
     panel = []
     for c in _eval_corpus_names():
@@ -3115,14 +3340,21 @@ def _gen_lines(i):
         for k in ks if args.gen_vis and _gen_inbox is not None else ks[:1]:
             # the caption generated with picture and sound over the clip's opening L tokens'
             # worth of media time, beside the L reference tokens read over that same time
-            v, L = _eval_vids[c][k], min(_GENV_LEN, len(docs[k]))
-            cap = model.generate(_prompt_ids(), L, temperature=args.temperature, video=v)
-            ref = _decode_plain([y for _, y in docs[k][:L]])
+            # REF: the clip's first _GENV_LEN reference tokens; the caption runs (at most the
+            # whole clip) until it has as many characters, and is cut to that length
+            ys = [y for _, y in docs[k]]
+            v = _eval_vids[c][k]
+            at = [j for j, y in enumerate(ys) if y != _SIL]
+            ref = _decode_plain(ys[:at[min(_GENV_LEN, len(at)) - 1] + 1] if at else [])
+            n_ref = max(1, len(ref))
+            cap = model.generate(_prompt_ids(), len(ys), temperature=args.temperature, video=v,
+                                 stop_chars=n_ref)
+            L = max(1, min(len(ys), len(cap)))
             vid, cat, _ = v.meta
             if k == ks[0]:
                 lines.append(f'GENV step {i:10} [{vid}{" " if cat else ""}{cat}]: '
-                             f'{_render(_prompt_ids() + cap)}')
-                lines.append(f'REF  step {i:10} [{vid}]: {_printable(ref[:400])}')
+                             f'{_printable(_decode_plain(cap)[:n_ref])}')
+                lines.append(f'REF  step {i:10} [{vid}]: {_printable(ref)}')
             if '_spec' not in v.__dict__ and model.aud_enc is not None:
                 v._spec = _spectro(v.codes[:, :max(1, v.ai[L - 1])], args.device)
             f1 = v.fi[L - 1]
@@ -3130,7 +3362,7 @@ def _gen_lines(i):
             strip = np.concatenate([v.frames[f].permute(1, 2, 0).numpy() for f in sel], axis=1)
             vpanel.append((strip, getattr(v, '_spec', None),
                            f'{vid}  {cat}  0-{(f1 + 1) / v.fps:.0f}s'.strip(),
-                           {'A+V': _decode_plain(cap)}, ref))
+                           {'A+V': _decode_plain(cap)[:n_ref]}, ref))
     if vpanel and _gen_inbox is not None and args.gen_vis:
         try:
             _gen_inbox.put_nowait(('genv', i, vpanel))
@@ -3159,8 +3391,12 @@ def _video_panel(i, m, off):
     """--sample_vis: one training video example as the TRAIN video window shows it: its first
     _VID_PANEL_TOK tokens, up to _VID_PANEL_CELLS frames spread over them (each labelled with
     the tokens read while it was on screen), and the spectrogram of the sound over that span."""
+    ys = [y for _, y in m['steps']]
     W = min(m['n'], _VID_PANEL_TOK)
-    fi, ids = m['fi'][:W], [y for _, y in m['steps'][:W]]
+    if m.get('clock'):              # ticks: as many as the first _VID_PANEL_TOK tokens span
+        at = [k for k, y in enumerate(ys) if y != _SIL]
+        W = at[min(_VID_PANEL_TOK, len(at)) - 1] + 1 if at else m['n']
+    fi, ids = m['fi'][:W], ys[:W]
     frames = sorted(set(fi))
     pick = frames[::max(1, math.ceil(len(frames) / _VID_PANEL_CELLS))][:_VID_PANEL_CELLS]
     ims = _decode_jpegs([m['jpegs'][f] for f in pick], 'cpu')
@@ -3169,18 +3405,20 @@ def _video_panel(i, m, off):
         ks = [k for k, g in enumerate(fi) if g == f]
         a, b = ks[0], ks[-1] + 1
         cells.append((_thumb(_crop224(im, off), 160), (m['f0'] + f) / m['fps'], a, b,
-                      _tokenizer.decode(ids[a:b])))
+                      _decode_plain(ids[a:b])))
     a_end = m['ai'][W - 1] if W else 0
     spec = _spectro(m['codes'][:, :max(1, a_end)], args.device) if model.aud_enc is not None \
         else np.zeros((1, 1), np.float32)
     ext = (m['a0'] / _AUD_RATE, (m['a0'] + a_end) / _AUD_RATE)
-    return ('video', i, m['name'], _tokenizer.decode(ids), cells, spec, ext, m['n'])
+    n = f'{m["n"]} ticks at {m["clock"]:g} Hz' if m.get('clock') else f'{m["n"]} tokens'
+    return ('video', i, m['name'], _decode_plain(ids), cells, spec, ext, n)
 
 
 _VID_PANEL_TOK = 400         # TRAIN video window: tokens shown ...
 _VID_PANEL_CELLS = 12        # ... and frames
 _GENV_CLIPS = 4              # GEN video window: clips per refresh ...
-_GENV_LEN = 80               # ... and caption tokens generated for each (REF: as many)
+_GENV_LEN = 80               # ... REF = each clip's first this many reference tokens, and the
+                             # generated caption runs until it is as long as REF (characters)
 
 
 def _thumb(x, side):
@@ -3386,6 +3624,10 @@ _imaginer = _Imaginer(_SYNTH_ROWS) if _SYNTH_ROWS else None
 
 larr, garr = [], []
 carr = {n: [] for n in _rows_of} if len(_rows_of) > 1 else {}
+_nul_col = {n: 'nul' if sum(m in _VIDEO_DATASETS for m in _rows_of) == 1 else f'nul_{n}'
+            for n in _rows_of if n in _VIDEO_DATASETS}      # STEP column: loss_nul when one
+if carr and _NUL_ID is not None:
+    carr.update({c: [] for c in _nul_col.values()})
 i, n_examples = _start_step, _start_exs
 _n_by = {n: int(_start_exs_by.get(n, 0)) for n in _rows_of}     # examples trained per corpus
 # STEP columns ex_t/ep_t (text corpora pooled) and ex_i/ep_i (image corpora pooled): examples
@@ -3470,7 +3712,12 @@ try:
             idx, shown = media
             for j, im in shown:
                 vid_cur[j] = im.to(args.device, non_blocking=True)
-            img[_vid_rows] = model.image_grid(_norm_u8(vid_cur))
+            if vid_grid is None:
+                vid_grid = model.image_grid(_norm_u8(vid_cur))
+            elif shown:
+                js = torch.tensor([j for j, _ in shown], device=args.device)
+                vid_grid[js] = model.image_grid(_norm_u8(vid_cur[js])).to(vid_grid.dtype)
+            img[_vid_rows] = vid_grid
             if vid_lat is not None:
                 aud = torch.zeros(len(x_list), model.aud_width, model.S, model.S, device=args.device)
                 ends = torch.tensor([min(a, _VID_CAP) for _, a in idx], device=args.device)
@@ -3494,7 +3741,22 @@ try:
 
         dff_prev = model.dff
         model.train()
-        logits, loss = model(x, targets=y, flag=flag & ~_continuous_row, img=img, aud=aud)
+        if args.inner_voice:         # after a silent tick the input is the model's own token
+            if _own is not None:
+                x = torch.where(x == _PAD, _own, x)
+            elif (x == _PAD).any():
+                x = torch.where(x == _PAD, torch.zeros_like(x), x)   # (a resumed run's first step)
+        logits, _ = model(x, flag=flag & ~_continuous_row, img=img, aud=aud)
+        ce_all = F.cross_entropy(logits, y, reduction='none')
+        if args.inner_voice:
+            with torch.no_grad():
+                _own = torch.multinomial(_min_p(F.softmax(logits.detach().float(), dim=-1)), 1)[:, 0]
+            loss = ce_all.sum() / (y != _SIL).sum().clamp(min=1)
+        elif _NUL_ID is not None:    # --clock_hz: <NUL> targets weigh --nul_weight
+            wt = torch.where(y == _NUL_ID, args.nul_weight, 1.0)
+            loss = (ce_all * wt).sum() / wt.sum()
+        else:
+            loss = ce_all.mean()
         if not torch.isfinite(loss):         # keep the last good checkpoint on disk
             print(f'\n*** HALT: non-finite loss at step {i}: {loss.item()} dff_max '
                   f'{float(model.dff.abs().max())} logit_max {float(logits.detach().abs().max())}')
@@ -3516,9 +3778,18 @@ try:
         larr.append(loss.item())
         if carr:
             with torch.no_grad():
-                ce = F.cross_entropy(logits.detach(), y, reduction='none')
+                ce = ce_all.detach()
                 for n, rows in _rows_of.items():
-                    carr[n].append(float(ce[rows].mean()))
+                    if _NUL_ID is not None and n in _VIDEO_DATASETS:
+                        # caption tokens only, as EVAL; the <NUL> targets get their own column
+                        isn = y[rows] == _NUL_ID
+                        carr[n].append(float(ce[rows][~isn].mean()) if (~isn).any() else float('nan'))
+                        carr[_nul_col[n]].append(float(ce[rows][isn].mean()) if isn.any() else float('nan'))
+                    elif args.inner_voice and n in _VIDEO_DATASETS:   # caption ticks only
+                        has = y[rows] != _SIL
+                        carr[n].append(float(ce[rows][has].mean()) if has.any() else float('nan'))
+                    else:
+                        carr[n].append(float(ce[rows].mean()))
         if i % args.monitor == 0:
             flat = model.dff.reshape(-1)
             line = ('STEP {:10} wall {} loss {:12.9f} grad {:12.6f} lr {:10.9f} dff_mean {:12.5f} '
@@ -3529,7 +3800,8 @@ try:
             line += _ex_ep()
             if _imaginer is not None:
                 line += _imaginer.stats()
-            line += ''.join(f' loss_{n} {np.mean(a[-args.monitor:]):6.3f}' for n, a in carr.items())
+            line += ''.join(f' loss_{n} {np.nanmean(a[-args.monitor:]) if np.isfinite(a[-args.monitor:]).any() else float("nan"):6.3f}'
+                            for n, a in carr.items())
             _emit(line)
             del larr[:-args.monitor], garr[:-args.monitor]   # keep host RAM flat
             for a in carr.values():

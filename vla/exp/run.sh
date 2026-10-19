@@ -53,7 +53,7 @@ CMD=(python vla.py
   --ctx_ema 256,64,16,4,1 --ctx_read_norm 1 --dec_tree_kernels 3,3,3 --dec_width 256
   --batch 250 --momentum 0.0 --weight_decay 0.0
   --schedule coswarm --lr_min 0.0001 --lr_max 0.01 --lr_period 20000 --device cuda
-  --monitor 100 --run_steps $((S+1)) --checkpoint 4000
+  --monitor 100 --run_steps $((S+1))
   --gen_interval 4000 --gen_score
   --eval_interval 20000 --eval_corpora smolfwedu --eval_docs 100 --eval_bands 1024,8192
   --eval_info 100 --eval_reach 100
