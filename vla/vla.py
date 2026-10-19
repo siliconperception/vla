@@ -337,6 +337,9 @@ parser.add_argument('--eval_gen',   default=0,    type=int, metavar='N',
 parser.add_argument('--eval_gen_judge', default='EleutherAI/pythia-410m', metavar='MODEL')
 parser.add_argument('--eval_gen_prompt', default=32, type=int, metavar='P', help='prompt tokens')
 parser.add_argument('--eval_gen_len', default=96, type=int, metavar='C', help='continuation tokens')
+parser.add_argument('--eval_rare',  default=10,   type=int, metavar='N',
+                    help='run the slow or low-value evals only at every Nth eval: EVALX, EVALI, '
+                         'the video "-off" variant and EVALB of video corpora (0 = every eval)')
 parser.add_argument('--eval_reach', default=0,    type=int, metavar='N',
                     help='EVALX on N spliced rows: excess loss from losing history older than c')
 parser.add_argument('--eval_reach_period', default=256, type=int, metavar='P')
@@ -371,6 +374,11 @@ parser.add_argument('--min_p',      default=None, type=float, metavar='P',
                     help='sample only words with at least P x the top word\'s probability: in '
                          'generation and for --inner_voice\'s own tokens in training and eval '
                          '(0 = the full distribution). Saved and restored like --clock_hz')
+parser.add_argument('--speech_delay', default=None, type=float, metavar='S',
+                    help='--clock_hz: each speech token is due S seconds after its estimated '
+                         'end (words are spread evenly over a transcript segment, so the delay '
+                         'absorbs timing error and its sound is heard by then). Saved and '
+                         'restored like --clock_hz; changes the eval set\'s targets')
 parser.add_argument('--voice_drop', default=None, type=float, metavar='P',
                     help='--inner_voice: on a random P of silent ticks the model\'s own word is '
                          'not fed back (the input stays _PAD, no word) -- in training, eval, '
@@ -498,13 +506,14 @@ if args.load:
     _start_step = int(_loaded_ckpt.get('step', 0))
     _start_exs = int(_loaded_ckpt.get('examples', 0))
     _start_exs_by = dict(_loaded_ckpt.get('examples_by', {}))
-    for k in ('clock_hz', 'ctx_tau', 'vision_hz', 'inner_voice', 'min_p', 'voice_drop'):     # restored unless given
+    for k in ('clock_hz', 'ctx_tau', 'vision_hz', 'inner_voice', 'min_p', 'voice_drop', 'speech_delay'):     # restored unless given
         if getattr(args, k) is None:
             setattr(args, k, _saved.get(k))
 args.clock_hz = float(args.clock_hz or 0)
 args.inner_voice = bool(args.inner_voice)
 args.min_p = float(args.min_p or 0)
 args.voice_drop = float(args.voice_drop or 0)
+args.speech_delay = float(args.speech_delay or 0)
 if args.inner_voice and not args.clock_hz:
     raise SystemExit('--inner_voice needs --clock_hz')
 if args.ctx_tau:
@@ -1571,18 +1580,20 @@ def _clocked_example(row, rng=None, maxspan=_VID_MAXSPAN):
     if n < 2:
         return None
     tgt, nxt, dropped = [_SIL] * n, 0, 0
-    for (s, e, kind, _), tk in zip(ev, _event_tokens(ev)):
+    kind = [0] * n                           # per tick: 0 silent, 1 speech, 2 activity line
+    for (s, e, kd, _), tk in zip(ev, _event_tokens(ev)):
         if not ta <= s < tb:
             continue
-        if kind != 'say' and ta + nxt / R - s > args.max_lag:
+        if kd != 'say' and ta + nxt / R - s > args.max_lag:
             dropped += len(tk)
             continue
         for m in range(len(tk)):
-            t = s + (e - s) * (m + 1) / len(tk) if kind == 'say' else s
+            t = s + (e - s) * (m + 1) / len(tk) + args.speech_delay if kd == 'say' else s
             k = max(math.ceil((t - ta) * R - 1e-9), nxt)
             if k >= n:
                 break
             tgt[k], nxt = tk[m], k + 1
+            kind[k] = 1 if kd == 'say' else 2
     ids = [y for y in tgt if y != _SIL]
     if not ids:
         return None
@@ -1596,7 +1607,7 @@ def _clocked_example(row, rng=None, maxspan=_VID_MAXSPAN):
     media = dict(jpegs=frames[f0:max(fabs) + 1], codes=np.ascontiguousarray(codes[:, a0:max(aabs)]),
                  off=rng.random() if rng is not None else 0.5,     # crop offset, per example
                  fi=[f - f0 for f in fabs], ai=[a - a0 for a in aabs], fps=fps,
-                 t0=ta, t1=tb, text=text, n=n, f0=f0, a0=a0, clock=R, dropped=dropped,
+                 t0=ta, t1=tb, text=text, n=n, f0=f0, a0=a0, clock=R, dropped=dropped, kind=kind,
                  name=f'{row["id"]}  {row.get("category") or ""}'.strip(),
                  steps=list(zip(xs, tgt)))
     return text, media
@@ -2622,10 +2633,11 @@ def _build_video_eval(corpus):
                     torch.zeros(_AUD_DIM, m['codes'].shape[1], device=dev)
                 span = max(m['t1'] - m['t0'], 1e-3)
                 ref = ' '.join(t for _, _, _, t in json.loads(r['events']))
-                items.append((m['steps'], _VideoClip(frames, lat, m['codes'], m['fi'], m['ai'],
-                                                     m['fps'], m['t0'],
-                                                     args.clock_hz or m['n'] / span,
-                                                     (r['id'], r.get('category') or '', ref))))
+                clip = _VideoClip(frames, lat, m['codes'], m['fi'], m['ai'], m['fps'], m['t0'],
+                                  args.clock_hz or m['n'] / span,
+                                  (r['id'], r.get('category') or '', ref))
+                clip.kind = m.get('kind')       # --clock_hz: speech / activity per tick (EVALS)
+                items.append((m['steps'], clip))
     items.sort(key=lambda it: len(it[0]))
     _eval_vids[corpus] = [it[1] for it in items]
     docs = [it[0] for it in items]
@@ -2737,7 +2749,7 @@ def _token_bands(dev):
     return _band_cache['b'].to(dev)
 
 
-def _score(step, corpus, docs, imgs=None, tag=None, clips=None):
+def _score(step, corpus, docs, imgs=None, tag=None, clips=None, bands=True):
     """EVAL (clean / median / runaway%) and EVALB (loss by frequency band) lines, tagged
     `tag` (default corpus). imgs: one image per doc, seen through a fresh random crop every
     token from a fixed-seed generator, so successive evals see the same crops. clips: one
@@ -2750,6 +2762,7 @@ def _score(step, corpus, docs, imgs=None, tag=None, clips=None):
     nb = int(band_of.max()) + 1 if band_of is not None else 0
     per_doc, bad_doc, band_sum, band_cnt = [], [], [], []
     nul = dict(ce=0.0, n=0, p_tok=0.0, n_tok=0, p_nul=0.0)    # --clock_hz: the <NUL> targets
+    kce, kn = [0.0, 0.0, 0.0], [0, 0, 0]     # EVALS: loss / count by tick kind (1 speech, 2 activity)
     with _EvalState(), torch.no_grad():
         c = 0
         gen = torch.Generator(device=dev).manual_seed(1234)
@@ -2773,6 +2786,11 @@ def _score(step, corpus, docs, imgs=None, tag=None, clips=None):
                         lat[r, :, :v.lat.shape[1]] = v.lat
                 last = [len(v.fi) - 1 for v in cb]
                 shown, grid = [-1] * B, None     # the encoder runs only when a frame changes
+            Kd = None
+            if cb is not None and all(getattr(v, 'kind', None) for v in cb):
+                Kd = torch.zeros((B, T), dtype=torch.long, device=dev)
+                for r, v in enumerate(cb):
+                    Kd[r, :len(v.kind)] = torch.tensor(v.kind[:T], device=dev)
             model.dff = None
             rs = torch.zeros(B, device=dev)
             bad = torch.zeros(B, dtype=torch.bool, device=dev)
@@ -2824,6 +2842,11 @@ def _score(step, corpus, docs, imgs=None, tag=None, clips=None):
                     bsum += oh * ce[:, None]
                     bcnt += oh
                 rs += ce * M[:, t]
+                if Kd is not None:
+                    for kk in (1, 2):
+                        mk = M[:, t] & (Kd[:, t] == kk)
+                        kce[kk] += float((ce.clamp(max=30) * mk).sum())
+                        kn[kk] += int(mk.sum())
                 bad |= M[:, t] & (ce > _EVAL_THRESH)     # ANY token over: exp/score.py's rule
             per_doc.append((rs / M.sum(dim=1).clamp(min=1)).cpu().numpy())
             bad_doc.append(bad.cpu().numpy())
@@ -2845,6 +2868,11 @@ def _score(step, corpus, docs, imgs=None, tag=None, clips=None):
           f'median {float(np.median(per)):11.6f} runaway {100.0 * float(bad.mean()):6.2f}% '
           f'nrun {int(bad.sum()):4d} docs {len(per):5d} wall {time.time() - t0:7.1f}s '
           f'nats/char {npc:.4f}')
+    if kn[1] + kn[2]:
+        # EVALS: token-mean loss (each clamped to 30 nats) on speech words and on activity lines
+        f = lambda kk: f'{kce[kk] / kn[kk]:.4f} ({100 * kn[kk] / (kn[1] + kn[2]):.0f}%)' if kn[kk] else 'n/a'
+        _eval_results[f'{tag}~kinds'] = dict(speech=kce[1] / max(1, kn[1]), activity=kce[2] / max(1, kn[2]))
+        _emit(f'EVALS step {step:10} corpus {tag:8} speech {f(1)} activity {f(2)}')
     if nul['n']:
         # EVALN: the <NUL> targets' loss, and the mean P(<NUL>) the model gives on ticks whose
         # target is <NUL> (want ~1) and on ticks whose target is a caption token (want ~0)
@@ -2854,7 +2882,7 @@ def _score(step, corpus, docs, imgs=None, tag=None, clips=None):
         _emit(f'EVALN step {step:10} corpus {tag:8} nul_ce {nul["ce"] / nul["n"]:9.6f} '
               f'P(nul|nul) {nul["p_nul"] / nul["n"]:.4f} P(nul|tok) '
               f'{nul["p_tok"] / max(1, nul["n_tok"]):.4f} nul {100 * nul["n"] / (nul["n"] + nul["n_tok"]):.1f}%')
-    if nb and (~bad).any():
+    if nb and bands and (~bad).any():
         bs = np.concatenate(band_sum)[~bad].sum(0)
         bc = np.concatenate(band_cnt)[~bad].sum(0)
         edges = [0] + [int(e) for e in args.eval_bands.split(',') if e.strip()]
@@ -3130,6 +3158,9 @@ def _heldout_eval(step):
     zeroed); the gap is what the model takes from the image. Failures are reported and
     never take the training run down."""
     text = [c for c in _eval_corpus_names() if c not in _MEDIA_DATASETS]
+    # --eval_rare: the slow / low-value evals only at every Nth eval (all of them under --eval)
+    rare = args.eval or not args.eval_rare or not args.eval_interval or \
+        (step // args.eval_interval) % args.eval_rare == 0
     for corpus in _eval_corpus_names():
         if _eval_failed.get(corpus):
             continue
@@ -3146,8 +3177,9 @@ def _heldout_eval(step):
                 # with picture and sound, then each sense removed, then both: the gaps are what
                 # the model takes from each
                 for see, hear, sfx in _VIDEO_VARIANTS:
-                    _score(step, corpus, docs, tag=corpus + sfx,
-                           clips=[v.variant(see, hear) for v in _eval_vids[corpus]])
+                    if (see or hear) or rare:
+                        _score(step, corpus, docs, tag=corpus + sfx, bands=rare,
+                               clips=[v.variant(see, hear) for v in _eval_vids[corpus]])
                 continue
             _score(step, corpus, docs)
         except Exception as e:
@@ -3155,8 +3187,8 @@ def _heldout_eval(step):
                   flush=True)
             _eval_failed[corpus] = True
             continue
-        for fn, on in ((_reach_eval, args.eval_reach), (_gen_eval, args.eval_gen),
-                       (_info_eval, args.eval_info and corpus == text[0])):
+        for fn, on in ((_reach_eval, args.eval_reach and rare), (_gen_eval, args.eval_gen),
+                       (_info_eval, args.eval_info and rare and corpus == text[0])):
             if on:
                 try:
                     fn(step, corpus, docs)
