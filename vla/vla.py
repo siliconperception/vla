@@ -184,9 +184,12 @@ def _decode_plain(ids):
     return _tokenizer.decode(body) if body else ''
 
 
-def _min_p(prob):
-    """--min_p: zero every word below min_p x the most likely word's probability (sampling
-    from the rest; torch.multinomial renormalizes)."""
+def _truncate(prob):
+    """--top_k: zero every word outside the K most likely; --min_p: zero every word below
+    min_p x the most likely word's probability. Sampling is from the rest (torch.multinomial
+    renormalizes); with both, a word must pass both."""
+    if args.top_k and args.top_k < prob.shape[-1]:
+        prob = prob * (prob >= prob.topk(args.top_k, dim=-1).values[..., -1:])
     if args.min_p:
         prob = prob * (prob >= args.min_p * prob.max(dim=-1, keepdim=True).values)
     return prob
@@ -374,6 +377,10 @@ parser.add_argument('--min_p',      default=None, type=float, metavar='P',
                     help='sample only words with at least P x the top word\'s probability: in '
                          'generation and for --inner_voice\'s own tokens in training and eval '
                          '(0 = the full distribution). Saved and restored like --clock_hz')
+parser.add_argument('--top_k',      default=None, type=int, metavar='K',
+                    help='sample only from the K most likely words, wherever --min_p applies '
+                         '(with --min_p too, a word must pass both; 0 = all words). Saved and '
+                         'restored like --clock_hz')
 parser.add_argument('--speech_delay', default=None, type=float, metavar='S',
                     help='--clock_hz: each speech token is due S seconds after its estimated '
                          'end (words are spread evenly over a transcript segment, so the delay '
@@ -507,12 +514,13 @@ if args.load:
     _start_step = int(_loaded_ckpt.get('step', 0))
     _start_exs = int(_loaded_ckpt.get('examples', 0))
     _start_exs_by = dict(_loaded_ckpt.get('examples_by', {}))
-    for k in ('clock_hz', 'ctx_tau', 'vision_hz', 'inner_voice', 'min_p', 'voice_drop', 'speech_delay'):     # restored unless given
+    for k in ('clock_hz', 'ctx_tau', 'vision_hz', 'inner_voice', 'min_p', 'top_k', 'voice_drop', 'speech_delay'):     # restored unless given
         if getattr(args, k) is None:
             setattr(args, k, _saved.get(k))
 args.clock_hz = float(args.clock_hz or 0)
 args.inner_voice = bool(args.inner_voice)
 args.min_p = float(args.min_p or 0)
+args.top_k = int(args.top_k or 0)
 args.voice_drop = float(args.voice_drop or 0)
 args.speech_delay = float(args.speech_delay or 0)
 if args.inner_voice and not args.clock_hz:
@@ -1323,7 +1331,7 @@ class VLAModel(nn.Module, _HubMixin):
         drop = args.voice_drop if args.inner_voice and video is not None else 0.0
         for _ in range(n_tokens):                 # one tick each
             prob = F.softmax(logits[0] / max(temperature, 1e-6), dim=-1)
-            b = torch.multinomial(_min_p(prob), 1).item()
+            b = torch.multinomial(_truncate(prob), 1).item()
             out.append(b)
             if stop_chars and b != _NUL_ID and len(_decode_plain(out)) >= stop_chars:
                 return out
@@ -2383,7 +2391,7 @@ def _video_live():
                             b = pending.pop(0)
                         else:
                             prob = F.softmax(logits[0] / max(args.temperature, 1e-6), dim=-1)
-                            b = torch.multinomial(_min_p(prob), 1).item()
+                            b = torch.multinomial(_truncate(prob), 1).item()
                             if b == _NUL_ID:
                                 b = _PAD                # nothing said this tick
                             else:
@@ -2503,7 +2511,7 @@ if args.vis:
         if pending:
             b = pending.pop(0)
         else:
-            b = int(torch.multinomial(_min_p(prob), 1).item())
+            b = int(torch.multinomial(_truncate(prob), 1).item())
             cur = (cur + [b])[-2 * _VIS_WIN:]
         maps = [o] + list(dff.chunk(model.K, dim=1))
         for r, t in enumerate(maps):
@@ -2824,7 +2832,7 @@ def _score(step, corpus, docs, imgs=None, tag=None, clips=None, bands=True):
                     xt = torch.where(fb, own, xt)
                 logits, _ = model(xt, img=img, aud=aud)
                 if args.inner_voice:
-                    own = torch.multinomial(_min_p(F.softmax(logits.float(), dim=-1)), 1,
+                    own = torch.multinomial(_truncate(F.softmax(logits.float(), dim=-1)), 1,
                                             generator=gen)[:, 0]
                 ce = F.cross_entropy(logits, Y[:, t], reduction='none')
                 # a diverged row is counted as runaway rather than poisoning the sums
@@ -3799,7 +3807,7 @@ try:
         ce_all = F.cross_entropy(logits, y, reduction='none')
         if args.inner_voice:
             with torch.no_grad():
-                _own = torch.multinomial(_min_p(F.softmax(logits.detach().float(), dim=-1)), 1)[:, 0]
+                _own = torch.multinomial(_truncate(F.softmax(logits.detach().float(), dim=-1)), 1)[:, 0]
             loss = ce_all.sum() / (y != _SIL).sum().clamp(min=1)
         elif _NUL_ID is not None:    # --clock_hz: <NUL> targets weigh --nul_weight
             wt = torch.where(y == _NUL_ID, args.nul_weight, 1.0)
