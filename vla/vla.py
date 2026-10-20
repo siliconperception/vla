@@ -622,7 +622,8 @@ def _viewer(inbox, stem, show, parent):
                 win = fig.canvas.manager.window
                 g = win.screen().availableGeometry()
                 w, h = g.width() // 2, g.height() // 2 - 40
-                win.setGeometry(g.x() + slot[kind] * w, g.y(), w, h)
+                if w >= 640 and h >= 360:             # a bogus screen (display asleep at
+                    win.setGeometry(g.x() + slot[kind] * w, g.y(), w, h)   # launch): keep figsize
             except Exception:
                 pass
         return fig
