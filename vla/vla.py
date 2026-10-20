@@ -382,8 +382,9 @@ parser.add_argument('--speech_delay', default=None, type=float, metavar='S',
 parser.add_argument('--voice_drop', default=None, type=float, metavar='P',
                     help='--inner_voice: on a random P of silent ticks the model\'s own word is '
                          'not fed back (the input stays _PAD, no word) -- in training, eval, '
-                         'video generation and the live player, where a dropped word is not '
-                         'shown. Saved and restored like --clock_hz')
+                         'video generation and the live player, where a dropped word is still '
+                         'shown. 1 = silent ticks never see the model\'s own words. Saved and '
+                         'restored like --clock_hz')
 parser.add_argument('--fluency_target', default=0.0, type=float, metavar='PCT',
                     help='with --gen_score and --min_p: after each GEN sample from <NUL>, move '
                          '--min_p so its GENSCORE fluency averages PCT (above it: the text is '
@@ -1323,15 +1324,12 @@ class VLAModel(nn.Module, _HubMixin):
         for _ in range(n_tokens):                 # one tick each
             prob = F.softmax(logits[0] / max(temperature, 1e-6), dim=-1)
             b = torch.multinomial(_min_p(prob), 1).item()
-            if drop and random.random() < drop:   # --voice_drop: not said, not fed back
-                logits, dff = feed(_PAD, dff)
-                if logits is None:
-                    return out
-                continue
             out.append(b)
             if stop_chars and b != _NUL_ID and len(_decode_plain(out)) >= stop_chars:
                 return out
-            logits, dff = feed(_PAD if b == _NUL_ID else b, dff)
+            # --voice_drop: a dropped word is said (shown) but not fed back
+            fed = _PAD if b == _NUL_ID or (drop and random.random() < drop) else b
+            logits, dff = feed(fed, dff)
             if logits is None:
                 return out
         return out
@@ -2386,11 +2384,13 @@ def _video_live():
                         else:
                             prob = F.softmax(logits[0] / max(args.temperature, 1e-6), dim=-1)
                             b = torch.multinomial(_min_p(prob), 1).item()
-                            if b == _NUL_ID or (args.inner_voice and args.voice_drop and
-                                                random.random() < args.voice_drop):
+                            if b == _NUL_ID:
                                 b = _PAD                # nothing said this tick
                             else:
                                 gen_ids.append(b)
+                                if (args.inner_voice and args.voice_drop and
+                                        random.random() < args.voice_drop):
+                                    b = _PAD            # said (shown) but not fed back
                         img, aud = clip.grids(model, [clip.at(pos)], dev)
                         dff, o = model.step(torch.tensor([b], device=dev), dff, img, aud)
                         logits = model.text_dec(o)
