@@ -377,6 +377,11 @@ parser.add_argument('--min_p',      default=None, type=float, metavar='P',
                     help='sample only words with at least P x the top word\'s probability: in '
                          'generation and for --inner_voice\'s own tokens in training and eval '
                          '(0 = the full distribution). Saved and restored like --clock_hz')
+parser.add_argument('--caption_feed', default=None, type=float, metavar='P',
+                    help='--inner_voice: on a random P of video caption ticks the next input is the '
+                         'word the model sampled there instead of the true caption word (scheduled '
+                         'sampling; the loss stays on the true word). Saved and restored like '
+                         '--clock_hz')
 parser.add_argument('--top_k',      default=None, type=int, metavar='K',
                     help='sample only from the K most likely words, wherever --min_p applies '
                          '(with --min_p too, a word must pass both; 0 = all words). Saved and '
@@ -514,7 +519,7 @@ if args.load:
     _start_step = int(_loaded_ckpt.get('step', 0))
     _start_exs = int(_loaded_ckpt.get('examples', 0))
     _start_exs_by = dict(_loaded_ckpt.get('examples_by', {}))
-    for k in ('clock_hz', 'ctx_tau', 'vision_hz', 'inner_voice', 'min_p', 'top_k', 'voice_drop', 'speech_delay'):     # restored unless given
+    for k in ('clock_hz', 'ctx_tau', 'vision_hz', 'inner_voice', 'min_p', 'top_k', 'voice_drop', 'caption_feed', 'speech_delay'):     # restored unless given
         if getattr(args, k) is None:
             setattr(args, k, _saved.get(k))
 args.clock_hz = float(args.clock_hz or 0)
@@ -522,6 +527,7 @@ args.inner_voice = bool(args.inner_voice)
 args.min_p = float(args.min_p or 0)
 args.top_k = int(args.top_k or 0)
 args.voice_drop = float(args.voice_drop or 0)
+args.caption_feed = float(args.caption_feed or 0)
 args.speech_delay = float(args.speech_delay or 0)
 if args.inner_voice and not args.clock_hz:
     raise SystemExit('--inner_voice needs --clock_hz')
@@ -2097,8 +2103,14 @@ class _GenScorer:
     def _anchor(self):
         if self.floor is not None:
             return True
-        with _text_lock:
-            docs = [d for d in _anchors if len(d.split()) >= 24][:12]
+        # the first 40 held-out documents (>= 100 words) of the first text eval corpus, a fixed
+        # set, so fluency means the same in every run on that corpus; until its eval set is
+        # built (the first eval) there are no anchors
+        text = [c for c in _eval_corpus_names() if c not in _MEDIA_DATASETS]
+        if not text or text[0] not in _eval_docs_cache:
+            return False
+        docs = [t for t in (_decode_plain(_doc_tokens(d)) for d in _eval_docs_cache[text[0]])
+                if len(t.split()) >= 100][:40]
         if len(docs) < 4:
             return False
         rng = random.Random(1234)
@@ -2757,12 +2769,14 @@ def _token_bands(dev):
     return _band_cache['b'].to(dev)
 
 
-def _score(step, corpus, docs, imgs=None, tag=None, clips=None, bands=True):
+def _score(step, corpus, docs, imgs=None, tag=None, clips=None, bands=True, free=False):
     """EVAL (clean / median / runaway%) and EVALB (loss by frequency band) lines, tagged
     `tag` (default corpus). imgs: one image per doc, seen through a fresh random crop every
     token from a fixed-seed generator, so successive evals see the same crops. clips: one
     _VideoClip per doc, its frame and sound at each step (blanked where it is blind / deaf).
-    Every row starts from zeroed registers, whatever --continuous says."""
+    Every row starts from zeroed registers, whatever --continuous says. free (--inner_voice
+    video): every input after the first tick is the model's own last word, as in the live demo;
+    only the EVALF line (speech / activity loss) is written."""
     tag = tag or corpus
     t0 = time.time()
     dev = next(model.parameters()).device
@@ -2825,7 +2839,9 @@ def _score(step, corpus, docs, imgs=None, tag=None, clips=None, bands=True):
                         aud = model.audio_grid(lat, torch.tensor(
                             [v.ai[min(t, last[r])] for r, v in enumerate(cb)], device=dev))
                 xt = X[:, t]
-                if args.inner_voice and own is not None:   # after a silent tick: its own token
+                if free and own is not None:     # EVALF: every word is the model's own
+                    xt = torch.where((xt >= 0) | (xt == _PAD), own, xt)
+                elif args.inner_voice and own is not None:   # after a silent tick: its own token
                     fb = xt == _PAD
                     if args.voice_drop:
                         fb &= torch.rand(xt.shape, device=dev, generator=gen) >= args.voice_drop
@@ -2862,6 +2878,13 @@ def _score(step, corpus, docs, imgs=None, tag=None, clips=None, bands=True):
                 band_sum.append(bsum.cpu().numpy())
                 band_cnt.append(bcnt.cpu().numpy())
     per, bad = np.concatenate(per_doc), np.concatenate(bad_doc)
+    if free:
+        f = lambda kk: f'{kce[kk] / kn[kk]:.4f}' if kn[kk] else 'n/a'
+        _eval_results[f'{tag}~free'] = dict(speech=kce[1] / max(1, kn[1]), activity=kce[2] / max(1, kn[2]),
+                                            median=float(np.median(per)))
+        _emit(f'EVALF step {step:10} corpus {tag:8} speech {f(1)} activity {f(2)} '
+              f'median {float(np.median(per)):.4f} wall {time.time() - t0:5.1f}s')
+        return
     clean = float(per[~bad].mean()) if (~bad).any() else float('nan')
     # nats per character over the clean documents: comparable across tokenizers
     nt = np.array([sum(y != _SIL for _, y in d) for d in docs], dtype=np.float64)
@@ -3188,6 +3211,11 @@ def _heldout_eval(step):
                     if (see or hear) or rare:
                         _score(step, corpus, docs, tag=corpus + sfx, bands=rare,
                                clips=[v.variant(see, hear) for v in _eval_vids[corpus]])
+                if args.inner_voice:     # EVALF: the same clips with every word its own
+                    for see, hear, sfx in _VIDEO_VARIANTS:
+                        if see or hear:
+                            _score(step, corpus, docs, tag=corpus + sfx, free=True,
+                                   clips=[v.variant(see, hear) for v in _eval_vids[corpus]])
                 continue
             _score(step, corpus, docs)
         except Exception as e:
@@ -3301,6 +3329,7 @@ _text_names = [n for n in _rows_of if n not in _MEDIA_DATASETS]
 _continuous_row = torch.tensor([('image' if n in _IMAGE_DATASETS else 'video' if n in _VIDEO_DATASETS
                                  else 'text') in _continuous
                            for n, k in _MIX for _ in range(k)], device=args.device)
+_video_row = torch.tensor([n in _VIDEO_DATASETS for n, k in _MIX for _ in range(k)], device=args.device)
 
 # Video rows: each holds its example's JPEG frames (decoded on the GPU when the frame on screen
 # changes, cropped 224x224 at a random offset per example along the longer side) and the Mimi
@@ -3802,6 +3831,9 @@ try:
                 fb = x == _PAD
                 if args.voice_drop:  # --voice_drop: some silent ticks keep _PAD (no word)
                     fb &= torch.rand(x.shape, device=x.device) >= args.voice_drop
+                if args.caption_feed:   # --caption_feed: some caption words -> the model's own
+                    fb |= (x >= 0) & _video_row & \
+                        (torch.rand(x.shape, device=x.device) < args.caption_feed)
                 x = torch.where(fb, _own, x)
         logits, _ = model(x, flag=flag & ~_continuous_row, img=img, aud=aud)
         ce_all = F.cross_entropy(logits, y, reduction='none')
