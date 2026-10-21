@@ -382,6 +382,11 @@ parser.add_argument('--caption_feed', default=None, type=float, metavar='P',
                          'word the model sampled there instead of the true caption word (scheduled '
                          'sampling; the loss stays on the true word). Saved and restored like '
                          '--clock_hz')
+parser.add_argument('--text_feed', default=None, type=float, metavar='P',
+                    help='--inner_voice: on a random P of text-corpus ticks the input is the word '
+                         'the model sampled at the previous tick instead of the true word '
+                         '(scheduled sampling; the loss stays on the true word). Saved and '
+                         'restored like --clock_hz')
 parser.add_argument('--top_k',      default=None, type=int, metavar='K',
                     help='sample only from the K most likely words, wherever --min_p applies '
                          '(with --min_p too, a word must pass both; 0 = all words). Saved and '
@@ -519,7 +524,7 @@ if args.load:
     _start_step = int(_loaded_ckpt.get('step', 0))
     _start_exs = int(_loaded_ckpt.get('examples', 0))
     _start_exs_by = dict(_loaded_ckpt.get('examples_by', {}))
-    for k in ('clock_hz', 'ctx_tau', 'vision_hz', 'inner_voice', 'min_p', 'top_k', 'voice_drop', 'caption_feed', 'speech_delay'):     # restored unless given
+    for k in ('clock_hz', 'ctx_tau', 'vision_hz', 'inner_voice', 'min_p', 'top_k', 'voice_drop', 'caption_feed', 'text_feed', 'speech_delay'):     # restored unless given
         if getattr(args, k) is None:
             setattr(args, k, _saved.get(k))
 args.clock_hz = float(args.clock_hz or 0)
@@ -528,6 +533,7 @@ args.min_p = float(args.min_p or 0)
 args.top_k = int(args.top_k or 0)
 args.voice_drop = float(args.voice_drop or 0)
 args.caption_feed = float(args.caption_feed or 0)
+args.text_feed = float(args.text_feed or 0)
 args.speech_delay = float(args.speech_delay or 0)
 if args.inner_voice and not args.clock_hz:
     raise SystemExit('--inner_voice needs --clock_hz')
@@ -3331,6 +3337,7 @@ _continuous_row = torch.tensor([('image' if n in _IMAGE_DATASETS else 'video' if
                                  else 'text') in _continuous
                            for n, k in _MIX for _ in range(k)], device=args.device)
 _video_row = torch.tensor([n in _VIDEO_DATASETS for n, k in _MIX for _ in range(k)], device=args.device)
+_text_row = torch.tensor([n not in _MEDIA_DATASETS for n, k in _MIX for _ in range(k)], device=args.device)
 
 # Video rows: each holds its example's JPEG frames (decoded on the GPU when the frame on screen
 # changes, cropped 224x224 at a random offset per example along the longer side) and the Mimi
@@ -3835,6 +3842,9 @@ try:
                 if args.caption_feed:   # --caption_feed: some caption words -> the model's own
                     fb |= (x >= 0) & _video_row & \
                         (torch.rand(x.shape, device=x.device) < args.caption_feed)
+                if args.text_feed:      # --text_feed: some text words -> the model's own
+                    fb |= (x >= 0) & _text_row & \
+                        (torch.rand(x.shape, device=x.device) < args.text_feed)
                 x = torch.where(fb, _own, x)
         logits, _ = model(x, flag=flag & ~_continuous_row, img=img, aud=aud)
         ce_all = F.cross_entropy(logits, y, reduction='none')
