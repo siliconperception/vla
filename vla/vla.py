@@ -246,6 +246,15 @@ parser.add_argument('--audio_encoder', default=None, choices=['none'] + sorted(_
                          'S*S Mimi frames (80 ms each; 3.9 s at S=7) laid out row-major over the '
                          'SxS grid; default: mimi if --mix or --eval_corpora names a video '
                          'corpus, else none')
+parser.add_argument('--streams', default=1, type=int, choices=[1, 3],
+                    help='3: three token streams, each with its own input embedding grid and its '
+                         'own decoder tree -- text (fineweb words; on video rows the inner voice: '
+                         'the model\'s own sampled word, no loss), voice (speech words) and image '
+                         '(activity lines). Voice and image target <NUL> where they have nothing '
+                         '(every text-row tick, silent video ticks) and are fed back on their own '
+                         'at inference. Needs --clock_hz; architecture, saved with the checkpoint. '
+                         'A one-stream checkpoint is widened: both new decoders start as copies of '
+                         'its decoder and the new token inputs as copies of its token input')
 # data
 parser.add_argument('--dataset',    default='smolfwedu', help='training corpus (see _TEXT_DATASETS)')
 parser.add_argument('--mix',        default=None, metavar='NAME:FRAC,...',
@@ -392,6 +401,10 @@ parser.add_argument('--top_k',      default=None, type=int, metavar='K',
                     help='sample only from the K most likely words, wherever --min_p applies '
                          '(with --min_p too, a word must pass both; 0 = all words). Saved and '
                          'restored like --clock_hz')
+parser.add_argument('--audio_hz',   default=None, type=float, metavar='A',
+                    help='--clock_hz: the audio grid refreshes at A Hz (at multiples of 1/A s, as '
+                         '--vision_hz does the picture) and is held in between (0 / unset: every '
+                         'tick). Saved and restored like --clock_hz')
 parser.add_argument('--speech_delay', default=None, type=float, metavar='S',
                     help='--clock_hz: each speech token is due S seconds after its estimated '
                          'end (words are spread evenly over a transcript segment, so the delay '
@@ -455,7 +468,7 @@ _ONESHOT = args.generate or args.eval or args.vis or args.push
 
 _ARCH_ARGS = ('context', 'n_hidden', 'c_context', 'depth', 'kernel', 'tokenizer', 'ctx_ema',
               'ctx_read_norm', 'dec_tree_kernels', 'dec_width', 'bn_momentum', 'init',
-              'image_encoder', 'audio_encoder')
+              'image_encoder', 'audio_encoder', 'streams')
 
 
 def _parse_mix():
@@ -525,7 +538,7 @@ if args.load:
     _start_step = int(_loaded_ckpt.get('step', 0))
     _start_exs = int(_loaded_ckpt.get('examples', 0))
     _start_exs_by = dict(_loaded_ckpt.get('examples_by', {}))
-    for k in ('clock_hz', 'ctx_tau', 'vision_hz', 'inner_voice', 'min_p', 'top_k', 'voice_drop', 'caption_feed', 'text_feed', 'speech_delay'):     # restored unless given
+    for k in ('clock_hz', 'ctx_tau', 'vision_hz', 'audio_hz', 'inner_voice', 'min_p', 'top_k', 'voice_drop', 'caption_feed', 'text_feed', 'speech_delay'):     # restored unless given
         if getattr(args, k) is None:
             setattr(args, k, _saved.get(k))
 args.clock_hz = float(args.clock_hz or 0)
@@ -536,6 +549,14 @@ args.voice_drop = float(args.voice_drop or 0)
 args.caption_feed = float(args.caption_feed or 0)
 args.text_feed = float(args.text_feed or 0)
 args.speech_delay = float(args.speech_delay or 0)
+args.audio_hz = float(args.audio_hz or 0)
+args.streams = int(args.streams or 1)
+if args.streams == 3:
+    if not args.clock_hz:
+        raise SystemExit('--streams 3 needs --clock_hz')
+    if args.inner_voice or args.voice_drop or args.caption_feed or args.text_feed:
+        raise SystemExit('--streams 3: the text stream is the inner voice; give --no-inner_voice '
+                         'and no --voice_drop / --caption_feed / --text_feed')
 if args.inner_voice and not args.clock_hz:
     raise SystemExit('--inner_voice needs --clock_hz')
 if args.ctx_tau:
@@ -557,6 +578,27 @@ def _upgrade_state_dict(sd):
             v = v[0]
         out[k] = v
     return out
+
+
+def _widen_state_dict(sd, model):
+    """A one-stream state_dict -> streams 3: the voice and image decoders start as copies of
+    the text decoder (its <NUL> logit included), the text decoder loses its <NUL> logit, and
+    ctx_cat gets the voice and image token-grid columns as copies of the text token columns, so
+    a caption word in either new stream reads as it did in the one stream."""
+    sd = dict(sd)
+    for k in [k for k in sd if k.startswith('text_dec.')]:
+        for d in ('voc_dec', 'img_dec'):
+            sd[d + k[len('text_dec'):]] = sd[k].clone()
+        if k.startswith('text_dec.nul.'):
+            del sd[k]
+    w = sd['ctx_cat.weight']
+    n_in = sum(model.in_widths[:len(model.in_widths) - 2])        # text, image, audio grids
+    c = model.c_text
+    sd['ctx_cat.weight'] = torch.cat([w[:, :n_in], w[:, :c], w[:, :c], w[:, n_in:]], dim=1)
+    print(f'--streams 3: widened a one-stream checkpoint (voice/image decoders copied from the '
+          f'text decoder; ctx_cat {tuple(w.shape)} -> {tuple(sd["ctx_cat.weight"].shape)})',
+          flush=True)
+    return sd
 
 
 # ── log / device / seed ───────────────────────────────────────────────────────
@@ -731,7 +773,7 @@ def _viewer(inbox, stem, show, parent):
         n = len(items)
         gs = fig.add_gridspec(n, 2, width_ratios=[1, 1.25], left=0.03, right=0.99, top=0.94,
                               bottom=0.03, wspace=0.03, hspace=0.3)
-        colors = {'A+V': 'white'}
+        colors = {'A+V': 'white', 'see': 'white', 'hear': 'white', 'think': 'skyblue'}
         for k, (strip, spec, name, caps, ref) in enumerate(items):
             sub = gs[k, 0].subgridspec(2, 1, height_ratios=[1, 0.7], hspace=0.05)
             ax = fig.add_subplot(sub[0])
@@ -1040,9 +1082,14 @@ class _VideoClip:
         return v
 
     def at(self, k):
-        """(fi, ai) for generation step k: the media time of the k-th token at self.rate."""
+        """(fi, ai) for generation step k: the media time of the k-th token at self.rate. A
+        clocked eval clip has them per tick already (exactly as training builds them)."""
+        if args.clock_hz and len(self.ai) > 1 and k < len(self.ai):
+            return self.fi[k], self.ai[k]
         t = self.t0 + (k + self.phase) / max(self.rate, 1e-6)
         fi = min(self.frames.shape[0] - 1, max(0, int((t - self.t0) * self.fps)))
+        if args.audio_hz:          # --audio_hz: the sound refreshes at multiples of 1/A s
+            t = max(self.t0, math.floor(t * args.audio_hz + 1e-9) / args.audio_hz)
         return fi, min(self.lat.shape[1], int((t - self.t0) * _AUD_RATE) + self.ai[0])
 
     def grids(self, model, sels, dev):
@@ -1137,12 +1184,15 @@ class VLAModel(nn.Module, _HubMixin):
            o      = linout(ContextCNN(x))                             [n_hidden, S, S]
            write    r_k <- r_k + a_k * (o - sum_{j<k} r_j[t] - r_k),  a_k = 1/W_k
            logits = text_dec(o)
+    streams 3: three token grids (text, voice, image; the voice and image grids after the audio
+    grid) and three decoders, logits [B, 3, vocab]; a one-stream idx [B] is read as the text
+    stream with voice and image silent (as on a text row) and gets the text logits [B, vocab].
     """
 
     def __init__(self, S=8, n_hidden=512, c_context=384, depth=8, kernel=3,
                  tokenizer='pythia31m', windows=(256, 64, 16, 4, 1), read_norm=1.0,
                  dec_kernels=(3, 3, 3), dec_width=256, bn_momentum=0.1, init='zero',
-                 image_encoder='none', audio_encoder='none', nul_head=False):
+                 image_encoder='none', audio_encoder='none', nul_head=False, streams=1):
         super().__init__()
         from transformers import AutoModelForCausalLM
         repo = _TOKENIZERS[tokenizer]
@@ -1159,10 +1209,18 @@ class VLAModel(nn.Module, _HubMixin):
 
         self.tok_embed = lm.get_input_embeddings()                      # frozen
         self.context = ContextCNN(c_context, depth, kernel, bn_momentum)
-        self.nul_id = len(self.tok.tok) if nul_head and len(self.tok.tok) < self.vocab else None
-        self.text_dec = TextDecoder(n_hidden, S, list(dec_kernels), dec_width,
-                                    lm.get_output_embeddings(),         # lm_head frozen
-                                    nul_id=self.nul_id)
+        self.streams = int(streams)
+        self.nul_id = len(self.tok.tok) if (nul_head or self.streams == 3) and \
+            len(self.tok.tok) < self.vocab else None
+        lmhead = lm.get_output_embeddings()                             # frozen, shared
+        # streams 3: the text stream never says <NUL>; voice and image do
+        self.text_dec = TextDecoder(n_hidden, S, list(dec_kernels), dec_width, lmhead,
+                                    nul_id=None if self.streams == 3 else self.nul_id)
+        if self.streams == 3:
+            self.voc_dec = TextDecoder(n_hidden, S, list(dec_kernels), dec_width, lmhead,
+                                       nul_id=self.nul_id)
+            self.img_dec = TextDecoder(n_hidden, S, list(dec_kernels), dec_width, lmhead,
+                                       nul_id=self.nul_id)
         for p in self.pretrained_params():
             p.requires_grad_(False)
 
@@ -1175,14 +1233,16 @@ class VLAModel(nn.Module, _HubMixin):
         self.img_width = 2048 if self.image_encoder != 'none' else 0
         self.aud_width = _AUD_DIM if self.audio_encoder != 'none' else 0
         self.in_widths = ([self.c_text] + ([self.img_width] if self.img_width else [])
-                          + ([self.aud_width] if self.aud_width else []))
+                          + ([self.aud_width] if self.aud_width else [])
+                          + [self.c_text] * (self.streams - 1))     # voice, image token grids
         widths = self.in_widths + [n_hidden] * self.K
+        n_tok_extra = self.streams - 1
         self.ctx_cat = nn.Conv2d(sum(widths), c_context, 1)
         with torch.no_grad():
             self.ctx_cat.weight.zero_()
             o = 0
             for i, w in enumerate(widths):
-                if i == 0 or i >= len(self.in_widths):
+                if i == 0 or i >= len(self.in_widths) - n_tok_extra:
                     n = min(w, c_context)
                     self.ctx_cat.weight[:n, o:o + n, 0, 0] = torch.eye(n)
                 o += w
@@ -1237,28 +1297,51 @@ class VLAModel(nn.Module, _HubMixin):
         a = _aud_windows(lat, ends, self.S).float()
         return a * torch.rsqrt(a.pow(2).mean(dim=1, keepdim=True) + 1e-6)
 
-    def _inputs(self, idx, img, aud=None):
-        """The input grids, in self.in_widths order: the RMS-normalized token embedding
-        broadcast over the grid, then (image model) the image grid and (audio model) the audio
-        grid, zeros where None."""
+    def expand(self, idx):
+        """streams 3: a one-stream idx [B] -> [B, 3], the text stream with voice and image
+        silent (_PAD; _NULL at a blink), as on a text row."""
+        if self.streams == 1 or idx.dim() == 2:
+            return idx
+        quiet = torch.where(idx == _NULL, _NULL, _PAD)
+        return torch.stack([idx, quiet, quiet], dim=1)
+
+    def _tok_grid(self, idx):
         B = idx.shape[0]
         tok = self.tok_embed(idx.clamp(min=0))
         tok = tok * torch.rsqrt(tok.pow(2).mean(dim=1, keepdim=True) + 1e-12)
         tok = tok.masked_fill((idx < 0)[:, None], 0.0)      # _NULL / _PAD: a zero token grid
-        grids = [tok.view(B, self.c_text, 1, 1).expand(-1, -1, self.S, self.S)]
+        return tok.view(B, self.c_text, 1, 1).expand(-1, -1, self.S, self.S)
+
+    def _inputs(self, idx, img, aud=None):
+        """The input grids, in self.in_widths order: the RMS-normalized token embedding
+        broadcast over the grid, then (image model) the image grid and (audio model) the audio
+        grid, zeros where None, then (streams 3) the voice and image token grids."""
+        idx = self.expand(idx)
+        cols = [idx] if idx.dim() == 1 else list(idx.unbind(1))
+        blink = cols[0] == _NULL
+        B = idx.shape[0]
+        grids = [self._tok_grid(cols[0])]
         if self.img_width:
             if img is None:
-                img = tok.new_zeros(B, self.img_width, self.S, self.S)
+                img = grids[0].new_zeros(B, self.img_width, self.S, self.S)
             else:      # <NUL> is a blink: no token AND no image, the registers carry on
-                img = img.masked_fill((idx == _NULL)[:, None, None, None], 0.0)
+                img = img.masked_fill(blink[:, None, None, None], 0.0)
             grids.append(img)
         if self.aud_width:
             if aud is None:
-                aud = tok.new_zeros(B, self.aud_width, self.S, self.S)
+                aud = grids[0].new_zeros(B, self.aud_width, self.S, self.S)
             else:      # ... and no sound (a _PAD tick keeps both)
-                aud = aud.masked_fill((idx == _NULL)[:, None, None, None], 0.0)
+                aud = aud.masked_fill(blink[:, None, None, None], 0.0)
             grids.append(aud)
+        grids += [self._tok_grid(c) for c in cols[1:]]
         return grids
+
+    def heads(self, o):
+        """Layer output -> logits: [B, vocab], or (streams 3) [B, 3, vocab] for text, voice,
+        image."""
+        if self.streams == 1:
+            return self.text_dec(o)
+        return torch.stack([self.text_dec(o), self.voc_dec(o), self.img_dec(o)], dim=1)
 
     def _read(self, dff):
         """The K registers as ctx_cat reads them."""
@@ -1306,7 +1389,10 @@ class VLAModel(nn.Module, _HubMixin):
             self.dff[flag] = self.new_state(int(flag.sum()), dev)
         new, o = self.step(idx, self.dff, img, aud)
         self.dff = new.detach().clone()
-        logits = self.text_dec(o)
+        if self.streams == 3 and idx.dim() == 1:     # a one-stream caller: the text stream
+            logits = self.text_dec(o)
+        else:
+            logits = self.heads(o)
         loss = F.cross_entropy(logits, targets.long()) if targets is not None else None
         return logits, loss
 
@@ -1355,6 +1441,31 @@ class VLAModel(nn.Module, _HubMixin):
             if logits is None:
                 return out
         return out
+
+    @torch.no_grad()
+    def generate3(self, n_ticks, video, temperature=1.0):
+        """streams 3: n_ticks of a _VideoClip from a _NULL blink on a private state, every
+        stream's sample fed back (no word after a <NUL>) -> (text, voice, image) id lists with
+        <NUL> dropped; short only on NaN/Inf."""
+        self.eval()
+        dev = next(self.parameters()).device
+        dff = self.new_state(1, dev)
+        x = torch.full((1, 3), _NULL, dtype=torch.long, device=dev)
+        outs = ([], [], [])
+        for k in range(n_ticks):
+            img, aud = video.grids(self, [video.at(k)], dev)
+            dff, o = self.step(x, dff, img, aud)
+            logits = self.heads(o)[0]
+            if not (dff.isfinite().all() and logits.isfinite().all()):
+                print('generate3: NaN/Inf')
+                break
+            prob = F.softmax(logits.float() / max(temperature, 1e-6), dim=-1)
+            b = torch.multinomial(_truncate(prob), 1)[:, 0]
+            for st in range(3):
+                if int(b[st]) != _NUL_ID:
+                    outs[st].append(int(b[st]))
+            x = torch.where(b == _NUL_ID, _PAD, b)[None]
+        return outs
 
 
 # ── data ──────────────────────────────────────────────────────────────────────
@@ -1620,7 +1731,9 @@ def _clocked_example(row, rng=None, maxspan=_VID_MAXSPAN):
     V = min(args.vision_hz or fps, fps)      # picture refresh: held between refreshes
     fabs = [min(len(frames) - 1, int(math.floor((ta + k / R) * V + 1e-9) / V * fps + 1e-9))
             for k in range(n)]
-    aabs = [min(codes.shape[1], int((ta + k / R) * _AUD_RATE)) for k in range(n)]
+    A = args.audio_hz                        # --audio_hz: sound refresh, held in between
+    aabs = [min(codes.shape[1], int((math.floor((ta + k / R) * A + 1e-9) / A if A else ta + k / R)
+                                    * _AUD_RATE)) for k in range(n)]
     f0, a0 = fabs[0], max(0, aabs[0] - 64)
     xs = [_NULL] + [_PAD if y == _SIL else y for y in tgt[:-1]]
     text = _tokenizer.decode(ids)
@@ -1871,7 +1984,9 @@ def worker(stop, q, datasets):
         for j, r in enumerate(_VIDEO_ROWS):
             sl = slots[r]
             f = sl.media['fi'][sl.pos]
-            idx.append((f, sl.media['ai'][sl.pos]))
+            kd = sl.media.get('kind')        # --streams 3: the tick kinds of this step's target and input
+            idx.append((f, sl.media['ai'][sl.pos], kd[sl.pos] if kd else 0,
+                        kd[sl.pos - 1] if kd and sl.pos else 0))
             if f != sl.shown:
                 sl.shown = f
                 shown.append((j, _crop224(_decode_jpegs([sl.media['jpegs'][f]])[0], sl.media['off'])))
@@ -1932,12 +2047,16 @@ else:
                      image_encoder=args.image_encoder, audio_encoder=args.audio_encoder,
                      nul_head=not args.inner_voice and (
                          bool(args.clock_hz) or (_loaded_ckpt is not None and
-                                                 'text_dec.nul.weight' in _loaded_ckpt['state_dict'])))
+                                                 'text_dec.nul.weight' in _loaded_ckpt['state_dict'])),
+                     streams=args.streams)
     if _loaded_ckpt is not None:
-        missing, unexpected = model.load_state_dict(_upgrade_state_dict(_loaded_ckpt['state_dict']),
-                                                    strict=False)
-        bad = [k for k in missing if not k.startswith('text_dec.nul.')] + \
-              [k for k in unexpected if not (args.inner_voice and k.startswith('text_dec.nul.'))]
+        _sd = _upgrade_state_dict(_loaded_ckpt['state_dict'])
+        if model.streams == 3 and 'voc_dec.proj.weight' not in _sd:
+            _sd = _widen_state_dict(_sd, model)
+        missing, unexpected = model.load_state_dict(_sd, strict=False)
+        bad = [k for k in missing if not re.match(r'(text|voc|img)_dec\.nul\.', k)] + \
+              [k for k in unexpected if not ((args.inner_voice or model.streams == 3)
+                                             and k.startswith('text_dec.nul.'))]
         if bad:
             raise SystemExit(f'{args.load} does not fit this model: {bad[:6]}')
         if missing:
@@ -1980,9 +2099,9 @@ def _model_graph(model):
     try:
         with torch.no_grad():
             dev = next(model.parameters()).device
-            new, o = model.step(torch.zeros(1, dtype=torch.long, device=dev),
+            new, o = model.step(model.expand(torch.zeros(1, dtype=torch.long, device=dev)),
                                 model.new_state(1, dev))
-            model.text_dec(o)
+            model.heads(o)
     finally:
         for h in hooks:
             h.remove()
@@ -2356,7 +2475,18 @@ def _video_live():
              f'sound: {snd}',
              fontsize=9, family='monospace', color='0.7', va='top')
     kw = dict(fontsize=10, family='monospace', va='center', ha='left')
-    if ref_ids is not None:
+    S3 = model.streams == 3          # one line per stream: hears (voice), sees (image), thinks (text)
+    if S3:
+        tick3 = {}
+        if ref_ids is not None:
+            fig.text(0.01, 0.17, 'REF', color='limegreen', **kw)
+            tick_ref = fig.text(0.07, 0.17, '', color='limegreen', **kw)
+        for y_, (lab, st, col) in zip((0.125, 0.08, 0.035), (('HEAR', 1, 'white'), ('SEE', 2, 'white'),
+                                                            ('THINK', 0, 'skyblue'))):
+            fig.text(0.01, y_, lab, color=col, **kw)
+            tick3[st] = fig.text(0.07, y_, '', color=col, **kw)
+        tick_gen = tick3[1]
+    elif ref_ids is not None:
         fig.text(0.01, 0.155, 'REF', color='limegreen', **kw)
         tick_ref = fig.text(0.05, 0.155, '', color='limegreen', **kw)
         fig.text(0.01, 0.09, 'VLA', color='white', **kw)
@@ -2375,6 +2505,7 @@ def _video_live():
 
     gen_done, ref_done = '', ''      # earlier plays' text; this play's is decoded whole, so a
     gen_ids, ref_now = [], []        # character split over several tokens renders correctly
+    done3, gen3, n3 = {0: '', 1: '', 2: ''}, {0: [], 1: [], 2: []}, {0: -1, 1: -1, 2: -1}
     prompt = _prompt_ids(args.prompt)
     t_all, player, pipe, plays = time.monotonic(), None, None, 0
     try:
@@ -2383,7 +2514,11 @@ def _video_live():
             if plays:
                 gen_done += clean(_decode_plain(gen_ids)) + ' <NUL> '
                 ref_done += clean(_decode_plain(ref_now)) + ' <NUL> '
+                for st in done3:
+                    done3[st] += clean(_decode_plain(gen3[st])) + ' <NUL> '
+            gen3 = {0: [], 1: [], 2: []}
             gen_ids, ref_now = list(prompt[1:]), []
+            n3 = {0: -1, 1: -1, 2: -1}
             plays += 1
             if path:
                 # -nostdin and no stdin: an ffmpeg on the terminal puts the tty in raw mode
@@ -2407,6 +2542,21 @@ def _video_live():
                 # the model: every token due by now, each at its own media time
                 with torch.no_grad():
                     while (pos + clip.phase) / rate <= t:
+                        if S3:
+                            if pending:
+                                xin = model.expand(torch.tensor([pending.pop(0)], device=dev))
+                            else:
+                                prob = F.softmax(logits[0] / max(args.temperature, 1e-6), dim=-1)
+                                b3 = torch.multinomial(_truncate(prob), 1)[:, 0]
+                                for st in range(3):
+                                    if int(b3[st]) != _NUL_ID:
+                                        gen3[st].append(int(b3[st]))
+                                xin = torch.where(b3 == _NUL_ID, _PAD, b3)[None]
+                            img, aud = clip.grids(model, [clip.at(pos)], dev)
+                            dff, o = model.step(xin, dff, img, aud)
+                            logits = model.heads(o)
+                            pos += 1
+                            continue
                         if pending:
                             b = pending.pop(0)
                         else:
@@ -2442,7 +2592,12 @@ def _video_live():
                     im.set_data(raw[want])
                 hud.set_text(f'{fps:.2f} fps  frame {max(shown, 0):d}\n'
                              f'{t:6.1f} / {dur:.1f} s  play {plays}')
-                if len(gen_ids) != n_gen:
+                if S3:
+                    for st in range(3):
+                        if len(gen3[st]) != n3[st]:
+                            n3[st] = len(gen3[st])
+                            tick3[st].set_text((done3[st] + clean(_decode_plain(gen3[st])))[-_LIVE_TICK:])
+                elif len(gen_ids) != n_gen:
                     n_gen = len(gen_ids)
                     tick_gen.set_text((gen_done + clean(_decode_plain(gen_ids)))[-_LIVE_TICK:])
                 if ref_ids is not None and len(ref_now) != n_ref:
@@ -2463,7 +2618,11 @@ def _video_live():
             fig.savefig(args.video_save, dpi=100)
             print(f'saved {args.video_save}')
     print(f'--video: {plays} play(s)')
-    print('VLA:', (gen_done + clean(_decode_plain(gen_ids)))[-2000:])
+    if S3:
+        for lab, st in (('HEAR', 1), ('SEE', 2), ('THINK', 0)):
+            print(f'{lab}:', (done3[st] + clean(_decode_plain(gen3[st])))[-2000:])
+    else:
+        print('VLA:', (gen_done + clean(_decode_plain(gen_ids)))[-2000:])
     raise SystemExit(0)
 
 
@@ -2556,6 +2715,22 @@ if args.vis:
         fig.canvas.flush_events()
         time.sleep(args.delay)
     raise SystemExit(0)
+
+def _stream_xy(x, y, kin, kout, video):
+    """--streams 3: one-stream inputs / targets x, y [B], the kinds of their ticks kin (x's)
+    and kout (y's; 0 silent, 1 speech, 2 activity), and video [B] bool -> X, Y [B, 3] for the
+    text, voice and image streams. A text row's word is the text stream's: voice and image read
+    _PAD and target <NUL>. A video row's caption word is voice's (speech) or image's (activity):
+    the other stream reads _PAD and targets <NUL>, and text reads _PAD with no target (-100; the
+    caller feeds it the inner voice, the model's own last text word). _NULL blinks all three."""
+    st_in = torch.where(video, torch.where(kin > 0, kin, -1), 0)
+    st_out = torch.where(video, torch.where(kout > 0, kout, -1), 0)
+    X = torch.stack([torch.where(st_in == k, x, _PAD) for k in range(3)], dim=1)
+    X = torch.where((x == _NULL)[:, None], _NULL, X)
+    Y = torch.stack([torch.where(st_out == 0, y, -100)] +
+                    [torch.where(st_out == k, y, _NUL_ID) for k in (1, 2)], dim=1)
+    return X, Y
+
 
 # ── held-out eval ─────────────────────────────────────────────────────────────
 # Each held-out set is built once and reused, so successive EVAL lines differ only by the
@@ -2777,6 +2952,48 @@ def _token_bands(dev):
     return _band_cache['b'].to(dev)
 
 
+def _score3_tick(x, y, Kd, t, video, free, own3, img, aud, Mt, Mnt, nul3, gen):
+    """--streams 3, one eval tick: x, y [B] one-stream input / target, Kd [B, T] tick kinds
+    (None: text docs), video: the rows are clips, own3 [B, 3] each stream's sample at the last
+    tick (None at the first). Training's streams (see _stream_xy); a clip's text stream reads its
+    own word, and free (EVALF) every stream reads its own (no word after a <NUL>). -> (loss [B]
+    of the word y in the stream that owns it, this tick's samples [B, 3]); the voice / image
+    <NUL> statistics of clips accumulate in nul3."""
+    B = x.shape[0]
+    z = torch.zeros_like(x)
+    kout = Kd[:, t] if Kd is not None else z
+    kin = Kd[:, t - 1] if Kd is not None and t else z
+    vid = torch.full((B,), bool(video), dtype=torch.bool, device=x.device)
+    X3, Y3 = _stream_xy(x, y, kin, kout, vid)
+    if own3 is not None and video:
+        fed = torch.where(own3 == _NUL_ID, _PAD, own3)
+        if free:                       # EVALF: every stream its own
+            X3 = torch.where(X3 == _NULL, X3, fed)
+        else:                          # the inner voice
+            X3[:, 0] = torch.where(X3[:, 0] == _PAD, fed[:, 0], X3[:, 0])
+    logits, _ = model(X3, img=img, aud=aud)                       # [B, 3, V]
+    V = logits.shape[-1]
+    samp = None
+    if video:
+        samp = torch.multinomial(_truncate(F.softmax(logits.float().view(-1, V), dim=-1)), 1,
+                                 generator=gen).view(B, 3)
+    ce3 = F.cross_entropy(logits.view(-1, V), Y3.view(-1), reduction='none').view(B, 3)
+    st = torch.where(vid, kout.clamp(min=0), 0)                   # the stream y belongs to
+    ce = ce3.gather(1, st[:, None])[:, 0]
+    if video:
+        pn = F.softmax(logits.float(), dim=-1)[:, :, _NUL_ID]     # [B, 3]
+        for k in (1, 2):
+            isn = (Y3[:, k] == _NUL_ID) & (Mt | Mnt)
+            tok = Mt & (kout == k)
+            d = nul3[k]
+            d['ce'] += float((ce3[:, k].clamp(max=30) * isn).sum())
+            d['n'] += int(isn.sum())
+            d['p_nul'] += float((pn[:, k] * isn).sum())
+            d['p_tok'] += float((pn[:, k] * tok).sum())
+            d['n_tok'] += int(tok.sum())
+    return ce, samp
+
+
 def _score(step, corpus, docs, imgs=None, tag=None, clips=None, bands=True, free=False):
     """EVAL (clean / median / runaway%) and EVALB (loss by frequency band) lines, tagged
     `tag` (default corpus). imgs: one image per doc, seen through a fresh random crop every
@@ -2793,6 +3010,7 @@ def _score(step, corpus, docs, imgs=None, tag=None, clips=None, bands=True, free
     nb = int(band_of.max()) + 1 if band_of is not None else 0
     per_doc, bad_doc, band_sum, band_cnt = [], [], [], []
     nul = dict(ce=0.0, n=0, p_tok=0.0, n_tok=0, p_nul=0.0)    # --clock_hz: the <NUL> targets
+    nul3 = {k: dict(ce=0.0, n=0, p_tok=0.0, n_tok=0, p_nul=0.0) for k in (1, 2)}  # voice, image
     kce, kn = [0.0, 0.0, 0.0], [0, 0, 0]     # EVALS: loss / count by tick kind (1 speech, 2 activity)
     with _EvalState(), torch.no_grad():
         c = 0
@@ -2805,6 +3023,7 @@ def _score(step, corpus, docs, imgs=None, tag=None, clips=None, bands=True, free
                 M = M & ~Mn
             M = M & (Y >= 0)                 # --inner_voice: a silent tick (-100) has no target
             own = None                       # --inner_voice: the token sampled at the last tick
+            own3 = None                      # --streams 3: each stream's sample at the last tick
             bank = _bank(imgs[c:c + B], dev) if imgs is not None else None
             cb = clips[c:c + B] if clips is not None else None
             c += B
@@ -2848,7 +3067,12 @@ def _score(step, corpus, docs, imgs=None, tag=None, clips=None, bands=True, free
                         aud = model.audio_grid(lat, torch.tensor(
                             [v.ai[min(t, last[r])] for r, v in enumerate(cb)], device=dev))
                 xt = X[:, t]
-                if free and own is not None:     # EVALF: every word is the model's own
+                if model.streams == 3:
+                    ce = _score3_tick(X[:, t], Y[:, t], Kd, t, cb is not None, free, own3,
+                                      img, aud, M[:, t], Mn[:, t], nul3, gen)
+                    own3 = ce[1]
+                    ce = ce[0]
+                elif free and own is not None:     # EVALF: every word is the model's own
                     xt = torch.where((xt >= 0) | (xt == _PAD), own, xt)
                     if _NUL_ID is not None:      # ... and after its own <NUL>, no word
                         xt = torch.where(xt == _NUL_ID, _PAD, xt)
@@ -2857,14 +3081,15 @@ def _score(step, corpus, docs, imgs=None, tag=None, clips=None, bands=True, free
                     if args.voice_drop:
                         fb &= torch.rand(xt.shape, device=dev, generator=gen) >= args.voice_drop
                     xt = torch.where(fb, own, xt)
-                logits, _ = model(xt, img=img, aud=aud)
-                if args.inner_voice or free:
-                    own = torch.multinomial(_truncate(F.softmax(logits.float(), dim=-1)), 1,
-                                            generator=gen)[:, 0]
-                ce = F.cross_entropy(logits, Y[:, t], reduction='none')
+                if model.streams == 1:
+                    logits, _ = model(xt, img=img, aud=aud)
+                    if args.inner_voice or free:
+                        own = torch.multinomial(_truncate(F.softmax(logits.float(), dim=-1)), 1,
+                                                generator=gen)[:, 0]
+                    ce = F.cross_entropy(logits, Y[:, t], reduction='none')
                 # a diverged row is counted as runaway rather than poisoning the sums
                 ce = torch.where(torch.isfinite(ce), ce, torch.full_like(ce, 1e30))
-                if Mn is not None:
+                if Mn is not None and model.streams == 1:
                     pn = F.softmax(logits.float(), dim=-1)[:, _NUL_ID]
                     nul['ce'] += float((ce.clamp(max=30) * Mn[:, t]).sum())
                     nul['n'] += int(Mn[:, t].sum())
@@ -2915,6 +3140,19 @@ def _score(step, corpus, docs, imgs=None, tag=None, clips=None, bands=True, free
         f = lambda kk: f'{kce[kk] / kn[kk]:.4f} ({100 * kn[kk] / (kn[1] + kn[2]):.0f}%)' if kn[kk] else 'n/a'
         _eval_results[f'{tag}~kinds'] = dict(speech=kce[1] / max(1, kn[1]), activity=kce[2] / max(1, kn[2]))
         _emit(f'EVALS step {step:10} corpus {tag:8} speech {f(1)} activity {f(2)}')
+    if nul3[1]['n']:
+        # EVALN (--streams 3): per stream, the mean P(<NUL>) on its <NUL> targets (want ~1) and
+        # on its caption words (want ~0); nul_ce over both streams' <NUL> targets
+        g = lambda d, a, b: d[a] / max(1, d[b])
+        nn_ = nul3[1]['n'] + nul3[2]['n']
+        _eval_results[f'{tag}~nul'] = {
+            'ce': (nul3[1]['ce'] + nul3[2]['ce']) / max(1, nn_),
+            **{f'{lab}_{q}': g(nul3[k], 'p_' + q, 'n' if q == 'nul' else 'n_tok')
+               for k, lab in ((1, 'voice'), (2, 'image')) for q in ('nul', 'tok')}}
+        _emit(f'EVALN step {step:10} corpus {tag:8} nul_ce {_eval_results[f"{tag}~nul"]["ce"]:9.6f} '
+              + ' '.join(f'{lab} P(nul|nul) {g(nul3[k], "p_nul", "n"):.4f} P(nul|tok) '
+                         f'{g(nul3[k], "p_tok", "n_tok"):.4f}'
+                         for k, lab in ((1, 'voice'), (2, 'image'))))
     if nul['n']:
         # EVALN: the <NUL> targets' loss, and the mean P(<NUL>) the model gives on ticks whose
         # target is <NUL> (want ~1) and on ticks whose target is a caption token (want ~0)
@@ -3327,6 +3565,8 @@ img_fit = torch.zeros(len(_BANK_ROWS), 3, _IMG_IN, _IMG_BANK, dtype=torch.uint8,
 img_hw = torch.full((len(_BANK_ROWS), 3), float(_IMG_BANK), device=args.device)
 img_live = torch.tensor([r in _IMAGE_ROWS for r in _BANK_ROWS], dtype=torch.bool,
                         device=args.device)
+if model.streams == 3 and _BANK_ROWS:
+    raise SystemExit('--streams 3: image corpora and --imagine are not supported yet')
 if _BANK_ROWS and model.img_enc is None:
     raise SystemExit('--mix has an image corpus (or --imagine is on) but the model has no '
                      'image encoder')
@@ -3444,14 +3684,29 @@ def _gen_lines(i):
             at = [j for j, y in enumerate(ys) if y != _SIL]
             ref = _decode_plain(ys[:at[min(_GENV_LEN, len(at)) - 1] + 1] if at else [])
             n_ref = max(1, len(ref))
-            cap = model.generate(_prompt_ids(), len(ys), temperature=args.temperature, video=v,
-                                 stop_chars=n_ref)
-            L = max(1, min(len(ys), len(cap)))
             vid, cat, _ = v.meta
-            if k == ks[0]:
-                lines.append(f'GENV step {i:10} [{vid}{" " if cat else ""}{cat}]: '
-                             f'{_printable(_decode_plain(cap)[:n_ref])}')
-                lines.append(f'REF  step {i:10} [{vid}]: {_printable(ref)}')
+            if model.streams == 3:
+                # every stream free-running over the media time the REF spans, each shown up
+                # to REF's length: what it sees (image), hears (voice) and thinks (text)
+                L = at[min(_GENV_LEN, len(at)) - 1] + 1 if at else len(ys)
+                tx, vo, im_ = model.generate3(L, v, temperature=args.temperature)
+                caps = {lab: _decode_plain(ids)[:n_ref]
+                        for lab, ids in (('see', im_), ('hear', vo), ('think', tx))}
+                if k == ks[0]:
+                    tag = f'[{vid}{" " if cat else ""}{cat}]'
+                    for lab, c_ in caps.items():
+                        lines.append(f'GENV step {i:10} {tag} {lab}: {_printable(c_)}')
+                        tag = f'[{vid}]'
+                    lines.append(f'REF  step {i:10} [{vid}]: {_printable(ref)}')
+            else:
+                cap = model.generate(_prompt_ids(), len(ys), temperature=args.temperature, video=v,
+                                     stop_chars=n_ref)
+                L = max(1, min(len(ys), len(cap)))
+                caps = {'A+V': _decode_plain(cap)[:n_ref]}
+                if k == ks[0]:
+                    lines.append(f'GENV step {i:10} [{vid}{" " if cat else ""}{cat}]: '
+                                 f'{_printable(_decode_plain(cap)[:n_ref])}')
+                    lines.append(f'REF  step {i:10} [{vid}]: {_printable(ref)}')
             if '_spec' not in v.__dict__ and model.aud_enc is not None:
                 v._spec = _spectro(v.codes[:, :max(1, v.ai[L - 1])], args.device)
             f1 = v.fi[L - 1]
@@ -3459,7 +3714,7 @@ def _gen_lines(i):
             strip = np.concatenate([v.frames[f].permute(1, 2, 0).numpy() for f in sel], axis=1)
             vpanel.append((strip, getattr(v, '_spec', None),
                            f'{vid}  {cat}  0-{(f1 + 1) / v.fps:.0f}s'.strip(),
-                           {'A+V': _decode_plain(cap)[:n_ref]}, ref))
+                           caps, ref))
     if vpanel and _gen_inbox is not None and args.gen_vis:
         try:
             _gen_inbox.put_nowait(('genv', i, vpanel))
@@ -3807,6 +4062,9 @@ try:
                     except queue.Full:
                         pass
             idx, shown = media
+            if model.streams == 3:
+                kout_v = torch.tensor([t[2] for t in idx], dtype=torch.long, device=args.device)
+                kin_v = torch.tensor([t[3] for t in idx], dtype=torch.long, device=args.device)
             for j, im in shown:
                 vid_cur[j] = im.to(args.device, non_blocking=True)
             if vid_grid is None:
@@ -3817,7 +4075,7 @@ try:
             img[_vid_rows] = vid_grid
             if vid_lat is not None:
                 aud = torch.zeros(len(x_list), model.aud_width, model.S, model.S, device=args.device)
-                ends = torch.tensor([min(a, _VID_CAP) for _, a in idx], device=args.device)
+                ends = torch.tensor([min(t[1], _VID_CAP) for t in idx], device=args.device)
                 aud[_vid_rows] = model.audio_grid(vid_lat, ends).float()
         if _BANK_ROWS:
             for r, (im, name) in new_imgs:
@@ -3838,6 +4096,13 @@ try:
 
         dff_prev = model.dff
         model.train()
+        if model.streams == 3:       # one-stream (x, y) -> the text, voice and image streams
+            kin, kout = torch.zeros_like(x), torch.zeros_like(x)
+            if _VIDEO_ROWS:
+                kin[_vid_rows], kout[_vid_rows] = kin_v, kout_v
+            x, y = _stream_xy(x, y, kin, kout, _video_row)
+            if _own is not None:     # the inner voice: a video row's text stream reads its own word
+                x[:, 0] = torch.where(_video_row & (x[:, 0] == _PAD), _own, x[:, 0])
         if args.inner_voice:         # after a silent tick the input is the model's own token
             if _own is not None:     # (none at a resumed run's first step: _PAD stays)
                 fb = x == _PAD
@@ -3851,8 +4116,17 @@ try:
                         (torch.rand(x.shape, device=x.device) < args.text_feed)
                 x = torch.where(fb, _own, x)
         logits, _ = model(x, flag=flag & ~_continuous_row, img=img, aud=aud)
-        ce_all = F.cross_entropy(logits, y, reduction='none')
-        if args.inner_voice:
+        if model.streams == 3:
+            ce_all = F.cross_entropy(logits.reshape(-1, logits.shape[-1]), y.reshape(-1),
+                                     reduction='none').view(y.shape)
+        else:
+            ce_all = F.cross_entropy(logits, y, reduction='none')
+        if model.streams == 3:       # <NUL> targets weigh --nul_weight; text on video rows: none
+            with torch.no_grad():
+                _own = torch.multinomial(_truncate(F.softmax(logits[:, 0].detach().float(), dim=-1)), 1)[:, 0]
+            wt = torch.where(y == _NUL_ID, args.nul_weight, 1.0) * (y != -100)
+            loss = (ce_all * wt).sum() / wt.sum()
+        elif args.inner_voice:
             with torch.no_grad():
                 _own = torch.multinomial(_truncate(F.softmax(logits.detach().float(), dim=-1)), 1)[:, 0]
             loss = ce_all.sum() / (y != _SIL).sum().clamp(min=1)
@@ -3884,7 +4158,15 @@ try:
             with torch.no_grad():
                 ce = ce_all.detach()
                 for n, rows in _rows_of.items():
-                    if _NUL_ID is not None and n in _VIDEO_DATASETS:
+                    if model.streams == 3:
+                        yr, cr = y[rows], ce[rows]
+                        if n in _VIDEO_DATASETS:     # caption words (voice, image); <NUL> apart
+                            isn, tok = yr[:, 1:] == _NUL_ID, yr[:, 1:] != _NUL_ID
+                            carr[n].append(float(cr[:, 1:][tok].mean()) if tok.any() else float('nan'))
+                            carr[_nul_col[n]].append(float(cr[:, 1:][isn].mean()))
+                        else:                        # the text stream
+                            carr[n].append(float(cr[:, 0].mean()))
+                    elif _NUL_ID is not None and n in _VIDEO_DATASETS:
                         # caption tokens only, as EVAL; the <NUL> targets get their own column
                         isn = y[rows] == _NUL_ID
                         carr[n].append(float(ce[rows][~isn].mean()) if (~isn).any() else float('nan'))
