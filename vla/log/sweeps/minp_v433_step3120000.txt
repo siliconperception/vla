@@ -1,0 +1,56 @@
+70
+anchors over 40 fineweb docs: FLOOR 3.964 CEIL 7.175; real docs rep1 0.113 distinct2 0.937
+  min_p   n   nats  fluency%   (sd)   rep1 distinct2
+      0  10  5.503      52.1    9.8  0.113     0.983
+  0.001  10  4.770      74.9   11.1  0.119     0.973
+  0.003  10  4.428      85.6    8.9  0.117     0.964
+   0.01  10  3.856     103.4    5.1  0.115     0.956
+   0.03  10  3.302     120.6    7.4  0.122     0.916
+    0.1  10  2.837     135.1    6.1  0.121     0.844
+    0.3  10  2.271     152.7    6.9  0.122     0.678
+
+--- min_p 0 (seed 1) ---
+Contact: Cambridge, MA
+The Hartford Open Woolfit is a Coconut Surf capitalmente served as its services business. McKinney was born in Gloucester square in the Utah hills. Rhino Carpenter Inc., and LePailry Dog Foods, was established in 1968 at the near Champlow Forest Schools. Over the last few years there was 16—the go-along before football and the residents.
+The BEAA, in the local metal shops and the staff, the vibrant secularists found in dogs being owned between around 15,500 voices and serv
+
+--- min_p 0.001 (seed 1) ---
+Contact: Cambridge, MA
+The Hartford Open, LMA with Coconut Surf. Tealm Ridge, NC
+More information.
+MedDadek Hummerset Research
+What are their years of its promising professional development in the 1970’s, has been an extraordinary opportunity for a few places to practice. With more than one yet.
+A Kindly go the mountain before football and the residents. We spend some time in the summer and then back to the office, and attending the hospital for a rather than a decade around the world – once wel
+
+--- min_p 0.003 (seed 1) ---
+Contact: Cambridge, MA
+The Hartford Open, LMA with Coconut Surf.
+Camsung, Florida.
+Published: 10th Nov 2005
+San John MacDonald, NMW, Inc., and LePailist, Linda Morris, National Executive Order (CEO) and the author of Nudek Howard (SARAPA) and the accreditation of the academic calendar.
+The Intertext International Works in the President’s Bar Association, President of Utah
+USA Today in January 2008, Dr. Kennedy introduced the Boston Post
+Husesmecoin with a supporting education agency. He was elec
+
+--- min_p 0.01 (seed 1) ---
+Chie, N.Y.I. (FMA). Coconut, Don. 5 (1514,796.38)
+A specimen of its vast power of our laundry. As such, it is still a result of the "some" of life’s life, like a motorist who was a folk, and then not only the other—the go-along thing in the world.
+There is no reasonable person in the world, and any of them, of course, to be in the world to find a way of it.”
+When we explore it with a bluebird. From the woodlands of the English, you find it difficult to quantify this. But with your new site, we g
+
+--- min_p 0.03 (seed 1) ---
+Chie, N.Y.I. (FMA). The big-screen TV. I really enjoy working with you. My husband and I have been involved with my personal and personal experience. I've been a big fan of this blog to showcase their company. My life has a strong reputation and is having my family to me, and I feel it is the perfect choice.
+I want to try something new. I've always had a lot of experience and I am always interested to know how to relate to them.
+I’m excited about the style I have recently grown with a website. I
+
+--- min_p 0.1 (seed 1) ---
+A: New York is an excellent company in the world. In this sense, you'll be able to find a few things that are in the right place. This is why the site is not on display. You can't afford to spend your time, you can download the library at a reasonable price, but it is also essential to know what the industry can make.
+We are looking for a range of service options. There is a difference in the overall price and you will be able to experience the same level of customer experience.
+It’s easy to mak
+
+--- min_p 0.3 (seed 1) ---
+A new, well-known, popular and popular brand of modern art, and is a very popular and popular genre, and it is also the bestselling artist. It is the perfect addition to anyone looking for a great collection of artists and designers, and a great example of our clients, and a great way to get you to the right place.
+The Best of the Year:
+Our latest and best-selling designers in the world, I've been making a big difference in my personal design, and I’ve always had a great time, and I would love t
+
+[exited with code 0]

@@ -9371,3 +9371,44 @@ loss/grad/state:
   step 415000  loss  2.0368  grad  6.011  dff_std  0.685  dff_max     14.3  dff_zeros 0.0000
   step 420000  loss  2.1287  grad  6.396  dff_std  0.686  dff_max     12.3  dff_zeros 0.0000
   step 425000  loss 
+================================================================================
+2026-10-21 STATUS -- FineVideo + Mimi, fixed 25 Hz clock, v428-v442
+================================================================================
+Model (vla.py @ 483b364): recurrent CNN, 5 DFF registers 512x7x7 (--ctx_tau 64,16,4,1 @
+--clock_hz 25 -> windows 1600,400,100,25,1 ticks); ctx_cat 1x1 5376->384; 8x(3x3 conv, BN,
+ReLU) @384; linout ->512; text decoder tree 7->5->3->1 into frozen pythia31m lmhead (256-d,
+vocab 50304). Senses: frozen ResNet-50 grid 2048x7x7 at --vision_hz 2; frozen Mimi latents
+(last 49 frames, 512x7x7). 15.24M trainable / 49.26M frozen. SGD lr coswarm 1e-2..1e-4 /20K,
+batch 250, one-step gradient. Data fineweb:0.5, finevideo:0.5 (~3460 h; 89% of caption tokens
+speech, 11% activity). Examples: a video window of <=2048 tokens / <=600 s from a random event;
+video evals score the opening <=120 s of 64 held-out clips from zero registers.
+
+Silent-tick schemes (85% of video ticks have no caption token):
+  --inner_voice (v428-v441): no loss on silent ticks; the input after one is the model's own
+      sampled word. --voice_drop P: P of silent ticks get no word instead. --caption_feed /
+      --text_feed P: scheduled sampling on caption / fineweb ticks.
+  <NUL> (v427, v442 via --no-inner_voice): silent ticks target <NUL> at --nul_weight 0.2; the
+      input after a <NUL> is _PAD (no word).
+Evals added this period: EVALS (speech/activity split), EVALF (free run: every input the
+model's own word, the live-demo condition), EVALN (<NUL> rates), GENSCORE anchors fixed to the
+first 40 held-out fineweb docs, --eval_rare 10. Sampling: --min_p, --top_k, adaptive min_p via
+--fluency_target 100 (sweeps: log/sweeps/minp_v433_step3120000.txt, topk_v435_step4080000.txt;
+top_k 30 reads most natural).
+
+Runs (all --clock_hz 25 --fluency_target 100 --speech_delay 0.5):
+  v433 voice_drop 0.5, --continuous            3.12M  FineVideo 6.36, speech 6.60/deaf 8.39, fineweb 4.75; EVALF 7.50
+  v435 voice_drop 1, --continuous              4.14M  fineweb 4.70, FineVideo 5.89 noisy; sound gap only 0.4
+  v436 caption_feed 0.25                       3.54M  FineVideo 6.29; EVALF flat 7.45
+  v437 caption_feed 0.5, voice_drop 0          3.88M  EVALF 6.72; fineweb 4.71
+  v438 + text_feed 0.1                         4.00M  no EVALG gain; dropped
+  v439 v437 without --continuous (reset/clip)  3.92M  FineVideo 5.92, speech 6.00, EVALF 6.26 -- big gain
+  v440 caption_feed 0                          4.78M  FineVideo 5.80, speech 5.89, EVALF 6.36, sound gap 1.2
+  v441 voice_drop 1 (no self-feedback)         4.98M  FineVideo 5.20, speech 5.21, EVALF 10.4, GENV noise
+  v442 <NUL> target (--no-inner_voice)         running from 4.98M; at 5.30M: FineVideo ~5.05 (best
+      4.92), speech ~5.04, fineweb median ~4.66 (best 4.620), P(nul|nul) ~0.83, P(nul|tok) ~0.13;
+      EVALF 11-13 but GENV is the best yet (caption-shaped: activity lines + quoted speech).
+Findings: per-clip register reset beat --continuous on every eval (but evals only cover the
+first 120 s from zero -- a long-run eval is still missing). Training on own words keeps the
+free-run eval low; training on true words gives the best teacher-forced losses. Under <NUL>
+EVALF stops tracking demo quality (it scores true words after the model's own sentences); an
+automatic GENV score is needed. Snapshots: checkpoint/v4{33,35,36,37,38,39,40,41}_*.step*.pt.
