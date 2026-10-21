@@ -368,11 +368,12 @@ parser.add_argument('--max_lag',    default=2.0, type=float, metavar='S',
                          'never dropped)')
 parser.add_argument('--nul_weight', default=0.2, type=float,
                     help='--clock_hz: loss weight of <NUL> targets (caption tokens weigh 1)')
-parser.add_argument('--inner_voice', default=None, action='store_true',
+parser.add_argument('--inner_voice', default=None, action=argparse.BooleanOptionalAction,
                     help='--clock_hz without <NUL>: a tick with no caption token has no target '
                          '(no loss) and the model\'s own sampled token from it is the next '
                          'input, so the text free-runs between captions as at inference. Saved '
-                         'and restored like --clock_hz')
+                         'and restored like --clock_hz; --no-inner_voice switches a loaded '
+                         'inner-voice model back to a zero-initialized <NUL> target on silent ticks')
 parser.add_argument('--min_p',      default=None, type=float, metavar='P',
                     help='sample only words with at least P x the top word\'s probability: in '
                          'generation and for --inner_voice\'s own tokens in training and eval '
@@ -2781,8 +2782,9 @@ def _score(step, corpus, docs, imgs=None, tag=None, clips=None, bands=True, free
     `tag` (default corpus). imgs: one image per doc, seen through a fresh random crop every
     token from a fixed-seed generator, so successive evals see the same crops. clips: one
     _VideoClip per doc, its frame and sound at each step (blanked where it is blind / deaf).
-    Every row starts from zeroed registers, whatever --continuous says. free (--inner_voice
-    video): every input after the first tick is the model's own last word, as in the live demo;
+    Every row starts from zeroed registers, whatever --continuous says. free (video): every
+    input after the first tick is the model's own last word (no word after its own <NUL>), as in
+    the live demo;
     only the EVALF line (speech / activity loss) is written."""
     tag = tag or corpus
     t0 = time.time()
@@ -2848,13 +2850,15 @@ def _score(step, corpus, docs, imgs=None, tag=None, clips=None, bands=True, free
                 xt = X[:, t]
                 if free and own is not None:     # EVALF: every word is the model's own
                     xt = torch.where((xt >= 0) | (xt == _PAD), own, xt)
+                    if _NUL_ID is not None:      # ... and after its own <NUL>, no word
+                        xt = torch.where(xt == _NUL_ID, _PAD, xt)
                 elif args.inner_voice and own is not None:   # after a silent tick: its own token
                     fb = xt == _PAD
                     if args.voice_drop:
                         fb &= torch.rand(xt.shape, device=dev, generator=gen) >= args.voice_drop
                     xt = torch.where(fb, own, xt)
                 logits, _ = model(xt, img=img, aud=aud)
-                if args.inner_voice:
+                if args.inner_voice or free:
                     own = torch.multinomial(_truncate(F.softmax(logits.float(), dim=-1)), 1,
                                             generator=gen)[:, 0]
                 ce = F.cross_entropy(logits, Y[:, t], reduction='none')
@@ -3218,7 +3222,7 @@ def _heldout_eval(step):
                     if (see or hear) or rare:
                         _score(step, corpus, docs, tag=corpus + sfx, bands=rare,
                                clips=[v.variant(see, hear) for v in _eval_vids[corpus]])
-                if args.inner_voice:     # EVALF: the same clips with every word its own
+                if args.inner_voice or _NUL_ID is not None:   # EVALF: every word its own
                     for see, hear, sfx in _VIDEO_VARIANTS:
                         if see or hear:
                             _score(step, corpus, docs, tag=corpus + sfx, free=True,
