@@ -333,6 +333,9 @@ parser.add_argument('--lr_period',  default=20000, type=int, help='coswarm rise 
 parser.add_argument('--schedule',   default='coswarm', choices=['const', 'coswarm'],
                     help='const: --lr_max throughout. coswarm: half-cosine rise from --lr_min '
                          'to --lr_max over --lr_period global steps, then hold')
+parser.add_argument('--lr_restart', action='store_true',
+                    help='coswarm: rise over --lr_period steps from this run\'s first step '
+                         '(a resumed run warms up again) instead of from global step 0')
 parser.add_argument('--momentum',   default=0.0,  type=float, help='SGD momentum')
 parser.add_argument('--weight_decay', default=0.0, type=float, help='SGD weight decay')
 parser.add_argument('--run_steps',  default=None, type=int, help='stop after N steps of this run')
@@ -4204,7 +4207,9 @@ def _lr_factor(step):
     """lr / lr_max at a global step."""
     if args.schedule == 'const':
         return 1.0
-    f = (1.0 - math.cos(math.pi * min(step / max(1, args.lr_period), 1.0))) / 2.0
+    if args.lr_restart:          # warm up again from this run's first step
+        step -= _start_step
+    f = (1.0 - math.cos(math.pi * min(max(0, step) / max(1, args.lr_period), 1.0))) / 2.0
     return (args.lr_min + (args.lr_max - args.lr_min) * f) / args.lr_max
 
 
