@@ -1239,6 +1239,9 @@ class _VideoClip:
         self.n_aud = lat.shape[-1] if lat.dim() == 2 else max(0, lat.shape[0] - _QN_WIN) // _QN_HOP
         self._ag = (None, None)          # quartznet: (cells heard, audio grid) of the last step
         self._agrid, self._aidx = None, {}   # quartznet: grids precomputed per cells heard
+        self.fps, self.t0, self.rate, self.meta = fps, t0, rate, meta
+        self.see, self.hear = see, hear
+        self.phase = 0.0 if args.clock_hz else 0.5     # tick k at t0 + k/R; token k mid-slot
 
     def precompute_audio(self, model, dev, chunk=64):
         """quartznet: the audio grid of every distinct cells-heard value of the clip's ticks,
@@ -1256,9 +1259,6 @@ class _VideoClip:
         if k is not None:
             return self._agrid[k:k + 1].float()
         return model.audio_grid(self.lat[None].to(dev), torch.tensor([ai], device=dev))
-        self.fps, self.t0, self.rate, self.meta = fps, t0, rate, meta
-        self.see, self.hear = see, hear
-        self.phase = 0.0 if args.clock_hz else 0.5     # tick k at t0 + k/R; token k mid-slot
 
     def variant(self, see, hear):
         v = copy.copy(self)
