@@ -136,8 +136,26 @@ _VID_MAXSPAN = 600.0        # ... that also spans at most this many seconds of m
 _AUD_RATE = 12.5            # audio grid cells per second (a Mimi frame, 80 ms)
 _AUD_DIM = 512              # Mimi latent width
 _AUDIO_ENCODERS = {'mimi': 'kyutai/mimi',      # frozen; codes -> [512, T] latents
-                   'quartznet': 'nvidia/stt_en_quartznet15x5'}   # frozen; 16 kHz sound -> [1024, T]
-_AUD_DIMS = {'mimi': _AUD_DIM, 'quartznet': 1024}
+                   'quartznet': 'nvidia/stt_en_quartznet15x5',   # frozen; 16 kHz sound -> [1024, T]
+                   'logmel': None}               # fixed DSP, no weights; 16 kHz sound -> [256, S, S]
+_LM_MELS, _LM_FR = 64, 4    # logmel: 64 mels x 4 frames of 10 ms per grid cell (40 ms; 1.96 s at S=7)
+_LM_NFFT, _LM_WIN, _LM_HOP = 512, 400, 160
+_AUD_DIMS = {'mimi': _AUD_DIM, 'quartznet': 1024, 'logmel': _LM_MELS * _LM_FR}
+_WAV_ENCODERS = ('quartznet', 'logmel')   # read the clean 16 kHz soundtrack (the sound buffers)
+# logmel: per-mel mean / std of log power over 4.1M non-silent frames of 200 FineVideo soundtracks
+_LM_MU = [
+    -5.557, -4.207, -4.062, -3.739, -4.051, -4.060, -4.423, -4.360, -4.623, -4.697, -5.034,
+    -5.224, -5.591, -5.875, -6.169, -6.390, -6.590, -6.815, -6.938, -7.172, -7.236, -7.373,
+    -7.503, -7.507, -7.650, -7.706, -7.752, -7.803, -7.881, -7.845, -7.936, -7.975, -8.078,
+    -8.181, -8.373, -8.464, -8.519, -8.612, -8.580, -8.592, -8.649, -8.758, -8.955, -9.102,
+    -9.232, -9.337, -9.437, -9.543, -9.703, -9.925, -10.126, -10.346, -10.533, -10.756, -10.946,
+    -11.077, -11.208, -11.324, -11.416, -11.497, -11.598, -11.764, -12.153, -12.838]
+_LM_SD = [
+    3.774, 3.627, 3.621, 3.570, 3.593, 3.608, 3.646, 3.685, 3.740, 3.777, 3.801, 3.801, 3.811,
+    3.825, 3.807, 3.757, 3.726, 3.683, 3.655, 3.640, 3.627, 3.612, 3.613, 3.600, 3.600, 3.608,
+    3.622, 3.611, 3.616, 3.593, 3.587, 3.585, 3.579, 3.567, 3.572, 3.557, 3.555, 3.582, 3.599,
+    3.624, 3.652, 3.631, 3.600, 3.563, 3.557, 3.587, 3.628, 3.642, 3.652, 3.626, 3.612, 3.617,
+    3.633, 3.636, 3.662, 3.667, 3.694, 3.688, 3.690, 3.649, 3.660, 3.673, 3.692, 3.669]
 # --audio_encoder quartznet: NVIDIA's QuartzNet 15x5 CTC speech recognizer (NGC, CC-BY-4.0), all
 # 1-D separable convs; its 1024-wide C3 features (50 Hz) of the clean soundtrack, which the
 # sidecar corpus holds (exp/audio_prep.py) as 16 kHz FLAC joined to the video rows by id
@@ -1219,11 +1237,63 @@ class QuartzNetEncoder(nn.Module):
         return ''.join(labels[c] for c, p in zip(lg, [-1] + lg[:-1]) if c != p and c < len(labels))
 
 
+class LogMelEncoder(nn.Module):
+    """--audio_encoder logmel: a fixed log-mel front end, no weights (an FFT and a filter
+    bank): 16 kHz sound -> 64 slaney mels of 25 ms frames every 10 ms (power, log), each mel
+    standardized by fixed corpus constants (_LM_MU/_LM_SD). The grid is the spectrogram of the
+    last S*S*4 frames heard, 4 frames (40 ms) per cell laid out row-major, channel = frame x 64
+    + mel -- causal, so each 25 Hz tick only adds a cell (a shift register in hardware)."""
+
+    def __init__(self):
+        super().__init__()
+        import torchaudio
+        fb = torchaudio.functional.melscale_fbanks(_LM_NFFT // 2 + 1, 0.0, _QN_SR / 2, _LM_MELS,
+                                                   _QN_SR, norm='slaney', mel_scale='slaney')
+        self.__dict__['_t'] = {'fb': fb.T.contiguous(), 'win': torch.hann_window(_LM_WIN),
+                               'mu': torch.tensor(_LM_MU)[:, None], 'sd': torch.tensor(_LM_SD)[:, None]}
+        self.width = _AUD_DIMS['logmel']
+        self.n_params = 0
+
+    def _on(self, dev):
+        if self._t['fb'].device != torch.device(dev):
+            self.__dict__['_t'] = {k: v.to(dev) for k, v in self._t.items()}
+
+    @torch.no_grad()
+    def features(self, x, norm=True):
+        """float sound [N, L] at 16 kHz -> (log-mel [N, 64, T], valid [N, T]), frame j over
+        samples j*160 .. j*160+512 (no padding); a frame of digital silence (before the sound
+        starts) is 0 and invalid."""
+        self._on(x.device)
+        t = self._t
+        sp = torch.stft(x.float(), _LM_NFFT, _LM_HOP, _LM_WIN, t['win'], center=False,
+                        return_complex=True)
+        p = t['fb'] @ sp.abs().pow(2)
+        ok = p.sum(1) > 1e-10
+        f = torch.log(p + 1e-10)
+        if norm:
+            f = (f - t['mu']) / t['sd']
+        return f * ok[:, None], ok
+
+    def grids(self, wav, ends, S):
+        """int16 sound buffers [N, L] (as QuartzNetEncoder.grids: sample 0 = _QN_WIN samples
+        before grid cell 0 of 80 ms) and 80 ms cells heard [N] (in 20 ms quarters) -> grids
+        [N, 256, S, S] of the S*S*4 frames ending at the sound heard."""
+        nf = S * S * _LM_FR
+        L = (nf - 1) * _LM_HOP + _LM_NFFT
+        e = (ends.double() * _QN_HOP).round().long()[:, None] + _QN_WIN
+        i0 = e - L + torch.arange(L, device=wav.device)[None]
+        x = wav.gather(1, i0.clamp(0, wav.shape[1] - 1)).float() / 32768.0
+        f, _ = self.features(x)
+        N = f.shape[0]
+        return f.view(N, _LM_MELS, S * S, _LM_FR).permute(0, 3, 1, 2).reshape(
+            N, _LM_FR * _LM_MELS, S, S)
+
+
 def _cells_heard(t):
     """Grid cells of sound heard by media time t (s): whole 80 ms cells for Mimi; for quartznet
     in quarter cells (one 20 ms QuartzNet frame each), so an --audio_hz above 12.5 still moves
     the grid every refresh."""
-    if args.audio_encoder == 'quartznet':
+    if args.audio_encoder in _WAV_ENCODERS:
         return math.floor(t * _AUD_RATE * _QN_FRAMES + 1e-9) / _QN_FRAMES
     return int(t * _AUD_RATE)
 
@@ -1518,7 +1588,8 @@ class VLAModel(nn.Module, _HubMixin):
 
         self.img_enc = ImageEncoder(self.image_encoder) if self.img_width else None   # frozen
         self.aud_enc = (None if not self.aud_width else QuartzNetEncoder()       # frozen
-                        if self.audio_encoder == 'quartznet' else AudioEncoder(self.audio_encoder))
+                        if self.audio_encoder == 'quartznet' else LogMelEncoder()  # no weights
+                        if self.audio_encoder == 'logmel' else AudioEncoder(self.audio_encoder))
 
         self.register_buffer('ctx_read_rms', torch.zeros(self.K))       # 0 = not measured yet
         self.register_buffer('rate', torch.tensor([min(1.0, 1.0 / w) for w in self.windows]),
@@ -1558,7 +1629,7 @@ class VLAModel(nn.Module, _HubMixin):
         _aud_windows), each position RMS-normalized over channels; silence-before-start stays 0.
         quartznet: lat is the int16 sound buffers [N, L] (see _qn_buffer), the grid [N, 1024,
         S, S] (see QuartzNetEncoder.grids)."""
-        if self.audio_encoder == 'quartznet':
+        if self.audio_encoder in _WAV_ENCODERS:
             a = self.aud_enc.grids(lat, ends, self.S)
         else:
             a = _aud_windows(lat, ends, self.S).float()
@@ -2263,7 +2334,7 @@ class _VideoSource(_ImageSource):
                 if not files:
                     raise SystemExit(f'{self.name}: no visual captions in '
                                      f'{_VCAP_SIDECAR.get(self.name)} (see exp/vcap_prep.py)')
-            if args.audio_encoder == 'quartznet':      # only shards whose sound is there
+            if args.audio_encoder in _WAV_ENCODERS:      # only shards whose sound is there
                 files = [f for f in files if os.path.exists(_sidecar_path(self.name, f) or '')]
                 if not files:
                     raise SystemExit(f'{self.name}: no sidecar sound in '
@@ -2295,7 +2366,7 @@ class _VideoSource(_ImageSource):
                 row['vcap'] = _row_vcap(self.name, row['_file'], row['id'])
                 if row['vcap'] is None:
                     continue
-            if args.audio_encoder == 'quartznet':
+            if args.audio_encoder in _WAV_ENCODERS:
                 row['wav'] = _row_wav(self.name, row['_file'], row['id'])
                 if row['wav'] is None:
                     continue
@@ -2589,7 +2660,15 @@ def _model_graph(model):
                                 inp=f'3x{_IMG_IN}x{_IMG_IN}', out=f'{model.img_width}x{S}x{S}', tr=0,
                                 fr=sum(p.numel() for p in model.img_enc.parameters())))
                 srcs.insert(1, '(image grid)')
-            if model.audio_encoder == 'quartznet':
+            if model.audio_encoder == 'logmel':
+                out.append(dict(name='aud_enc -> (audio grid)',
+                                op=f'log-mel (fixed: STFT {_LM_NFFT}/{_LM_WIN}/{_LM_HOP}, {_LM_MELS} '
+                                   f'mels, corpus mu/sd), last {S * S} cells of {_LM_FR} frames '
+                                   f'(40 ms), RMSnorm',
+                                inp=f'{(S * S * _LM_FR - 1) * _LM_HOP + _LM_NFFT} samples',
+                                out=f'{model.aud_width}x{S}x{S}', tr=0, fr=0))
+                srcs.insert(2 if model.img_enc is not None else 1, '(audio grid)')
+            elif model.audio_encoder == 'quartznet':
                 out.append(dict(name='aud_enc -> (audio grid)',
                                 op=f'QuartzNet 15x5 C3 (frozen) over the last {_QN_WIN / _QN_SR:g} s, '
                                    f'last {S * S} cells of 80 ms, RMSnorm',
@@ -2923,13 +3002,13 @@ def _video_live():
         print(f'--video: preparing {path} (2 fps frames, Mimi codes) ...', flush=True)
         vfps = args.vision_hz or 2.0
         frames = _ff_frames2(path, vfps)
-        codes = (torch.zeros(32, 0, dtype=torch.short) if model.audio_encoder == 'quartznet'
+        codes = (torch.zeros(32, 0, dtype=torch.short) if model.audio_encoder in _WAV_ENCODERS
                  else model.aud_enc.codes(_ff_audio(path, 24000, 1)[:, 0], dev))
         dur, rate, name = _ff_json(path)[3], args.clock_hz or args.video_rate, os.path.basename(path)
     if len(frames) == 0:
         raise SystemExit('--video: no frames')
     w16 = None                   # quartznet: the clean 16 kHz sound it hears
-    if model.audio_encoder == 'quartznet':
+    if model.audio_encoder in _WAV_ENCODERS:
         w16 = _row_wav('finevideo', row['_file'], row['id']) if args.video == 'eval' else None
         if w16 is None:
             w16 = (np.clip(_ff_audio(path, _QN_SR, 1)[:, 0], -1, 1) * 32767).astype(np.int16) \
@@ -3302,7 +3381,7 @@ def _clip_of(r, m, dev):
     """A video row and its example's media (see _video_example) -> a _VideoClip: centre-crop
     frames on the CPU, the sound on dev."""
     frames = torch.stack([_crop224(im) for im in _decode_jpegs(m['jpegs'], 'cpu')])
-    if model.audio_encoder == 'quartznet':
+    if model.audio_encoder in _WAV_ENCODERS:
         lat = torch.from_numpy(m['wav']).to(dev)
     elif model.aud_enc is not None:
         lat = model.aud_enc.latents(m['codes'], dev)
@@ -3324,7 +3403,7 @@ def _gen_clip(corpus, rng):
     import pyarrow.parquet as pq
     held = _VIDEO_DATASETS[corpus].get('eval') is None
     files = _video_files(corpus, 'eval')
-    if model.audio_encoder == 'quartznet':
+    if model.audio_encoder in _WAV_ENCODERS:
         files = [f for f in files if os.path.exists(_sidecar_path(corpus, f) or '')]
     if args.fifo3:
         files = [f for f in files if os.path.exists(_vcap_path(corpus, f) or '')]
@@ -3342,7 +3421,7 @@ def _gen_clip(corpus, rng):
                                   for g in range(pf.metadata.num_row_groups)])
         g = int(np.searchsorted(bounds, k, side='right')) - 1
         r = pf.read_row_group(g, columns=_VID_COLS).to_pylist()[k - bounds[g]]
-        if model.audio_encoder == 'quartznet':
+        if model.audio_encoder in _WAV_ENCODERS:
             r['wav'] = _row_wav(corpus, f, r['id'])
             if r['wav'] is None:
                 continue
@@ -3405,7 +3484,7 @@ def _build_video_eval(corpus):
                 if not bounds[g] <= k < bounds[g + 1] or len(items) >= want:
                     continue
                 r = rows[k - bounds[g]]
-                if model.audio_encoder == 'quartznet':
+                if model.audio_encoder in _WAV_ENCODERS:
                     r['wav'] = _row_wav(corpus, f, r['id'])
                     if r['wav'] is None:
                         no_wav += 1
@@ -3421,7 +3500,7 @@ def _build_video_eval(corpus):
                     continue
                 text, m = ex
                 clip = _clip_of(r, m, dev)
-                if model.audio_encoder == 'quartznet':
+                if model.audio_encoder in _WAV_ENCODERS:
                     clip.precompute_audio(model, dev)
                 items.append((m['steps'], clip))
     items.sort(key=lambda it: len(it[0]))
@@ -3663,14 +3742,14 @@ def _score(step, corpus, docs, imgs=None, tag=None, clips=None, bands=True, free
             c += B
             if cb is not None:
                 see, hear = cb[0].see and model.img_width, cb[0].hear and model.aud_width
-                if hear and model.audio_encoder != 'quartznet':
+                if hear and model.audio_encoder not in _WAV_ENCODERS:
                     Tm = max(1, max(v.lat.shape[1] for v in cb))
                     lat = torch.zeros(B, _AUD_DIM, Tm, device=dev)
                     for r, v in enumerate(cb):
                         lat[r, :, :v.lat.shape[1]] = v.lat
                 heard, agrid = [-1] * B, None    # quartznet: each clip's precomputed grids
                 wbuf = None                      # ... or, not precomputed, the sound buffers
-                if hear and model.audio_encoder == 'quartznet' and \
+                if hear and model.audio_encoder in _WAV_ENCODERS and \
                         any(v._agrid is None for v in cb):
                     wbuf = torch.zeros(B, max(v.lat.shape[0] for v in cb), dtype=torch.int16,
                                        device=dev)
@@ -3707,7 +3786,7 @@ def _score(step, corpus, docs, imgs=None, tag=None, clips=None, bands=True, free
                         img = grid
                     if hear:
                         ais = [v.ai[min(t, last[r])] for r, v in enumerate(cb)]
-                        if model.audio_encoder != 'quartznet':
+                        if model.audio_encoder not in _WAV_ENCODERS:
                             aud = model.audio_grid(lat, torch.tensor(ais, device=dev))
                         else:
                             ch = [r for r in range(B) if ais[r] != heard[r]]
@@ -4286,12 +4365,12 @@ _own = None                  # --inner_voice: each row's token sampled at the la
 vid_grid = None              # the frozen encoder's grid of vid_cur, recomputed only for rows whose
                              # frame changed (frames are held between 2 fps updates)
 vid_lat = (torch.zeros(len(_VIDEO_ROWS), _AUD_DIM, _VID_CAP, dtype=torch.float16, device=args.device)
-           if _VIDEO_ROWS and model.aud_width and model.audio_encoder != 'quartznet' else None)
+           if _VIDEO_ROWS and model.aud_width and model.audio_encoder not in _WAV_ENCODERS else None)
 # quartznet: each video row's int16 sound buffer (see _qn_buffer), its audio grid and the cells
 # heard when that was computed (it runs only for rows whose sound refreshed)
 vid_wav = (torch.zeros(len(_VIDEO_ROWS), _QN_WIN + _VID_CAP * _QN_HOP, dtype=torch.int16,
                        device=args.device)
-           if _VIDEO_ROWS and model.audio_encoder == 'quartznet' else None)
+           if _VIDEO_ROWS and model.audio_encoder in _WAV_ENCODERS else None)
 vid_agrid = None
 vid_heard = torch.full((len(_VIDEO_ROWS),), -1.0, device=args.device)
 if _VIDEO_ROWS and model.img_enc is None:
@@ -4300,8 +4379,10 @@ _vid_rec = False             # --sample_vis: record the next example of the firs
 
 
 def _grad_norm():
-    return sum(p.grad.detach().norm(2).item() ** 2
-               for p in model.parameters() if p.grad is not None and p.requires_grad) ** 0.5
+    """The global gradient norm, one host sync (not one per parameter tensor: behind a GPU
+    shared with another process each sync waits its turn)."""
+    g = [p.grad.detach() for p in model.parameters() if p.grad is not None and p.requires_grad]
+    return float(torch.linalg.vector_norm(torch.stack(torch._foreach_norm(g)))) if g else 0.0
 
 
 def _save(i, n_examples):
@@ -4730,6 +4811,15 @@ class _Imaginer:
 _imaginer = _Imaginer(_SYNTH_ROWS) if _SYNTH_ROWS else None
 
 larr, garr = [], []
+_rows_t = {}                 # each corpus's training rows as a device index tensor
+
+
+def _mmean(v, m):
+    """Mean of v where m, nan where m is empty -- a GPU tensor, no host sync."""
+    m = m.to(v.dtype)
+    return (v * m).sum() / m.sum()
+
+
 carr = {n: [] for n in _rows_of} if len(_rows_of) > 1 else {}
 _nul_col = {n: 'nul' if sum(m in _VIDEO_DATASETS for m in _rows_of) == 1 else f'nul_{n}'
             for n in _rows_of if n in _VIDEO_DATASETS}      # STEP column: loss_nul when one
@@ -4964,42 +5054,45 @@ try:
             model(x, flag=flag & ~_continuous_row, img=img, aud=aud)
         _pt('recompute')
 
-        larr.append(loss.item())
+        larr.append(loss.detach())   # 0-d GPU tensors, read once per --monitor (no sync per step)
         if carr:
             with torch.no_grad():
                 ce = ce_all.detach()
                 for n, rows in _rows_of.items():
+                    rt = _rows_t.get(n)
+                    if rt is None:
+                        rt = _rows_t[n] = torch.tensor(rows, device=ce.device)
                     if model.streams == 3:
-                        yr, cr = y[rows], ce[rows]
+                        yr, cr = y[rt], ce[rt]
                         if n in _VIDEO_DATASETS:     # caption words (voice, image; --fifo3 text
                             c0 = 0 if args.fifo3 else 1   # too); <NUL> apart
-                            isn, tok = yr[:, c0:] == _NUL_ID, yr[:, c0:] != _NUL_ID
-                            carr[n].append(float(cr[:, c0:][tok].mean()) if tok.any() else float('nan'))
-                            carr[_nul_col[n]].append(float(cr[:, c0:][isn].mean()))
+                            isn = yr[:, c0:] == _NUL_ID
+                            carr[n].append(_mmean(cr[:, c0:], ~isn))
+                            carr[_nul_col[n]].append(_mmean(cr[:, c0:], isn))
                         else:                        # the text stream
-                            carr[n].append(float(cr[:, 0].mean()))
+                            carr[n].append(cr[:, 0].mean())
                     elif _NUL_ID is not None and n in _VIDEO_DATASETS:
                         # caption tokens only, as EVAL; the <NUL> targets get their own column
-                        isn = y[rows] == _NUL_ID
-                        carr[n].append(float(ce[rows][~isn].mean()) if (~isn).any() else float('nan'))
-                        carr[_nul_col[n]].append(float(ce[rows][isn].mean()) if isn.any() else float('nan'))
+                        isn = y[rt] == _NUL_ID
+                        carr[n].append(_mmean(ce[rt], ~isn))
+                        carr[_nul_col[n]].append(_mmean(ce[rt], isn))
                     elif args.inner_voice and n in _VIDEO_DATASETS:   # caption ticks only
-                        has = y[rows] != _SIL
-                        carr[n].append(float(ce[rows][has].mean()) if has.any() else float('nan'))
+                        carr[n].append(_mmean(ce[rt], y[rt] != _SIL))
                     else:
-                        carr[n].append(float(ce[rows].mean()))
+                        carr[n].append(ce[rt].mean())
         if i % args.monitor == 0:
             flat = model.dff.reshape(-1)
             line = ('STEP {:10} wall {} loss {:12.9f} grad {:12.6f} lr {:10.9f} dff_mean {:12.5f} '
                     'dff_std {:12.5f} dff_max {:11.3f}'
-                    ).format(i, datetime.datetime.now(), np.mean(larr[-args.monitor:]),
+                    ).format(i, datetime.datetime.now(), torch.stack(larr[-args.monitor:]).mean().item(),
                              np.mean(garr[-args.monitor:]), optimizer.param_groups[0]['lr'],
                              flat.mean().item(), flat.std().item(), flat.abs().max().item())
             line += _ex_ep()
             if _imaginer is not None:
                 line += _imaginer.stats()
-            line += ''.join(f' loss_{n} {np.nanmean(a[-args.monitor:]) if np.isfinite(a[-args.monitor:]).any() else float("nan"):6.3f}'
-                            for n, a in carr.items())
+            for n, a in carr.items():
+                v = torch.stack(a[-args.monitor:]).float().cpu().numpy()
+                line += f' loss_{n} {np.nanmean(v) if np.isfinite(v).any() else float("nan"):6.3f}'
             _emit(line)
             del larr[:-args.monitor], garr[:-args.monitor]   # keep host RAM flat
             for a in carr.values():
