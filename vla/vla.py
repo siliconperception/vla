@@ -128,7 +128,7 @@ _VIDEO_DATASETS = {
 }                           # valor: deprecated 2026-10-17 (25k short clips, over-repeated)
 _VID_EVAL_CLIPS = 64        # held-out videos per video eval corpus (decoded frames stay in RAM) ...
 _VID_EVAL_MAXLEN = 512      # ... each its opening window of at most this many tokens
-_VID_EVAL_SPAN = 120.0      # ... (--clock_hz: of at most this many seconds)
+_VID_EVAL_SPAN = 60.0       # ... (--clock_hz: of at most this many seconds; 120 until v448)
 _VID_EVAL_MINTOK = 20       # ... with at least this many caption tokens
 _VID_MAXTOK = 2048          # a longer video example is a random window of whole events ...
 _VID_MAXSPAN = 600.0        # ... that also spans at most this many seconds of media
@@ -411,6 +411,9 @@ parser.add_argument('--nul_weight', default=None, type=float,
                     help='--clock_hz: loss weight of <NUL> targets (caption tokens weigh 1); below '
                          '1 the model learns P(<NUL>) too low (its odds scaled by the weight). '
                          'Default 0.2. Saved and restored unless given')
+parser.add_argument('--clip', default=0.0, type=float, metavar='G',
+                    help='scale the gradient down to norm G when it is larger (0 = off); the STEP '
+                         'grad column is the norm before clipping')
 parser.add_argument('--loss_norm', default=None, choices=('weight', 'words'),
                     help='--clock_hz: divide the summed loss by the summed target weight (weight, '
                          'the default) or by the number of word (non-<NUL>) targets (words: with '
@@ -4897,6 +4900,10 @@ try:
         if not math.isfinite(gnorm):
             print(f'\n*** HALT: non-finite grad at step {i}')
             break
+        if args.clip and gnorm > args.clip:
+            for p in model.parameters():
+                if p.grad is not None:
+                    p.grad.mul_(args.clip / gnorm)
         optimizer.step()
         # recompute this step's state with the updated weights (eval-mode BatchNorm), so the
         # state carried forward is the one the model would compute at inference
