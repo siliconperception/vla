@@ -132,9 +132,21 @@ _VID_EVAL_SPAN = 120.0      # ... (--clock_hz: of at most this many seconds)
 _VID_EVAL_MINTOK = 20       # ... with at least this many caption tokens
 _VID_MAXTOK = 2048          # a longer video example is a random window of whole events ...
 _VID_MAXSPAN = 600.0        # ... that also spans at most this many seconds of media
-_AUD_RATE = 12.5            # Mimi frames per second
+_AUD_RATE = 12.5            # audio grid cells per second (a Mimi frame, 80 ms)
 _AUD_DIM = 512              # Mimi latent width
-_AUDIO_ENCODERS = {'mimi': 'kyutai/mimi'}      # frozen; codes -> [512, T] latents
+_AUDIO_ENCODERS = {'mimi': 'kyutai/mimi',      # frozen; codes -> [512, T] latents
+                   'quartznet': 'nvidia/stt_en_quartznet15x5'}   # frozen; 16 kHz sound -> [1024, T]
+_AUD_DIMS = {'mimi': _AUD_DIM, 'quartznet': 1024}
+# --audio_encoder quartznet: NVIDIA's QuartzNet 15x5 CTC speech recognizer (NGC, CC-BY-4.0), all
+# 1-D separable convs; its 1024-wide C3 features (50 Hz) of the clean soundtrack, which the
+# sidecar corpus holds (exp/audio_prep.py) as 16 kHz FLAC joined to the video rows by id
+_QN_URL = ('https://api.ngc.nvidia.com/v2/models/nvidia/nemo/stt_en_quartznet15x5/versions/'
+           '1.0.0rc1/files/stt_en_quartznet15x5.nemo')
+_QN_DIR = '/data/huggingface/quartznet'
+_QN_SR = 16000
+_QN_HOP = int(_QN_SR / _AUD_RATE)      # samples per audio grid cell (1280)
+_QN_WIN = 8 * _QN_SR        # each grid is computed from the last 8 s heard (it looks both ways)
+_AUD_SIDECAR = {'finevideo': '/data/finevideo_audio'}
 
 _IMAGE_ENCODERS = {'resnet50': 'timm/resnet50.a1_in1k'}   # frozen; [3,224,224] -> [2048,7,7]
 _IMG_BANK = 1024            # image canvas side; larger images keep their central 1024x1024
@@ -244,7 +256,11 @@ parser.add_argument('--image_encoder', default=None, choices=['none'] + sorted(_
 parser.add_argument('--audio_encoder', default=None, choices=['none'] + sorted(_AUDIO_ENCODERS),
                     help='frozen audio encoder whose latents join the input concat: the last '
                          'S*S Mimi frames (80 ms each; 3.9 s at S=7) laid out row-major over the '
-                         'SxS grid; default: mimi if --mix or --eval_corpora names a video '
+                         'SxS grid; quartznet: the same layout of QuartzNet 15x5 speech features '
+                         '(1024 wide, 4 frames averaged per cell) computed over the last 8 s of '
+                         'the clean 16 kHz soundtrack (exp/audio_prep.py sidecar); given with '
+                         '--load, it replaces the checkpoint\'s encoder (its ctx_cat columns '
+                         'start at zero); default: mimi if --mix or --eval_corpora names a video '
                          'corpus, else none')
 parser.add_argument('--streams', default=1, type=int, choices=[1, 3],
                     help='3: three token streams, each with its own input embedding grid and its '
@@ -518,6 +534,7 @@ _FIXED_ARCH = dict(n_layers=1, linout=True, linout_kernel=1, linin=False, ctx_mi
                    qproj='none', tap=False, clip_dff=0.0, char_onehot=False)
 
 _loaded_ckpt = None
+_aud_switch = None           # --load with another --audio_encoder: (old, new)
 _start_step = 0
 _start_exs = 0
 _start_exs_by = {}            # corpus -> examples trained, for the STEP ex_/ep_ columns
@@ -530,9 +547,14 @@ if args.load:
     _bad = {k: _saved[k] for k, v in _FIXED_ARCH.items() if k in _saved and _saved[k] != v}
     if _bad:
         raise SystemExit(f'{args.load} is not a v395-type checkpoint: {_bad}')
+    _aud_given = (args.audio_encoder if any(a == '--audio_encoder' or a.startswith('--audio_encoder=')
+                                            for a in sys.argv) else None)
     for k in _ARCH_ARGS:
         if k in _saved:
             setattr(args, k, _saved[k])
+    if _aud_given and _aud_given != (_saved.get('audio_encoder') or 'none'):
+        _aud_switch = (_saved.get('audio_encoder') or 'none', _aud_given)   # a new audio encoder
+        args.audio_encoder = _aud_given
     if 'full_crops' not in _saved and not any(a.startswith('--full_crops') for a in sys.argv):
         args.full_crops = 0.0         # trained before full views existed: keep its crops
     _start_step = int(_loaded_ckpt.get('step', 0))
@@ -578,6 +600,21 @@ def _upgrade_state_dict(sd):
             v = v[0]
         out[k] = v
     return out
+
+
+def _switch_audio_state_dict(sd, model, old, new):
+    """--load with another --audio_encoder: ctx_cat's audio-grid columns are replaced by zeros
+    of the new encoder's width, so the model starts deaf and learns to read the new grid."""
+    sd = dict(sd)
+    w = sd['ctx_cat.weight']
+    o = model.c_text + model.img_width
+    wo = _AUD_DIMS[old] if old != 'none' else 0
+    sd['ctx_cat.weight'] = torch.cat([w[:, :o], w.new_zeros(w.shape[0], model.aud_width, 1, 1),
+                                      w[:, o + wo:]], dim=1)
+    print(f'--audio_encoder {new} (checkpoint: {old}): ctx_cat audio columns {wo} -> '
+          f'{model.aud_width}, zero-initialized; ctx_cat {tuple(w.shape)} -> '
+          f'{tuple(sd["ctx_cat.weight"].shape)}', flush=True)
+    return sd
 
 
 def _widen_state_dict(sd, model):
@@ -1010,6 +1047,132 @@ class AudioEncoder(nn.Module):
         return np.concatenate(out)
 
 
+class QuartzNetEncoder(nn.Module):
+    """Frozen QuartzNet 15x5 (pure PyTorch, weights from the .nemo file, BatchNorm folded into
+    the pointwise convs), kept out of the module registry like Mimi: 16 kHz sound -> NeMo's
+    log-mel front end (pre-emphasis, 20/10 ms STFT, 64 mels, per-mel normalization) -> C1 +
+    15 residual blocks of 5 separable conv sub-blocks + C2 + C3 -> [1024, T] at 50 Hz."""
+    BLOCKS = ([(256, 33, 1, 2, 1)] + [(256, 33, 5, 1, 1)] * 3 + [(256, 39, 5, 1, 1)] * 3 +
+              [(512, 51, 5, 1, 1)] * 3 + [(512, 63, 5, 1, 1)] * 3 + [(512, 75, 5, 1, 1)] * 3 +
+              [(512, 87, 1, 1, 2)])          # (filters, kernel, sub-blocks, stride, dilation)
+
+    def __init__(self):
+        super().__init__()
+        ck = os.path.join(_QN_DIR, 'model_weights.ckpt')
+        if not os.path.exists(ck):
+            import tarfile, urllib.request
+            os.makedirs(_QN_DIR, exist_ok=True)
+            nemo = os.path.join(_QN_DIR, 'stt_en_quartznet15x5.nemo')
+            print(f'downloading {_QN_URL}', flush=True)
+            urllib.request.urlretrieve(_QN_URL, nemo)
+            with tarfile.open(nemo) as tf:
+                tf.extract(tf.getmember(next(n for n in tf.getnames()
+                                             if n.endswith('model_weights.ckpt'))), _QN_DIR,
+                           filter='data')
+            ck = next(os.path.join(r, f) for r, _, fs in os.walk(_QN_DIR) for f in fs
+                      if f == 'model_weights.ckpt')
+        sd = torch.load(ck, map_location='cpu', weights_only=True)
+
+        def fold(pw, p):                     # pointwise conv + BatchNorm (eps 1e-3) -> (w, b)
+            s = sd[p + '.weight'] / torch.sqrt(sd[p + '.running_var'] + 1e-3)
+            return pw * s[:, None, None], sd[p + '.bias'] - sd[p + '.running_mean'] * s
+
+        t = {'win': sd['preprocessor.featurizer.window'], 'fb': sd['preprocessor.featurizer.fb'][0]}
+        blocks = []
+        for b, (c, k, rep, st, dil) in enumerate(self.BLOCKS):
+            p = f'encoder.encoder.{b}.'
+            subs = [(sd[p + f'mconv.{5 * r}.conv.weight'],) +
+                    fold(sd[p + f'mconv.{5 * r + 1}.conv.weight'], p + f'mconv.{5 * r + 2}')
+                    for r in range(rep)]
+            res = fold(sd[p + 'res.0.0.conv.weight'], p + 'res.0.1') if rep > 1 else None
+            blocks.append((subs, res, k, st, dil))
+        t['c3'] = fold(sd['encoder.encoder.17.mconv.0.conv.weight'], 'encoder.encoder.17.mconv.1')
+        t['ctc'] = (sd['decoder.decoder_layers.0.weight'], sd['decoder.decoder_layers.0.bias'])
+        self.__dict__['_t'], self.__dict__['_blocks'] = t, blocks
+        self.__dict__['_dev'] = torch.device('cpu')
+        self.width = _AUD_DIMS['quartznet']
+        self.n_params = sum(v.numel() for k, v in sd.items() if k.startswith(('encoder.', 'decoder.')))
+
+    def _on(self, dev):
+        dev = torch.device(dev)
+        if self._dev != dev:
+            mv = lambda x: x.to(dev) if torch.is_tensor(x) else x
+            self.__dict__['_t'] = {k: tuple(map(mv, v)) if isinstance(v, tuple) else mv(v)
+                                   for k, v in self._t.items()}
+            self.__dict__['_blocks'] = [([tuple(map(mv, sb)) for sb in subs],
+                                         tuple(map(mv, res)) if res else None, k, st, dil)
+                                        for subs, res, k, st, dil in self._blocks]
+            self.__dict__['_dev'] = dev
+
+    @torch.no_grad()
+    def features(self, wav):
+        """float sound [N, L] at 16 kHz -> (C3 features [N, 1024, T], valid [N, T]) at 50 Hz;
+        a frame of digital silence (before the sound starts) is left out of the normalization
+        and marked invalid."""
+        self._on(wav.device)
+        t = self._t
+        x = torch.cat([wav[:, :1], wav[:, 1:] - 0.97 * wav[:, :-1]], 1)
+        s = torch.stft(x, 512, 160, 320, t['win'], center=True, pad_mode='constant',
+                       return_complex=True)
+        p = t['fb'] @ s.abs().pow(2)                                        # [N, 64, T]
+        ok = (p.sum(1, keepdim=True) > 1e-10).float()
+        x = torch.log(p + 2 ** -24)
+        n = ok.sum(2, keepdim=True).clamp(min=2)
+        mu = (x * ok).sum(2, keepdim=True) / n
+        sd = (((x - mu) * ok).pow(2).sum(2, keepdim=True) / (n - 1)).sqrt()
+        x = (x - mu) / (sd + 1e-5) * ok
+        with torch.autocast(x.device.type, dtype=torch.bfloat16, enabled=x.is_cuda):
+            for subs, res, k, st, dil in self._blocks:
+                y = x
+                for j, (dw, pw, b) in enumerate(subs):
+                    y = F.conv1d(y, dw.to(y.dtype), stride=st, padding=dil * (k // 2),
+                                 dilation=dil, groups=y.shape[1])
+                    y = F.conv1d(y, pw.to(y.dtype), b.to(y.dtype))
+                    if j < len(subs) - 1:
+                        y = F.relu(y)
+                if res is not None:
+                    y = y + F.conv1d(x, res[0].to(y.dtype), res[1].to(y.dtype))
+                x = F.relu(y)
+            w, b = t['c3']
+            x = F.relu(F.conv1d(x, w.to(x.dtype), b.to(x.dtype)))
+        return x.float(), ok[:, 0, ::2][:, :x.shape[2]] > 0
+
+    @torch.no_grad()
+    def grids(self, wav, ends, S):
+        """int16 sound buffers [N, L] (sample 0 of a buffer = _QN_WIN samples before its grid
+        cell 0) and cells heard [N] -> audio grids [N, 1024, S, S]: the C3 features of the
+        _QN_WIN samples before each end, the last S*S cells of 4 frames (80 ms) each laid out
+        row-major; a cell before the sound starts is zeros."""
+        i0 = ends.long()[:, None] * _QN_HOP + torch.arange(_QN_WIN, device=wav.device)[None]
+        x = wav.gather(1, i0.clamp(max=wav.shape[1] - 1)).float() / 32768.0
+        f, ok = self.features(x)
+        W = S * S * 4
+        f, ok = f[:, :, -W:], ok[:, -W:].float()
+        f = (f * ok[:, None]).view(f.shape[0], f.shape[1], S * S, 4).sum(3)
+        f = f / ok.view(ok.shape[0], 1, S * S, 4).sum(3).clamp(min=1)
+        return f.view(f.shape[0], f.shape[1], S, S)
+
+    @torch.no_grad()
+    def transcribe(self, wav):
+        """float sound [L] at 16 kHz -> greedy CTC text (a check that the weights loaded)."""
+        f, _ = self.features(wav[None])
+        lg = F.conv1d(f, *self._t['ctc'])[0].argmax(0).tolist()
+        labels = " abcdefghijklmnopqrstuvwxyz'"
+        return ''.join(labels[c] for c, p in zip(lg, [-1] + lg[:-1]) if c != p and c < len(labels))
+
+
+def _qn_buffer(wav, a0, a1):
+    """A row's whole-video int16 sound at 16 kHz -> the buffer QuartzNetEncoder.grids reads for
+    an example whose grid cells a0..a1 (12.5 Hz) are heard: samples from _QN_WIN before cell
+    a0 to cell a1, zeros before the start of the sound."""
+    s0, s1 = a0 * _QN_HOP - _QN_WIN, max(a1, a0) * _QN_HOP
+    out = np.zeros(s1 - s0, np.int16)
+    a, b = max(s0, 0), min(s1, len(wav))
+    if b > a:
+        out[a - s0:b - s0] = wav[a:b]
+    return out
+
+
 def _aud_windows(lat, ends, S):
     """lat [N, 512, T] latents, ends [N] long = Mimi frames heard so far per row -> the last
     S*S frames before each end laid out row-major over an SxS grid, [N, 512, S, S]; frames
@@ -1072,6 +1235,27 @@ class _VideoClip:
 
     def __init__(self, frames, lat, codes, fi, ai, fps, t0, rate, meta, see=True, hear=True):
         self.frames, self.lat, self.codes, self.fi, self.ai = frames, lat, codes, fi, ai
+        # grid cells of sound: a 1-D lat is a quartznet sound buffer (see _qn_buffer)
+        self.n_aud = lat.shape[-1] if lat.dim() == 2 else max(0, lat.shape[0] - _QN_WIN) // _QN_HOP
+        self._ag = (None, None)          # quartznet: (cells heard, audio grid) of the last step
+        self._agrid, self._aidx = None, {}   # quartznet: grids precomputed per cells heard
+
+    def precompute_audio(self, model, dev, chunk=64):
+        """quartznet: the audio grid of every distinct cells-heard value of the clip's ticks,
+        computed once (the encoder is frozen) and kept fp16 on dev."""
+        u = sorted(set(self.ai))
+        lat = self.lat[None].to(dev)
+        self._agrid = torch.cat([model.audio_grid(lat.expand(len(u[i:i + chunk]), -1),
+                                                  torch.tensor(u[i:i + chunk], device=dev)).half()
+                                 for i in range(0, len(u), chunk)])
+        self._aidx = {a: k for k, a in enumerate(u)}
+
+    def aud_at(self, model, ai, dev):
+        """quartznet: the audio grid [1, 1024, S, S] after ai cells heard."""
+        k = self._aidx.get(ai)
+        if k is not None:
+            return self._agrid[k:k + 1].float()
+        return model.audio_grid(self.lat[None].to(dev), torch.tensor([ai], device=dev))
         self.fps, self.t0, self.rate, self.meta = fps, t0, rate, meta
         self.see, self.hear = see, hear
         self.phase = 0.0 if args.clock_hz else 0.5     # tick k at t0 + k/R; token k mid-slot
@@ -1090,7 +1274,7 @@ class _VideoClip:
         fi = min(self.frames.shape[0] - 1, max(0, int((t - self.t0) * self.fps)))
         if args.audio_hz:          # --audio_hz: the sound refreshes at multiples of 1/A s
             t = max(self.t0, math.floor(t * args.audio_hz + 1e-9) / args.audio_hz)
-        return fi, min(self.lat.shape[1], int((t - self.t0) * _AUD_RATE) + self.ai[0])
+        return fi, min(self.n_aud, int((t - self.t0) * _AUD_RATE) + self.ai[0])
 
     def grids(self, model, sels, dev):
         """(img, aud) grids [1, ...] for one step of this clip."""
@@ -1099,7 +1283,12 @@ class _VideoClip:
         if model.img_width and self.see:
             img = model.image_grid(_norm_u8(self.frames[fi][None].to(dev)))
         if model.aud_width and self.hear:
-            aud = model.audio_grid(self.lat[None].to(dev), torch.tensor([ai], device=dev))
+            if self.lat.dim() == 2:
+                aud = model.audio_grid(self.lat[None].to(dev), torch.tensor([ai], device=dev))
+            else:                        # quartznet runs only when the sound refreshes
+                if self._ag[0] != ai:
+                    self._ag = (ai, self.aud_at(model, ai, dev))
+                aud = self._ag[1]
         return img, aud
 
 
@@ -1231,7 +1420,7 @@ class VLAModel(nn.Module, _HubMixin):
         self.image_encoder = image_encoder or 'none'
         self.audio_encoder = audio_encoder or 'none'
         self.img_width = 2048 if self.image_encoder != 'none' else 0
-        self.aud_width = _AUD_DIM if self.audio_encoder != 'none' else 0
+        self.aud_width = _AUD_DIMS[self.audio_encoder] if self.audio_encoder != 'none' else 0
         self.in_widths = ([self.c_text] + ([self.img_width] if self.img_width else [])
                           + ([self.aud_width] if self.aud_width else [])
                           + [self.c_text] * (self.streams - 1))     # voice, image token grids
@@ -1256,7 +1445,8 @@ class VLAModel(nn.Module, _HubMixin):
             self.linout.bias.zero_()
 
         self.img_enc = ImageEncoder(self.image_encoder) if self.img_width else None   # frozen
-        self.aud_enc = AudioEncoder(self.audio_encoder) if self.aud_width else None   # frozen
+        self.aud_enc = (None if not self.aud_width else QuartzNetEncoder()       # frozen
+                        if self.audio_encoder == 'quartznet' else AudioEncoder(self.audio_encoder))
 
         self.register_buffer('ctx_read_rms', torch.zeros(self.K))       # 0 = not measured yet
         self.register_buffer('rate', torch.tensor([min(1.0, 1.0 / w) for w in self.windows]),
@@ -1293,8 +1483,13 @@ class VLAModel(nn.Module, _HubMixin):
 
     def audio_grid(self, lat, ends):
         """Latents [N, 512, T] and frames heard [N] -> audio grid [N, 512, S, S] (see
-        _aud_windows), each position RMS-normalized over channels; silence-before-start stays 0."""
-        a = _aud_windows(lat, ends, self.S).float()
+        _aud_windows), each position RMS-normalized over channels; silence-before-start stays 0.
+        quartznet: lat is the int16 sound buffers [N, L] (see _qn_buffer), the grid [N, 1024,
+        S, S] (see QuartzNetEncoder.grids)."""
+        if self.audio_encoder == 'quartznet':
+            a = self.aud_enc.grids(lat, ends, self.S)
+        else:
+            a = _aud_windows(lat, ends, self.S).float()
         return a * torch.rsqrt(a.pow(2).mean(dim=1, keepdim=True) + 1e-6)
 
     def expand(self, idx):
@@ -1664,6 +1859,44 @@ def _video_files(name, split='train'):
 _VID_COLS = ['id', 'category', 'duration', 'fps', 'frames', 'codes', 'n_codes', 'events']
 
 
+_sidecar_idx = {}            # sidecar parquet -> (row-group bounds, {id: row})
+_sidecar_lock = threading.Lock()
+
+
+def _sidecar_path(corpus, feat_file):
+    d = _AUD_SIDECAR.get(corpus)
+    return os.path.join(d, os.path.basename(feat_file)) if d else None
+
+
+def _row_wav(corpus, feat_file, vid):
+    """--audio_encoder quartznet: a video's clean soundtrack, int16 [n] at 16 kHz, from the
+    sidecar corpus (exp/audio_prep.py); None if its shard is not there (yet) or lacks the id."""
+    import pyarrow.parquet as pq
+    import soundfile as sf
+    path = _sidecar_path(corpus, feat_file)
+    if not path or not os.path.exists(path):
+        return None
+    with _sidecar_lock:
+        idx = _sidecar_idx.get(path)
+    pf = pq.ParquetFile(path)
+    if idx is None:
+        ids = pf.read(columns=['id']).column('id').to_pylist()
+        idx = (np.cumsum([0] + [pf.metadata.row_group(g).num_rows
+                                for g in range(pf.metadata.num_row_groups)]),
+               {v: k for k, v in enumerate(ids)})
+        with _sidecar_lock:
+            _sidecar_idx[path] = idx
+    bounds, at = idx
+    k = at.get(vid)
+    if k is None:
+        return None
+    g = int(np.searchsorted(bounds, k, side='right')) - 1
+    flac = pf.read_row_group(g, columns=['flac']).column('flac')[int(k - bounds[g])].as_py()
+    if not flac:
+        return np.zeros(0, np.int16)
+    return sf.read(io.BytesIO(flac), dtype='int16')[0]
+
+
 def _video_events(row):
     """A video row's events [[start, end, kind, text]] that have text, in time order."""
     return [e for e in json.loads(row['events']) if e[3].strip()]
@@ -1738,6 +1971,7 @@ def _clocked_example(row, rng=None, maxspan=_VID_MAXSPAN):
     xs = [_NULL] + [_PAD if y == _SIL else y for y in tgt[:-1]]
     text = _tokenizer.decode(ids)
     media = dict(jpegs=frames[f0:max(fabs) + 1], codes=np.ascontiguousarray(codes[:, a0:max(aabs)]),
+                 wav=_qn_buffer(row['wav'], a0, max(aabs)) if row.get('wav') is not None else None,
                  off=rng.random() if rng is not None else 0.5,     # crop offset, per example
                  fi=[f - f0 for f in fabs], ai=[a - a0 for a in aabs], fps=fps,
                  t0=ta, t1=tb, text=text, n=n, f0=f0, a0=a0, clock=R, dropped=dropped, kind=kind,
@@ -1778,6 +2012,7 @@ def _video_example(row, rng=None, maxtok=_VID_MAXTOK, maxspan=_VID_MAXSPAN):
     text = _tokenizer.decode(ids)
     full = [_NULL] + ids
     media = dict(jpegs=frames[f0:max(fabs) + 1], codes=np.ascontiguousarray(codes[:, a0:a1]),
+                 wav=_qn_buffer(row['wav'], a0, a1) if row.get('wav') is not None else None,
                  off=rng.random() if rng is not None else 0.5,     # crop offset, per example
                  fi=[f - f0 for f in fabs], ai=[a - a0 for a in aabs], fps=fps,
                  t0=times[0], t1=times[-1], text=text, n=len(ids), f0=f0, a0=a0,
@@ -1812,27 +2047,40 @@ class _VideoSource(_ImageSource):
                 self.files = _video_files(self.name) or self.files
                 if len(self.files) != n:
                     print(f'{self.name}: {len(self.files)} local parquet files', flush=True)
-            f = self.rng.choice(self.files)
+            files = self.files
+            if args.audio_encoder == 'quartznet':      # only shards whose sound is there
+                files = [f for f in files if os.path.exists(_sidecar_path(self.name, f) or '')]
+                if not files:
+                    raise SystemExit(f'{self.name}: no sidecar sound in '
+                                     f'{_AUD_SIDECAR.get(self.name)} (see exp/audio_prep.py)')
+            f = self.rng.choice(files)
         pf = self.pq.ParquetFile(f)
         if not pf.metadata.num_row_groups:
             return
         with self.lock:
             g = self.rng.randrange(pf.metadata.num_row_groups)
         rows = pf.read_row_group(g, columns=_VID_COLS).to_pylist()
-        rows = [r for r in rows if not (self.held and _id_heldout(r['id']))]
+        rows = [dict(r, _file=f) for r in rows if not (self.held and _id_heldout(r['id']))]
         with self.lock:
             self.pool.extend(rows)
 
     def next(self):
-        """-> a video row."""
+        """-> a video row (--audio_encoder quartznet: with its clean sound, 'wav')."""
         while True:
+            row = None
             with self.lock:
                 if len(self.pool) >= self.POOL:
                     i = self.rng.randrange(len(self.pool))
                     row, self.pool[i] = self.pool[i], self.pool[-1]
                     self.pool.pop()
+            if row is None:
+                self._fill()
+            elif args.audio_encoder != 'quartznet':
+                return row
+            else:                                       # read only now: the pool stays small
+                row['wav'] = _row_wav(self.name, row['_file'], row['id'])
+                if row['wav'] is not None:
                     return row
-            self._fill()
 
 
 # Worker -> training-loop tallies, per corpus: documents/tokens since the last TEXT line, the
@@ -2051,6 +2299,8 @@ else:
                      streams=args.streams)
     if _loaded_ckpt is not None:
         _sd = _upgrade_state_dict(_loaded_ckpt['state_dict'])
+        if _aud_switch:
+            _sd = _switch_audio_state_dict(_sd, model, *_aud_switch)
         if model.streams == 3 and 'voc_dec.proj.weight' not in _sd:
             _sd = _widen_state_dict(_sd, model)
         missing, unexpected = model.load_state_dict(_sd, strict=False)
@@ -2118,7 +2368,13 @@ def _model_graph(model):
                                 inp=f'3x{_IMG_IN}x{_IMG_IN}', out=f'{model.img_width}x{S}x{S}', tr=0,
                                 fr=sum(p.numel() for p in model.img_enc.parameters())))
                 srcs.insert(1, '(image grid)')
-            if model.aud_enc is not None:
+            if model.audio_encoder == 'quartznet':
+                out.append(dict(name='aud_enc -> (audio grid)',
+                                op=f'QuartzNet 15x5 C3 (frozen) over the last {_QN_WIN / _QN_SR:g} s, '
+                                   f'last {S * S} cells of 80 ms, RMSnorm',
+                                inp=f'{_QN_WIN} samples', out=f'{model.aud_width}x{S}x{S}', tr=0,
+                                fr=model.aud_enc.n_params))
+            elif model.aud_enc is not None:
                 mimi = model.aud_enc.__dict__['_mimi']
                 out.append(dict(name='aud_enc -> (audio grid)',
                                 op=f'Mimi codes -> latents (frozen), last {S * S} frames, RMSnorm',
@@ -2373,6 +2629,7 @@ def _eval_video():
                               for g in range(pf.metadata.num_row_groups)])
     g = int(np.searchsorted(bounds, k, side='right')) - 1
     row = pf.read_row_group(g, columns=_VID_COLS).to_pylist()[k - bounds[g]]
+    row['_file'] = f
     print(f'--video eval: {row["id"]} ({row.get("category")}, {row["duration"]:.0f} s) '
           f'from {os.path.basename(f)}', flush=True)
     try:
@@ -2433,11 +2690,20 @@ def _video_live():
         print(f'--video: preparing {path} (2 fps frames, Mimi codes) ...', flush=True)
         vfps = args.vision_hz or 2.0
         frames = _ff_frames2(path, vfps)
-        codes = model.aud_enc.codes(_ff_audio(path, 24000, 1)[:, 0], dev)
+        codes = (torch.zeros(32, 0, dtype=torch.short) if model.audio_encoder == 'quartznet'
+                 else model.aud_enc.codes(_ff_audio(path, 24000, 1)[:, 0], dev))
         dur, rate, name = _ff_json(path)[3], args.clock_hz or args.video_rate, os.path.basename(path)
     if len(frames) == 0:
         raise SystemExit('--video: no frames')
-    lat = model.aud_enc.latents(codes, dev)
+    w16 = None                   # quartznet: the clean 16 kHz sound it hears
+    if model.audio_encoder == 'quartznet':
+        w16 = _row_wav('finevideo', row['_file'], row['id']) if args.video == 'eval' else None
+        if w16 is None:
+            w16 = (np.clip(_ff_audio(path, _QN_SR, 1)[:, 0], -1, 1) * 32767).astype(np.int16) \
+                if path else np.zeros(0, np.int16)
+        lat = torch.from_numpy(_qn_buffer(w16, 0, len(w16) // _QN_HOP)).to(dev)
+    else:
+        lat = model.aud_enc.latents(codes, dev)
     clip = _VideoClip(frames, lat, codes, [0], [0], 2.0 if args.video == 'eval' else vfps, 0.0,
                       rate, (name, '', ''))
     # what the window shows and plays: the original file, else the 2 fps frames and the sound
@@ -2446,6 +2712,8 @@ def _video_live():
     tmp.append(wav)
     if path and args.video_sound == 'original':
         _write_wav(wav, _ff_audio(path, 48000, 2), 48000)
+    elif w16 is not None:       # what the model hears: the clean 16 kHz sound
+        _write_wav(wav, (w16.astype(np.float32) / 32768.0)[:, None], _QN_SR)
     else:       # what the model hears: its Mimi codes decoded back to 24 kHz sound
         _write_wav(wav, model.aud_enc.audio(codes, dev)[:, None], 24000)
     if path:
@@ -2455,7 +2723,8 @@ def _video_live():
     else:
         fps, W = 2.0, round(frames.shape[3] * _LIVE_H / frames.shape[2])
         raw = [im.permute(1, 2, 0).numpy() for im in _decode_jpegs(row['frames'], 'cpu')]
-    has_sound = os.path.getsize(wav) > 1000 and codes.shape[-1] > 0
+    has_sound = os.path.getsize(wav) > 1000 and (codes.shape[-1] > 0 or
+                                                 (w16 is not None and len(w16) > 0))
     dur = dur or len(frames) / 2.0
     print(f'--video: {name}: {dur:.1f} s at {fps:.2f} fps, '
           f'{"one step per tick at %g Hz" % rate if args.clock_hz else "captioned at %.2f tokens/s" % rate}'
@@ -2811,7 +3080,7 @@ def _build_video_eval(corpus):
         files = files[::max(1, len(files) // want)]
     per = 1 << 30 if held else max(1, math.ceil(want / max(1, len(files))))
     dev = next(model.parameters()).device
-    items = []
+    items, no_wav = [], 0
     for f in files:
         if len(items) >= want:
             break
@@ -2826,26 +3095,40 @@ def _build_video_eval(corpus):
                 if not bounds[g] <= k < bounds[g + 1] or len(items) >= want:
                     continue
                 r = rows[k - bounds[g]]
+                if model.audio_encoder == 'quartznet':
+                    r['wav'] = _row_wav(corpus, f, r['id'])
+                    if r['wav'] is None:
+                        no_wav += 1
+                        continue
                 ex = _video_example(r, None, maxtok=min(_EVAL_MAXLEN, _VID_EVAL_MAXLEN),
                                     maxspan=_VID_EVAL_SPAN if args.clock_hz else _VID_MAXSPAN)
                 if ex is None or sum(y != _SIL for _, y in ex[1]['steps']) < _VID_EVAL_MINTOK:
                     continue
                 text, m = ex
                 frames = torch.stack([_crop224(im) for im in _decode_jpegs(m['jpegs'], 'cpu')])
-                lat = model.aud_enc.latents(m['codes'], dev) if model.aud_enc is not None else \
-                    torch.zeros(_AUD_DIM, m['codes'].shape[1], device=dev)
+                if model.audio_encoder == 'quartznet':
+                    lat = torch.from_numpy(m['wav']).to(dev)
+                elif model.aud_enc is not None:
+                    lat = model.aud_enc.latents(m['codes'], dev)
+                else:
+                    lat = torch.zeros(_AUD_DIM, m['codes'].shape[1], device=dev)
                 span = max(m['t1'] - m['t0'], 1e-3)
                 ref = ' '.join(t for _, _, _, t in json.loads(r['events']))
                 clip = _VideoClip(frames, lat, m['codes'], m['fi'], m['ai'], m['fps'], m['t0'],
                                   args.clock_hz or m['n'] / span,
                                   (r['id'], r.get('category') or '', ref))
                 clip.kind = m.get('kind')       # --clock_hz: speech / activity per tick (EVALS)
+                if model.audio_encoder == 'quartznet':
+                    clip.precompute_audio(model, dev)
                 items.append((m['steps'], clip))
     items.sort(key=lambda it: len(it[0]))
     _eval_vids[corpus] = [it[1] for it in items]
     docs = [it[0] for it in items]
     print(f'eval set: {corpus} {len(docs)} held-out videos from {len(files)} files, '
           f'{sum(len(d) for d in docs)} tokens', flush=True)
+    if no_wav:
+        print(f'WARNING: eval set {corpus}: {no_wav} held-out videos skipped, their sidecar '
+              f'sound is not there yet (the set differs from a full corpus\'s)', flush=True)
     return docs
 
 
@@ -3029,11 +3312,12 @@ def _score(step, corpus, docs, imgs=None, tag=None, clips=None, bands=True, free
             c += B
             if cb is not None:
                 see, hear = cb[0].see and model.img_width, cb[0].hear and model.aud_width
-                if hear:
+                if hear and model.audio_encoder != 'quartznet':
                     Tm = max(1, max(v.lat.shape[1] for v in cb))
                     lat = torch.zeros(B, _AUD_DIM, Tm, device=dev)
                     for r, v in enumerate(cb):
                         lat[r, :, :v.lat.shape[1]] = v.lat
+                heard, agrid = [-1] * B, None    # quartznet: each clip's precomputed grids
                 last = [len(v.fi) - 1 for v in cb]
                 shown, grid = [-1] * B, None     # the encoder runs only when a frame changes
             Kd = None
@@ -3064,8 +3348,19 @@ def _score(step, corpus, docs, imgs=None, tag=None, clips=None, bands=True, free
                                 shown[r] = fis[r]
                         img = grid
                     if hear:
-                        aud = model.audio_grid(lat, torch.tensor(
-                            [v.ai[min(t, last[r])] for r, v in enumerate(cb)], device=dev))
+                        ais = [v.ai[min(t, last[r])] for r, v in enumerate(cb)]
+                        if model.audio_encoder != 'quartznet':
+                            aud = model.audio_grid(lat, torch.tensor(ais, device=dev))
+                        else:
+                            ch = [r for r in range(B) if ais[r] != heard[r]]
+                            if ch:
+                                g = torch.cat([cb[r].aud_at(model, ais[r], dev) for r in ch])
+                                if agrid is None:
+                                    agrid = g.new_zeros((B,) + tuple(g.shape[1:]))
+                                agrid[ch] = g
+                                for r in ch:
+                                    heard[r] = ais[r]
+                            aud = agrid
                 xt = X[:, t]
                 if model.streams == 3:
                     ce = _score3_tick(X[:, t], Y[:, t], Kd, t, cb is not None, free, own3,
@@ -3596,7 +3891,14 @@ _own = None                  # --inner_voice: each row's token sampled at the la
 vid_grid = None              # the frozen encoder's grid of vid_cur, recomputed only for rows whose
                              # frame changed (frames are held between 2 fps updates)
 vid_lat = (torch.zeros(len(_VIDEO_ROWS), _AUD_DIM, _VID_CAP, dtype=torch.float16, device=args.device)
-           if _VIDEO_ROWS and model.aud_width else None)
+           if _VIDEO_ROWS and model.aud_width and model.audio_encoder != 'quartznet' else None)
+# quartznet: each video row's int16 sound buffer (see _qn_buffer), its audio grid and the cells
+# heard when that was computed (it runs only for rows whose sound refreshed)
+vid_wav = (torch.zeros(len(_VIDEO_ROWS), _QN_WIN + _VID_CAP * _QN_HOP, dtype=torch.int16,
+                       device=args.device)
+           if _VIDEO_ROWS and model.audio_encoder == 'quartznet' else None)
+vid_agrid = None
+vid_heard = torch.full((len(_VIDEO_ROWS),), -1, dtype=torch.long, device=args.device)
 if _VIDEO_ROWS and model.img_enc is None:
     raise SystemExit('--mix has a video corpus but the model has no image encoder')
 _vid_rec = False             # --sample_vis: record the next example of the first video row
@@ -3708,7 +4010,9 @@ def _gen_lines(i):
                                  f'{_printable(_decode_plain(cap)[:n_ref])}')
                     lines.append(f'REF  step {i:10} [{vid}]: {_printable(ref)}')
             if '_spec' not in v.__dict__ and model.aud_enc is not None:
-                v._spec = _spectro(v.codes[:, :max(1, v.ai[L - 1])], args.device)
+                v._spec = (_spectro(None, args.device, v.lat[_QN_WIN:_QN_WIN + max(1, v.ai[L - 1]) * _QN_HOP])
+                           if v.lat.dim() == 1 else
+                           _spectro(v.codes[:, :max(1, v.ai[L - 1])], args.device))
             f1 = v.fi[L - 1]
             sel = np.linspace(0, f1, 4).round().astype(int)
             strip = np.concatenate([v.frames[f].permute(1, 2, 0).numpy() for f in sel], axis=1)
@@ -3728,13 +4032,18 @@ def _gen_lines(i):
     return lines
 
 
-def _spectro(codes, dev):
+def _spectro(codes, dev, w16=None):
     """Mimi codes -> log-magnitude spectrogram [freq, time] numpy (0-8 kHz, 100 columns/s),
-    from the sound the frozen Mimi decoder renders."""
-    wav = torch.from_numpy(model.aud_enc.audio(codes, dev)).to(dev)
-    if wav.numel() < 1024:
+    from the sound the frozen Mimi decoder renders; or of w16, int16 sound at 16 kHz."""
+    if w16 is not None:
+        wav = torch.as_tensor(w16).to(dev).float() / 32768.0
+        n_fft, hop = 683, 160                    # 342 bins over 0-8 kHz, as below
+    else:
+        wav = torch.from_numpy(model.aud_enc.audio(codes, dev)).to(dev)
+        n_fft, hop = 1024, 240
+    if wav.numel() < n_fft:
         return np.zeros((171, 1), np.float32)
-    S_ = torch.stft(wav, n_fft=1024, hop_length=240, window=torch.hann_window(1024, device=dev),
+    S_ = torch.stft(wav, n_fft=n_fft, hop_length=hop, window=torch.hann_window(n_fft, device=dev),
                     return_complex=True).abs()
     return torch.log10(S_[:342] + 1e-4).cpu().numpy()
 
@@ -3759,8 +4068,12 @@ def _video_panel(i, m, off):
         cells.append((_thumb(_crop224(im, off), 160), (m['f0'] + f) / m['fps'], a, b,
                       _decode_plain(ids[a:b])))
     a_end = m['ai'][W - 1] if W else 0
-    spec = _spectro(m['codes'][:, :max(1, a_end)], args.device) if model.aud_enc is not None \
-        else np.zeros((1, 1), np.float32)
+    if m.get('wav') is not None:
+        spec = _spectro(None, args.device, m['wav'][_QN_WIN:_QN_WIN + max(1, a_end) * _QN_HOP])
+    elif model.aud_enc is not None:
+        spec = _spectro(m['codes'][:, :max(1, a_end)], args.device)
+    else:
+        spec = np.zeros((1, 1), np.float32)
     ext = (m['a0'] / _AUD_RATE, (m['a0'] + a_end) / _AUD_RATE)
     n = f'{m["n"]} ticks at {m["clock"]:g} Hz' if m.get('clock') else f'{m["n"]} tokens'
     return ('video', i, m['name'], _decode_plain(ids), cells, spec, ext, n)
@@ -4055,6 +4368,11 @@ try:
                     lat = model.aud_enc.latents(m['codes'][:, :_VID_CAP], args.device)
                     vid_lat[j].zero_()
                     vid_lat[j, :, :lat.shape[1]] = lat.half()
+                if vid_wav is not None:
+                    w = torch.from_numpy(m['wav'][:vid_wav.shape[1]])
+                    vid_wav[j].zero_()
+                    vid_wav[j, :len(w)] = w.to(args.device, non_blocking=True)
+                    vid_heard[j] = -1
                 if _vid_rec and r == _VIDEO_ROWS[0]:
                     _vid_rec = False
                     try:
@@ -4073,10 +4391,20 @@ try:
                 js = torch.tensor([j for j, _ in shown], device=args.device)
                 vid_grid[js] = model.image_grid(_norm_u8(vid_cur[js])).to(vid_grid.dtype)
             img[_vid_rows] = vid_grid
-            if vid_lat is not None:
+            if vid_lat is not None or vid_wav is not None:
                 aud = torch.zeros(len(x_list), model.aud_width, model.S, model.S, device=args.device)
                 ends = torch.tensor([min(t[1], _VID_CAP) for t in idx], device=args.device)
+            if vid_lat is not None:
                 aud[_vid_rows] = model.audio_grid(vid_lat, ends).float()
+            elif vid_wav is not None:
+                ch = (ends != vid_heard).nonzero()[:, 0]
+                if vid_agrid is None:
+                    vid_agrid = torch.zeros(len(_VIDEO_ROWS), model.aud_width, model.S, model.S,
+                                            device=args.device)
+                if len(ch):
+                    vid_agrid[ch] = model.audio_grid(vid_wav[ch], ends[ch])
+                    vid_heard[ch] = ends[ch]
+                aud[_vid_rows] = vid_agrid
         if _BANK_ROWS:
             for r, (im, name) in new_imgs:
                 if r in _vid_of:
