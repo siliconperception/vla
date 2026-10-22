@@ -407,8 +407,16 @@ parser.add_argument('--max_lag',    default=2.0, type=float, metavar='S',
                     help='--clock_hz: caption tokens wait in a FIFO for free ticks; an activity '
                          'line that would start more than S seconds late is dropped (speech is '
                          'never dropped)')
-parser.add_argument('--nul_weight', default=0.2, type=float,
-                    help='--clock_hz: loss weight of <NUL> targets (caption tokens weigh 1)')
+parser.add_argument('--nul_weight', default=None, type=float,
+                    help='--clock_hz: loss weight of <NUL> targets (caption tokens weigh 1); below '
+                         '1 the model learns P(<NUL>) too low (its odds scaled by the weight). '
+                         'Default 0.2. Saved and restored unless given')
+parser.add_argument('--loss_norm', default=None, choices=('weight', 'words'),
+                    help='--clock_hz: divide the summed loss by the summed target weight (weight, '
+                         'the default) or by the number of word (non-<NUL>) targets (words: with '
+                         '--nul_weight 1 the loss is the true likelihood and P(<NUL>) calibrated, '
+                         'while a word gets the same step however many <NUL>s share the batch; '
+                         'learned <NUL>s fade by themselves). Saved and restored unless given')
 parser.add_argument('--inner_voice', default=None, action=argparse.BooleanOptionalAction,
                     help='--clock_hz without <NUL>: a tick with no caption token has no target '
                          '(no loss) and the model\'s own sampled token from it is the next '
@@ -576,7 +584,7 @@ if args.load:
     _start_step = int(_loaded_ckpt.get('step', 0))
     _start_exs = int(_loaded_ckpt.get('examples', 0))
     _start_exs_by = dict(_loaded_ckpt.get('examples_by', {}))
-    for k in ('clock_hz', 'ctx_tau', 'vision_hz', 'audio_hz', 'inner_voice', 'min_p', 'top_k', 'voice_drop', 'caption_feed', 'text_feed', 'speech_delay', 'fifo3'):     # restored unless given
+    for k in ('clock_hz', 'ctx_tau', 'vision_hz', 'audio_hz', 'inner_voice', 'min_p', 'top_k', 'voice_drop', 'caption_feed', 'text_feed', 'speech_delay', 'fifo3', 'nul_weight', 'loss_norm'):     # restored unless given
         if getattr(args, k) is None:
             setattr(args, k, _saved.get(k))
 args.clock_hz = float(args.clock_hz or 0)
@@ -590,6 +598,8 @@ args.speech_delay = float(args.speech_delay or 0)
 args.audio_hz = float(args.audio_hz or 0)
 args.streams = int(args.streams or 1)
 args.fifo3 = bool(args.fifo3)
+args.nul_weight = 0.2 if args.nul_weight is None else float(args.nul_weight)
+args.loss_norm = args.loss_norm or 'weight'
 if args.fifo3 and args.streams != 3:
     raise SystemExit('--fifo3 needs --streams 3')
 if args.streams == 3:
@@ -2154,6 +2164,14 @@ def _ntok(steps):
                for _, y in steps)
 
 
+def _loss_den(wt, y):
+    """The clocked loss's denominator: the summed target weight, or (--loss_norm words) the
+    number of word targets."""
+    if args.loss_norm == 'words':
+        return ((y != _NUL_ID) & (y != -100)).sum().clamp(min=1)
+    return wt.sum()
+
+
 def _as3(x, y):
     """--fifo3: a one-stream text / image row's (x, y) -> the three streams' (as _stream_xy):
     the word is the text stream's, voice and image read _PAD and target <NUL>."""
@@ -2567,6 +2585,7 @@ def _model_graph(model):
                                    f'last {S * S} cells of 80 ms, RMSnorm',
                                 inp=f'{_QN_WIN} samples', out=f'{model.aud_width}x{S}x{S}', tr=0,
                                 fr=model.aud_enc.n_params))
+                srcs.insert(2 if model.img_enc is not None else 1, '(audio grid)')
             elif model.aud_enc is not None:
                 mimi = model.aud_enc.__dict__['_mimi']
                 out.append(dict(name='aud_enc -> (audio grid)',
@@ -2574,6 +2593,8 @@ def _model_graph(model):
                                 inp=f'32x{S * S}', out=f'{model.aud_width}x{S}x{S}', tr=0,
                                 fr=sum(p.numel() for p in mimi.quantizer.parameters())))
                 srcs.insert(2 if model.img_enc is not None else 1, '(audio grid)')
+            if model.streams == 3:         # the voice and image streams' token grids
+                srcs[len(srcs) - model.K:len(srcs) - model.K] = ['(voice token grid)', '(image token grid)']
             out.append(dict(name=', '.join(srcs), op='Concat (channels)',
                             inp=f'{"+".join(map(str, model.in_widths))}+{model.K}x{model.n_hidden} x{S}x{S}',
                             out=r['inp'], tr=0, fr=0))
@@ -4856,14 +4877,14 @@ try:
                 if not args.fifo3:
                     _own = torch.multinomial(_truncate(F.softmax(logits[:, 0].detach().float(), dim=-1)), 1)[:, 0]
             wt = torch.where(y == _NUL_ID, args.nul_weight, 1.0) * (y != -100)
-            loss = (ce_all * wt).sum() / wt.sum()
+            loss = (ce_all * wt).sum() / _loss_den(wt, y)
         elif args.inner_voice:
             with torch.no_grad():
                 _own = torch.multinomial(_truncate(F.softmax(logits.detach().float(), dim=-1)), 1)[:, 0]
             loss = ce_all.sum() / (y != _SIL).sum().clamp(min=1)
         elif _NUL_ID is not None:    # --clock_hz: <NUL> targets weigh --nul_weight
             wt = torch.where(y == _NUL_ID, args.nul_weight, 1.0)
-            loss = (ce_all * wt).sum() / wt.sum()
+            loss = (ce_all * wt).sum() / _loss_den(wt, y)
         else:
             loss = ce_all.mean()
         if not torch.isfinite(loss):         # keep the last good checkpoint on disk
