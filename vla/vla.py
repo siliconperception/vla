@@ -29,6 +29,7 @@ import datetime
 import glob
 import io
 import itertools
+import textwrap
 import json
 import math
 import os
@@ -2614,16 +2615,25 @@ def _model_graph(model):
                 out.append(dict(name=f'{g}[t] <- {src}',
                                 op='Write (replace)' if w <= 1 else f'Write (EMA w={w:g})',
                                 inp=H, out=H, tr=0, fr=0))
-    w = max(len(r['name']) for r in out)
-    wo = max(len(r['op']) for r in out)
+    # a long module name or op wraps onto continuation lines, so no line passes _GRAPH_WIDTH
     ws = max(max(len(r['inp']), len(r['out'])) for r in out)
+    room = _GRAPH_WIDTH - (3 + 2 + 2 + 2 + ws + 4 + ws + 2 + 12)
+    w = min(max(len(r['name']) for r in out), room * 2 // 5)
+    wo = min(max(len(r['op']) for r in out), room - w)
     lines = [f'{"#":>3}  {"module":<{w}}  {"op":<{wo}}  {"in":>{ws}}    {"out":<{ws}}  {"params":>12}']
     for n, r in enumerate(out, 1):
         p = r['tr'] + r['fr']
         ps = '' if not p else f'{p:,}' + (' frozen' if r['fr'] and not r['tr'] else '')
-        lines.append(f'{n:>3}  {r["name"]:<{w}}  {r["op"]:<{wo}}  {r["inp"]:>{ws}} -> '
-                     f'{r["out"]:<{ws}}  {ps:>12}')
+        nm = textwrap.wrap(r['name'], w, break_on_hyphens=False) or ['']
+        op = textwrap.wrap(r['op'], wo, break_on_hyphens=False) or ['']
+        lines.append(f'{n:>3}  {nm[0]:<{w}}  {op[0]:<{wo}}  {r["inp"]:>{ws}} -> '
+                     f'{r["out"]:<{ws}}  {ps:>12}'.rstrip())
+        for a, b in itertools.zip_longest(nm[1:], op[1:], fillvalue=''):
+            lines.append(f'{"":>3}  {a:<{w}}  {b}'.rstrip())
     return lines
+
+
+_GRAPH_WIDTH = 270                # INFO model-graph lines fit the terminal
 
 
 def _param_summary(model):
