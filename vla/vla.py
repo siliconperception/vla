@@ -806,25 +806,32 @@ def _viewer(inbox, stem, show, parent):
         ax.tick_params(axis='x', labelsize=7, pad=1)
 
     def draw_genv(fig, step, items):
-        """Held-out clips: 4 frames and the spectrogram of the sound over the opening stretch,
-        then the caption generated with picture and sound (A+V) and the reference (REF)."""
+        """Held-out clips: 4 frames (titled with their media time) and the spectrogram of the
+        sound over the stretch captioned, then the caption generated with picture and sound
+        (A+V, or see / hear / think) and the reference (REF), marked every _GENV_MARK s."""
         n = len(items)
         gs = fig.add_gridspec(n, 2, width_ratios=[1, 1.25], left=0.03, right=0.99, top=0.94,
                               bottom=0.03, wspace=0.03, hspace=0.3)
         colors = {'A+V': 'white', 'see': 'white', 'hear': 'white', 'think': 'skyblue'}
-        for k, (strip, spec, name, caps, ref) in enumerate(items):
-            sub = gs[k, 0].subgridspec(2, 1, height_ratios=[1, 0.7], hspace=0.05)
+        for k, (strip, spec, name, caps, ftimes, ext) in enumerate(items):
+            sub = gs[k, 0].subgridspec(2, 1, height_ratios=[1, 0.7], hspace=0.25)
             ax = fig.add_subplot(sub[0])
             ax.imshow(strip)
-            ax.set_axis_off()
+            w = strip.shape[1] / max(1, len(ftimes))  # each frame titled with its media time
+            ax.set_xticks([(j + 0.5) * w for j in range(len(ftimes))])
+            ax.set_xticklabels([f't={t:.1f}s' for t in ftimes], fontsize=7, color='0.7')
+            ax.tick_params(length=0, pad=1)
+            ax.set_yticks([])
+            for sp in ax.spines.values():
+                sp.set_visible(False)
             ax.set_title(name, fontsize=8, pad=2)
             sa = fig.add_subplot(sub[1])
-            spec_ax(sa, spec, (0, spec.shape[1] / 100 if spec is not None else 1))
+            spec_ax(sa, spec, ext, ftimes)            # cyan: when those frames were shown
             tx = fig.add_subplot(gs[k, 1])
             tx.set_axis_off()
             dy = 0                                    # points below the top of the cell
-            for lab, cap in list(caps.items()) + [('REF', ref)]:
-                t = textwrap.fill(f'{lab}: ' + cut(cap.replace(chr(10), ' / '), 400), 100)
+            for lab, cap in caps.items():
+                t = textwrap.fill(f'{lab}: ' + cut(cap.replace(chr(10), ' / '), 500), 100)
                 tx.annotate(t, xy=(0, 1), xycoords='axes fraction', xytext=(0, -dy),
                             textcoords='offset points', va='top', fontsize=7.5,
                             color=colors.get(lab, 'limegreen'), annotation_clip=False)
@@ -1655,12 +1662,12 @@ class VLAModel(nn.Module, _HubMixin):
     def generate3(self, n_ticks, video, temperature=1.0):
         """streams 3: n_ticks of a _VideoClip from a _NULL blink on a private state, every
         stream's sample fed back (no word after a <NUL>) -> (text, voice, image) id lists with
-        <NUL> dropped; short only on NaN/Inf."""
+        <NUL> dropped, and each token's tick; short only on NaN/Inf."""
         self.eval()
         dev = next(self.parameters()).device
         dff = self.new_state(1, dev)
         x = torch.full((1, 3), _NULL, dtype=torch.long, device=dev)
-        outs = ([], [], [])
+        outs, ticks = ([], [], []), ([], [], [])
         for k in range(n_ticks):
             img, aud = video.grids(self, [video.at(k)], dev)
             dff, o = self.step(x, dff, img, aud)
@@ -1673,8 +1680,9 @@ class VLAModel(nn.Module, _HubMixin):
             for st in range(3):
                 if int(b[st]) != _NUL_ID:
                     outs[st].append(int(b[st]))
+                    ticks[st].append(k)
             x = torch.where(b == _NUL_ID, _PAD, b)[None]
-        return outs
+        return outs, ticks
 
 
 # ── data ──────────────────────────────────────────────────────────────────────
@@ -3079,6 +3087,77 @@ def _build_image_eval(corpus):
     return docs
 
 
+def _clip_of(r, m, dev):
+    """A video row and its example's media (see _video_example) -> a _VideoClip: centre-crop
+    frames on the CPU, the sound on dev."""
+    frames = torch.stack([_crop224(im) for im in _decode_jpegs(m['jpegs'], 'cpu')])
+    if model.audio_encoder == 'quartznet':
+        lat = torch.from_numpy(m['wav']).to(dev)
+    elif model.aud_enc is not None:
+        lat = model.aud_enc.latents(m['codes'], dev)
+    else:
+        lat = torch.zeros(_AUD_DIM, m['codes'].shape[1], device=dev)
+    span = max(m['t1'] - m['t0'], 1e-3)
+    ref = ' '.join(t for _, _, _, t in json.loads(r['events']))
+    clip = _VideoClip(frames, lat, m['codes'], m['fi'], m['ai'], m['fps'], m['t0'],
+                      args.clock_hz or m['n'] / span, (r['id'], r.get('category') or '', ref))
+    clip.kind = m.get('kind')       # --clock_hz: speech / activity per tick (EVALS)
+    clip.f0, clip.a0 = m['f0'], m['a0']       # first frame / grid cell kept (the GEN window)
+    return clip
+
+
+def _gen_clip(corpus, rng):
+    """A random held-out video of a local video corpus for the GEN window -- a fresh one each
+    refresh, not the eval set -- as (steps, clip), its window starting at a random event (a
+    fresh state, as training starts one); None if none was found."""
+    import pyarrow.parquet as pq
+    held = _VIDEO_DATASETS[corpus].get('eval') is None
+    files = _video_files(corpus, 'eval')
+    if model.audio_encoder == 'quartznet':
+        files = [f for f in files if os.path.exists(_sidecar_path(corpus, f) or '')]
+    for _ in range(8):
+        if not files:
+            return None
+        f = rng.choice(files)
+        pf = pq.ParquetFile(f)
+        ids = pf.read(columns=['id']).column('id').to_pylist()
+        pick = [k for k, v in enumerate(ids) if not held or _id_heldout(v)]
+        if not pick:
+            continue
+        k = rng.choice(pick)
+        bounds = np.cumsum([0] + [pf.metadata.row_group(g).num_rows
+                                  for g in range(pf.metadata.num_row_groups)])
+        g = int(np.searchsorted(bounds, k, side='right')) - 1
+        r = pf.read_row_group(g, columns=_VID_COLS).to_pylist()[k - bounds[g]]
+        if model.audio_encoder == 'quartznet':
+            r['wav'] = _row_wav(corpus, f, r['id'])
+            if r['wav'] is None:
+                continue
+        ex = _video_example(r, rng, maxspan=_GENV_SPAN)
+        if ex is None or sum(y != _SIL for _, y in ex[1]['steps']) < _VID_EVAL_MINTOK:
+            continue
+        return ex[1]['steps'], _clip_of(r, ex[1], next(model.parameters()).device)
+    return None
+
+
+def _timed_text(ids, ticks, t0, rate, limit, every=None):
+    """Token ids, each at tick k = media time t0 + k / rate -> their text with a [Ns] mark
+    before the first token of each `every` seconds, cut once about `limit` characters of text
+    (marks not counted) are out."""
+    every = every or _GENV_MARK
+    segs, n = [], 0
+    for y, k in zip(ids, ticks):
+        if n >= limit:
+            break
+        m = int((t0 + k / rate) // every)
+        if not segs or segs[-1][0] != m:
+            segs.append((m, []))
+        segs[-1][1].append(y)
+        n += len(_decode_plain([y]))
+    return ' '.join(f'[{m * every:.0f}s] ' + _decode_plain(ys).replace(chr(10), ' / ').strip()
+                    for m, ys in segs)
+
+
 def _build_video_eval(corpus):
     """Up to _VID_EVAL_CLIPS held-out videos of a video corpus (its eval files spread evenly,
     else the id-hash held-out rows of the train files in name order, so the set is stable as
@@ -3119,19 +3198,7 @@ def _build_video_eval(corpus):
                 if ex is None or sum(y != _SIL for _, y in ex[1]['steps']) < _VID_EVAL_MINTOK:
                     continue
                 text, m = ex
-                frames = torch.stack([_crop224(im) for im in _decode_jpegs(m['jpegs'], 'cpu')])
-                if model.audio_encoder == 'quartznet':
-                    lat = torch.from_numpy(m['wav']).to(dev)
-                elif model.aud_enc is not None:
-                    lat = model.aud_enc.latents(m['codes'], dev)
-                else:
-                    lat = torch.zeros(_AUD_DIM, m['codes'].shape[1], device=dev)
-                span = max(m['t1'] - m['t0'], 1e-3)
-                ref = ' '.join(t for _, _, _, t in json.loads(r['events']))
-                clip = _VideoClip(frames, lat, m['codes'], m['fi'], m['ai'], m['fps'], m['t0'],
-                                  args.clock_hz or m['n'] / span,
-                                  (r['id'], r.get('category') or '', ref))
-                clip.kind = m.get('kind')       # --clock_hz: speech / activity per tick (EVALS)
+                clip = _clip_of(r, m, dev)
                 if model.audio_encoder == 'quartznet':
                     clip.precompute_audio(model, dev)
                 items.append((m['steps'], clip))
@@ -4001,33 +4068,37 @@ def _gen_lines(i):
     for c in _eval_corpus_names():
         if c not in _VIDEO_DATASETS or model.img_enc is None or not args.gen_images:
             continue
-        docs = _eval_docs(c)
-        n = len(docs)
-        if not n:
-            continue
-        ks = random.Random(f'{c}:{i}').sample(range(n), min(n, _GENV_CLIPS, args.gen_images))
-        for k in ks if args.gen_vis and _gen_inbox is not None else ks[:1]:
-            # the caption generated with picture and sound over the clip's opening L tokens'
-            # worth of media time, beside the L reference tokens read over that same time
-            # REF: the clip's first _GENV_LEN reference tokens; the caption runs (at most the
-            # whole clip) until it has as many characters, and is cut to that length
-            ys = [y for _, y in docs[k]]
-            v = _eval_vids[c][k]
-            at = [j for j, y in enumerate(ys) if y != _SIL]
-            ref = _decode_plain(ys[:at[min(_GENV_LEN, len(at)) - 1] + 1] if at else [])
+        # fresh held-out videos every refresh (the eval set's 64 kept coming back), each
+        # from a random event
+        rng = random.Random(f'{c}:{i}')
+        want = min(_GENV_CLIPS, args.gen_images) if args.gen_vis and _gen_inbox is not None else 1
+        try:
+            clips = [g for g in (_gen_clip(c, rng) for _ in range(want)) if g is not None]
+        except Exception as e:
+            print(f'WARNING: GEN video clips: {e!r}', flush=True)
+            clips = []
+        for n_clip, (steps, v) in enumerate(clips):
+            # the caption generated with picture and sound over the media time of the clip's
+            # first _GENV_LEN reference tokens; each stream shown up to REF's length, with a
+            # mark every _GENV_MARK s of media time
+            ys = [y for _, y in steps]
+            at = [j for j, y in enumerate(ys) if y != _SIL][:_GENV_LEN]
+            ref = _decode_plain([ys[j] for j in at])
             n_ref = max(1, len(ref))
             vid, cat, _ = v.meta
+            L = at[-1] + 1 if at else len(ys)
+            tick0 = v.t0 + v.phase / v.rate
+            ref_t = _timed_text([ys[j] for j in at], at, tick0, v.rate, n_ref)
             if model.streams == 3:
-                # every stream free-running over the media time the REF spans, each shown up
-                # to REF's length: what it sees (image), hears (voice) and thinks (text)
-                L = at[min(_GENV_LEN, len(at)) - 1] + 1 if at else len(ys)
-                tx, vo, im_ = model.generate3(L, v, temperature=args.temperature)
-                caps = {lab: _decode_plain(ids)[:n_ref]
-                        for lab, ids in (('see', im_), ('hear', vo), ('think', tx))}
-                if k == ks[0]:
+                (tx, vo, im_), (ttx, tvo, tim) = model.generate3(L, v, temperature=args.temperature)
+                caps = {lab: _timed_text(ids, tk, tick0, v.rate, n_ref)
+                        for lab, ids, tk in (('see', im_, tim), ('hear', vo, tvo),
+                                             ('think', tx, ttx))}
+                if n_clip == 0:
                     tag = f'[{vid}{" " if cat else ""}{cat}]'
-                    for lab, c_ in caps.items():
-                        lines.append(f'GENV step {i:10} {tag} {lab}: {_printable(c_)}')
+                    for lab, ids in (('see', im_), ('hear', vo), ('think', tx)):
+                        lines.append(f'GENV step {i:10} {tag} {lab}: '
+                                     f'{_printable(_decode_plain(ids)[:n_ref])}')
                         tag = f'[{vid}]'
                     lines.append(f'REF  step {i:10} [{vid}]: {_printable(ref)}')
             else:
@@ -4035,20 +4106,28 @@ def _gen_lines(i):
                                      stop_chars=n_ref)
                 L = max(1, min(len(ys), len(cap)))
                 caps = {'A+V': _decode_plain(cap)[:n_ref]}
-                if k == ks[0]:
+                if n_clip == 0:
                     lines.append(f'GENV step {i:10} [{vid}{" " if cat else ""}{cat}]: '
                                  f'{_printable(_decode_plain(cap)[:n_ref])}')
                     lines.append(f'REF  step {i:10} [{vid}]: {_printable(ref)}')
-            if '_spec' not in v.__dict__ and model.aud_enc is not None:
-                v._spec = (_spectro(None, args.device, v.lat[_QN_WIN:_QN_WIN + int(max(1, v.ai[L - 1]) * _QN_HOP)])
-                           if v.lat.dim() == 1 else
-                           _spectro(v.codes[:, :int(max(1, v.ai[L - 1]))], args.device))
+            # the sound from the window's start (a quartznet buffer / the codes begin a0 cells
+            # in, up to 64 cells before it) to the last cell heard
+            c0 = max(0.0, v.t0 * _AUD_RATE - v.a0)
+            c1 = max(c0 + 1, v.ai[L - 1])
+            spec = None
+            if model.aud_enc is not None:
+                spec = (_spectro(None, args.device, v.lat[_QN_WIN + round(c0 * _QN_HOP):
+                                                          _QN_WIN + int(c1 * _QN_HOP)])
+                        if v.lat.dim() == 1 else
+                        _spectro(v.codes[:, int(c0):int(c1)], args.device))
             f1 = v.fi[L - 1]
-            sel = np.linspace(0, f1, 4).round().astype(int)
+            sel = np.linspace(v.fi[0], f1, 4).round().astype(int)
             strip = np.concatenate([v.frames[f].permute(1, 2, 0).numpy() for f in sel], axis=1)
-            vpanel.append((strip, getattr(v, '_spec', None),
-                           f'{vid}  {cat}  0-{(f1 + 1) / v.fps:.0f}s'.strip(),
-                           caps, ref))
+            ftimes = [(v.f0 + f) / v.fps for f in sel]
+            t1 = v.t0 + (L - 1 + v.phase) / v.rate
+            ext = (v.t0, v.t0 + (spec.shape[1] / 100 if spec is not None else t1 - v.t0))
+            vpanel.append((strip, spec, f'{vid}  {cat}  {v.t0:.0f}-{t1:.0f}s'.strip(),
+                           dict(caps, REF=ref_t), ftimes, ext))
     if vpanel and _gen_inbox is not None and args.gen_vis:
         try:
             _gen_inbox.put_nowait(('genv', i, vpanel))
@@ -4111,7 +4190,9 @@ def _video_panel(i, m, off):
 
 _VID_PANEL_TOK = 400         # TRAIN video window: tokens shown ...
 _VID_PANEL_CELLS = 12        # ... and frames
-_GENV_CLIPS = 4              # GEN video window: clips per refresh ...
+_GENV_CLIPS = 3              # GEN video window: clips per refresh ...
+_GENV_SPAN = 60.0            # ... each a window of at most this many seconds from a random event
+_GENV_MARK = 5.0             # ... its captions marked every this many seconds of media time
 _GENV_LEN = 80               # ... REF = each clip's first this many reference tokens, and the
                              # generated caption runs until it is as long as REF (characters)
 
