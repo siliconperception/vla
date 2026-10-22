@@ -334,6 +334,9 @@ parser.add_argument('--lr_period',  default=20000, type=int, help='coswarm rise 
 parser.add_argument('--schedule',   default='coswarm', choices=['const', 'coswarm'],
                     help='const: --lr_max throughout. coswarm: half-cosine rise from --lr_min '
                          'to --lr_max over --lr_period global steps, then hold')
+parser.add_argument('--profile', default=0, type=int, metavar='N',
+                    help='time each part of the training step (GPU synchronized) over N steps '
+                         'after 50 of warm-up, print the table and exit')
 parser.add_argument('--lr_restart', action='store_true',
                     help='coswarm: rise over --lr_period steps from this run\'s first step '
                          '(a resumed run warms up again) instead of from global step 0')
@@ -4762,8 +4765,32 @@ def _ex_ep():
     return out
 
 
+_prof, _prof_t = collections.defaultdict(float), [0.0]
+
+
+def _pt(name):
+    """--profile: charge the time since the last mark to name."""
+    if args.profile:
+        if args.device != 'cpu':
+            torch.cuda.synchronize()
+        t = time.perf_counter()
+        _prof[name] += t - _prof_t[0]
+        _prof_t[0] = t
+
+
 try:
     while True:
+        if args.profile and i - _start_step == 50:
+            _prof.clear()
+            _pt('-')
+            _prof.clear()
+        if args.profile and i - _start_step == 50 + args.profile:
+            tot = sum(_prof.values())
+            print(f'\nPROFILE {args.profile} steps: {args.profile / tot:.2f} steps/s, '
+                  f'{1000 * tot / args.profile:.1f} ms/step')
+            for k, v in sorted(_prof.items(), key=lambda kv: -kv[1]):
+                print(f'PROFILE {k:<12} {1000 * v / args.profile:8.2f} ms  {100 * v / tot:5.1f}%')
+            break
         if i % args.checkpoint == 0:
             _save(i, n_examples)
             counts = _text_drain()
@@ -4788,7 +4815,9 @@ try:
             elif _gen_inbox is not None and args.sample_vis and _imaginer is not None:
                 _imaginer.record(i)
 
+        _pt('other')
         x_list, y_list, flag_list, new_imgs, media = q.get()
+        _pt('data_wait')
         # the text stream's input per row, for the image-bank tools (--fifo3 rows are triples)
         x_one = [x[0] if isinstance(x, tuple) else x for x in x_list]
         n_examples += sum(flag_list)
@@ -4832,6 +4861,7 @@ try:
                 js = torch.tensor([j for j, _ in shown], device=args.device)
                 vid_grid[js] = model.image_grid(_norm_u8(vid_cur[js])).to(vid_grid.dtype)
             img[_vid_rows] = vid_grid
+            _pt('image_enc')
             if vid_lat is not None or vid_wav is not None:
                 aud = torch.zeros(len(x_list), model.aud_width, model.S, model.S, device=args.device)
                 ends = torch.tensor([min(t[1], _VID_CAP) for t in idx], device=args.device)
@@ -4846,6 +4876,7 @@ try:
                     vid_agrid[ch] = model.audio_grid(vid_wav[ch], ends[ch])
                     vid_heard[ch] = ends[ch]
                 aud[_vid_rows] = vid_agrid
+            _pt('audio_enc')
         if _BANK_ROWS:
             for r, (im, name) in new_imgs:
                 if r in _vid_of:
@@ -4863,6 +4894,7 @@ try:
             if _sample is not None:
                 _record_sample(i, x_one, flag_list, views)
 
+        _pt('inputs')
         dff_prev = model.dff
         model.train()
         if model.streams == 3 and not args.fifo3:   # one-stream (x, y) -> the three streams
@@ -4905,11 +4937,13 @@ try:
             loss = (ce_all * wt).sum() / _loss_den(wt, y)
         else:
             loss = ce_all.mean()
+        _pt('forward')
         if not torch.isfinite(loss):         # keep the last good checkpoint on disk
             print(f'\n*** HALT: non-finite loss at step {i}: {loss.item()} dff_max '
                   f'{float(model.dff.abs().max())} logit_max {float(logits.detach().abs().max())}')
             break
         loss.backward()
+        _pt('backward')
         gnorm = _grad_norm()
         garr.append(gnorm)
         if not math.isfinite(gnorm):
@@ -4919,13 +4953,16 @@ try:
             for p in model.parameters():
                 if p.grad is not None:
                     p.grad.mul_(args.clip / gnorm)
+        _pt('grad_norm')
         optimizer.step()
+        _pt('optimizer')
         # recompute this step's state with the updated weights (eval-mode BatchNorm), so the
         # state carried forward is the one the model would compute at inference
         model.dff = dff_prev
         model.eval()
         with torch.no_grad():
             model(x, flag=flag & ~_continuous_row, img=img, aud=aud)
+        _pt('recompute')
 
         larr.append(loss.item())
         if carr:
@@ -4968,6 +5005,7 @@ try:
             for a in carr.values():
                 del a[:-args.monitor]
 
+        _pt('stats')
         scheduler.step()
         optimizer.zero_grad()
         i += 1
