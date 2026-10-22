@@ -148,6 +148,9 @@ _QN_HOP = int(_QN_SR / _AUD_RATE)      # samples per audio grid cell (1280)
 _QN_WIN = 8 * _QN_SR        # each grid is computed from the last 8 s heard (it looks both ways)
 _QN_FRAMES = 4              # quartznet: sound heard is counted in its 20 ms frames, 4 per grid cell
 _AUD_SIDECAR = {'finevideo': '/data/finevideo_audio'}
+_VCAP_SIDECAR = {'finevideo': '/data/finevideo_vcap'}   # --fifo3: visual captions (exp/vcap_prep.py)
+_VCAP_SAME = 0.6             # --fifo3: a caption whose word overlap (Jaccard) with one of the last 3
+                             # kept exceeds this repeats it and is dropped
 
 _IMAGE_ENCODERS = {'resnet50': 'timm/resnet50.a1_in1k'}   # frozen; [3,224,224] -> [2048,7,7]
 _IMG_BANK = 1024            # image canvas side; larger images keep their central 1024x1024
@@ -263,6 +266,14 @@ parser.add_argument('--audio_encoder', default=None, choices=['none'] + sorted(_
                          '--load, it replaces the checkpoint\'s encoder (its ctx_cat columns '
                          'start at zero); default: mimi if --mix or --eval_corpora names a video '
                          'corpus, else none')
+parser.add_argument('--fifo3', default=None, action=argparse.BooleanOptionalAction,
+                    help='--streams 3 with a FIFO per stream and every target from the dataset: '
+                         'voice = the speech transcript, image = the visual captions of '
+                         'exp/vcap_prep.py (Florence-2, picture only), text = the activity lines '
+                         '(on video rows the text stream says <NUL> between them). Each stream '
+                         'reads its own last target, never a sample. Video shards without a '
+                         'visual-caption sidecar are skipped. Architecture (the text stream gets '
+                         'a <NUL> logit); saved and restored like --clock_hz')
 parser.add_argument('--streams', default=1, type=int, choices=[1, 3],
                     help='3: three token streams, each with its own input embedding grid and its '
                          'own decoder tree -- text (fineweb words; on video rows the inner voice: '
@@ -305,6 +316,10 @@ parser.add_argument('--imagine_batch', default=16, type=int, help='--imagine: pi
 parser.add_argument('--image',      default=None, metavar='PATH',
                     help='--generate/--vis: condition on this image (caption it)')
 parser.add_argument('--shards',     default=None, type=int, help='load only the first N parquet shards')
+parser.add_argument('--shard_offset', default=0, type=int, metavar='K',
+                    help='a local hub-subset corpus (e.g. fineweb) trains on shards K..K+N-1 '
+                         'instead of the first N (fresh text); its eval set stays on the first N, '
+                         'so EVAL lines remain comparable')
 parser.add_argument('--streaming',  default=False, action='store_true')
 parser.add_argument('--shuffle',    default=True, action=argparse.BooleanOptionalAction,
                     help='--no-shuffle reads the corpus in file order; with --seed and '
@@ -561,7 +576,7 @@ if args.load:
     _start_step = int(_loaded_ckpt.get('step', 0))
     _start_exs = int(_loaded_ckpt.get('examples', 0))
     _start_exs_by = dict(_loaded_ckpt.get('examples_by', {}))
-    for k in ('clock_hz', 'ctx_tau', 'vision_hz', 'audio_hz', 'inner_voice', 'min_p', 'top_k', 'voice_drop', 'caption_feed', 'text_feed', 'speech_delay'):     # restored unless given
+    for k in ('clock_hz', 'ctx_tau', 'vision_hz', 'audio_hz', 'inner_voice', 'min_p', 'top_k', 'voice_drop', 'caption_feed', 'text_feed', 'speech_delay', 'fifo3'):     # restored unless given
         if getattr(args, k) is None:
             setattr(args, k, _saved.get(k))
 args.clock_hz = float(args.clock_hz or 0)
@@ -574,6 +589,9 @@ args.text_feed = float(args.text_feed or 0)
 args.speech_delay = float(args.speech_delay or 0)
 args.audio_hz = float(args.audio_hz or 0)
 args.streams = int(args.streams or 1)
+args.fifo3 = bool(args.fifo3)
+if args.fifo3 and args.streams != 3:
+    raise SystemExit('--fifo3 needs --streams 3')
 if args.streams == 3:
     if not args.clock_hz:
         raise SystemExit('--streams 3 needs --clock_hz')
@@ -845,12 +863,23 @@ def _viewer(inbox, stem, show, parent):
         m = max(1, len(cells))
         cols = min(m, 6)
         rows = math.ceil(m / cols)
-        gs = fig.add_gridspec(3, 1, height_ratios=[1.0, 1.55 * rows, 0.9], left=0.04,
-                              right=0.99, top=0.93, bottom=0.05, hspace=0.18)
+        tracks = isinstance(text, list)   # --fifo3: [(stream, text marked [Ns])]
+        gs = fig.add_gridspec(3, 1, height_ratios=[1.8 if tracks else 1.0, 1.55 * rows, 0.9],
+                              left=0.04, right=0.99, top=0.93, bottom=0.05, hspace=0.18)
         tx = fig.add_subplot(gs[0])
         tx.set_axis_off()
-        tx.text(0, 1, textwrap.fill(cut(text.replace(chr(10), ' / '), 900), 170), va='top',
-                fontsize=8, color='limegreen', transform=tx.transAxes, clip_on=True)
+        if tracks:                        # one block per stream, each in its own colour
+            dy = 0
+            for lab, t in text:
+                t = textwrap.fill(f'{lab}: ' + cut(t, 560), 170)
+                tx.annotate(t, xy=(0, 1), xycoords='axes fraction', xytext=(0, -dy),
+                            textcoords='offset points', va='top', fontsize=8,
+                            color={'see': 'white', 'hear': 'gold'}.get(lab, 'skyblue'),
+                            annotation_clip=False)
+                dy += 10.0 * (t.count(chr(10)) + 1) + 3
+        else:
+            tx.text(0, 1, textwrap.fill(cut(text.replace(chr(10), ' / '), 900), 170), va='top',
+                    fontsize=8, color='limegreen', transform=tx.transAxes, clip_on=True)
         sub = gs[1].subgridspec(rows, cols, wspace=0.05, hspace=0.45)
         for k, (im, t, a, b, span) in enumerate(cells):
             ax = fig.add_subplot(sub[k // cols, k % cols])
@@ -1402,7 +1431,8 @@ class VLAModel(nn.Module, _HubMixin):
     def __init__(self, S=8, n_hidden=512, c_context=384, depth=8, kernel=3,
                  tokenizer='pythia31m', windows=(256, 64, 16, 4, 1), read_norm=1.0,
                  dec_kernels=(3, 3, 3), dec_width=256, bn_momentum=0.1, init='zero',
-                 image_encoder='none', audio_encoder='none', nul_head=False, streams=1):
+                 image_encoder='none', audio_encoder='none', nul_head=False, streams=1,
+                 text_nul=False):
         super().__init__()
         from transformers import AutoModelForCausalLM
         repo = _TOKENIZERS[tokenizer]
@@ -1423,9 +1453,10 @@ class VLAModel(nn.Module, _HubMixin):
         self.nul_id = len(self.tok.tok) if (nul_head or self.streams == 3) and \
             len(self.tok.tok) < self.vocab else None
         lmhead = lm.get_output_embeddings()                             # frozen, shared
-        # streams 3: the text stream never says <NUL>; voice and image do
+        # streams 3: the text stream never says <NUL> (but --fifo3: text_nul); voice and image do
         self.text_dec = TextDecoder(n_hidden, S, list(dec_kernels), dec_width, lmhead,
-                                    nul_id=None if self.streams == 3 else self.nul_id)
+                                    nul_id=None if self.streams == 3 and not text_nul
+                                    else self.nul_id)
         if self.streams == 3:
             self.voc_dec = TextDecoder(n_hidden, S, list(dec_kernels), dec_width, lmhead,
                                        nul_id=self.nul_id)
@@ -1773,8 +1804,11 @@ def _load_corpus(name, streaming, shards=None):
         if not files:
             raise SystemExit(f'{name}: no downloaded parquet files under HF_HOME for '
                              f'{_HUB_SUBSET[name]}; fetch a subset first')
-        files = files[:shards] if shards else files
-        print(f'{name}: {len(files)} local parquet file(s) from the hub cache', flush=True)
+        k = args.shard_offset
+        files = files[k:k + shards] if shards else files[k:]
+        print(f'{name}: {len(files)} local parquet file(s) from the hub cache'
+              + (f', from shard {k}: {[os.path.basename(f) for f in files][:4]}' if k else ''),
+              flush=True)
         return load_dataset('parquet', data_files={'train': files}, streaming=streaming)
     if name not in _TEXT_DATASETS:
         raise SystemExit(f'unknown dataset: {name}')
@@ -1890,6 +1924,35 @@ def _sidecar_path(corpus, feat_file):
     return os.path.join(d, os.path.basename(feat_file)) if d else None
 
 
+_vcap_cache = collections.OrderedDict()   # --fifo3: sidecar parquet -> {id: (t, cap)}
+
+
+def _vcap_path(corpus, feat_file):
+    d = _VCAP_SIDECAR.get(corpus)
+    return os.path.join(d, os.path.basename(feat_file)) if d else None
+
+
+def _row_vcap(corpus, feat_file, vid):
+    """--fifo3: a video's visual captions ([times], [captions]) from the sidecar corpus
+    (exp/vcap_prep.py); None if its shard is not there (yet) or lacks the id. Whole shards are
+    cached (small: text only), the 64 most recent."""
+    import pyarrow.parquet as pq
+    path = _vcap_path(corpus, feat_file)
+    if not path or not os.path.exists(path):
+        return None
+    with _sidecar_lock:
+        d = _vcap_cache.get(path)
+        if d is not None:
+            _vcap_cache.move_to_end(path)
+    if d is None:
+        d = {r['id']: (r['t'], r['cap']) for r in pq.read_table(path).to_pylist()}
+        with _sidecar_lock:
+            _vcap_cache[path] = d
+            while len(_vcap_cache) > 64:
+                _vcap_cache.popitem(last=False)
+    return d.get(vid)
+
+
 def _row_wav(corpus, feat_file, vid):
     """--audio_encoder quartznet: a video's clean soundtrack, int16 [n] at 16 kHz, from the
     sidecar corpus (exp/audio_prep.py); None if its shard is not there (yet) or lacks the id."""
@@ -2002,6 +2065,103 @@ def _clocked_example(row, rng=None, maxspan=_VID_MAXSPAN):
     return text, media
 
 
+def _vcap_lines(vcap):
+    """--fifo3: a video's visual captions (times, captions) -> [(t, caption)] without the
+    near-repeats (word Jaccard over _VCAP_SAME with one of the last 3 kept)."""
+    out, last = [], []
+    for t, c in zip(*(vcap or ([], []))):
+        w = set(c.lower().split())
+        if not w or any(len(w & q) / len(w | q) > _VCAP_SAME for q in last):
+            continue
+        out.append((float(t), c.strip()))
+        last = (last + [w])[-3:]
+    return out
+
+
+def _clocked3_example(row, rng=None, maxspan=_VID_MAXSPAN):
+    """--fifo3: a video row -> (text, media) with one step per tick of 1/R s, as
+    _clocked_example, but every tick has a target for each of the three streams, each from its
+    own FIFO: voice the speech transcript (each token due where just heard, plus
+    --speech_delay), image the visual captions (row['vcap'], each line due at its frame), text
+    the activity lines (each due at its start); a line that would start more than --max_lag s
+    late is dropped. A stream with nothing due targets <NUL>. Step k's input per stream is that
+    stream's previous target (_PAD after a <NUL>; the _NULL blink at k = 0) -- always the
+    dataset's, never the model's. steps: [((x_text, x_voice, x_image), (y_text, y_voice,
+    y_image))] per tick."""
+    R, frames = args.clock_hz, row['frames']
+    if not frames:
+        return None
+    fps = float(row['fps'])
+    codes = np.frombuffer(row['codes'], dtype='<i2').reshape(32, -1)
+    ev = _video_events(row)
+    caps = _vcap_lines(row.get('vcap'))
+    dur = float(row.get('duration') or 0) or len(frames) / fps
+    starts = [e[0] for e in ev] + [t for t, _ in caps]
+    ta = 0.0
+    if rng is not None and dur > maxspan and starts:
+        ta = max(0.0, min(rng.choice(starts), dur - maxspan))
+    tb = min(dur, ta + maxspan)
+    n = int((tb - ta) * R)
+    if n < 2:
+        return None
+    # (stream, start, end, is speech, text) lines; stream 0 text, 1 voice, 2 image
+    lines = [(1 if kd == 'say' else 0, s, e, kd == 'say', f'"{t}"' if kd == 'say' else t)
+             for s, e, kd, t in ev] + [(2, t, t, False, c) for t, c in caps]
+    lines.sort(key=lambda x: (x[1], x[0]))
+    tgt = [[_SIL] * n for _ in range(3)]
+    nxt, dropped = [0, 0, 0], 0
+    for st, s, e, say, txt in lines:
+        if not ta <= s < tb:
+            continue
+        tk = _tokenizer.encode(txt + '\n')
+        if not say and ta + nxt[st] / R - s > args.max_lag:
+            dropped += len(tk)
+            continue
+        for m in range(len(tk)):
+            t = s + (e - s) * (m + 1) / len(tk) + args.speech_delay if say else s
+            k = max(math.ceil((t - ta) * R - 1e-9), nxt[st])
+            if k >= n:
+                break
+            tgt[st][k], nxt[st] = tk[m], k + 1
+    ids = [[y for y in tg if y != _SIL] for tg in tgt]
+    if not any(ids):
+        return None
+    V = min(args.vision_hz or fps, fps)
+    fabs = [min(len(frames) - 1, int(math.floor((ta + k / R) * V + 1e-9) / V * fps + 1e-9))
+            for k in range(n)]
+    A = args.audio_hz
+    aabs = [min(codes.shape[1], _cells_heard(math.floor((ta + k / R) * A + 1e-9) / A if A
+                                             else ta + k / R)) for k in range(n)]
+    f0, a0 = fabs[0], max(0, int(aabs[0]) - 64)
+    xs = [tuple(_NULL for _ in range(3))] + \
+        [tuple(_PAD if tgt[st][k] == _SIL else tgt[st][k] for st in range(3)) for k in range(n - 1)]
+    ys = [tuple(tgt[st][k] for st in range(3)) for k in range(n)]
+    text = '\n'.join(f'{lab}: ' + _tokenizer.decode(i).replace('\n', ' / ')
+                      for lab, i in zip(('think', 'hear', 'see'), ids))
+    media = dict(jpegs=frames[f0:max(fabs) + 1], codes=np.ascontiguousarray(codes[:, a0:int(max(aabs))]),
+                 wav=_qn_buffer(row['wav'], a0, max(aabs)) if row.get('wav') is not None else None,
+                 off=rng.random() if rng is not None else 0.5,
+                 fi=[f - f0 for f in fabs], ai=[a - a0 for a in aabs], fps=fps,
+                 t0=ta, t1=tb, text=text, n=n, f0=f0, a0=a0, clock=R, dropped=dropped,
+                 name=f'{row["id"]}  {row.get("category") or ""}'.strip(),
+                 steps=list(zip(xs, ys)))
+    return text, media
+
+
+def _ntok(steps):
+    """Caption / text targets in an example's steps (every stream's, --fifo3)."""
+    return sum(sum(v != _SIL for v in y) if isinstance(y, tuple) else y != _SIL
+               for _, y in steps)
+
+
+def _as3(x, y):
+    """--fifo3: a one-stream text / image row's (x, y) -> the three streams' (as _stream_xy):
+    the word is the text stream's, voice and image read _PAD and target <NUL>."""
+    if isinstance(y, tuple):
+        return x, y
+    return ((x, x, x) if x == _NULL else (x, _PAD, _PAD)), (y, _NUL_ID, _NUL_ID)
+
+
 def _video_example(row, rng=None, maxtok=_VID_MAXTOK, maxspan=_VID_MAXSPAN):
     """A video row -> (text, steps, media) for one token-clocked example. Events become lines
     of text in time order (speech segments in double quotes); a video longer than maxtok
@@ -2015,7 +2175,7 @@ def _video_example(row, rng=None, maxtok=_VID_MAXTOK, maxspan=_VID_MAXSPAN):
     frames and codes plus, per step, fi (frame index into them) and ai (Mimi frames heard,
     relative to the codes kept)."""
     if args.clock_hz:
-        return _clocked_example(row, rng, maxspan)
+        return (_clocked3_example if args.fifo3 else _clocked_example)(row, rng, maxspan)
     ev = _video_events(row)
     if not ev:
         return None
@@ -2070,6 +2230,11 @@ class _VideoSource(_ImageSource):
                 if len(self.files) != n:
                     print(f'{self.name}: {len(self.files)} local parquet files', flush=True)
             files = self.files
+            if args.fifo3:                             # only shards with visual captions
+                files = [f for f in files if os.path.exists(_vcap_path(self.name, f) or '')]
+                if not files:
+                    raise SystemExit(f'{self.name}: no visual captions in '
+                                     f'{_VCAP_SIDECAR.get(self.name)} (see exp/vcap_prep.py)')
             if args.audio_encoder == 'quartznet':      # only shards whose sound is there
                 files = [f for f in files if os.path.exists(_sidecar_path(self.name, f) or '')]
                 if not files:
@@ -2097,12 +2262,16 @@ class _VideoSource(_ImageSource):
                     self.pool.pop()
             if row is None:
                 self._fill()
-            elif args.audio_encoder != 'quartznet':
-                return row
-            else:                                       # read only now: the pool stays small
+                continue
+            if args.fifo3:                              # read only now: the pool stays small
+                row['vcap'] = _row_vcap(self.name, row['_file'], row['id'])
+                if row['vcap'] is None:
+                    continue
+            if args.audio_encoder == 'quartznet':
                 row['wav'] = _row_wav(self.name, row['_file'], row['id'])
-                if row['wav'] is not None:
-                    return row
+                if row['wav'] is None:
+                    continue
+            return row
 
 
 # Worker -> training-loop tallies, per corpus: documents/tokens since the last TEXT line, the
@@ -2262,6 +2431,8 @@ def worker(stop, q, datasets):
                 shown.append((j, _crop224(_decode_jpegs([sl.media['jpegs'][f]])[0], sl.media['off'])))
         for slot in slots:
             slot.pos += 1
+        if args.fifo3:                       # every row as the three streams' (x, y)
+            xy = [_as3(x, y) for x, y in xy]
         q.put(([x for x, _ in xy], [y for _, y in xy], flags, new_imgs, (idx, shown)))
 
 
@@ -2318,7 +2489,7 @@ else:
                      nul_head=not args.inner_voice and (
                          bool(args.clock_hz) or (_loaded_ckpt is not None and
                                                  'text_dec.nul.weight' in _loaded_ckpt['state_dict'])),
-                     streams=args.streams)
+                     streams=args.streams, text_nul=args.fifo3)
     if _loaded_ckpt is not None:
         _sd = _upgrade_state_dict(_loaded_ckpt['state_dict'])
         if _aud_switch:
@@ -3115,6 +3286,8 @@ def _gen_clip(corpus, rng):
     files = _video_files(corpus, 'eval')
     if model.audio_encoder == 'quartznet':
         files = [f for f in files if os.path.exists(_sidecar_path(corpus, f) or '')]
+    if args.fifo3:
+        files = [f for f in files if os.path.exists(_vcap_path(corpus, f) or '')]
     for _ in range(8):
         if not files:
             return None
@@ -3133,8 +3306,12 @@ def _gen_clip(corpus, rng):
             r['wav'] = _row_wav(corpus, f, r['id'])
             if r['wav'] is None:
                 continue
+        if args.fifo3:
+            r['vcap'] = _row_vcap(corpus, f, r['id'])
+            if r['vcap'] is None:
+                continue
         ex = _video_example(r, rng, maxspan=_GENV_SPAN)
-        if ex is None or sum(y != _SIL for _, y in ex[1]['steps']) < _VID_EVAL_MINTOK:
+        if ex is None or _ntok(ex[1]['steps']) < _VID_EVAL_MINTOK:
             continue
         return ex[1]['steps'], _clip_of(r, ex[1], next(model.parameters()).device)
     return None
@@ -3193,9 +3370,14 @@ def _build_video_eval(corpus):
                     if r['wav'] is None:
                         no_wav += 1
                         continue
+                if args.fifo3:
+                    r['vcap'] = _row_vcap(corpus, f, r['id'])
+                    if r['vcap'] is None:
+                        no_wav += 1
+                        continue
                 ex = _video_example(r, None, maxtok=min(_EVAL_MAXLEN, _VID_EVAL_MAXLEN),
                                     maxspan=_VID_EVAL_SPAN if args.clock_hz else _VID_MAXSPAN)
-                if ex is None or sum(y != _SIL for _, y in ex[1]['steps']) < _VID_EVAL_MINTOK:
+                if ex is None or _ntok(ex[1]['steps']) < _VID_EVAL_MINTOK:
                     continue
                 text, m = ex
                 clip = _clip_of(r, m, dev)
@@ -3209,7 +3391,7 @@ def _build_video_eval(corpus):
           f'{sum(len(d) for d in docs)} tokens', flush=True)
     if no_wav:
         print(f'WARNING: eval set {corpus}: {no_wav} held-out videos skipped, their sidecar '
-              f'sound is not there yet (the set differs from a full corpus\'s)', flush=True)
+              f'sound / visual captions are not there yet (the set differs from a full corpus\'s)', flush=True)
     return docs
 
 
@@ -3280,8 +3462,9 @@ def _batches(rows):
     for c in range(0, len(rows), _EVAL_BATCH):
         chunk = rows[c:c + _EVAL_BATCH]
         B, T = len(chunk), max(len(xs) for xs, _ in chunk)
-        X = torch.zeros((B, T), dtype=torch.long)
-        Y = torch.zeros((B, T), dtype=torch.long)
+        shp = (B, T, 3) if isinstance(chunk[0][1][0], tuple) else (B, T)   # --fifo3 clips
+        X = torch.zeros(shp, dtype=torch.long)
+        Y = torch.zeros(shp, dtype=torch.long)
         M = torch.zeros((B, T), dtype=torch.bool)
         for r, (xs, ys) in enumerate(chunk):
             X[r, :len(xs)] = torch.tensor(xs)
@@ -3304,7 +3487,7 @@ def _token_bands(dev):
         cnt = collections.Counter()
         for c in _eval_corpus_names():
             for d in _eval_docs(c) or []:
-                cnt.update(y for _, y in d)
+                cnt.update(v for _, y in d for v in (y if isinstance(y, tuple) else (y,)))
         V = max(model.vocab, max(cnt) + 1 if cnt else 1)
         edges = [int(e) for e in args.eval_bands.split(',') if e.strip()]
         band = torch.full((V,), len(edges), dtype=torch.long)
@@ -3314,6 +3497,44 @@ def _token_bands(dev):
         print(f'--eval_bands: ranks from {sum(cnt.values())} held-out tokens, {len(cnt)} '
               f'distinct; edges {edges}', flush=True)
     return _band_cache['b'].to(dev)
+
+
+def _score3f_tick(X3, Y3, video, free, own3, img, aud, Mt3, Mnt3, nul3, kce, kn, gen, bands):
+    """--fifo3, one eval tick: X3, Y3 [B, 3] the streams' inputs and targets (the dataset's),
+    Mt3 / Mnt3 [B, 3] bool their word / <NUL> targets; own3 [B, 3] each stream's sample at the
+    last tick. free (EVALF): every stream reads its own last sample instead (no word after its
+    own <NUL>), as in the live demo. -> (summed word loss [B], words [B], largest word loss
+    [B], this tick's samples [B, 3] or None). Per-stream word loss (kce / kn: 1 voice, 2 image,
+    3 text), <NUL> statistics (nul3 by stream) and bands = (band_of, bsum, bcnt) accumulate."""
+    B = X3.shape[0]
+    if free and own3 is not None and video:
+        X3 = torch.where(X3 == _NULL, X3, torch.where(own3 == _NUL_ID, _PAD, own3))
+    logits, _ = model(X3, img=img, aud=aud)                       # [B, 3, V]
+    V = logits.shape[-1]
+    samp = None
+    if free and video:
+        samp = torch.multinomial(_truncate(F.softmax(logits.float().view(-1, V), dim=-1)), 1,
+                                 generator=gen).view(B, 3)
+    ce3 = F.cross_entropy(logits.view(-1, V), Y3.clamp(min=0).view(-1), reduction='none').view(B, 3)
+    ce3 = torch.where(torch.isfinite(ce3), ce3, torch.full_like(ce3, 1e30))
+    w = Mt3.float()
+    if video:
+        pn = F.softmax(logits.float(), dim=-1)[:, :, _NUL_ID]     # [B, 3]
+        for kk, st in ((1, 1), (2, 2), (3, 0)):
+            kce[kk] += float((ce3[:, st].clamp(max=30) * Mt3[:, st]).sum())
+            kn[kk] += int(Mt3[:, st].sum())
+            d = nul3[st]
+            d['ce'] += float((ce3[:, st].clamp(max=30) * Mnt3[:, st]).sum())
+            d['n'] += int(Mnt3[:, st].sum())
+            d['p_nul'] += float((pn[:, st] * Mnt3[:, st]).sum())
+            d['p_tok'] += float((pn[:, st] * Mt3[:, st]).sum())
+            d['n_tok'] += int(Mt3[:, st].sum())
+    if bands is not None:
+        band_of, bsum, bcnt = bands
+        oh = F.one_hot(band_of[Y3.clamp(0, band_of.numel() - 1)], bsum.shape[1]).float() * w[..., None]
+        bsum += (oh * ce3[..., None]).sum(1)
+        bcnt += oh.sum(1)
+    return (ce3 * w).sum(1), w.sum(1), (ce3 * w).max(1).values, samp
 
 
 def _score3_tick(x, y, Kd, t, video, free, own3, img, aud, Mt, Mnt, nul3, gen):
@@ -3374,18 +3595,27 @@ def _score(step, corpus, docs, imgs=None, tag=None, clips=None, bands=True, free
     nb = int(band_of.max()) + 1 if band_of is not None else 0
     per_doc, bad_doc, band_sum, band_cnt = [], [], [], []
     nul = dict(ce=0.0, n=0, p_tok=0.0, n_tok=0, p_nul=0.0)    # --clock_hz: the <NUL> targets
-    nul3 = {k: dict(ce=0.0, n=0, p_tok=0.0, n_tok=0, p_nul=0.0) for k in (1, 2)}  # voice, image
-    kce, kn = [0.0, 0.0, 0.0], [0, 0, 0]     # EVALS: loss / count by tick kind (1 speech, 2 activity)
+    nul3 = {k: dict(ce=0.0, n=0, p_tok=0.0, n_tok=0, p_nul=0.0) for k in (0, 1, 2)}  # by stream
+    # EVALS: loss / count by tick kind (1 speech, 2 activity; --fifo3 by stream: 1 voice,
+    # 2 image, 3 text)
+    kce, kn = [0.0, 0.0, 0.0, 0.0], [0, 0, 0, 0]
+    f3 = False                               # --fifo3 clips: three targets per tick
     with _EvalState(), torch.no_grad():
         c = 0
         gen = torch.Generator(device=dev).manual_seed(1234)
         for chunk, X, Y, M in _batches(_doc_rows(docs)):
-            B, T = X.shape
+            B, T = X.shape[:2]
+            f3 = X.dim() == 3
+            if f3:                           # per stream: word targets, <NUL> targets
+                M3, Mn3 = M[..., None] & (Y != _NUL_ID), M[..., None] & (Y == _NUL_ID)
+                n3 = torch.zeros(B, device=X.device)
+                Mn = None
             # every loss below is over caption tokens only; <NUL> targets are summed apart
-            Mn = M & (Y == _NUL_ID) if _NUL_ID is not None else None
+            Mn = M & (Y == _NUL_ID) if _NUL_ID is not None and not f3 else None
             if Mn is not None:
                 M = M & ~Mn
-            M = M & (Y >= 0)                 # --inner_voice: a silent tick (-100) has no target
+            if not f3:
+                M = M & (Y >= 0)             # --inner_voice: a silent tick (-100) has no target
             own = None                       # --inner_voice: the token sampled at the last tick
             own3 = None                      # --streams 3: each stream's sample at the last tick
             bank = _bank(imgs[c:c + B], dev) if imgs is not None else None
@@ -3454,6 +3684,14 @@ def _score(step, corpus, docs, imgs=None, tag=None, clips=None, bands=True, free
                                     heard[r] = ais[r]
                             aud = agrid
                 xt = X[:, t]
+                if f3:
+                    ce, nw, cmax, own3 = _score3f_tick(
+                        X[:, t], Y[:, t], cb is not None, free, own3, img, aud, M3[:, t],
+                        Mn3[:, t], nul3, kce, kn, gen, (band_of, bsum, bcnt) if nb else None)
+                    rs += ce
+                    n3 += nw
+                    bad |= cmax > _EVAL_THRESH
+                    continue
                 if model.streams == 3:
                     ce = _score3_tick(X[:, t], Y[:, t], Kd, t, cb is not None, free, own3,
                                       img, aud, M[:, t], Mn[:, t], nul3, gen)
@@ -3495,23 +3733,28 @@ def _score(step, corpus, docs, imgs=None, tag=None, clips=None, bands=True, free
                         kce[kk] += float((ce.clamp(max=30) * mk).sum())
                         kn[kk] += int(mk.sum())
                 bad |= M[:, t] & (ce > _EVAL_THRESH)     # ANY token over: exp/score.py's rule
-            per_doc.append((rs / M.sum(dim=1).clamp(min=1)).cpu().numpy())
+            per_doc.append((rs / (n3 if f3 else M.sum(dim=1)).clamp(min=1)).cpu().numpy())
             bad_doc.append(bad.cpu().numpy())
             if nb:
                 band_sum.append(bsum.cpu().numpy())
                 band_cnt.append(bcnt.cpu().numpy())
     per, bad = np.concatenate(per_doc), np.concatenate(bad_doc)
+    # word loss by kind: speech / activity lines, or (--fifo3) by stream: hear / see / think
+    kinds = ((1, 'speech'), (2, 'see'), (3, 'think')) if f3 else ((1, 'speech'), (2, 'activity'))
     if free:
         f = lambda kk: f'{kce[kk] / kn[kk]:.4f}' if kn[kk] else 'n/a'
-        _eval_results[f'{tag}~free'] = dict(speech=kce[1] / max(1, kn[1]), activity=kce[2] / max(1, kn[2]),
+        _eval_results[f'{tag}~free'] = dict(**{lab: kce[kk] / max(1, kn[kk]) for kk, lab in kinds},
                                             median=float(np.median(per)))
-        _emit(f'EVALF step {step:10} corpus {tag:8} speech {f(1)} activity {f(2)} '
-              f'median {float(np.median(per)):.4f} wall {time.time() - t0:5.1f}s')
+        _emit(f'EVALF step {step:10} corpus {tag:8} '
+              + ' '.join(f'{lab} {f(kk)}' for kk, lab in kinds)
+              + f' median {float(np.median(per)):.4f} wall {time.time() - t0:5.1f}s')
         return
     clean = float(per[~bad].mean()) if (~bad).any() else float('nan')
     # nats per character over the clean documents: comparable across tokenizers
-    nt = np.array([sum(y != _SIL for _, y in d) for d in docs], dtype=np.float64)
-    nc = np.array([max(1, len(_decode_plain(_doc_tokens(d)))) for d in docs], dtype=np.float64)
+    nt = np.array([_ntok(d) for d in docs], dtype=np.float64)
+    nc = np.array([max(1, sum(len(_decode_plain([y[st] for _, y in d if y[st] != _SIL]))
+                              for st in range(3)) if f3 else len(_decode_plain(_doc_tokens(d))))
+                   for d in docs], dtype=np.float64)
     npc = float((per * nt)[~bad].sum() / nc[~bad].sum()) if (~bad).any() else float('nan')
     ppl = math.exp(min(clean, 700)) if clean == clean else float('nan')
     _eval_results[tag] = dict(corpus=tag, step=int(step), clean=clean,
@@ -3522,12 +3765,25 @@ def _score(step, corpus, docs, imgs=None, tag=None, clips=None, bands=True, free
           f'median {float(np.median(per)):11.6f} runaway {100.0 * float(bad.mean()):6.2f}% '
           f'nrun {int(bad.sum()):4d} docs {len(per):5d} wall {time.time() - t0:7.1f}s '
           f'nats/char {npc:.4f}')
-    if kn[1] + kn[2]:
+    if sum(kn):
         # EVALS: token-mean loss (each clamped to 30 nats) on speech words and on activity lines
-        f = lambda kk: f'{kce[kk] / kn[kk]:.4f} ({100 * kn[kk] / (kn[1] + kn[2]):.0f}%)' if kn[kk] else 'n/a'
-        _eval_results[f'{tag}~kinds'] = dict(speech=kce[1] / max(1, kn[1]), activity=kce[2] / max(1, kn[2]))
-        _emit(f'EVALS step {step:10} corpus {tag:8} speech {f(1)} activity {f(2)}')
-    if nul3[1]['n']:
+        # (--fifo3: on each stream's words)
+        f = lambda kk: f'{kce[kk] / kn[kk]:.4f} ({100 * kn[kk] / sum(kn):.0f}%)' if kn[kk] else 'n/a'
+        _eval_results[f'{tag}~kinds'] = {lab: kce[kk] / max(1, kn[kk]) for kk, lab in kinds}
+        _emit(f'EVALS step {step:10} corpus {tag:8} ' + ' '.join(f'{lab} {f(kk)}' for kk, lab in kinds))
+    if f3 and nul3[1]['n']:
+        # EVALN (--fifo3): as below, for all three streams (text says <NUL> between activities)
+        g = lambda d, a, b: d[a] / max(1, d[b])
+        sts = ((1, 'voice'), (2, 'image'), (0, 'text'))
+        nn_ = sum(nul3[k]['n'] for k, _ in sts)
+        _eval_results[f'{tag}~nul'] = {
+            'ce': sum(nul3[k]['ce'] for k, _ in sts) / max(1, nn_),
+            **{f'{lab}_{q}': g(nul3[k], 'p_' + q, 'n' if q == 'nul' else 'n_tok')
+               for k, lab in sts for q in ('nul', 'tok')}}
+        _emit(f'EVALN step {step:10} corpus {tag:8} nul_ce {_eval_results[f"{tag}~nul"]["ce"]:9.6f} '
+              + ' '.join(f'{lab} P(nul|nul) {g(nul3[k], "p_nul", "n"):.4f} P(nul|tok) '
+                         f'{g(nul3[k], "p_tok", "n_tok"):.4f}' for k, lab in sts))
+    elif nul3[1]['n']:
         # EVALN (--streams 3): per stream, the mean P(<NUL>) on its <NUL> targets (want ~1) and
         # on its caption words (want ~0); nul_ce over both streams' <NUL> targets
         g = lambda d, a, b: d[a] / max(1, d[b])
@@ -4082,14 +4338,33 @@ def _gen_lines(i):
             # first _GENV_LEN reference tokens; each stream shown up to REF's length, with a
             # mark every _GENV_MARK s of media time
             ys = [y for _, y in steps]
-            at = [j for j, y in enumerate(ys) if y != _SIL][:_GENV_LEN]
-            ref = _decode_plain([ys[j] for j in at])
-            n_ref = max(1, len(ref))
             vid, cat, _ = v.meta
-            L = at[-1] + 1 if at else len(ys)
             tick0 = v.t0 + v.phase / v.rate
-            ref_t = _timed_text([ys[j] for j in at], at, tick0, v.rate, n_ref)
-            if model.streams == 3:
+            if isinstance(ys[0], tuple):     # --fifo3: each stream beside its own reference
+                L = min(len(ys), int(_GENV_SECS * v.rate))
+                gen3 = model.generate3(L, v, temperature=args.temperature)
+                caps = {}
+                for lab, st in (('see', 2), ('hear', 1), ('think', 0)):
+                    at = [k for k in range(L) if ys[k][st] != _SIL]
+                    caps[lab] = _timed_text(gen3[0][st], gen3[1][st], tick0, v.rate, 1 << 30)
+                    caps[f'{lab} REF'] = _timed_text([ys[k][st] for k in at], at, tick0, v.rate,
+                                                     1 << 30)
+                    if n_clip == 0:
+                        lines.append(f'GENV step {i:10} [{vid}{" " if cat and lab == "see" else ""}'
+                                     f'{cat if lab == "see" else ""}] {lab}: '
+                                     f'{_printable(_decode_plain(gen3[0][st]))}')
+                        lines.append(f'REF  step {i:10} [{vid}] {lab}: '
+                                     f'{_printable(_decode_plain([ys[k][st] for k in at]))}')
+                ref_t = None
+            else:
+                at = [j for j, y in enumerate(ys) if y != _SIL][:_GENV_LEN]
+                ref = _decode_plain([ys[j] for j in at])
+                n_ref = max(1, len(ref))
+                L = at[-1] + 1 if at else len(ys)
+                ref_t = _timed_text([ys[j] for j in at], at, tick0, v.rate, n_ref)
+            if ref_t is None:
+                pass
+            elif model.streams == 3:
                 (tx, vo, im_), (ttx, tvo, tim) = model.generate3(L, v, temperature=args.temperature)
                 caps = {lab: _timed_text(ids, tk, tick0, v.rate, n_ref)
                         for lab, ids, tk in (('see', im_, tim), ('hear', vo, tvo),
@@ -4127,7 +4402,7 @@ def _gen_lines(i):
             t1 = v.t0 + (L - 1 + v.phase) / v.rate
             ext = (v.t0, v.t0 + (spec.shape[1] / 100 if spec is not None else t1 - v.t0))
             vpanel.append((strip, spec, f'{vid}  {cat}  {v.t0:.0f}-{t1:.0f}s'.strip(),
-                           dict(caps, REF=ref_t), ftimes, ext))
+                           dict(caps, REF=ref_t) if ref_t is not None else caps, ftimes, ext))
     if vpanel and _gen_inbox is not None and args.gen_vis:
         try:
             _gen_inbox.put_nowait(('genv', i, vpanel))
@@ -4162,10 +4437,22 @@ def _video_panel(i, m, off):
     _VID_PANEL_TOK tokens, up to _VID_PANEL_CELLS frames spread over them (each labelled with
     the tokens read while it was on screen), and the spectrogram of the sound over that span."""
     ys = [y for _, y in m['steps']]
-    W = min(m['n'], _VID_PANEL_TOK)
-    if m.get('clock'):              # ticks: as many as the first _VID_PANEL_TOK tokens span
+    head = None
+    if ys and isinstance(ys[0], tuple):
+        # --fifo3: the first _GENV_SECS s, each stream's targets marked every _GENV_MARK s of
+        # media time; frames labelled with the speech heard while they were on screen
+        W = min(m['n'], int(_GENV_SECS * m['clock']))
+        head = []
+        for lab, st in (('see', 2), ('hear', 1), ('think', 0)):
+            at = [k for k in range(W) if ys[k][st] != _SIL]
+            head.append((lab, _timed_text([ys[k][st] for k in at], at, m['t0'], m['clock'],
+                                          1 << 30)))
+        ys = [y[1] for y in ys]
+    elif m.get('clock'):            # ticks: as many as the first _VID_PANEL_TOK tokens span
         at = [k for k, y in enumerate(ys) if y != _SIL]
         W = at[min(_VID_PANEL_TOK, len(at)) - 1] + 1 if at else m['n']
+    else:
+        W = min(m['n'], _VID_PANEL_TOK)
     fi, ids = m['fi'][:W], ys[:W]
     frames = sorted(set(fi))
     pick = frames[::max(1, math.ceil(len(frames) / _VID_PANEL_CELLS))][:_VID_PANEL_CELLS]
@@ -4185,7 +4472,8 @@ def _video_panel(i, m, off):
         spec = np.zeros((1, 1), np.float32)
     ext = (m['a0'] / _AUD_RATE, (m['a0'] + a_end) / _AUD_RATE)
     n = f'{m["n"]} ticks at {m["clock"]:g} Hz' if m.get('clock') else f'{m["n"]} tokens'
-    return ('video', i, m['name'], _decode_plain(ids), cells, spec, ext, n)
+    head = head or _decode_plain(ids)
+    return ('video', i, m['name'], head, cells, spec, ext, n)
 
 
 _VID_PANEL_TOK = 400         # TRAIN video window: tokens shown ...
@@ -4193,6 +4481,7 @@ _VID_PANEL_CELLS = 12        # ... and frames
 _GENV_CLIPS = 3              # GEN video window: clips per refresh ...
 _GENV_SPAN = 60.0            # ... each a window of at most this many seconds from a random event
 _GENV_MARK = 5.0             # ... its captions marked every this many seconds of media time
+_GENV_SECS = 20.0            # ... --fifo3: each clip's first this many seconds
 _GENV_LEN = 80               # ... REF = each clip's first this many reference tokens, and the
                              # generated caption runs until it is as long as REF (characters)
 
@@ -4461,6 +4750,8 @@ try:
                 _imaginer.record(i)
 
         x_list, y_list, flag_list, new_imgs, media = q.get()
+        # the text stream's input per row, for the image-bank tools (--fifo3 rows are triples)
+        x_one = [x[0] if isinstance(x, tuple) else x for x in x_list]
         n_examples += sum(flag_list)
         for n, rows in _rows_of.items():
             _n_by[n] += sum(flag_list[r] for r in rows)
@@ -4524,18 +4815,18 @@ try:
                 _bank_put(img_bank, img_hw, img_fit, j, im.to(args.device, non_blocking=True))
                 _img_name[j] = name
             if _imaginer is not None:
-                _imaginer.step(i, x_list, flag_list)
+                _imaginer.step(i, x_one, flag_list)
             views = _views(img_bank, img_hw, img_fit)
             grid = model.image_grid(views)
             if _SYNTH_ROWS:              # a row without a picture yet sees a zero grid
                 grid = grid * img_live[:, None, None, None]
             img[_img_rows] = grid
             if _sample is not None:
-                _record_sample(i, x_list, flag_list, views)
+                _record_sample(i, x_one, flag_list, views)
 
         dff_prev = model.dff
         model.train()
-        if model.streams == 3:       # one-stream (x, y) -> the text, voice and image streams
+        if model.streams == 3 and not args.fifo3:   # one-stream (x, y) -> the three streams
             kin, kout = torch.zeros_like(x), torch.zeros_like(x)
             if _VIDEO_ROWS:
                 kin[_vid_rows], kout[_vid_rows] = kin_v, kout_v
@@ -4561,8 +4852,9 @@ try:
         else:
             ce_all = F.cross_entropy(logits, y, reduction='none')
         if model.streams == 3:       # <NUL> targets weigh --nul_weight; text on video rows: none
-            with torch.no_grad():
-                _own = torch.multinomial(_truncate(F.softmax(logits[:, 0].detach().float(), dim=-1)), 1)[:, 0]
+            with torch.no_grad():    # (--fifo3: no sample is ever fed back; _own stays None)
+                if not args.fifo3:
+                    _own = torch.multinomial(_truncate(F.softmax(logits[:, 0].detach().float(), dim=-1)), 1)[:, 0]
             wt = torch.where(y == _NUL_ID, args.nul_weight, 1.0) * (y != -100)
             loss = (ce_all * wt).sum() / wt.sum()
         elif args.inner_voice:
@@ -4599,10 +4891,11 @@ try:
                 for n, rows in _rows_of.items():
                     if model.streams == 3:
                         yr, cr = y[rows], ce[rows]
-                        if n in _VIDEO_DATASETS:     # caption words (voice, image); <NUL> apart
-                            isn, tok = yr[:, 1:] == _NUL_ID, yr[:, 1:] != _NUL_ID
-                            carr[n].append(float(cr[:, 1:][tok].mean()) if tok.any() else float('nan'))
-                            carr[_nul_col[n]].append(float(cr[:, 1:][isn].mean()))
+                        if n in _VIDEO_DATASETS:     # caption words (voice, image; --fifo3 text
+                            c0 = 0 if args.fifo3 else 1   # too); <NUL> apart
+                            isn, tok = yr[:, c0:] == _NUL_ID, yr[:, c0:] != _NUL_ID
+                            carr[n].append(float(cr[:, c0:][tok].mean()) if tok.any() else float('nan'))
+                            carr[_nul_col[n]].append(float(cr[:, c0:][isn].mean()))
                         else:                        # the text stream
                             carr[n].append(float(cr[:, 0].mean()))
                     elif _NUL_ID is not None and n in _VIDEO_DATASETS:

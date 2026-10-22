@@ -16,6 +16,7 @@ audio_prep.py: finished shards are skipped, each is written to .tmp and renamed.
     nice -n 10 python exp/vcap_prep.py --out /data/finevideo_vcap
 """
 import argparse
+import collections
 import glob
 import io
 import multiprocessing as mp
@@ -94,8 +95,19 @@ def main():
         return out
 
     t0, n_cap = time.time(), 0
+    def gated(pool):
+        # at most 2 shards per worker decoded ahead of the GPU: an unbounded imap queued
+        # every gated shard's JPEGs in RAM (OOM-killed at 36 GB)
+        pending = collections.deque()
+        for f in todo:
+            pending.append(pool.apply_async(shard_frames, (f,)))
+            if len(pending) >= 2 * args.workers:
+                yield pending.popleft().get()
+        while pending:
+            yield pending.popleft().get()
+
     with mp.get_context('spawn').Pool(args.workers, maxtasksperchild=4) as pool:
-        for k, (f, vids) in enumerate(pool.imap(shard_frames, todo)):
+        for k, (f, vids) in enumerate(gated(pool)):
             ts = time.time()
             caps = caption([j for _, _, js in vids for j in js])
             rows, i = [], 0
