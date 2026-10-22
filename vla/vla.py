@@ -37,6 +37,7 @@ import queue
 import random
 import re
 import subprocess
+import signal
 import sys
 import threading
 import time
@@ -4870,6 +4871,21 @@ def _pt(name):
         _prof_t[0] = t
 
 
+_stop_req = False
+
+
+def _on_sigterm(signum, frame):
+    """The first SIGTERM asks the loop to save a checkpoint at the next step boundary and
+    exit (a restart then loses no steps); a second one exits at once."""
+    global _stop_req
+    if _stop_req:
+        os._exit(143)
+    _stop_req = True
+    print(f'\nSIGTERM: saving a checkpoint at the next step, then exiting', flush=True)
+
+
+signal.signal(signal.SIGTERM, _on_sigterm)
+
 try:
     while True:
         if args.profile and i - _start_step == 50:
@@ -4883,6 +4899,18 @@ try:
             for k, v in sorted(_prof.items(), key=lambda kv: -kv[1]):
                 print(f'PROFILE {k:<12} {1000 * v / args.profile:8.2f} ms  {100 * v / tot:5.1f}%')
             break
+        if _stop_req:                # SIGTERM: save this step's weights and exit cleanly
+            _save(i, n_examples)
+            _emit(f'STOP step {i:10} SIGTERM: checkpoint saved at this step, exiting')
+            break
+        # before the save at the same step (same weights), so the checkpoint's copy of the log
+        # holds its EVAL lines and a run resumed from it keeps them; not at step 0, where it
+        # would only measure ln(vocab), nor at a resumed run's first step (the checkpoint it
+        # loaded; --eval_at_start to measure it anyway)
+        if args.eval_interval and i > 0 and i % args.eval_interval == 0 and \
+                (i > _start_step or args.eval_at_start):
+            _heldout_eval(i)
+
         if i % args.checkpoint == 0:
             _save(i, n_examples)
             counts = _text_drain()
@@ -4892,13 +4920,6 @@ try:
                 per = (' | ' + ' '.join(f'{n} {e}/{t}' for n, (e, t) in counts.items())
                        if len(counts) > 1 else '')
                 _emit(f'TEXT step {i:10} examples {te} tokens {tt} epoch {ep}{per}')
-
-        # after the save, so an EVAL line describes weights that exist on disk; not at step
-        # 0, where it would only measure ln(vocab), nor at a resumed run's first step (the
-        # checkpoint it loaded; --eval_at_start to measure it anyway)
-        if args.eval_interval and i > 0 and i % args.eval_interval == 0 and \
-                (i > _start_step or args.eval_at_start):
-            _heldout_eval(i)
 
         if args.gen_interval and i % args.gen_interval == 0:
             _emit('\n' + '\n'.join(_gen_lines(i)) + '\n')

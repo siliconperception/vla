@@ -40,7 +40,9 @@ case "${1:-}" in ''|*[!0-9]*) ;; *) S=$1; shift ;; esac
 [ "${1:-}" = "--" ] && shift
 cd /proj/devices/vla
 mkdir -p checkpoint
-rm -f log/exp.$M
+# a resumed run rebuilds log/exp.$M from its checkpoint's copy; the previous log (with any lines
+# written after that checkpoint) is kept as .prev rather than deleted
+[ -f log/exp.$M ] && mv -f log/exp.$M log/exp.$M.prev
 
 # The baseline, as an ARRAY rather than a here-and-now command, so the exact argv that is
 # about to run can also be written to ./doit.  Expansion order is unchanged: "$@" still comes
@@ -88,6 +90,7 @@ case " $* " in *" --load "*) _tag="  (resume)" ;; esac
   [ -f doit ] && cat doit
 } > doit.$$ && mv doit.$$ doit
 
-conda run --no-capture-output -n dev "${CMD[@]}" > log/exp.$M.out 2>&1
+echo "RUN_START $M $(date)" >> log/exp.$M.out    # appended: a restart keeps the earlier output
+conda run --no-capture-output -n dev "${CMD[@]}" >> log/exp.$M.out 2>&1
 RC=$?                                  # capture BEFORE $(date) below, which clobbers $?
 echo "RUN_DONE $M rc=$RC $(date)" >> log/exp.$M.out
