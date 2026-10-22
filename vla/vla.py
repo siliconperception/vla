@@ -352,6 +352,8 @@ parser.add_argument('--lr_period',  default=20000, type=int, help='coswarm rise 
 parser.add_argument('--schedule',   default='coswarm', choices=['const', 'coswarm'],
                     help='const: --lr_max throughout. coswarm: half-cosine rise from --lr_min '
                          'to --lr_max over --lr_period global steps, then hold')
+parser.add_argument('--eval_at_start', action='store_true',
+                    help='also run the held-out eval at a resumed run\'s first step')
 parser.add_argument('--profile', default=0, type=int, metavar='N',
                     help='time each part of the training step (GPU synchronized) over N steps '
                          'after 50 of warm-up, print the table and exit')
@@ -4601,7 +4603,7 @@ def _video_panel(i, m, off):
 
 _VID_PANEL_TOK = 400         # TRAIN video window: tokens shown ...
 _VID_PANEL_CELLS = 12        # ... and frames
-_GENV_CLIPS = 3              # GEN video window: clips per refresh ...
+_GENV_CLIPS = 1              # GEN video window: clips per refresh ...
 _GENV_SPAN = 60.0            # ... each a window of at most this many seconds from a random event
 _GENV_MARK = 5.0             # ... its captions marked every this many seconds of media time
 _GENV_SECS = 20.0            # ... --fifo3: each clip's first this many seconds
@@ -4892,8 +4894,10 @@ try:
                 _emit(f'TEXT step {i:10} examples {te} tokens {tt} epoch {ep}{per}')
 
         # after the save, so an EVAL line describes weights that exist on disk; not at step
-        # 0, where it would only measure ln(vocab)
-        if args.eval_interval and i > 0 and i % args.eval_interval == 0:
+        # 0, where it would only measure ln(vocab), nor at a resumed run's first step (the
+        # checkpoint it loaded; --eval_at_start to measure it anyway)
+        if args.eval_interval and i > 0 and i % args.eval_interval == 0 and \
+                (i > _start_step or args.eval_at_start):
             _heldout_eval(i)
 
         if args.gen_interval and i % args.gen_interval == 0:
