@@ -4377,7 +4377,7 @@ vid_agrid = None
 vid_heard = torch.full((len(_VIDEO_ROWS),), -1.0, device=args.device)
 if _VIDEO_ROWS and model.img_enc is None:
     raise SystemExit('--mix has a video corpus but the model has no image encoder')
-_vid_rec = False             # --sample_vis: record the next example of the first video row
+_vid_rec = False             # --sample_vis: record the next example to start in any video row
 
 
 def _grad_norm():
@@ -4937,7 +4937,7 @@ try:
                     vid_wav[j].zero_()
                     vid_wav[j, :len(snd)] = snd.to(args.device, non_blocking=True)
                     vid_heard[j] = -1
-                if _vid_rec and r == _VIDEO_ROWS[0]:
+                if _vid_rec:          # any row: one row's examples can run for minutes
                     _vid_rec = False
                     try:
                         _gen_inbox.put_nowait(_video_panel(i, m, m['off']))
