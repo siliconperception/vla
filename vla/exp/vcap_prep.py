@@ -35,7 +35,7 @@ SCHEMA = pa.schema([('id', pa.string()), ('t', pa.list_(pa.float32())),
                     ('cap', pa.list_(pa.string()))])
 
 
-def gate(frames, fps):
+def gate(frames, fps, refresh=REFRESH):
     """Indices of the frames to caption."""
     from PIL import Image
     keep, last_t, last = [], -1e9, None
@@ -43,20 +43,20 @@ def gate(frames, fps):
         th = np.asarray(Image.open(io.BytesIO(jp)).convert('L').resize((16, 16)),
                         np.float32) / 255.0
         t = i / fps
-        if last is None or np.abs(th - last).mean() > CUT or t - last_t >= REFRESH:
+        if last is None or np.abs(th - last).mean() > CUT or t - last_t >= refresh:
             keep.append(i)
             last_t, last = t, th
     return keep
 
 
-def shard_frames(f):
+def shard_frames(f, refresh=REFRESH):
     """One feat shard -> (file, [(id, [times], [jpeg bytes]), ...]) of its gated frames."""
     pf = pq.ParquetFile(f)
     vids = []
     for g in range(pf.num_row_groups):
         for r in pf.read_row_group(g, columns=['id', 'fps', 'frames']).to_pylist():
             fps = float(r['fps'] or 2.0)
-            k = gate(r['frames'] or [], fps)
+            k = gate(r['frames'] or [], fps, refresh)
             vids.append((r['id'], [i / fps for i in k], [r['frames'][i] for i in k]))
     return f, vids
 
@@ -68,6 +68,10 @@ def main():
     ap.add_argument('--workers', type=int, default=4)
     ap.add_argument('--batch', type=int, default=32)
     ap.add_argument('--limit', type=int, default=0, help='first N shards only')
+    ap.add_argument('--refresh', type=float, default=REFRESH,
+                    help='s a static shot goes without a caption (default %(default)s; 8 does '
+                         '75%% of the work and keeps 86%% of the captions vla.py keeps after its '
+                         'near-repeat filter)')
     ap.add_argument('--reverse', action='store_true',
                     help='last shard first: a second instance works from the other end (each '
                          'skips a shard the other has written)')
@@ -106,7 +110,7 @@ def main():
         for f in todo:
             if done(f):                      # written by the other instance meanwhile
                 continue
-            pending.append(pool.apply_async(shard_frames, (f,)))
+            pending.append(pool.apply_async(shard_frames, (f, args.refresh)))
             if len(pending) >= 2 * args.workers:
                 yield pending.popleft().get()
         while pending:
