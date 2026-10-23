@@ -22,6 +22,7 @@
 # sit beside.
 
 import argparse
+import bisect
 import collections
 import contextlib
 import copy
@@ -169,6 +170,7 @@ _QN_WIN = 8 * _QN_SR        # each grid is computed from the last 8 s heard (it 
 _QN_FRAMES = 4              # quartznet: sound heard is counted in its 20 ms frames, 4 per grid cell
 _AUD_SIDECAR = {'finevideo': '/data/finevideo_audio'}
 _VCAP_SIDECAR = {'finevideo': '/data/finevideo_vcap'}   # --fifo3: visual captions (exp/vcap_prep.py)
+_ALIGN_SIDECAR = {'finevideo': '/data/finevideo_align'}  # --speech_align: word times (exp/align_prep.py)
 _VCAP_SAME = 0.6             # --fifo3: a caption whose word overlap (Jaccard) with one of the last 3
                              # kept exceeds this repeats it and is dropped
 
@@ -481,6 +483,17 @@ parser.add_argument('--speech_delay', default=None, type=float, metavar='S',
                          'end (words are spread evenly over a transcript segment, so the delay '
                          'absorbs timing error and its sound is heard by then). Saved and '
                          'restored like --clock_hz; changes the eval set\'s targets')
+parser.add_argument('--speech_align', default=None, action=argparse.BooleanOptionalAction,
+                    help='--fifo3: each speech token is due at the aligned end of its word '
+                         '(exp/align_prep.py\'s CTC forced alignment, /data/finevideo_align) plus '
+                         '--speech_delay, not spread evenly over its transcript segment. A '
+                         'video without alignments is skipped, an example holding a segment '
+                         'whose alignment failed or scored under --align_min is dropped. Saved '
+                         'and restored like --clock_hz; changes the eval set\'s targets')
+parser.add_argument('--align_min', default=None, type=float, metavar='P',
+                    help='--speech_align: the lowest segment score (mean frame probability of '
+                         'its aligned characters; low = not English, or not what was said) an '
+                         'example may hold (default 0.5). Saved and restored like --clock_hz')
 parser.add_argument('--voice_drop', default=None, type=float, metavar='P',
                     help='--inner_voice: on a random P of silent ticks the model\'s own word is '
                          'not fed back (the input stays _PAD, no word) -- in training, eval, '
@@ -615,7 +628,7 @@ if args.load:
     _start_step = int(_loaded_ckpt.get('step', 0))
     _start_exs = int(_loaded_ckpt.get('examples', 0))
     _start_exs_by = dict(_loaded_ckpt.get('examples_by', {}))
-    for k in ('clock_hz', 'ctx_tau', 'vision_hz', 'audio_hz', 'inner_voice', 'min_p', 'top_k', 'voice_drop', 'caption_feed', 'text_feed', 'speech_delay', 'fifo3', 'nul_weight', 'loss_norm'):     # restored unless given
+    for k in ('clock_hz', 'ctx_tau', 'vision_hz', 'audio_hz', 'inner_voice', 'min_p', 'top_k', 'voice_drop', 'caption_feed', 'text_feed', 'speech_delay', 'fifo3', 'nul_weight', 'loss_norm', 'speech_align', 'align_min'):     # restored unless given
         if getattr(args, k) is None:
             setattr(args, k, _saved.get(k))
 args.clock_hz = float(args.clock_hz or 0)
@@ -629,6 +642,10 @@ args.speech_delay = float(args.speech_delay or 0)
 args.audio_hz = float(args.audio_hz or 0)
 args.streams = int(args.streams or 1)
 args.fifo3 = bool(args.fifo3)
+args.speech_align = bool(args.speech_align)
+args.align_min = 0.5 if args.align_min is None else float(args.align_min)
+if args.speech_align and not (args.fifo3 and args.clock_hz):
+    raise SystemExit('--speech_align needs --fifo3 and --clock_hz')
 args.nul_weight = 0.2 if args.nul_weight is None else float(args.nul_weight)
 args.loss_norm = args.loss_norm or 'weight'
 if args.fifo3 and args.streams != 3:
@@ -2047,6 +2064,36 @@ def _row_vcap(corpus, feat_file, vid):
     return d.get(vid)
 
 
+_align_cache = collections.OrderedDict()  # --speech_align: sidecar parquet -> {id: (s, we, score)}
+
+
+def _align_path(corpus, feat_file):
+    d = _ALIGN_SIDECAR.get(corpus)
+    return os.path.join(d, os.path.basename(feat_file)) if d else None
+
+
+def _row_align(corpus, feat_file, vid):
+    """--speech_align: a video's word timings (say-event starts, per event its word ends,
+    per event its score) from the sidecar corpus (exp/align_prep.py); None if its shard is not
+    there (yet) or lacks the id. Whole shards are cached, the 64 most recent."""
+    import pyarrow.parquet as pq
+    path = _align_path(corpus, feat_file)
+    if not path or not os.path.exists(path):
+        return None
+    with _sidecar_lock:
+        d = _align_cache.get(path)
+        if d is not None:
+            _align_cache.move_to_end(path)
+    if d is None:
+        d = {r['id']: (r['s'], r['we'], r['score'])
+             for r in pq.read_table(path, columns=['id', 's', 'we', 'score']).to_pylist()}
+        with _sidecar_lock:
+            _align_cache[path] = d
+            while len(_align_cache) > 64:
+                _align_cache.popitem(last=False)
+    return d.get(vid)
+
+
 def _row_wav(corpus, feat_file, vid):
     """--audio_encoder quartznet: a video's clean soundtrack, int16 [n] at 16 kHz, from the
     sidecar corpus (exp/audio_prep.py); None if its shard is not there (yet) or lacks the id."""
@@ -2172,6 +2219,20 @@ def _vcap_lines(vcap):
     return out
 
 
+def _word_timed_tokens(text, ends):
+    """--speech_align: a speech line's tokens ('"text"' and a newline) and the media time each
+    is heard by: the aligned end of the word holding its last character (the opening quote:
+    the first word's; the closing quote and newline: the last word's). (None, None) if the
+    words do not match the alignment."""
+    wb = [m.end() for m in re.finditer(r'\S+', text)]    # end offset of each word in text
+    if len(wb) != len(ends) or not wb:
+        return None, None
+    enc = _tokenizer.tok(f'"{text}"\n', return_offsets_mapping=True, add_special_tokens=False)
+    times = [ends[min(bisect.bisect_right(wb, min(max(b - 2, 0), len(text) - 1)), len(wb) - 1)]
+             for _, b in enc['offset_mapping']]
+    return enc['input_ids'], times
+
+
 def _clocked3_example(row, rng=None, maxspan=_VID_MAXSPAN):
     """--fifo3: a video row -> (text, media) with one step per tick of 1/R s, as
     _clocked_example, but every tick has a target for each of the three streams, each from its
@@ -2198,21 +2259,39 @@ def _clocked3_example(row, rng=None, maxspan=_VID_MAXSPAN):
     n = int((tb - ta) * R)
     if n < 2:
         return None
-    # (stream, start, end, is speech, text) lines; stream 0 text, 1 voice, 2 image
-    lines = [(1 if kd == 'say' else 0, s, e, kd == 'say', f'"{t}"' if kd == 'say' else t)
-             for s, e, kd, t in ev] + [(2, t, t, False, c) for t, c in caps]
+    wend = [None] * len(ev)                  # --speech_align: per say event (word ends, score)
+    if args.speech_align:
+        a_s, a_we, a_sc = row['align']
+        si = [i for i, x in enumerate(ev) if x[2] == 'say']
+        if len(si) != len(a_s) or any(abs(ev[i][0] - x) > 1e-3 for i, x in zip(si, a_s)):
+            return None                      # aligned to other events: not this row's
+        for i, we, sc in zip(si, a_we, a_sc):
+            wend[i] = (we, sc)
+    # (stream, start, end, is speech, text, event) lines; stream 0 text, 1 voice, 2 image
+    lines = [(1 if kd == 'say' else 0, s, e, kd == 'say', f'"{t}"' if kd == 'say' else t, i)
+             for i, (s, e, kd, t) in enumerate(ev)] + [(2, t, t, False, c, None) for t, c in caps]
     lines.sort(key=lambda x: (x[1], x[0]))
     tgt = [[_SIL] * n for _ in range(3)]
     nxt, dropped = [0, 0, 0], 0
-    for st, s, e, say, txt in lines:
+    for st, s, e, say, txt, i in lines:
         if not ta <= s < tb:
             continue
-        tk = _tokenizer.encode(txt + '\n')
+        tt = None
+        if say and args.speech_align:
+            we, sc = wend[i]
+            if not sc >= args.align_min:     # a failed (NaN) or doubtful alignment
+                return None
+            tk, tt = _word_timed_tokens(txt[1:-1], we)
+            if tk is None:
+                return None
+        else:
+            tk = _tokenizer.encode(txt + '\n')
         if not say and ta + nxt[st] / R - s > args.max_lag:
             dropped += len(tk)
             continue
         for m in range(len(tk)):
-            t = s + (e - s) * (m + 1) / len(tk) + args.speech_delay if say else s
+            t = (tt[m] if tt else s + (e - s) * (m + 1) / len(tk)) + args.speech_delay if say \
+                else s
             k = max(math.ceil((t - ta) * R - 1e-9), nxt[st])
             if k >= n:
                 break
@@ -2337,6 +2416,11 @@ class _VideoSource(_ImageSource):
                 if not files:
                     raise SystemExit(f'{self.name}: no visual captions in '
                                      f'{_VCAP_SIDECAR.get(self.name)} (see exp/vcap_prep.py)')
+            if args.speech_align:                      # only shards with word timings
+                files = [f for f in files if os.path.exists(_align_path(self.name, f) or '')]
+                if not files:
+                    raise SystemExit(f'{self.name}: no word timings in '
+                                     f'{_ALIGN_SIDECAR.get(self.name)} (see exp/align_prep.py)')
             if args.audio_encoder in _WAV_ENCODERS:      # only shards whose sound is there
                 files = [f for f in files if os.path.exists(_sidecar_path(self.name, f) or '')]
                 if not files:
@@ -2368,6 +2452,10 @@ class _VideoSource(_ImageSource):
             if args.fifo3:                              # read only now: the pool stays small
                 row['vcap'] = _row_vcap(self.name, row['_file'], row['id'])
                 if row['vcap'] is None:
+                    continue
+            if args.speech_align:
+                row['align'] = _row_align(self.name, row['_file'], row['id'])
+                if row['align'] is None:
                     continue
             if args.audio_encoder in _WAV_ENCODERS:
                 row['wav'] = _row_wav(self.name, row['_file'], row['id'])
@@ -3410,6 +3498,8 @@ def _gen_clip(corpus, rng):
         files = [f for f in files if os.path.exists(_sidecar_path(corpus, f) or '')]
     if args.fifo3:
         files = [f for f in files if os.path.exists(_vcap_path(corpus, f) or '')]
+    if args.speech_align:
+        files = [f for f in files if os.path.exists(_align_path(corpus, f) or '')]
     for _ in range(8):
         if not files:
             return None
@@ -3431,6 +3521,10 @@ def _gen_clip(corpus, rng):
         if args.fifo3:
             r['vcap'] = _row_vcap(corpus, f, r['id'])
             if r['vcap'] is None:
+                continue
+        if args.speech_align:
+            r['align'] = _row_align(corpus, f, r['id'])
+            if r['align'] is None:
                 continue
         ex = _video_example(r, rng, maxspan=_GENV_SPAN)
         if ex is None or _ntok(ex[1]['steps']) < _VID_EVAL_MINTOK:
@@ -3495,6 +3589,11 @@ def _build_video_eval(corpus):
                 if args.fifo3:
                     r['vcap'] = _row_vcap(corpus, f, r['id'])
                     if r['vcap'] is None:
+                        no_wav += 1
+                        continue
+                if args.speech_align:
+                    r['align'] = _row_align(corpus, f, r['id'])
+                    if r['align'] is None:
                         no_wav += 1
                         continue
                 ex = _video_example(r, None, maxtok=min(_EVAL_MAXLEN, _VID_EVAL_MAXLEN),
