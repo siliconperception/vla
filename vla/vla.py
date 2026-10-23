@@ -3025,14 +3025,21 @@ def _eval_video():
         pf = pq.ParquetFile(f)
         ids = pf.read(columns=['id']).column('id').to_pylist()
         held = [k for k, v in enumerate(ids) if _id_heldout(v)]
-        if held:
-            break
-    k = rng.choice(held)
-    bounds = np.cumsum([0] + [pf.metadata.row_group(g).num_rows
-                              for g in range(pf.metadata.num_row_groups)])
-    g = int(np.searchsorted(bounds, k, side='right')) - 1
-    row = pf.read_row_group(g, columns=_VID_COLS).to_pylist()[k - bounds[g]]
-    row['_file'] = f
+        if not held:
+            continue
+        k = rng.choice(held)
+        bounds = np.cumsum([0] + [pf.metadata.row_group(g).num_rows
+                                  for g in range(pf.metadata.num_row_groups)])
+        g = int(np.searchsorted(bounds, k, side='right')) - 1
+        row = pf.read_row_group(g, columns=_VID_COLS).to_pylist()[k - bounds[g]]
+        row['_file'] = f
+        if args.fifo3 and args.clock_hz:     # its sidecars, and a reference training would use
+            row['vcap'] = _row_vcap('finevideo', f, row['id'])
+            row['align'] = _row_align('finevideo', f, row['id']) if args.speech_align else None
+            if row['vcap'] is None or (args.speech_align and row['align'] is None) or \
+                    _clocked3_example(row, None, math.inf) is None:
+                continue
+        break
     print(f'--video eval: {row["id"]} ({row.get("category")}, {row["duration"]:.0f} s) '
           f'from {os.path.basename(f)}', flush=True)
     try:
@@ -3068,7 +3075,7 @@ def _video_live():
     model.eval()
     tmp = []
     atexit.register(lambda: [os.path.exists(p) and os.remove(p) for p in tmp])
-    ref_ids = ref_times = None
+    ref_ids = ref_times = ref3 = None
     if args.video == 'eval':
         row, path = _eval_video()
         if path:
@@ -3077,7 +3084,13 @@ def _video_live():
         frames = torch.stack([_crop224(im) for im in _decode_jpegs(jp, 'cpu')])
         codes = torch.from_numpy(np.frombuffer(row['codes'], '<i2').reshape(32, -1).copy())
         dur = float(row['duration'])
-        if args.clock_hz:        # the reference as training places it: tokens on free ticks
+        if args.clock_hz and args.fifo3:     # each stream's reference as training places it
+            ys = [y for _, y in _clocked3_example(row, None, math.inf)[1]['steps']]
+            ref3 = {st: ([ys[k][st] for k in range(len(ys)) if ys[k][st] != _SIL],
+                         [k / args.clock_hz for k in range(len(ys)) if ys[k][st] != _SIL])
+                    for st in range(3)}
+            rate = args.clock_hz
+        elif args.clock_hz:      # the reference as training places it: tokens on free ticks
             ys = [y for _, y in _clocked_example(row, None, math.inf)[1]['steps']]
             at = [k for k, y in enumerate(ys) if y != _SIL]
             ref_ids, ref_times = [ys[k] for k in at], [k / args.clock_hz for k in at]
@@ -3142,13 +3155,24 @@ def _video_live():
     hud = ax.text(0.995, 0.99, '', transform=ax.transAxes, ha='right', va='top', fontsize=12,
                   family='monospace', color='white',
                   bbox=dict(facecolor='black', alpha=0.6, pad=3, edgecolor='none'))
-    snd = 'Mimi (what the model hears)' if args.video_sound == 'mimi' or not path else 'original'
+    snd = ('original' if path and args.video_sound == 'original' else
+           'clean 16 kHz (what the model hears)' if w16 is not None else 'Mimi (what the model hears)')
     fig.text(0.01, 0.975, f'{name}   {args.load or args.pretrained}   T={args.temperature:g}   '
              f'sound: {snd}',
              fontsize=9, family='monospace', color='0.7', va='top')
     kw = dict(fontsize=10, family='monospace', va='center', ha='left')
     S3 = model.streams == 3          # one line per stream: hears (voice), sees (image), thinks (text)
-    if S3:
+    tick_ref3 = {}
+    if S3 and ref3 is not None:      # --fifo3: each stream's reference above it
+        tick3 = {}
+        for y_, (lab, st, col) in zip((0.163, 0.103, 0.043), (('HEAR', 1, 'white'), ('SEE', 2, 'white'),
+                                                          ('THINK', 0, 'skyblue'))):
+            fig.text(0.01, y_ + 0.025, 'REF', color='limegreen', **kw)
+            tick_ref3[st] = fig.text(0.07, y_ + 0.025, '', color='limegreen', **kw)
+            fig.text(0.01, y_, lab, color=col, **kw)
+            tick3[st] = fig.text(0.07, y_, '', color=col, **kw)
+        tick_gen = tick3[1]
+    elif S3:
         tick3 = {}
         if ref_ids is not None:
             fig.text(0.01, 0.17, 'REF', color='limegreen', **kw)
@@ -3178,6 +3202,7 @@ def _video_live():
     gen_done, ref_done = '', ''      # earlier plays' text; this play's is decoded whole, so a
     gen_ids, ref_now = [], []        # character split over several tokens renders correctly
     done3, gen3, n3 = {0: '', 1: '', 2: ''}, {0: [], 1: [], 2: []}, {0: -1, 1: -1, 2: -1}
+    rdone3, rnow3 = {0: '', 1: '', 2: ''}, {0: [], 1: [], 2: []}    # --fifo3 references
     prompt = _prompt_ids(args.prompt)
     t_all, player, pipe, plays = time.monotonic(), None, None, 0
     try:
@@ -3188,7 +3213,8 @@ def _video_live():
                 ref_done += clean(_decode_plain(ref_now)) + ' <NUL> '
                 for st in done3:
                     done3[st] += clean(_decode_plain(gen3[st])) + ' <NUL> '
-            gen3 = {0: [], 1: [], 2: []}
+                    rdone3[st] += clean(_decode_plain(rnow3[st])) + ' <NUL> '
+            gen3, rnow3, rn3 = {0: [], 1: [], 2: []}, {0: [], 1: [], 2: []}, {0: -1, 1: -1, 2: -1}
             gen_ids, ref_now = list(prompt[1:]), []
             n3 = {0: -1, 1: -1, 2: -1}
             plays += 1
@@ -3249,6 +3275,9 @@ def _video_live():
                     while nref < len(ref_ids) and ref_times[nref] <= t:
                         ref_now.append(ref_ids[nref])
                         nref += 1
+                for st, (rids, rts) in (ref3 or {}).items():
+                    while len(rnow3[st]) < len(rids) and rts[len(rnow3[st])] <= t:
+                        rnow3[st].append(rids[len(rnow3[st])])
                 # the picture: the frame due now (frames behind the clock are skipped)
                 want = int(t * fps)
                 if path:
@@ -3269,6 +3298,9 @@ def _video_live():
                         if len(gen3[st]) != n3[st]:
                             n3[st] = len(gen3[st])
                             tick3[st].set_text((done3[st] + clean(_decode_plain(gen3[st])))[-_LIVE_TICK:])
+                        if st in tick_ref3 and len(rnow3[st]) != rn3[st]:
+                            rn3[st] = len(rnow3[st])
+                            tick_ref3[st].set_text((rdone3[st] + clean(_decode_plain(rnow3[st])))[-_LIVE_TICK:])
                 elif len(gen_ids) != n_gen:
                     n_gen = len(gen_ids)
                     tick_gen.set_text((gen_done + clean(_decode_plain(gen_ids)))[-_LIVE_TICK:])
