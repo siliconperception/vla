@@ -68,11 +68,15 @@ def main():
     ap.add_argument('--workers', type=int, default=4)
     ap.add_argument('--batch', type=int, default=32)
     ap.add_argument('--limit', type=int, default=0, help='first N shards only')
+    ap.add_argument('--reverse', action='store_true',
+                    help='last shard first: a second instance works from the other end (each '
+                         'skips a shard the other has written)')
     args = ap.parse_args()
     os.makedirs(args.out, exist_ok=True)
     files = sorted(glob.glob(os.path.join(args.src, '*.parquet')))
     files = files[:args.limit] if args.limit else files
-    todo = [f for f in files if not os.path.exists(os.path.join(args.out, os.path.basename(f)))]
+    done = lambda f: os.path.exists(os.path.join(args.out, os.path.basename(f)))
+    todo = [f for f in files if not done(f)][::-1 if args.reverse else 1]
     print(f'{len(files)} shards, {len(todo)} to caption', flush=True)
 
     import torch
@@ -100,6 +104,8 @@ def main():
         # every gated shard's JPEGs in RAM (OOM-killed at 36 GB)
         pending = collections.deque()
         for f in todo:
+            if done(f):                      # written by the other instance meanwhile
+                continue
             pending.append(pool.apply_async(shard_frames, (f,)))
             if len(pending) >= 2 * args.workers:
                 yield pending.popleft().get()
@@ -108,6 +114,8 @@ def main():
 
     with mp.get_context('spawn').Pool(args.workers, maxtasksperchild=4) as pool:
         for k, (f, vids) in enumerate(gated(pool)):
+            if done(f):
+                continue
             ts = time.time()
             caps = caption([j for _, _, js in vids for j in js])
             rows, i = [], 0
@@ -115,8 +123,9 @@ def main():
                 rows.append(dict(id=vid, t=times, cap=caps[i:i + len(js)]))
                 i += len(js)
             out = os.path.join(args.out, os.path.basename(f))
-            pq.write_table(pa.Table.from_pylist(rows, schema=SCHEMA), out + '.tmp')
-            os.replace(out + '.tmp', out)
+            tmp = f'{out}.{os.getpid()}.tmp'
+            pq.write_table(pa.Table.from_pylist(rows, schema=SCHEMA), tmp)
+            os.replace(tmp, out)
             n_cap += len(caps)
             print(f'[{k + 1}/{len(todo)}] {os.path.basename(f)}: {len(vids)} videos, '
                   f'{len(caps)} captions in {time.time() - ts:.0f}s ({len(caps) / max(1e-3, time.time() - ts):.0f}/s; '
