@@ -72,6 +72,9 @@ def main():
                     help='s a static shot goes without a caption (default %(default)s; 8 does '
                          '75%% of the work and keeps 86%% of the captions vla.py keeps after its '
                          'near-repeat filter)')
+    ap.add_argument('--start', type=int, default=0,
+                    help='only shards from the START-th (in name order) on: a third instance '
+                         'can begin mid-way')
     ap.add_argument('--reverse', action='store_true',
                     help='last shard first: a second instance works from the other end (each '
                          'skips a shard the other has written)')
@@ -80,7 +83,7 @@ def main():
     files = sorted(glob.glob(os.path.join(args.src, '*.parquet')))
     files = files[:args.limit] if args.limit else files
     done = lambda f: os.path.exists(os.path.join(args.out, os.path.basename(f)))
-    todo = [f for f in files if not done(f)][::-1 if args.reverse else 1]
+    todo = [f for f in files[args.start:] if not done(f)][::-1 if args.reverse else 1]
     print(f'{len(files)} shards, {len(todo)} to caption', flush=True)
 
     import torch
