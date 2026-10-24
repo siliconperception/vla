@@ -523,11 +523,14 @@ parser.add_argument('--align_min', default=None, type=float, metavar='P',
                     help='--speech_align: the lowest segment score (mean frame probability of '
                          'its aligned characters; low = not English, or not what was said) an '
                          'example may hold (default 0.5). Saved and restored like --clock_hz')
-parser.add_argument('--write_surprise', default=None, metavar='LO,HI[,MEAN]',
+parser.add_argument('--write_surprise', default=None, metavar='rat,H[,MEAN] | LO,HI[,MEAN]',
                     help='each step, the slow registers (all but the plain copy) write at their '
-                         'rate times g = surprise / its running mean, clamped to [LO, HI], where '
-                         'surprise is -log p of the text token just read, from the state before it: '
-                         'unexpected tokens are kept longer (e.g. 0.25,4; off / 0: plain EMAs). '
+                         'rate times a gain g from the surprise s = -log p of the text token just '
+                         'read (from the state before it), so unexpected tokens are kept longer. '
+                         'rat,H: g = H pm / ((H-1) p + pm), pm = exp(-running mean of s): smooth '
+                         'and bounded, 1 at the mean surprise, toward H as p -> 0, then divided by '
+                         'its running mean so the average write rate is unchanged. LO,HI: g = '
+                         's / its running mean, clamped to [LO, HI]. off / 0: plain EMAs. '
                          'MEAN: the running mean to start from when the checkpoint has none '
                          '(default: measured in training; until then gain 1). '
                          'Saved and restored like --clock_hz')
@@ -685,10 +688,20 @@ if args.eval_recent and args.doc_log_len < 1 + args.eval_gen_prompt + args.eval_
                      f'and its continuation ({1 + args.eval_gen_prompt + args.eval_gen_len})')
 if args.write_surprise in (None, '', '0', 'off'):
     args.write_surprise = None
-_surprise = (tuple(float(v) for v in str(args.write_surprise).split(','))
-             if args.write_surprise else None)
-if _surprise and (len(_surprise) not in (2, 3) or not 0 < _surprise[0] <= 1 <= _surprise[1]):
-    raise SystemExit(f'--write_surprise {args.write_surprise}: want LO,HI[,MEAN], 0 < LO <= 1 <= HI')
+_surprise, _surp_init = None, None      # ('rat', H) or ('clamp', LO, HI); the starting mean
+if args.write_surprise:
+    _v = str(args.write_surprise).split(',')
+    try:
+        if _v[0] == 'rat' and len(_v) in (2, 3) and float(_v[1]) > 1:
+            _surprise, _surp_init = ('rat', float(_v[1])), (float(_v[2]) if len(_v) == 3 else None)
+        elif len(_v) in (2, 3) and 0 < float(_v[0]) <= 1 <= float(_v[1]):
+            _surprise = ('clamp', float(_v[0]), float(_v[1]))
+            _surp_init = float(_v[2]) if len(_v) == 3 else None
+    except ValueError:
+        pass
+    if _surprise is None:
+        raise SystemExit(f'--write_surprise {args.write_surprise}: want rat,H[,MEAN] with H > 1, '
+                         f'or LO,HI[,MEAN] with 0 < LO <= 1 <= HI')
 args.align_min = 0.5 if args.align_min is None else float(args.align_min)
 if args.speech_align and not (args.fifo3 and args.clock_hz):
     raise SystemExit('--speech_align needs --fifo3 and --clock_hz')
@@ -1660,11 +1673,12 @@ class VLAModel(nn.Module, _HubMixin):
         self.register_buffer('ctx_read_rms', torch.zeros(self.K))       # 0 = not measured yet
         self.register_buffer('rate', torch.tensor([min(1.0, 1.0 / w) for w in self.windows]),
                              persistent=False)
-        # --write_surprise (LO, HI): the slow registers' write gain from the token's surprise
+        # --write_surprise ('rat', H) / ('clamp', LO, HI): the slow registers' write gain
         self.surprise = tuple(surprise) if surprise else None
         if self.surprise and self.windows[-1] != 1:
             raise SystemExit('--write_surprise needs a plain-copy last register (window 1)')
         self.register_buffer('surp_mean', torch.zeros(()))     # running mean surprise; 0 = unset
+        self.register_buffer('gain_mean', torch.zeros(()))     # 'rat': running mean gain; 0 = unset
         self.dff = None              # [B, K*n_hidden, S, S], detached; None until first step
         self._ablate = None          # --eval_info: registers read as their mean ...
         self._read_mean = None       # ... which is this [1, K*n_hidden, S, S] tensor
@@ -1786,11 +1800,12 @@ class VLAModel(nn.Module, _HubMixin):
 
     @torch.no_grad()
     def _gain(self, idx, dff):
-        """--write_surprise: [B] write gain, the surprise of the text token being read
+        """--write_surprise: [B] write gain from the surprise s of the text token being read
         (-log p under the text logits of the state before it; the registers of a cascade
-        whose last is a plain copy sum to the previous layer output) over its running mean,
-        clamped to (LO, HI); 1 for no token (<NUL> blink, pad). Training updates the mean;
-        until it is set, the row's own surprise stands in (gain 1)."""
+        whose last is a plain copy sum to the previous layer output) and its running mean m.
+        'rat': H / (1 + (H-1) exp(m - s)) = H pm / ((H-1) p + pm), over its own running mean;
+        'clamp': s / m clamped to (LO, HI). 1 for no token (<NUL> blink, pad). Training
+        updates the means; until they are set, the row's own surprise stands in (gain 1)."""
         t = self.expand(idx)
         t = t[:, 0] if t.dim() == 2 else t
         lp = F.log_softmax(self.text_dec(sum(dff.chunk(self.K, dim=1))).float(), dim=-1)
@@ -1801,7 +1816,16 @@ class VLAModel(nn.Module, _HubMixin):
             b = s[ok].mean()
             run.copy_(torch.where(run == 0, b, 0.999 * run + 0.001 * b))
         m = torch.where(run > 0, run, s)
-        g = (s / m.clamp(min=1e-6)).clamp(*self.surprise)
+        if self.surprise[0] == 'rat':
+            H = self.surprise[1]
+            g = H / (1 + (H - 1) * torch.exp(m - s))
+            gm = self.gain_mean
+            if self.training and bool(ok.any()):
+                b = g[ok].mean()
+                gm.copy_(torch.where(gm == 0, b, 0.999 * gm + 0.001 * b))
+            g = g / torch.where(gm > 0, gm, torch.ones_like(gm))
+        else:
+            g = (s / m.clamp(min=1e-6)).clamp(*self.surprise[1:])
         return torch.where(ok, g, torch.ones_like(g))
 
     def step(self, idx, dff, img=None, aud=None):
@@ -2756,7 +2780,7 @@ else:
                          bool(args.clock_hz) or (_loaded_ckpt is not None and
                                                  'text_dec.nul.weight' in _loaded_ckpt['state_dict'])),
                      streams=args.streams, text_nul=args.fifo3,
-                     surprise=_surprise[:2] if _surprise else None)
+                     surprise=_surprise)
     if _loaded_ckpt is not None:
         _sd = _upgrade_state_dict(_loaded_ckpt['state_dict'])
         if _aud_switch:
@@ -2764,17 +2788,17 @@ else:
         if model.streams == 3 and 'voc_dec.proj.weight' not in _sd:
             _sd = _widen_state_dict(_sd, model)
         missing, unexpected = model.load_state_dict(_sd, strict=False)
-        bad = [k for k in missing if not re.match(r'(text|voc|img)_dec\.nul\.|surp_mean$', k)] + \
+        bad = [k for k in missing if not re.match(r'(text|voc|img)_dec\.nul\.|surp_mean$|gain_mean$', k)] + \
               [k for k in unexpected if not ((args.inner_voice or model.streams == 3)
                                              and k.startswith('text_dec.nul.'))]
         if bad:
             raise SystemExit(f'{args.load} does not fit this model: {bad[:6]}')
-        if [k for k in missing if k != 'surp_mean']:
+        if [k for k in missing if k not in ('surp_mean', 'gain_mean')]:
             print('text_dec.nul (the <NUL> logit) is new: zero-initialized', flush=True)
         if unexpected:
             print('--inner_voice: the checkpoint\'s <NUL> logit (text_dec.nul) is dropped', flush=True)
-    if _surprise and len(_surprise) == 3 and float(model.surp_mean) == 0:
-        model.surp_mean.fill_(_surprise[2])
+    if _surp_init is not None and float(model.surp_mean) == 0:
+        model.surp_mean.fill_(_surp_init)
 model = model.to(args.device)
 _tokenizer = model.tok
 _NUL_ID = model.nul_id
