@@ -4455,7 +4455,9 @@ def _wp_samples(step):
         for k, p in enumerate(_wp_prompts):
             prompt = _prompt_ids(p + '\n')
             out = model.generate(prompt, args.eval_wp_len, temperature=args.temperature)
-            _emit(f'GENW step {step:10} [{k}]: {_render(prompt + out)}')
+            # the prompt in bold (ANSI, for a terminal) and closed by ‖, so the continuation's
+            # start shows in any viewer
+            _emit(f'GENW step {step:10} [{k}]: \033[1m{_render(prompt)}\033[0m ‖ {_render(out)}')
 
 
 _VIDEO_VARIANTS = ((True, True, ''), (False, True, '-blind'), (True, False, '-deaf'),
