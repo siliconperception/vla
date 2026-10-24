@@ -423,6 +423,20 @@ parser.add_argument('--eval_cloze', default=0,    type=int, metavar='N',
 parser.add_argument('--eval_hold',  default=0,    type=int, metavar='N',
                     help='EVALH on N samples from <NUL>: does the second half follow the first '
                          '(self), beyond generic priming (cross), and when re-read (own)')
+parser.add_argument('--doc_log',    default=0,    type=int, metavar='N',
+                    help='from every N-th step on, the next document a text row starts is '
+                         'recorded as fed (its first --doc_log_len tokens, with the steps it '
+                         'started and ended), for EVALR; every 10th is kept for good in '
+                         '--doc_log_file, the rest in memory while under 10K steps old')
+parser.add_argument('--doc_log_len', default=384, type=int, metavar='T')
+parser.add_argument('--doc_log_file', default=None, metavar='PATH',
+                    help='--doc_log / --eval_recent: the recorded training documents '
+                         '(default <--log>.docs)')
+parser.add_argument('--eval_recent', default=0, type=int, metavar='K',
+                    help='EVALR: up to K recorded training documents per age band (steps since '
+                         'the model last read them), and K held-out ones: loss on them, on their '
+                         'continuation after --eval_gen_prompt tokens, and EVALG delta from that '
+                         'prefix -- does the model know what it read recently better than old?')
 parser.add_argument('--eval_wp',    default=0,    type=int, metavar='N',
                     help='GENW: N fixed WritingPrompts prompts continued at every eval, for reading')
 parser.add_argument('--eval_wp_len', default=256, type=int, metavar='C', help='GENW tokens')
@@ -509,6 +523,14 @@ parser.add_argument('--align_min', default=None, type=float, metavar='P',
                     help='--speech_align: the lowest segment score (mean frame probability of '
                          'its aligned characters; low = not English, or not what was said) an '
                          'example may hold (default 0.5). Saved and restored like --clock_hz')
+parser.add_argument('--write_surprise', default=None, metavar='LO,HI[,MEAN]',
+                    help='each step, the slow registers (all but the plain copy) write at their '
+                         'rate times g = surprise / its running mean, clamped to [LO, HI], where '
+                         'surprise is -log p of the text token just read, from the state before it: '
+                         'unexpected tokens are kept longer (e.g. 0.25,4; off / 0: plain EMAs). '
+                         'MEAN: the running mean to start from when the checkpoint has none '
+                         '(default: measured in training; until then gain 1). '
+                         'Saved and restored like --clock_hz')
 parser.add_argument('--voice_drop', default=None, type=float, metavar='P',
                     help='--inner_voice: on a random P of silent ticks the model\'s own word is '
                          'not fed back (the input stays _PAD, no word) -- in training, eval, '
@@ -643,7 +665,7 @@ if args.load:
     _start_step = int(_loaded_ckpt.get('step', 0))
     _start_exs = int(_loaded_ckpt.get('examples', 0))
     _start_exs_by = dict(_loaded_ckpt.get('examples_by', {}))
-    for k in ('clock_hz', 'ctx_tau', 'vision_hz', 'audio_hz', 'inner_voice', 'min_p', 'top_k', 'voice_drop', 'caption_feed', 'text_feed', 'speech_delay', 'fifo3', 'nul_weight', 'loss_norm', 'speech_align', 'align_min'):     # restored unless given
+    for k in ('clock_hz', 'ctx_tau', 'vision_hz', 'audio_hz', 'inner_voice', 'min_p', 'top_k', 'voice_drop', 'caption_feed', 'text_feed', 'speech_delay', 'fifo3', 'nul_weight', 'loss_norm', 'speech_align', 'align_min', 'write_surprise'):     # restored unless given
         if getattr(args, k) is None:
             setattr(args, k, _saved.get(k))
 args.clock_hz = float(args.clock_hz or 0)
@@ -658,6 +680,15 @@ args.audio_hz = float(args.audio_hz or 0)
 args.streams = int(args.streams or 1)
 args.fifo3 = bool(args.fifo3)
 args.speech_align = bool(args.speech_align)
+if args.eval_recent and args.doc_log_len < 1 + args.eval_gen_prompt + args.eval_gen_len:
+    raise SystemExit(f'--eval_recent: --doc_log_len {args.doc_log_len} is shorter than a prompt '
+                     f'and its continuation ({1 + args.eval_gen_prompt + args.eval_gen_len})')
+if args.write_surprise in (None, '', '0', 'off'):
+    args.write_surprise = None
+_surprise = (tuple(float(v) for v in str(args.write_surprise).split(','))
+             if args.write_surprise else None)
+if _surprise and (len(_surprise) not in (2, 3) or not 0 < _surprise[0] <= 1 <= _surprise[1]):
+    raise SystemExit(f'--write_surprise {args.write_surprise}: want LO,HI[,MEAN], 0 < LO <= 1 <= HI')
 args.align_min = 0.5 if args.align_min is None else float(args.align_min)
 if args.speech_align and not (args.fifo3 and args.clock_hz):
     raise SystemExit('--speech_align needs --fifo3 and --clock_hz')
@@ -1557,7 +1588,7 @@ class VLAModel(nn.Module, _HubMixin):
                  tokenizer='pythia31m', windows=(256, 64, 16, 4, 1), read_norm=1.0,
                  dec_kernels=(3, 3, 3), dec_width=256, bn_momentum=0.1, init='zero',
                  image_encoder='none', audio_encoder='none', nul_head=False, streams=1,
-                 text_nul=False):
+                 text_nul=False, surprise=None):
         super().__init__()
         from transformers import AutoModelForCausalLM
         repo = _TOKENIZERS[tokenizer]
@@ -1629,6 +1660,11 @@ class VLAModel(nn.Module, _HubMixin):
         self.register_buffer('ctx_read_rms', torch.zeros(self.K))       # 0 = not measured yet
         self.register_buffer('rate', torch.tensor([min(1.0, 1.0 / w) for w in self.windows]),
                              persistent=False)
+        # --write_surprise (LO, HI): the slow registers' write gain from the token's surprise
+        self.surprise = tuple(surprise) if surprise else None
+        if self.surprise and self.windows[-1] != 1:
+            raise SystemExit('--write_surprise needs a plain-copy last register (window 1)')
+        self.register_buffer('surp_mean', torch.zeros(()))     # running mean surprise; 0 = unset
         self.dff = None              # [B, K*n_hidden, S, S], detached; None until first step
         self._ablate = None          # --eval_info: registers read as their mean ...
         self._read_mean = None       # ... which is this [1, K*n_hidden, S, S] tensor
@@ -1735,20 +1771,45 @@ class VLAModel(nn.Module, _HubMixin):
             regs = [r * (self.read_norm / (sc[k] + 1e-12)) for k, r in enumerate(regs)]
         return regs
 
-    def _write(self, o, dff):
+    def _write(self, o, dff, gain=None):
         """Laplacian-pyramid cascade: register k blends toward o minus registers 1..k-1 as
-        just written."""
+        just written. gain [B] (--write_surprise) scales the rate of every register but the
+        plain copy, capped at 1."""
         new = []
         for k, p in enumerate(dff.chunk(self.K, dim=1)):
             inp = o - sum(new) if k else o
-            new.append(p + self.rate[k] * (inp - p))
+            r = self.rate[k]
+            if gain is not None and self.windows[k] > 1:
+                r = (r * gain).clamp(max=1.0).view(-1, 1, 1, 1)
+            new.append(p + r * (inp - p))
         return torch.cat(new, dim=1)
+
+    @torch.no_grad()
+    def _gain(self, idx, dff):
+        """--write_surprise: [B] write gain, the surprise of the text token being read
+        (-log p under the text logits of the state before it; the registers of a cascade
+        whose last is a plain copy sum to the previous layer output) over its running mean,
+        clamped to (LO, HI); 1 for no token (<NUL> blink, pad). Training updates the mean;
+        until it is set, the row's own surprise stands in (gain 1)."""
+        t = self.expand(idx)
+        t = t[:, 0] if t.dim() == 2 else t
+        lp = F.log_softmax(self.text_dec(sum(dff.chunk(self.K, dim=1))).float(), dim=-1)
+        s = -lp.gather(1, t.clamp(min=0)[:, None])[:, 0]
+        ok = t >= 0
+        run = self.surp_mean
+        if self.training and bool(ok.any()):
+            b = s[ok].mean()
+            run.copy_(torch.where(run == 0, b, 0.999 * run + 0.001 * b))
+        m = torch.where(run > 0, run, s)
+        g = (s / m.clamp(min=1e-6)).clamp(*self.surprise)
+        return torch.where(ok, g, torch.ones_like(g))
 
     def step(self, idx, dff, img=None, aud=None):
         """One token for every row: -> (new registers, layer output). No detach."""
+        gain = self._gain(idx, dff) if self.surprise else None
         x = self.ctx_cat(torch.cat(self._inputs(idx, img, aud) + self._read(dff), dim=1))
         o = self.linout(self.context(x))
-        return self._write(o, dff), o
+        return self._write(o, dff, gain), o
 
     def forward(self, idx, targets=None, flag=None, img=None, aud=None):
         """idx [B] current tokens; targets [B] next tokens or None; flag [B] rows starting a
@@ -2694,7 +2755,8 @@ else:
                      nul_head=not args.inner_voice and (
                          bool(args.clock_hz) or (_loaded_ckpt is not None and
                                                  'text_dec.nul.weight' in _loaded_ckpt['state_dict'])),
-                     streams=args.streams, text_nul=args.fifo3)
+                     streams=args.streams, text_nul=args.fifo3,
+                     surprise=_surprise[:2] if _surprise else None)
     if _loaded_ckpt is not None:
         _sd = _upgrade_state_dict(_loaded_ckpt['state_dict'])
         if _aud_switch:
@@ -2702,15 +2764,17 @@ else:
         if model.streams == 3 and 'voc_dec.proj.weight' not in _sd:
             _sd = _widen_state_dict(_sd, model)
         missing, unexpected = model.load_state_dict(_sd, strict=False)
-        bad = [k for k in missing if not re.match(r'(text|voc|img)_dec\.nul\.', k)] + \
+        bad = [k for k in missing if not re.match(r'(text|voc|img)_dec\.nul\.|surp_mean$', k)] + \
               [k for k in unexpected if not ((args.inner_voice or model.streams == 3)
                                              and k.startswith('text_dec.nul.'))]
         if bad:
             raise SystemExit(f'{args.load} does not fit this model: {bad[:6]}')
-        if missing:
+        if [k for k in missing if k != 'surp_mean']:
             print('text_dec.nul (the <NUL> logit) is new: zero-initialized', flush=True)
         if unexpected:
             print('--inner_voice: the checkpoint\'s <NUL> logit (text_dec.nul) is dropped', flush=True)
+    if _surprise and len(_surprise) == 3 and float(model.surp_mean) == 0:
+        model.surp_mean.fill_(_surprise[2])
 model = model.to(args.device)
 _tokenizer = model.tok
 _NUL_ID = model.nul_id
@@ -4393,6 +4457,91 @@ def _hold_eval(step):
           f'own {o:+.4f} rep1 {np.mean(reps):.3f} wall {time.time() - t0:.1f}s')
 
 
+_RECENT_BANDS = (0, 2000, 10000, 50000, 200000, 1000000)   # EVALR age bands, lower edges
+_DOC_KEEP = 10               # --doc_log: one record in this many goes to the file and stays
+_DOC_BRIEF = 10000           # the others stay in memory while younger than this (steps)
+_doc_records = None          # [(start step, end step, ids, kept)]; --doc_log_file, read once
+
+
+def _doc_file():
+    return args.doc_log_file or args.log + '.docs'
+
+
+def _load_doc_records():
+    global _doc_records
+    if _doc_records is None:
+        _doc_records = []
+        if os.path.exists(_doc_file()):
+            with open(_doc_file()) as f:
+                for line in f:
+                    try:
+                        r = json.loads(line)
+                    except ValueError:
+                        continue
+                    _doc_records.append((r['step'], r['end'], np.array(r['ids'], dtype=np.int32),
+                                         True))
+    return _doc_records
+
+
+def _recent_eval(step, corpus, docs):
+    """EVALR: training documents by how long ago they were read (age = step - the step the
+    record ended), against held-out ones cut the same way. Per band: ce, the model's nats per
+    token over the record; cont, over the tokens after the --eval_gen_prompt prefix; gain,
+    held-out minus band (how much better it knows what it read); delta, EVALG's delta when
+    continuing that prefix; ovl, the share of the continuation's word bigrams in the real one."""
+    global _judge
+    t0 = time.time()
+    _load_doc_records()
+    if _judge is None:
+        _judge = _Judge(args.eval_gen_judge)
+    P, C, K, T = args.eval_gen_prompt, args.eval_gen_len, args.eval_recent, args.doc_log_len
+    need = 1 + P + C
+    rng = random.Random(step)
+    groups = []
+    for b, lo in enumerate(_RECENT_BANDS):
+        hi = _RECENT_BANDS[b + 1] if b + 1 < len(_RECENT_BANDS) else float('inf')
+        pool = [q for s0, e, q, _ in _doc_records
+                if lo <= step - e < hi and e <= step and len(q) >= need]
+        if pool:
+            groups.append((f'{lo // 1000}K+' if lo else '0+',
+                           [q.tolist() for q in rng.sample(pool, min(K, len(pool)))]))
+    held = [q[:T] for q in (_doc_tokens(d) for d in docs) if len(q) >= need][:K]
+    groups.append(('heldout', held))
+    rows = [(q[:-1], q[1:]) for _, g in groups for q in g]
+    if not rows or not groups[:-1]:
+        return
+    ce = iter(_ce_pairs(rows))
+    res = []
+    dev = next(model.parameters()).device
+    for name, g in groups:
+        cs, cc, dl, ov = [], [], [], []
+        for q in g:
+            c = next(ce)
+            cs.append(float(c.mean())); cc.append(float(c[P:].mean()))
+        with _EvalState(), torch.random.fork_rng(devices=[dev] if dev.type == 'cuda' else []):
+            torch.manual_seed(step)
+            for q in g:
+                ptxt, real = _decode_plain(q[:1 + P]), _decode_plain(q[1 + P:1 + P + C])
+                gen = _decode_plain(model.generate(q[:1 + P], C, temperature=args.temperature))
+                n = _judge.cond_nll(ptxt, gen) if gen.strip() else None
+                n0 = _judge.cond_nll(_NO_PROMPT, gen.lstrip()) if n is not None else None
+                if n0 is None:
+                    continue
+                dl.append(n0 - n)
+                w, rw = gen.split(), real.split()
+                bg, rb = list(zip(w, w[1:])), set(zip(rw, rw[1:]))
+                ov.append(sum(x in rb for x in bg) / len(bg) if bg else 0.0)
+        res.append((name, len(g), np.mean(cs), np.mean(cc), np.mean(dl) if dl else float('nan'),
+                    np.mean(ov) if ov else float('nan')))
+    h = res[-1]
+    _eval_results['recent'] = {r[0]: dict(n=r[1], ce=r[2], cont=r[3], delta=r[4], ovl=r[5])
+                               for r in res}
+    _emit(f'EVALR step {step:10} corpus {corpus:8} records {len(_doc_records)} | ' +
+          ' | '.join(f'{r[0]} n{r[1]} ce {r[2]:.3f} cont {r[3]:.3f} gain {h[3] - r[3]:+.3f} '
+                     f'delta {r[4]:+.3f} ovl {r[5]:.3f}' for r in res) +
+          f' | wall {time.time() - t0:.1f}s')
+
+
 _CLOZE_SRC = ('juletxara/xstory_cloze', 'en', 'eval')
 _cloze_set = []              # [(story token ids, right ending ids, wrong ending ids)]
 
@@ -4509,6 +4658,7 @@ def _heldout_eval(step):
             _eval_failed[corpus] = True
             continue
         for fn, on in ((_reach_eval, args.eval_reach and rare), (_gen_eval, args.eval_gen),
+                       (_recent_eval, args.eval_recent and corpus == text[0]),
                        (_info_eval, args.eval_info and rare and corpus == text[0])):
             if on:
                 try:
@@ -5153,6 +5303,36 @@ def _pt(name):
 
 
 _stop_req = False
+_doc_rec = {}                # --doc_log: row -> [start step, ids] being recorded
+_doc_next = 0                # the step from which the next document start is recorded
+
+
+def _doc_log_step(i, x_one, flag_list):
+    """--doc_log: extend the records in progress by this step's text input; a row's record
+    ends at its next document (or --doc_log_len tokens) and is appended to --doc_log_file.
+    From every --doc_log-th step on, the next text row starting a document opens one."""
+    global _doc_next
+    for r in list(_doc_rec):
+        s0, ids = _doc_rec[r]
+        if flag_list[r] or len(ids) >= args.doc_log_len:
+            del _doc_rec[r]
+            keep = (s0 // args.doc_log) % _DOC_KEEP == 0
+            recs = _load_doc_records()
+            recs.append((s0, i, np.array(ids, dtype=np.int32), keep))
+            if not keep:          # drop the brief records that have aged out
+                recs[:] = [d for d in recs if d[3] or i - d[1] < _DOC_BRIEF]
+            if keep:
+                with open(_doc_file(), 'a') as f:
+                    print(json.dumps(dict(step=s0, end=i, ids=ids)), file=f)
+        else:
+            ids.append(int(x_one[r]))
+    if i >= _doc_next:
+        for n in _text_names:
+            r = next((r for r in _rows_of[n] if flag_list[r] and r not in _doc_rec), None)
+            if r is not None:
+                _doc_rec[r] = [i, [int(x_one[r])]]
+                _doc_next = (i // args.doc_log + 1) * args.doc_log
+                break
 
 
 def _on_sigterm(signum, frame):
@@ -5216,6 +5396,8 @@ try:
         _pt('data_wait')
         # the text stream's input per row, for the image-bank tools (--fifo3 rows are triples)
         x_one = [x[0] if isinstance(x, tuple) else x for x in x_list]
+        if args.doc_log:
+            _doc_log_step(i, x_one, flag_list)
         n_examples += sum(flag_list)
         for n, rows in _rows_of.items():
             _n_by[n] += sum(flag_list[r] for r in rows)
