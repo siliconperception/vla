@@ -352,9 +352,15 @@ parser.add_argument('--batch',      default=250,  type=int, help='independent do
 parser.add_argument('--lr_max',     default=0.01, type=float, help='peak / constant lr')
 parser.add_argument('--lr_min',     default=1e-4, type=float, help='coswarm start lr')
 parser.add_argument('--lr_period',  default=20000, type=int, help='coswarm rise length in steps')
-parser.add_argument('--schedule',   default='coswarm', choices=['const', 'coswarm'],
+parser.add_argument('--schedule',   default='coswarm', choices=['const', 'coswarm', 'decay'],
                     help='const: --lr_max throughout. coswarm: half-cosine rise from --lr_min '
-                         'to --lr_max over --lr_period global steps, then hold')
+                         'to --lr_max over --lr_period global steps, then hold. decay: coswarm, '
+                         'then a half-cosine fall to --lr_final over --decay_steps steps from '
+                         '--decay_start, then hold')
+parser.add_argument('--lr_final',   default=1e-3, type=float, help='decay: final lr')
+parser.add_argument('--decay_steps', default=200000, type=int, help='decay: fall length in steps')
+parser.add_argument('--decay_start', default=None, type=int, metavar='STEP',
+                    help='decay: global step the fall begins (default: this run\'s first step)')
 parser.add_argument('--eval_at_start', action='store_true',
                     help='also run the held-out eval at a resumed run\'s first step')
 parser.add_argument('--profile', default=0, type=int, metavar='N',
@@ -4521,6 +4527,11 @@ def _lr_factor(step):
     """lr / lr_max at a global step."""
     if args.schedule == 'const':
         return 1.0
+    if args.schedule == 'decay':
+        d0 = _start_step if args.decay_start is None else args.decay_start
+        if step >= d0:
+            f = (1.0 + math.cos(math.pi * min((step - d0) / max(1, args.decay_steps), 1.0))) / 2.0
+            return (args.lr_final + (args.lr_max - args.lr_final) * f) / args.lr_max
     if args.lr_restart:          # warm up again from this run's first step
         step -= _start_step
     f = (1.0 - math.cos(math.pi * min(max(0, step) / max(1, args.lr_period), 1.0))) / 2.0
