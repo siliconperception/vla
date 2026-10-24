@@ -411,6 +411,12 @@ parser.add_argument('--eval_gen',   default=0,    type=int, metavar='N',
 parser.add_argument('--eval_gen_judge', default='EleutherAI/pythia-410m', metavar='MODEL')
 parser.add_argument('--eval_gen_prompt', default=32, type=int, metavar='P', help='prompt tokens')
 parser.add_argument('--eval_gen_len', default=96, type=int, metavar='C', help='continuation tokens')
+parser.add_argument('--eval_cloze', default=0,    type=int, metavar='N',
+                    help='EVALC on N Story Cloze stories (xstory_cloze en): share where the '
+                         'right ending costs fewer nats than the wrong one after the 4-sentence story')
+parser.add_argument('--eval_wp',    default=0,    type=int, metavar='N',
+                    help='GENW: N fixed WritingPrompts prompts continued at every eval, for reading')
+parser.add_argument('--eval_wp_len', default=256, type=int, metavar='C', help='GENW tokens')
 parser.add_argument('--eval_rare',  default=10,   type=int, metavar='N',
                     help='run the slow or low-value evals only at every Nth eval: EVALX, EVALI, '
                          'the video "-off" variant and EVALB of video corpora (0 = every eval)')
@@ -4274,12 +4280,17 @@ class _Judge:
 
 
 _judge = None
-_gen_anchor = {}             # corpus -> [(prompt ids, prompt text, real nats, shuffled nats)]
+_gen_anchor = {}             # corpus -> [(prompt ids, prompt text, real nats, shuffled nats,
+                             #             real nats without the prompt)]
+_NO_PROMPT = '\n'            # the judge's "no prompt": a bare document start
 
 
 def _gen_eval(step, corpus, docs):
     """EVALG: continue held-out prompts; the judge scores the continuation given the prompt,
-    against the document's real continuation (floor) and its words shuffled (ceiling)."""
+    against the document's real continuation (floor) and its words shuffled (ceiling).
+    delta: the judge's nats on the continuation without the prompt minus with it -- how much
+    the prompt explains the continuation, i.e. how on-topic it stayed (real_delta: the same for
+    the document's own continuation)."""
     global _judge
     t0 = time.time()
     if _judge is None:
@@ -4295,33 +4306,102 @@ def _gen_eval(step, corpus, docs):
             sw = real.split()
             rng.shuffle(sw)
             a, b = _judge.cond_nll(ptxt, real), _judge.cond_nll(ptxt, ' ' + ' '.join(sw))
-            if a is not None and b is not None:
-                items.append((q[:1 + P], ptxt, a, b))
+            u = _judge.cond_nll(_NO_PROMPT, real.lstrip())
+            if a is not None and b is not None and u is not None:
+                items.append((q[:1 + P], ptxt, a, b, u))
             if len(items) >= args.eval_gen:
                 break
         _gen_anchor[corpus] = items
-    g_n, r_n, s_n, reps, d2s = [], [], [], [], []
+    g_n, r_n, s_n, gd, rd, reps, d2s = [], [], [], [], [], [], []
     dev = next(model.parameters()).device
     with _EvalState(), torch.random.fork_rng(devices=[dev] if dev.type == 'cuda' else []):
-        for prompt, ptxt, a, b in _gen_anchor[corpus]:
+        for prompt, ptxt, a, b, u in _gen_anchor[corpus]:
             out = model.generate(prompt, C, temperature=args.temperature)
             ctxt = _decode_plain(out)
             n = _judge.cond_nll(ptxt, ctxt) if ctxt.strip() else None
-            if n is None:
+            n0 = _judge.cond_nll(_NO_PROMPT, ctxt.lstrip()) if n is not None else None
+            if n0 is None:
                 continue
             w = ctxt.split()
             bg = list(zip(w, w[1:]))
-            g_n.append(n); r_n.append(a); s_n.append(b)
+            g_n.append(n); r_n.append(a); s_n.append(b); gd.append(n0 - n); rd.append(u - a)
             reps.append(_rep1(ctxt)); d2s.append(len(set(bg)) / len(bg) if bg else 0.0)
     if not g_n:
         return
     g, r, s = float(np.mean(g_n)), float(np.mean(r_n)), float(np.mean(s_n))
     flu = 100.0 * (s - g) / (s - r) if s > r else float('nan')
-    _eval_results[f'{corpus}~gen'] = dict(nats=g, real=r, shuf=s, fluency=flu,
-                                          rep1=float(np.mean(reps)), distinct2=float(np.mean(d2s)))
+    d, dr = float(np.mean(gd)), float(np.mean(rd))
+    _eval_results[f'{corpus}~gen'] = dict(nats=g, real=r, shuf=s, fluency=flu, delta=d,
+                                          real_delta=dr, rep1=float(np.mean(reps)),
+                                          distinct2=float(np.mean(d2s)))
     _emit(f'EVALG step {step:10} corpus {corpus:8} prompts {len(g_n)} nats {g:.4f} '
-          f'real {r:.4f} shuf {s:.4f} fluency {flu:.1f}% rep1 {np.mean(reps):.3f} '
-          f'distinct2 {np.mean(d2s):.3f} wall {time.time() - t0:.1f}s')
+          f'real {r:.4f} shuf {s:.4f} fluency {flu:.1f}% delta {d:+.4f} real_delta {dr:+.4f} '
+          f'rep1 {np.mean(reps):.3f} distinct2 {np.mean(d2s):.3f} wall {time.time() - t0:.1f}s')
+
+
+_CLOZE_SRC = ('juletxara/xstory_cloze', 'en', 'eval')
+_cloze_set = []              # [(story token ids, right ending ids, wrong ending ids)]
+
+
+def _cloze_eval(step):
+    """EVALC: Story Cloze. Each story's four sentences, then each of its two endings, from a
+    fresh state; acc: the right ending has the lower summed nats (lm-eval's acc), acc_tok: the
+    lower nats per token (length-normalized). margin: wrong minus right, nats per token."""
+    t0 = time.time()
+    if not _cloze_set:
+        from datasets import load_dataset
+        rows = load_dataset(*_CLOZE_SRC[:2], split=_CLOZE_SRC[2])
+        for ex in rows.select(range(min(args.eval_cloze, len(rows)))):
+            story = ' '.join(ex[f'input_sentence_{k}'] for k in range(1, 5))
+            ends = [ex['sentence_quiz1'], ex['sentence_quiz2']]
+            r = int(ex['answer_right_ending']) - 1
+            _cloze_set.append((_prompt_ids(story), _tokenizer.encode(' ' + ends[r]),
+                               _tokenizer.encode(' ' + ends[1 - r])))
+        print(f'--eval_cloze: {len(_cloze_set)} stories from {"/".join(_CLOZE_SRC)}', flush=True)
+    rows = [(s + e[:-1], s[1:] + e) for s, R, W in _cloze_set for e in (R, W)]
+    ce = _ce_pairs(rows)
+    right, tok, marg = [], [], []
+    for k, (s, R, W) in enumerate(_cloze_set):
+        a, b = ce[2 * k][len(s) - 1:], ce[2 * k + 1][len(s) - 1:]
+        right.append(a.sum() < b.sum())
+        tok.append(a.mean() < b.mean())
+        marg.append(b.mean() - a.mean())
+    acc, acc_t, m = 100.0 * np.mean(right), 100.0 * np.mean(tok), float(np.mean(marg))
+    _eval_results['cloze'] = dict(acc=acc, acc_tok=acc_t, margin=m, stories=len(_cloze_set))
+    _emit(f'EVALC step {step:10} stories {len(_cloze_set)} acc {acc:.1f}% acc_tok {acc_t:.1f}% '
+          f'margin {m:+.4f} wall {time.time() - t0:.1f}s')
+
+
+_WP_SRC = ('euclaise/writingprompts', 'test')
+_wp_prompts = []             # fixed prompt texts, the same at every eval
+
+
+def _wp_clean(t):
+    """A WritingPrompts prompt, its tag and the dataset's tokenized spacing undone."""
+    t = re.sub(r'^\s*\[\s*\w+\s*\]\s*', '', t).replace('``', '"').replace("''", '"')
+    t = re.sub(r' ([.,!?;:%)\]])', r'\1', t)
+    t = re.sub(r" (n't|'s|'re|'ve|'ll|'d|'m)\b", r'\1', t)
+    return re.sub(r'([(\[]) ', r'\1', t).strip()
+
+
+def _wp_samples(step):
+    """GENW: the --eval_wp fixed WritingPrompts prompts, each continued for --eval_wp_len
+    tokens, one log line each, for reading across evals."""
+    if not _wp_prompts:
+        from datasets import load_dataset
+        for ex in load_dataset(*_WP_SRC[:1], split=_WP_SRC[1], streaming=True):
+            p = _wp_clean(ex['prompt'])
+            if 40 <= len(p) <= 300:
+                _wp_prompts.append(p)
+            if len(_wp_prompts) >= args.eval_wp:
+                break
+    dev = next(model.parameters()).device
+    with _EvalState(), torch.random.fork_rng(devices=[dev] if dev.type == 'cuda' else []):
+        torch.manual_seed(step)
+        for k, p in enumerate(_wp_prompts):
+            prompt = _prompt_ids(p + '\n')
+            out = model.generate(prompt, args.eval_wp_len, temperature=args.temperature)
+            _emit(f'GENW step {step:10} [{k}]: {_render(prompt + out)}')
 
 
 _VIDEO_VARIANTS = ((True, True, ''), (False, True, '-blind'), (True, False, '-deaf'),
@@ -4380,6 +4460,14 @@ def _heldout_eval(step):
                 except Exception as e:
                     print(f'WARNING: {fn.__name__} failed at step {step} on "{corpus}": {e!r}',
                           flush=True)
+    for fn, on in ((_cloze_eval, args.eval_cloze), (_wp_samples, args.eval_wp)):  # corpus-free
+        if on and not _eval_failed.get(fn.__name__):
+            try:
+                fn(step)
+            except Exception as e:
+                print(f'WARNING: {fn.__name__} failed at step {step}: {e!r}; disabling it',
+                      flush=True)
+                _eval_failed[fn.__name__] = True
 
 
 if args.eval:
