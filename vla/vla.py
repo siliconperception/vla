@@ -420,6 +420,9 @@ parser.add_argument('--eval_gen_len', default=96, type=int, metavar='C', help='c
 parser.add_argument('--eval_cloze', default=0,    type=int, metavar='N',
                     help='EVALC on N Story Cloze stories (xstory_cloze en): share where the '
                          'right ending costs fewer nats than the wrong one after the 4-sentence story')
+parser.add_argument('--eval_hold',  default=0,    type=int, metavar='N',
+                    help='EVALH on N samples from <NUL>: does the second half follow the first '
+                         '(self), beyond generic priming (cross), and when re-read (own)')
 parser.add_argument('--eval_wp',    default=0,    type=int, metavar='N',
                     help='GENW: N fixed WritingPrompts prompts continued at every eval, for reading')
 parser.add_argument('--eval_wp_len', default=256, type=int, metavar='C', help='GENW tokens')
@@ -4345,6 +4348,51 @@ def _gen_eval(step, corpus, docs):
           f'rep1 {np.mean(reps):.3f} distinct2 {np.mean(d2s):.3f} wall {time.time() - t0:.1f}s')
 
 
+def _hold_eval(step):
+    """EVALH: does the model hold a topic it chose itself? N samples of 2C tokens from <NUL>
+    (seed k for sample k, so evals are paired), split into halves A, B. The judge's nats on B:
+      self   = nats(B | no prompt) - nats(B | A)       its own topic, carried in its state
+      cross  = nats(B | no prompt) - nats(B | A of the next sample)   generic priming only
+      own    = the same as self for B', a fresh state's continuation of A fed back as a prompt
+               (its own text re-read; compare EVALG delta, a human prompt re-read)
+    self - cross is the topic-specific part; rep1 of B guards against a loop scoring high."""
+    global _judge
+    t0 = time.time()
+    if _judge is None:
+        _judge = _Judge(args.eval_gen_judge)
+    C, N = args.eval_gen_len, args.eval_hold
+    dev = next(model.parameters()).device
+    halves = []
+    with _EvalState(), torch.random.fork_rng(devices=[dev] if dev.type == 'cuda' else []):
+        for k in range(N):
+            torch.manual_seed(k)
+            out = model.generate(_prompt_ids(), 2 * C, temperature=args.temperature)
+            if len(out) < 2 * C:
+                continue
+            a = out[:C]
+            torch.manual_seed(k)
+            b2 = model.generate(_prompt_ids() + a, C, temperature=args.temperature)
+            halves.append((_decode_plain(a), _decode_plain(out[C:]), _decode_plain(b2)))
+    sd, xd, od, reps = [], [], [], []
+    for k, (a, b, b2) in enumerate(halves):
+        ax = halves[(k + 1) % len(halves)][0]
+        if not (a.strip() and b.strip() and b2.strip() and ax.strip()):
+            continue
+        n0, n1, nx = (_judge.cond_nll(_NO_PROMPT, b.lstrip()), _judge.cond_nll(a, b),
+                      _judge.cond_nll(ax, b))
+        m0, m1 = _judge.cond_nll(_NO_PROMPT, b2.lstrip()), _judge.cond_nll(a, b2)
+        if None in (n0, n1, nx, m0, m1):
+            continue
+        sd.append(n0 - n1); xd.append(n0 - nx); od.append(m0 - m1); reps.append(_rep1(b))
+    if not sd:
+        return
+    s, x, o = float(np.mean(sd)), float(np.mean(xd)), float(np.mean(od))
+    _eval_results['hold'] = dict(self=s, cross=x, own=o, topic=s - x, rep1=float(np.mean(reps)),
+                                 samples=len(sd))
+    _emit(f'EVALH step {step:10} samples {len(sd)} self {s:+.4f} cross {x:+.4f} topic {s - x:+.4f} '
+          f'own {o:+.4f} rep1 {np.mean(reps):.3f} wall {time.time() - t0:.1f}s')
+
+
 _CLOZE_SRC = ('juletxara/xstory_cloze', 'en', 'eval')
 _cloze_set = []              # [(story token ids, right ending ids, wrong ending ids)]
 
@@ -4466,7 +4514,8 @@ def _heldout_eval(step):
                 except Exception as e:
                     print(f'WARNING: {fn.__name__} failed at step {step} on "{corpus}": {e!r}',
                           flush=True)
-    for fn, on in ((_cloze_eval, args.eval_cloze), (_wp_samples, args.eval_wp)):  # corpus-free
+    for fn, on in ((_cloze_eval, args.eval_cloze), (_hold_eval, args.eval_hold),   # corpus-free
+                   (_wp_samples, args.eval_wp)):
         if on and not _eval_failed.get(fn.__name__):
             try:
                 fn(step)
