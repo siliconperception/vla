@@ -5126,8 +5126,8 @@ try:
         # holds its EVAL lines and a run resumed from it keeps them; not at step 0, where it
         # would only measure ln(vocab), nor at a resumed run's first step (the checkpoint it
         # loaded; --eval_at_start to measure it anyway)
-        if args.eval_interval and i > 0 and i % args.eval_interval == 0 and \
-                (i > _start_step or args.eval_at_start):
+        if args.eval_interval and i > 0 and ((i % args.eval_interval == 0 and i > _start_step) or
+                                             (i == _start_step and args.eval_at_start)):
             _heldout_eval(i)
 
         if i % args.checkpoint == 0:
