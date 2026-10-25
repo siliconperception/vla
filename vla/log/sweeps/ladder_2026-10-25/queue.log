@@ -5,3 +5,22 @@
 2026-10-25 13:33:06 queue3.sh restarted (rev 2: GEN lines in v469/v470)
 2026-10-25 13:58:17 queue3.sh stopped; v468 SIGTERM at 8839493; queue4.sh resumes it with GEN lines, then runs queue3.sh
 2026-10-25 13:58:17 resume v468_tau64_250K at 8839493 for 133598 steps, GEN every 2000
+STEP    8973000 wall 2026-10-25 15:40:29
+error: process ID out of range
+
+Usage:
+ ps [options]
+
+ Try 'ps --help <simple|list|output|threads|misc|all>'
+  or 'ps --help <s|l|o|t|m|a>'
+ for additional help text.
+
+For more details see ps(1).
+2026-10-25 15:40:34 v468 trainer 0 gone; scoring + evaluating v468
+2026-10-25 15:40:34 start v471_b1bnf_lr1e5_1M batch 1 lr 0.00001 steps 1000000
+2026-10-25 15:51:09 post-run done for v468_tau64_250K
+2026-10-25 15:57:27 queue3.sh stopped; v471 SIGTERM at 8861110; queue5.sh resumes it with TOK lines, then v469, v470, selection, v472
+2026-10-25 15:57:27 start v471_b1bnf_lr1e5_1M batch 1 lr 0.00001 steps 1000000
+2026-10-25 15:58:39 queue5.sh and v471 stopped by the user ('not what I was expecting'); nothing queued
+2026-10-25 16:00:04 queue6.sh: v471 resumes plainly (user: restart normally), then v469, v470, selection, v472
+2026-10-25 16:00:04 resume v471_b1bnf_lr1e5_1M at 8875129 for 847962 steps
