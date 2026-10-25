@@ -50,3 +50,7 @@ v459 keeps training throughout.
 ## Measurements behind this plan (v459, steps 7.82M–8.08M)
 
 EVALR gain vs held-out (nats/token), mean over 14 evals: 0–2K steps since read **+0.19** (14/14 positive), 2K–10K **+0.08**, 10K–50K −0.03, 50K–200K −0.03, 200K–1M −0.05 (4 evals). Verbatim overlap `ovl` stays 0.01–0.02 in every band.
+
+## Future goal (user, 2026-10-24): continuous running and continuous learning
+
+The application is embodied AI. The VLA runs continuously, with no state reset between "examples", and eventually it learns continuously while deployed. Training today is episodic (the state resets at every example's `<NUL>`), so that gap needs closing. Constraints already known: the registers are leaky averages with bounded memory (slowest window 64 s), and the 1-token gradient horizon makes on-chip learning cheap (no BPTT memory). EVALR shows an SGD imprint lasts about 2K steps, so on-line learning will need replay and slow (consolidated) weights.
