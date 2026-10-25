@@ -1,0 +1,18 @@
+3b: is the weights' memory of a training document keyed on the register context?
+Paired forgetting curve (log/sweeps/forgetting_2026-10-25/pair.py): v461's 757 recorded documents and 400 held-out ones, scored with
+checkpoint/v460...step7900000.pt (before reading) and checkpoint/v461...step8646887.pt, each with the listed registers read as their
+mean state over the held-out documents (vla.py --doc_score --doc_ablate). Registers: 1 = 64 s (1600 ticks), 2 = 16 s, 3 = 4 s, 4 = 1 s.
+
+memory, nats/token (+- 1 s.e.)      age  5K           20K          65K          200K         500K        | held-out improvement
+all registers                          +0.089 .012  +0.063 .022  +0.024 .008  +0.028 .005  +0.016 .004  | +0.012
+1 (64 s) ablated                       +0.068 .011  +0.071 .023  +0.028 .008  +0.032 .005  +0.015 .004  | +0.006
+1,2 (64 s + 16 s) ablated              +0.040 .014  +0.064 .019  +0.015 .009  +0.018 .006  +0.007 .004  | +0.003
+3,4 (4 s + 1 s) ablated                +0.017 .017  +0.053 .018  +0.004 .009  +0.012 .006  +0.007 .005  | +0.014
+
+Reading:
+- Memory is context-keyed. Without the slow pair (64 s + 16 s), long-term memory (200K-500K) about halves (+0.022 -> +0.012 averaged)
+  and 5K memory halves; without the fast pair it halves too and short-term is nearly gone. The 64 s register alone changes nothing.
+- The generalized (held-out) improvement over these 700K steps lives in the slow-register pathway: +0.012 -> +0.006 -> +0.003 as the
+  slow registers are removed, unchanged without the fast ones. Recent learning is largely about using document-level context.
+- So the register ladder plausibly shapes what the weights keep: a warm-start ladder change is a real experiment, not a no-op.
+Caveats: each age bin is ~2 sigma; fast-register ablation also cripples prediction generally, so "keyed on local context" is partly trivial.

@@ -264,6 +264,10 @@ parser.add_argument('--dec_tree_kernels', default='3,3,3', metavar='K1,K2,...',
                          '--dec_width, the last maps to the embedding width; whatever grid is '
                          'left is average-pooled. sum(k-1) <= S-1')
 parser.add_argument('--dec_width',  default=256,  type=int, help='text decoder tree width')
+parser.add_argument('--bn_frozen', action='store_true',
+                    help='train with BatchNorm in eval mode: its running statistics normalize and '
+                         'are not updated (no batch statistics), as a batch-1 continual learner '
+                         'and the FPGA (BatchNorm folded into the convs) would run')
 parser.add_argument('--bn_momentum', default=0.1, type=float,
                     help='ContextCNN BatchNorm running-statistics momentum (0 = cumulative)')
 parser.add_argument('--init',       default='zero', choices=['zero', 'gaussian', 'relu'],
@@ -436,6 +440,8 @@ parser.add_argument('--doc_log',    default=0,    type=int, metavar='N',
                          'started and ended), for EVALR; every 10th is kept for good in '
                          '--doc_log_file, the rest in memory while under 10K steps old')
 parser.add_argument('--doc_log_len', default=384, type=int, metavar='T')
+parser.add_argument('--doc_keep',   default=10,   type=int, metavar='K',
+                    help='--doc_log: one record in K is kept for good in --doc_log_file (1 = all)')
 parser.add_argument('--doc_log_file', default=None, metavar='PATH',
                     help='--doc_log / --eval_recent: the recorded training documents '
                          '(default <--log>.docs)')
@@ -457,6 +463,10 @@ parser.add_argument('--doc_score',  default=None, metavar='OUT',
                          'held-out documents (cut to --doc_log_len) with this checkpoint, one '
                          'JSON line each to OUT (kind, start / end step, nats per token), exit. '
                          'Two checkpoints\' files, paired by record, give a forgetting curve')
+parser.add_argument('--doc_ablate', default='', metavar='K1,K2,...',
+                    help='--doc_score: registers K (1 = the slowest) read as their mean state over '
+                         'the held-out documents, as in EVALI\'s ablations: is what the weights '
+                         'remember about a document keyed on the slow context?')
 parser.add_argument('--eval_wp',    default=0,    type=int, metavar='N',
                     help='GENW: N fixed WritingPrompts prompts continued at every eval, for reading')
 parser.add_argument('--eval_wp_len', default=256, type=int, metavar='C', help='GENW tokens')
@@ -4613,7 +4623,6 @@ def _hold_eval(step):
 
 
 _RECENT_BANDS = (0, 2000, 10000, 50000, 200000, 1000000)   # EVALR age bands, lower edges
-_DOC_KEEP = 10               # --doc_log: one record in this many goes to the file and stays
 _DOC_BRIEF = 10000           # the others stay in memory while younger than this (steps)
 _doc_records = None          # [(start step, end step, ids, kept)]; --doc_log_file, read once
 
@@ -5163,12 +5172,28 @@ if args.doc_score:
     _held = [q[:args.doc_log_len] for q in (_doc_tokens(d) for d in _eval_docs(_eval_corpus_names()[0]))
              if len(q) >= 2]
     _rows = [(list(q[:-1]), list(q[1:])) for _, _, q, _ in _recs] + [(q[:-1], q[1:]) for q in _held]
+    if args.doc_ablate:
+        # the mean register state over the held-out documents, every position and token
+        _dev = next(model.parameters()).device
+        _sum, _n = 0.0, 0
+        with _EvalState(), torch.no_grad():
+            for _c, _X, _Y, _M in _batches([(q[:-1], q[1:]) for q in _held]):
+                model.dff = None
+                for _t in range(_X.shape[1]):
+                    model(_X[:, _t])
+                    _m = _M[:, _t].bool()
+                    if _m.any():
+                        _sum = _sum + model.dff[_m].double().sum(0, keepdim=True)
+                        _n += int(_m.sum())
+        model._read_mean = (_sum / _n).float().to(_dev)
+        model._ablate = {int(k) - 1 for k in args.doc_ablate.split(',')}
+        print(f'--doc_ablate: registers {args.doc_ablate} read as their mean state', flush=True)
     _ce = _ce_pairs(_rows)
     with open(args.doc_score, 'w') as f:
         for k, c in enumerate(_ce):
             r = dict(kind='train', start=int(_recs[k][0]), end=int(_recs[k][1])) if k < len(_recs) \
                 else dict(kind='heldout', idx=k - len(_recs))
-            r.update(n=len(c), nats=float(c.mean()), step=_start_step)
+            r.update(n=len(c), nats=float(c.mean()), step=_start_step, ablate=args.doc_ablate)
             print(json.dumps(r), file=f)
     print(f'--doc_score: {len(_recs)} training records, {len(_held)} held-out documents at step '
           f'{_start_step} -> {args.doc_score}')
@@ -5211,6 +5236,7 @@ if args.eval:
 # ── optimizer / schedule ──────────────────────────────────────────────────────
 
 _trainable = [p for p in model.parameters() if p.requires_grad]
+_bn_layers = [m for m in model.modules() if isinstance(m, nn.BatchNorm2d)]
 optimizer = torch.optim.SGD(_trainable, lr=args.lr_max, momentum=args.momentum,
                             weight_decay=args.weight_decay)
 if _loaded_ckpt is not None and _loaded_ckpt.get('optimizer'):
@@ -5864,7 +5890,7 @@ def _doc_log_step(i, x_one, flag_list):
         s0, ids = _doc_rec[r]
         if flag_list[r] or len(ids) >= args.doc_log_len:
             del _doc_rec[r]
-            keep = (s0 // args.doc_log) % _DOC_KEEP == 0
+            keep = (s0 // args.doc_log) % args.doc_keep == 0
             recs = _load_doc_records()
             recs.append((s0, i, np.array(ids, dtype=np.int32), keep))
             if not keep:          # drop the brief records that have aged out
@@ -6024,6 +6050,9 @@ try:
         _pt('inputs')
         dff_prev = model.dff
         model.train()
+        if args.bn_frozen:
+            for m in _bn_layers:
+                m.eval()
         if model.streams == 3 and not args.fifo3:   # one-stream (x, y) -> the three streams
             kin, kout = torch.zeros_like(x), torch.zeros_like(x)
             if _VIDEO_ROWS:
@@ -6141,6 +6170,8 @@ try:
         optimizer.zero_grad()
         i += 1
         if args.run_steps is not None and i - _start_step >= args.run_steps:
+            if i % args.checkpoint:      # the last step's weights, unless just saved
+                _save(i, n_examples)
             break
 except KeyboardInterrupt:
     pass
