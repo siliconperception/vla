@@ -9,7 +9,7 @@ M=$1; E=${2:-100000}
 cd /proj/devices/vla
 C=checkpoint/$M.pt
 last=$(stat -c %Y $C 2>/dev/null || echo 0)
-while pgrep -f "vla.py .*--save checkpoint/$M.pt" >/dev/null; do
+while pgrep -f "^python vla.py .*--save checkpoint/$M.pt" >/dev/null; do   # anchored: shells quoting the pattern never match
   sleep 30
   now=$(stat -c %Y $C 2>/dev/null || echo 0)
   [ "$now" -gt "$last" ] || continue
