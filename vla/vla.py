@@ -42,6 +42,7 @@ import signal
 import sys
 import threading
 import time
+_T0 = time.time()           # STARTUP: wall clock from here to the first training step
 import zlib
 
 import numpy as np
@@ -2797,9 +2798,11 @@ def worker(stop, q, datasets):
 hf_datasets = {}
 if not _ONESHOT:
     print('loading datasets...')
+    _t_data = time.time()
     for name in dict.fromkeys(n for n, _ in _MIX):
         if name not in _MEDIA_DATASETS:
             hf_datasets[name] = _load_corpus(name, args.streaming, args.shards)
+    _t_data = time.time() - _t_data
     print('datasets ready')
 
 
@@ -6152,6 +6155,10 @@ try:
                         carr[n].append(_mmean(ce[rt], y[rt] != _SIL))
                     else:
                         carr[n].append(ce[rt].mean())
+        if _T0 is not None:          # once, at the first step
+            _emit(f'STARTUP step {i:10} wall to first step {time.time() - _T0:6.1f}s (of which datasets '
+                  f'{_t_data:6.1f}s)')
+            _T0 = None
         if i % args.monitor == 0:
             flat = model.dff.reshape(-1)
             line = ('STEP {:10} wall {} loss {:12.9f} grad {:12.6f} lr {:10.9f} dff_mean {:12.5f} '
