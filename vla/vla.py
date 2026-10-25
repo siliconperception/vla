@@ -450,6 +450,17 @@ parser.add_argument('--eval_reach_period', default=256, type=int, metavar='P')
 parser.add_argument('--generate',   default=False, action='store_true',
                     help='load, generate --n tokens from <NUL>+--prompt, print, exit')
 parser.add_argument('--n',          default=200,  type=int, help='--generate length')
+parser.add_argument('--free_run',   default=0,    type=int, metavar='N',
+                    help='load, free-run --free_rows streams of N tokens each from one zero '
+                         'state (<NUL>, never reset, every sample fed back), report each '
+                         '--free_window tokens (FREE lines: judge fluency, coherence, rep1, '
+                         '<NUL> share, register RMS), exit')
+parser.add_argument('--free_rows',  default=8,    type=int, metavar='R')
+parser.add_argument('--free_window', default=2000, type=int, metavar='W')
+parser.add_argument('--free_chunk', default=128,  type=int, metavar='C',
+                    help='--free_run: the judge reads C-token chunks, each after the one before')
+parser.add_argument('--free_save',  default=None, metavar='PATH',
+                    help='--free_run: write each stream\'s text to PATH (one section per row)')
 parser.add_argument('--clock_hz',   default=None, type=float, metavar='R',
                     help='video corpora run on a fixed clock: one step per 1/R s tick, the '
                          'target a caption token or <NUL> (0 / unset: one step per caption '
@@ -586,7 +597,7 @@ _continuous = {k.strip() for k in args.continuous.split(',') if k.strip()}   # e
 if _continuous - {'text', 'image', 'video'}:
     raise SystemExit(f'--continuous {args.continuous}: kinds are text, image and video')
 
-_ONESHOT = args.generate or args.eval or args.vis or args.push
+_ONESHOT = args.generate or args.eval or args.vis or args.push or args.free_run
 
 # ── checkpoint ────────────────────────────────────────────────────────────────
 
@@ -4700,6 +4711,104 @@ def _heldout_eval(step):
                       flush=True)
                 _eval_failed[fn.__name__] = True
 
+
+def _free_run():
+    """--free_run: R streams from one zero state, never reset, for N tokens. Every chunk of C
+    words (<NUL> dropped) is judged after the chunk before it: nats, fluency between real
+    held-out text (100%) and its words shuffled (0%) at the same geometry, and coh = nats
+    without the previous chunk minus with it (does it still follow itself?). Per window:
+    those, rep1 / distinct2 of the window's text, the <NUL> share, and each register's RMS
+    (does the state settle, grow or die?)."""
+    global _judge
+    R, N, W, C = args.free_rows, args.free_run, args.free_window, args.free_chunk
+    dev = next(model.parameters()).device
+    if _judge is None:
+        _judge = _Judge(args.eval_gen_judge)
+    rng, real, shuf = random.Random(1234), [], []
+    for d in _eval_docs(_eval_corpus_names()[0]):
+        q = _doc_tokens(d)
+        if len(q) < 1 + 2 * C:
+            continue
+        p, c = _decode_plain(q[1:1 + C]), _decode_plain(q[1 + C:1 + 2 * C])
+        sw = c.split()
+        rng.shuffle(sw)
+        a, b = _judge.cond_nll(p, c), _judge.cond_nll(p, ' ' + ' '.join(sw))
+        if a is not None and b is not None:
+            real.append(a); shuf.append(b)
+    fr, fs = float(np.mean(real)), float(np.mean(shuf))
+    print(f'FREE anchors: {len(real)} held-out chunk pairs, real {fr:.4f} shuffled {fs:.4f} '
+          f'nats/token; {R} streams x {N} tokens, window {W}, chunk {C}', flush=True)
+    model.eval()
+    dff = model.new_state(R, dev)
+    x = torch.full((R,), _NULL, dtype=torch.long, device=dev)
+    toks = [[] for _ in range(R)]           # every sample, <NUL> included
+    words = [[] for _ in range(R)]          # <NUL> dropped
+    done = [0] * R                          # words already judged (whole chunks)
+    prev = [None] * R                       # the last judged chunk's text
+    win = dict(n=[], n0=[], rms=[])
+    t0 = time.time()
+    with torch.no_grad():
+        for t in range(N):
+            dff, o = model.step(x, dff)
+            logits = model.text_dec(o)
+            if not (dff.isfinite().all() and logits.isfinite().all()):
+                print(f'FREE step {t}: NaN/Inf in the state or logits -- stopping', flush=True)
+                break
+            prob = F.softmax(logits.float() / max(args.temperature, 1e-6), dim=-1)
+            b = torch.multinomial(_truncate(prob), 1)[:, 0]
+            x = torch.where(b == _NUL_ID, torch.full_like(b, _PAD), b) if _NUL_ID is not None else b
+            win['rms'].append(torch.stack([r.pow(2).mean(dim=(1, 2, 3)).sqrt()
+                                           for r in dff.chunk(model.K, dim=1)], 1).mean(0).cpu())
+            for r, v in enumerate(b.tolist()):
+                toks[r].append(v)
+                if v != _NUL_ID:
+                    words[r].append(v)
+            for r in range(R):              # judge each finished chunk after the one before
+                while len(words[r]) - done[r] >= C:
+                    txt = _decode_plain(words[r][done[r]:done[r] + C])
+                    done[r] += C
+                    if prev[r] is not None and txt.strip():
+                        n1 = _judge.cond_nll(prev[r], txt)
+                        n0 = _judge.cond_nll(_NO_PROMPT, txt.lstrip())
+                        if n1 is not None and n0 is not None:
+                            win['n'].append(n1); win['n0'].append(n0)
+                    prev[r] = txt
+            if (t + 1) % W == 0 or t + 1 == N:
+                lo = t + 1 - len(win['rms'])
+                reps, d2s, nul = [], [], []
+                for r in range(R):
+                    seg = toks[r][lo:t + 1]
+                    nul.append(sum(v == _NUL_ID for v in seg) / len(seg))
+                    txt = _decode_plain(seg)
+                    if txt.split():
+                        w = txt.split()
+                        bg = list(zip(w, w[1:]))
+                        reps.append(_rep1(txt)); d2s.append(len(set(bg)) / len(bg) if bg else 0.0)
+                rms = torch.stack(win['rms']).mean(0).tolist()
+                if win['n']:
+                    g = float(np.mean(win['n']))
+                    flu = 100.0 * (fs - g) / (fs - fr) if fs > fr else float('nan')
+                    coh = float(np.mean(np.array(win['n0']) - np.array(win['n'])))
+                    js = f'chunks {len(win["n"]):4d} nats {g:.4f} fluency {flu:5.1f}% coh {coh:+.4f}'
+                else:
+                    js = 'chunks    0' + ' ' * 37
+                print(f'FREE tokens {lo:8d}-{t + 1:<8d} {js} rep1 '
+                      f'{np.mean(reps) if reps else float("nan"):.3f} distinct2 '
+                      f'{np.mean(d2s) if d2s else float("nan"):.3f} nul {100 * np.mean(nul):4.1f}% '
+                      f'rms {"/".join(f"{v:.4f}" for v in rms)} wall {time.time() - t0:.0f}s',
+                      flush=True)
+                win = dict(n=[], n0=[], rms=[])
+    if args.free_save:
+        with open(args.free_save, 'w') as f:
+            for r in range(R):
+                print(f'===== stream {r} ({len(toks[r])} tokens) =====\n{_decode_plain(toks[r])}\n',
+                      file=f)
+        print(f'FREE: text saved to {args.free_save}')
+
+
+if args.free_run:
+    _free_run()
+    raise SystemExit(0)
 
 if args.eval:
     if args.load is None and args.pretrained is None:
