@@ -421,7 +421,8 @@ parser.add_argument('--eval_cloze', default=0,    type=int, metavar='N',
                     help='EVALC on N Story Cloze stories (xstory_cloze en): share where the '
                          'right ending costs fewer nats than the wrong one after the 4-sentence story')
 parser.add_argument('--eval_pairs', default=0,    type=int, metavar='N',
-                    help='EVALM: minimal pairs, each sentence read from a zero state; share '
+                    help='EVALM (every --eval_rare-th eval): minimal pairs, each sentence read '
+                         'from a zero state; share '
                          'where the acceptable one costs fewer nats. Up to N pairs from each of '
                          'BLiMP (grammar, spread over its 67 paradigms) and ComVE (which '
                          'statement makes sense). Winogrande was tried and dropped: it sits at '
@@ -4854,7 +4855,7 @@ def _heldout_eval(step):
                 except Exception as e:
                     print(f'WARNING: {fn.__name__} failed at step {step} on "{corpus}": {e!r}',
                           flush=True)
-    for fn, on in ((_cloze_eval, args.eval_cloze), (_pairs_eval, args.eval_pairs),  # corpus-free
+    for fn, on in ((_cloze_eval, args.eval_cloze), (_pairs_eval, args.eval_pairs and rare),  # corpus-free
                    (_hold_eval, args.eval_hold), (_free_eval, args.eval_free and rare),
                    (_wp_samples, args.eval_wp)):
         if on and not _eval_failed.get(fn.__name__):
