@@ -1,5 +1,5 @@
 #!/bin/bash
-# queue3.sh (rev 2: v469/v470 with GEN lines every 2000 steps, user 2026-10-25; min_p stays fixed, no --fluency_target): replaces queue2.sh (user, 2026-10-25: "go ahead with that rule, make it automatic"). After v468: v471, v469, v470
+# queue3.sh (rev 3: v469/v470 with GEN lines every 2000 steps and one held-out eval at the first step so GENSCORE has fluency anchors, user 2026-10-25; min_p stays fixed, no --fluency_target): replaces queue2.sh (user, 2026-10-25: "go ahead with that rule, make it automatic"). After v468: v471, v469, v470
 # as before; each 3c run is scored (forgetting curve) and evaluated (eval.sh: EVAL, EVALH, EVALL, EVALM) in the background;
 # then select.py applies the rule, and the main run continues as v472 from the winner's checkpoint with its ladder,
 # WITHOUT --weight_ema (v462 is not resumed), plus its snapshot watcher. If selection fails: the control (v468, 64,16,4,1).
@@ -32,7 +32,7 @@ N=250000
 for x in v469_tau128_250K:128,32,8,2 v470_tau32_250K:32,8,2,0.5; do
   M=${x%%:*}; T=${x#*:}
   echo "$(date '+%F %T') start $M ctx_tau $T steps $N"
-  bash exp/run.sh $M $N "${BASE[@]}" --ctx_tau $T --run_steps $N --gen_interval 2000
+  bash exp/run.sh $M $N "${BASE[@]}" --ctx_tau $T --run_steps $N --gen_interval 2000 --eval_interval 1000000000 --eval_at_start
   echo "$(date '+%F %T') done $M: $(grep -c '^STEP' log/exp.$M) STEP lines, $(wc -l < log/exp.$M.docs) records; scoring + evaluating"
   post $M $T &
 done
