@@ -467,6 +467,26 @@ parser.add_argument('--free_chunk', default=128,  type=int, metavar='C',
                     help='--free_run: the judge reads C-token chunks, each after the one before')
 parser.add_argument('--free_save',  default=None, metavar='PATH',
                     help='--free_run: write each stream\'s text to PATH (one section per row)')
+parser.add_argument('--prompt_tune', default=0,   type=int, metavar='I',
+                    help='load, then for the EVALG prompts compare ways of starting a '
+                         'continuation (TUNE lines): cold (zero state, read the prompt), warm '
+                         '(free-run --prompt_warm tokens first), and tuned (the initial '
+                         'registers optimized for I Adam steps, by BPTT through the prompt, so '
+                         'the model predicts it; weights frozen); each scored by its own nats '
+                         'on the real continuation and by the judge (EVALG fluency / delta), exit. '
+                         'With --generate: tune the start state on --prompt (one per '
+                         '--prompt_tune_cap), print each continuation and the cold one, same seed')
+parser.add_argument('--prompt_tune_lr', default=0.01, type=float, metavar='LR')
+parser.add_argument('--prompt_tune_cap', default='1', metavar='C1,C2,...',
+                    help='--prompt_tune: one tuned variant per value: each register\'s RMS is '
+                         'held to at most C x its natural level (its mean RMS after reading the '
+                         'prompts cold); 0 = no cap')
+parser.add_argument('--prompt_tune_batch', default=10, type=int, metavar='B',
+                    help='--prompt_tune: prompts tuned together (BPTT memory is about B x the '
+                         'prompt length)')
+parser.add_argument('--prompt_warm', default=256, type=int, metavar='K')
+parser.add_argument('--prompt_tune_save', default=None, metavar='PATH',
+                    help='--prompt_tune: write every prompt and each method\'s continuation')
 parser.add_argument('--clock_hz',   default=None, type=float, metavar='R',
                     help='video corpora run on a fixed clock: one step per 1/R s tick, the '
                          'target a caption token or <NUL> (0 / unset: one step per caption '
@@ -603,7 +623,7 @@ _continuous = {k.strip() for k in args.continuous.split(',') if k.strip()}   # e
 if _continuous - {'text', 'image', 'video'}:
     raise SystemExit(f'--continuous {args.continuous}: kinds are text, image and video')
 
-_ONESHOT = args.generate or args.eval or args.vis or args.push or args.free_run
+_ONESHOT = args.generate or args.eval or args.vis or args.push or args.free_run or args.prompt_tune
 
 # ── checkpoint ────────────────────────────────────────────────────────────────
 
@@ -1873,13 +1893,13 @@ class VLAModel(nn.Module, _HubMixin):
 
     @torch.no_grad()
     def generate(self, prompt_ids, n_tokens, temperature=1.0, image=None, video=None,
-                 stop_chars=None):
+                 stop_chars=None, h0=None):
         """Sample n_tokens after prompt_ids (opened with _NULL, see _prompt_ids) on a private
         state; short only on NaN/Inf. image: uint8 [3, h, w], seen through a fresh random
         224x224 crop every token (as in training); None = text-only. video: a _VideoClip,
         played at its own token rate (see _VideoClip.at); its frames and/or sound may be
         None (blind / deaf). stop_chars: stop early once the text (<NUL> dropped) is that
-        many characters long."""
+        many characters long. h0: the starting registers [1, ...] (None = zero)."""
         self.eval()
         dev = next(self.parameters()).device
         bank = _bank([image], dev) if image is not None else None
@@ -1898,7 +1918,7 @@ class VLAModel(nn.Module, _HubMixin):
                 return None, None
             return logits, new
 
-        out, dff, logits = [], self.new_state(1, dev), None
+        out, dff, logits = [], self.new_state(1, dev) if h0 is None else h0, None
         for b in prompt_ids:
             logits, dff = feed(b, dff)
             if logits is None:
@@ -2966,6 +2986,43 @@ def _prompt_ids(text=''):
     return [_NULL] + (_tokenizer.encode(text) if text else [])
 
 
+def _reg_rms(h):
+    """Each register's RMS per row: [b, n_hidden * K, S, S] -> [b, K]."""
+    return torch.stack([r.pow(2).mean(dim=(1, 2, 3)).sqrt() for r in h.chunk(model.K, dim=1)], 1)
+
+
+def _tune_state(P, iters, cap, nat):
+    """--prompt_tune: the initial registers h0 [b, ...] optimized by Adam (--prompt_tune_lr),
+    BPTT through the prompt ids P [b, T] with the weights frozen, so the model predicts P
+    from h0. cap > 0 holds each register's RMS to at most cap x nat [K] (its natural level)
+    after every step. -> (h0, 'iter:nats ...' at log points)."""
+    dev = P.device
+    h0 = torch.zeros_like(model.new_state(P.shape[0], dev), requires_grad=True)
+    opt = torch.optim.Adam([h0], lr=args.prompt_tune_lr)
+    log = []
+    for it in range(iters + 1):
+        h, loss = h0, 0.0
+        for t in range(P.shape[1] - 1):
+            h, o = model.step(P[:, t], h)
+            loss = loss + F.cross_entropy(model.text_dec(o).float(), P[:, t + 1])
+        loss = loss / (P.shape[1] - 1)
+        if it in (0, 10, 25, 50, 100, 200, 400) or it == iters:
+            log.append(f'{it}:{float(loss.detach()):.3f}')
+        if it == iters:
+            break
+        opt.zero_grad()
+        loss.backward()
+        opt.step()
+        if cap:
+            with torch.no_grad():
+                f = (cap * nat / _reg_rms(h0).clamp(min=1e-8)).clamp(max=1.0)
+                h0.mul_(f.repeat_interleave(model.n_hidden, 1)[:, :, None, None])
+    h0 = h0.detach()
+    if dev.type == 'cuda':
+        torch.cuda.empty_cache()             # BPTT's peak, returned to a GPU shared with a trainer
+    return h0, ' '.join(log)
+
+
 def _rep1(text):
     """Share of the text taken by its most common word or non-space character (the larger):
     a high fluency score next to a high rep1 is a collapsed model, not a fluent one."""
@@ -3457,8 +3514,34 @@ if args.generate:
     if args.load is None and args.pretrained is None:
         print('WARNING: --generate without --load/--pretrained is running an untrained model')
     prompt = _prompt_ids(args.prompt)
-    print(_render(prompt + model.generate(prompt, args.n, temperature=args.temperature,
-                                          image=_image)))
+    if not args.prompt_tune:
+        print(_render(prompt + model.generate(prompt, args.n, temperature=args.temperature,
+                                              image=_image)))
+        raise SystemExit(0)
+    # --prompt_tune: the start state tuned on --prompt (as in --prompt_tune's TUNE), then the
+    # prompt read from it; the cold continuation (zero state) with the same seed, to compare
+    if len(prompt) < 3:
+        raise SystemExit('--generate --prompt_tune needs a --prompt of at least two tokens')
+    dev = next(model.parameters()).device
+    model.eval()
+    for q in model.parameters():
+        q.requires_grad_(False)
+    P = torch.tensor([prompt], device=dev)
+    with torch.no_grad():
+        h = model.new_state(1, dev)
+        for t in prompt:
+            h, _ = model.step(torch.tensor([t], device=dev), h)
+    nat = _reg_rms(h)[0]
+    seed = random.randrange(2 ** 31)
+    for cap in [None] + [float(c) for c in args.prompt_tune_cap.split(',')]:
+        if cap is None:
+            h0, tag = None, 'cold'
+        else:
+            h0, log = _tune_state(P, args.prompt_tune, cap, nat)
+            tag = f'tuned cap {cap:g}, prompt nats by iter {log}'
+        torch.manual_seed(seed)
+        out = model.generate(prompt, args.n, temperature=args.temperature, image=_image, h0=h0)
+        print(f'===== {tag} =====\n{_render(prompt)} ‖ {_render(out)}\n', flush=True)
     raise SystemExit(0)
 
 if args.vis:
@@ -4394,21 +4477,13 @@ class _Judge:
 
 
 _judge = None
-_gen_anchor = {}             # corpus -> [(prompt ids, prompt text, real nats, shuffled nats,
-                             #             real nats without the prompt)]
+_gen_anchor = {}             # corpus -> _gen_prompts' list
 _NO_PROMPT = '\n'            # the judge's "no prompt": a bare document start
 
 
-def _gen_eval(step, corpus, docs):
-    """EVALG: continue held-out prompts; the judge scores the continuation given the prompt,
-    against the document's real continuation (floor) and its words shuffled (ceiling).
-    delta: the judge's nats on the continuation without the prompt minus with it -- how much
-    the prompt explains the continuation, i.e. how on-topic it stayed (real_delta: the same for
-    the document's own continuation)."""
-    global _judge
-    t0 = time.time()
-    if _judge is None:
-        _judge = _Judge(args.eval_gen_judge)
+def _gen_prompts(corpus, docs):
+    """EVALG's fixed prompts for a corpus, built once: (prompt ids, prompt text, the judge's
+    nats on the real continuation, on it shuffled, on it without the prompt, its ids)."""
     P, C = args.eval_gen_prompt, args.eval_gen_len
     if corpus not in _gen_anchor:
         rng, items = random.Random(1234), []
@@ -4422,14 +4497,28 @@ def _gen_eval(step, corpus, docs):
             a, b = _judge.cond_nll(ptxt, real), _judge.cond_nll(ptxt, ' ' + ' '.join(sw))
             u = _judge.cond_nll(_NO_PROMPT, real.lstrip())
             if a is not None and b is not None and u is not None:
-                items.append((q[:1 + P], ptxt, a, b, u))
+                items.append((q[:1 + P], ptxt, a, b, u, q[1 + P:1 + P + C]))
             if len(items) >= args.eval_gen:
                 break
         _gen_anchor[corpus] = items
+    return _gen_anchor[corpus]
+
+
+def _gen_eval(step, corpus, docs):
+    """EVALG: continue held-out prompts; the judge scores the continuation given the prompt,
+    against the document's real continuation (floor) and its words shuffled (ceiling).
+    delta: the judge's nats on the continuation without the prompt minus with it -- how much
+    the prompt explains the continuation, i.e. how on-topic it stayed (real_delta: the same for
+    the document's own continuation)."""
+    global _judge
+    t0 = time.time()
+    if _judge is None:
+        _judge = _Judge(args.eval_gen_judge)
+    C = args.eval_gen_len
     g_n, r_n, s_n, gd, rd, reps, d2s = [], [], [], [], [], [], []
     dev = next(model.parameters()).device
     with _EvalState(), torch.random.fork_rng(devices=[dev] if dev.type == 'cuda' else []):
-        for prompt, ptxt, a, b, u in _gen_anchor[corpus]:
+        for prompt, ptxt, a, b, u, _ in _gen_prompts(corpus, docs):
             out = model.generate(prompt, C, temperature=args.temperature)
             ctxt = _decode_plain(out)
             n = _judge.cond_nll(ptxt, ctxt) if ctxt.strip() else None
@@ -4868,8 +4957,140 @@ def _free_run():
         print(f'FREE: text saved to {args.free_save}')
 
 
+def _prompt_tune():
+    """--prompt_tune: the EVALG prompts, continued from four kinds of start, all scored alike.
+      none   zero state, no prompt (what the continuation costs the model unprompted)
+      cold   zero state, read the prompt (EVALG)
+      warm   free-run --prompt_warm tokens from zero, then read the prompt
+      tune   the initial registers h0 optimized by Adam, BPTT through the prompt, so the model
+             predicts the prompt from h0 (weights frozen); then read the prompt from h0. One
+             variant per --prompt_tune_cap: each register's RMS held to at most cap x its level
+             after reading the prompts cold (0 = no cap)
+    Per method: pnll, the model's nats/token on the prompt; cont, on the real continuation
+    after it (teacher-forced); then a sampled continuation judged as in EVALG (fluency, delta =
+    the judge's nats without the prompt minus with it) and its rep1. rms: the start state's
+    per-register RMS."""
+    global _judge
+    dev = next(model.parameters()).device
+    if _judge is None:
+        _judge = _Judge(args.eval_gen_judge)
+    corpus = _eval_corpus_names()[0]
+    items = _gen_prompts(corpus, _eval_docs(corpus))
+    C, B = args.eval_gen_len, args.prompt_tune_batch
+    caps = [float(c) for c in args.prompt_tune_cap.split(',')]
+    model.eval()
+    for q in model.parameters():
+        q.requires_grad_(False)
+
+    def run(h, ids):
+        """Teacher-force ids [b, T] from state h: (nats [b, T-1], end state, last logits)."""
+        ce = []
+        for t in range(ids.shape[1]):
+            h, o = model.step(ids[:, t], h)
+            logits = model.text_dec(o).float()
+            if t + 1 < ids.shape[1]:
+                ce.append(F.cross_entropy(logits, ids[:, t + 1], reduction='none'))
+        return (torch.stack(ce, 1) if ce else None), h, logits
+
+    def sample(h, logits, n):
+        out = []
+        for _ in range(n):
+            prob = F.softmax(logits / max(args.temperature, 1e-6), dim=-1)
+            b = torch.multinomial(_truncate(prob), 1)[:, 0]
+            out.append(b)
+            x = torch.where(b == _NUL_ID, torch.full_like(b, _PAD), b) if _NUL_ID is not None else b
+            h, o = model.step(x, h)
+            logits = model.text_dec(o).float()
+        return torch.stack(out, 1).tolist(), h
+
+    methods = ['none', 'cold', f'warm{args.prompt_warm}'] + \
+        [f'tune{args.prompt_tune}_cap{c:g}' for c in caps]
+    res = {m: dict(pnll=[], cont=[], gen=[], rms=[]) for m in methods}
+    nat = None
+    t0 = time.time()
+    for c0 in range(0, len(items), B):
+        chunk = items[c0:c0 + B]
+        b = len(chunk)
+        P = torch.tensor([it[0] for it in chunk], device=dev)                 # [b, 1+P]
+        R = torch.tensor([it[5] for it in chunk], device=dev)                 # [b, C]
+        zero = model.new_state(b, dev)
+
+        def score(m, h0, read_prompt=True):
+            with torch.no_grad():
+                if read_prompt:
+                    ce, h, lg = run(h0, torch.cat([P, R], 1))
+                    res[m]['pnll'] += ce[:, :P.shape[1] - 1].mean(1).tolist()
+                    res[m]['cont'] += ce[:, P.shape[1] - 1:].mean(1).tolist()
+                    _, h, lg = run(h0, P)
+                else:
+                    ce, _, _ = run(h0, torch.cat([P[:, :1], R], 1))
+                    res[m]['cont'] += ce.mean(1).tolist()
+                    _, h, lg = run(h0, P[:, :1])
+                res[m]['rms'].append(_reg_rms(h0).cpu())
+                with torch.random.fork_rng(devices=[dev] if dev.type == 'cuda' else []):
+                    torch.manual_seed(1234 + c0)
+                    res[m]['gen'] += sample(h, lg, C)[0]
+            return h
+
+        score('none', zero, read_prompt=False)
+        h_cold = score('cold', zero)
+        nat_c = _reg_rms(h_cold).mean(0)
+        nat = nat_c if nat is None else nat + nat_c
+        with torch.no_grad(), torch.random.fork_rng(devices=[dev] if dev.type == 'cuda' else []):
+            torch.manual_seed(4321 + c0)
+            h = zero
+            x = torch.full((b,), _NULL, dtype=torch.long, device=dev)
+            lg = None
+            for _ in range(args.prompt_warm):
+                h, o = model.step(x, h)
+                lg = model.text_dec(o).float()
+                s_ = torch.multinomial(_truncate(F.softmax(lg / max(args.temperature, 1e-6), -1)), 1)[:, 0]
+                x = torch.where(s_ == _NUL_ID, torch.full_like(s_, _PAD), s_) if _NUL_ID is not None else s_
+        score(methods[2], h)
+        for cap, m in zip(caps, methods[3:]):
+            h0, log = _tune_state(P, args.prompt_tune, cap, nat_c)
+            print(f'TUNE prompts {c0}-{c0 + b - 1} {m} prompt nats by iter {log} '
+                  f'wall {time.time() - t0:.0f}s', flush=True)
+            score(m, h0)
+    nat = (nat / -(-len(items) // B)).tolist()
+    texts = {}
+    for m in methods:
+        g_n, gd, reps = [], [], []
+        texts[m] = []
+        for (prompt, ptxt, a, b_, u, _), out in zip(items, res[m]['gen']):
+            ctxt = _decode_plain(out)
+            texts[m].append(ctxt)
+            n = _judge.cond_nll(ptxt, ctxt) if ctxt.strip() else None
+            n0 = _judge.cond_nll(_NO_PROMPT, ctxt.lstrip()) if n is not None else None
+            if n0 is None:
+                continue
+            g_n.append(n); gd.append(n0 - n); reps.append(_rep1(ctxt))
+        r_, s_ = np.mean([it[2] for it in items]), np.mean([it[3] for it in items])
+        g = float(np.mean(g_n))
+        rr = torch.cat(res[m]['rms']).mean(0).tolist()
+        pn = f'{np.mean(res[m]["pnll"]):.4f}' if res[m]['pnll'] else '     -'
+        print(f'TUNE {m:16} prompts {len(g_n)} pnll {pn} cont {np.mean(res[m]["cont"]):.4f} | '
+              f'judge {g:.4f} fluency {100.0 * (s_ - g) / (s_ - r_):5.1f}% delta {np.mean(gd):+.4f} '
+              f'rep1 {np.mean(reps):.3f} | rms {"/".join(f"{v:.4f}" for v in rr)}', flush=True)
+    print(f'TUNE natural register RMS after a cold prompt: {"/".join(f"{v:.4f}" for v in nat)}; '
+          f'real-continuation delta {np.mean([it[4] - it[2] for it in items]):+.4f}; '
+          f'wall {time.time() - t0:.0f}s', flush=True)
+    if args.prompt_tune_save:
+        with open(args.prompt_tune_save, 'w') as f:
+            for k, it in enumerate(items):
+                print(f'===== prompt {k} =====\n{it[1]}\n----- real -----\n{_decode_plain(it[5])}', file=f)
+                for m in methods:
+                    print(f'----- {m} -----\n{texts[m][k]}', file=f)
+                print(file=f)
+        print(f'TUNE: texts saved to {args.prompt_tune_save}')
+
+
 if args.free_run:
     _free_run()
+    raise SystemExit(0)
+
+if args.prompt_tune:
+    _prompt_tune()
     raise SystemExit(0)
 
 if args.eval:
