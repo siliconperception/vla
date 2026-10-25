@@ -54,3 +54,26 @@ EVALR gain vs held-out (nats/token), mean over 14 evals: 0–2K steps since read
 ## Future goal (user, 2026-10-24): continuous running and continuous learning
 
 The application is embodied AI. The VLA runs continuously, with no state reset between "examples", and eventually it learns continuously while deployed. Training today is episodic (the state resets at every example's `<NUL>`), so that gap needs closing. Constraints already known: the registers are leaky averages with bounded memory (slowest window 64 s), and the 1-token gradient horizon makes on-chip learning cheap (no BPTT memory). EVALR shows an SGD imprint lasts about 2K steps, so on-line learning will need replay and slow (consolidated) weights.
+
+## Follow-up (2026-10-24): the user's three points, and the revised order
+
+**1. Parameter efficiency: plausible, so measure it.** The ~2 bits per parameter figure comes from transformers. Nothing measures it for a recurrent CNN, so whether ours does better is open.
+- **Against:** storing *distinct* facts needs distinct free parameters. Weight sharing reuses each weight at 49 positions and every step, which multiplies compute, not storage.
+- **For:** common sense is mostly *rules*, not facts ("cups hold liquid", "people answer questions"). Shared weights applied everywhere are a strong bias toward learning rules. That's where the CNN could beat a transformer on what a parameter is worth.
+
+**Test:** a synthetic-biography capacity test. N made-up people with a few attributes each, in a fixed template. Train until the loss stops falling, then count the bits stored from teacher-forced loss on the attribute tokens. Training and test text share one format, so it's in-distribution and needs no prompting. It's the quantitative version of the v280 memorization test, small enough to run on the GPU between long runs.
+
+**2. EVALK needs prompting: agreed, with a way around it.** Likelihood probes like PIQA or HellaSwag score answers *given a context*, which is the same weakness (EVALC sits at 54–57%). They'd stay near chance. Two measurements work in the model's native regime instead:
+- **Minimal pairs from a zero state.** Score two short complete sentences, each read from scratch, and check that the sensible one gets the lower loss: "She poured the milk into the glass" vs "She poured the glass into the milk". The only context is the sentence's own 10–20 tokens, and EVALX shows the model does use context at that range (+0.6 nats at 8–15 tokens). Sources: BLiMP for grammar, and existing "which sentence makes sense" common-sense pair sets (both small downloads).
+- **Judging free-run output for common sense.** An instruct LM (Qwen2.5-3B-Instruct fits next to the trainer) reads GEN/EVALH samples and counts world-model violations: impossible physics, wrong social causality, contradictions. That measures what the model "believes" when it thinks on its own.
+
+**3. Episodic training vs a continuously running VLA.** This is the biggest train/deploy gap.
+- **Long free-run stability:** EVALH only runs 256 tokens; a deployed model runs for hours. Generate 10K–100K tokens with no reset, and track fluency, `rep1` and topic drift over time. The registers are leaky averages with a 64 s horizon, so it *should* stay stable. Nothing has tested that on text.
+- **Continuous text training:** `--continuous` carries the state across document boundaries instead of resetting, so the model learns to "move on" mid-stream. The cost is that a document's start is no longer a clean slate, which could hurt the zero-init free-running that works now. The long free-run eval measures exactly that.
+- **Continuous learning later:** the 1-token gradient horizon is an asset. On-device learning needs only one step of backprop per token and no memory of past states, so an FPGA can do it. EVALR says it also needs fast/slow weights (learn online in a small fast set, consolidate slowly) plus replay. That fits a three-level memory: registers for seconds, fast weights for minutes to hours, slow weights for general knowledge.
+
+**Revised order:**
+1. Long free-run stability eval, offline on a v459 checkpoint, as a standalone option like `--generate`.
+2. Minimal pairs and free-run common-sense judging, as the common-sense scoreboard.
+3. Capacity test (synthetic biographies).
+4. The question/answer pilot (section 3 above).
