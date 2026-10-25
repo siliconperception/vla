@@ -1,3 +1,5 @@
 2026-10-25 12:09:09 batch ladder trainer 545342 gone; scoring v467 in the background
 2026-10-25 12:09:09 start v468_tau64_250K ctx_tau 64,16,4,1 steps 250000
 2026-10-25 13:12:50 queue.sh stopped by hand; queue2.sh takes over after v468 (v471 next, then v469, v470, v462)
+2026-10-25 13:24:27 queue2.sh stopped by hand; queue3.sh takes over (adds selection evals; v472 auto-launch per the user's rule, no weight EMA)
+2026-10-25 13:33:06 queue3.sh restarted (rev 2: GEN lines in v469/v470)
