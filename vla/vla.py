@@ -461,6 +461,9 @@ parser.add_argument('--free_run',   default=0,    type=int, metavar='N',
                          'state (<NUL>, never reset, every sample fed back), report each '
                          '--free_window tokens (FREE lines: judge fluency, coherence, rep1, '
                          '<NUL> share, register RMS), exit')
+parser.add_argument('--eval_free',  default=0,    type=int, metavar='N',
+                    help='EVALL: --free_run in short at every --eval_rare-th eval: --free_rows '
+                         'streams of N tokens, never reset; fluency per --free_window, drift')
 parser.add_argument('--free_rows',  default=8,    type=int, metavar='R')
 parser.add_argument('--free_window', default=2000, type=int, metavar='W')
 parser.add_argument('--free_chunk', default=128,  type=int, metavar='C',
@@ -4852,7 +4855,7 @@ def _heldout_eval(step):
                     print(f'WARNING: {fn.__name__} failed at step {step} on "{corpus}": {e!r}',
                           flush=True)
     for fn, on in ((_cloze_eval, args.eval_cloze), (_pairs_eval, args.eval_pairs),  # corpus-free
-                   (_hold_eval, args.eval_hold),
+                   (_hold_eval, args.eval_hold), (_free_eval, args.eval_free and rare),
                    (_wp_samples, args.eval_wp)):
         if on and not _eval_failed.get(fn.__name__):
             try:
@@ -4863,32 +4866,40 @@ def _heldout_eval(step):
                 _eval_failed[fn.__name__] = True
 
 
-def _free_run():
-    """--free_run: R streams from one zero state, never reset, for N tokens. Every chunk of C
-    words (<NUL> dropped) is judged after the chunk before it: nats, fluency between real
-    held-out text (100%) and its words shuffled (0%) at the same geometry, and coh = nats
-    without the previous chunk minus with it (does it still follow itself?). Per window:
-    those, rep1 / distinct2 of the window's text, the <NUL> share, and each register's RMS
-    (does the state settle, grow or die?)."""
+_free_anchor = []            # [real nats, shuffled nats, pairs] on held-out chunk pairs, built once
+
+
+def _free_anchors(C):
+    """--free_run / EVALL fluency anchors: the judge's nats on a held-out chunk of C tokens
+    after the chunk before it (real, 100%), and on it with its words shuffled (0%)."""
     global _judge
-    R, N, W, C = args.free_rows, args.free_run, args.free_window, args.free_chunk
-    dev = next(model.parameters()).device
     if _judge is None:
         _judge = _Judge(args.eval_gen_judge)
-    rng, real, shuf = random.Random(1234), [], []
-    for d in _eval_docs(_eval_corpus_names()[0]):
-        q = _doc_tokens(d)
-        if len(q) < 1 + 2 * C:
-            continue
-        p, c = _decode_plain(q[1:1 + C]), _decode_plain(q[1 + C:1 + 2 * C])
-        sw = c.split()
-        rng.shuffle(sw)
-        a, b = _judge.cond_nll(p, c), _judge.cond_nll(p, ' ' + ' '.join(sw))
-        if a is not None and b is not None:
-            real.append(a); shuf.append(b)
-    fr, fs = float(np.mean(real)), float(np.mean(shuf))
-    print(f'FREE anchors: {len(real)} held-out chunk pairs, real {fr:.4f} shuffled {fs:.4f} '
-          f'nats/token; {R} streams x {N} tokens, window {W}, chunk {C}', flush=True)
+    if not _free_anchor:
+        rng, real, shuf = random.Random(1234), [], []
+        for d in _eval_docs(_eval_corpus_names()[0]):
+            q = _doc_tokens(d)
+            if len(q) < 1 + 2 * C:
+                continue
+            p, c = _decode_plain(q[1:1 + C]), _decode_plain(q[1 + C:1 + 2 * C])
+            sw = c.split()
+            rng.shuffle(sw)
+            a, b = _judge.cond_nll(p, c), _judge.cond_nll(p, ' ' + ' '.join(sw))
+            if a is not None and b is not None:
+                real.append(a); shuf.append(b)
+        _free_anchor[:] = [float(np.mean(real)), float(np.mean(shuf)), len(real)]
+    return _free_anchor
+
+
+def _free_streams(R, N, W, C):
+    """R streams from one zero state, never reset, for N tokens. Every chunk of C words
+    (<NUL> dropped) is judged after the chunk before it: nats, fluency between _free_anchors'
+    real (100%) and shuffled (0%), and coh = nats without the previous chunk minus with it
+    (does it still follow itself?). -> (one dict per W-token window: those, rep1 / distinct2
+    of the window's text, the <NUL> share, each register's RMS (does the state settle, grow
+    or die?); each stream's tokens, <NUL> included)."""
+    fr, fs, _ = _free_anchors(C)
+    dev = next(model.parameters()).device
     model.eval()
     dff = model.new_state(R, dev)
     x = torch.full((R,), _NULL, dtype=torch.long, device=dev)
@@ -4896,8 +4907,7 @@ def _free_run():
     words = [[] for _ in range(R)]          # <NUL> dropped
     done = [0] * R                          # words already judged (whole chunks)
     prev = [None] * R                       # the last judged chunk's text
-    win = dict(n=[], n0=[], rms=[])
-    t0 = time.time()
+    win, out = dict(n=[], n0=[], rms=[]), []
     with torch.no_grad():
         for t in range(N):
             dff, o = model.step(x, dff)
@@ -4908,8 +4918,7 @@ def _free_run():
             prob = F.softmax(logits.float() / max(args.temperature, 1e-6), dim=-1)
             b = torch.multinomial(_truncate(prob), 1)[:, 0]
             x = torch.where(b == _NUL_ID, torch.full_like(b, _PAD), b) if _NUL_ID is not None else b
-            win['rms'].append(torch.stack([r.pow(2).mean(dim=(1, 2, 3)).sqrt()
-                                           for r in dff.chunk(model.K, dim=1)], 1).mean(0).cpu())
+            win['rms'].append(_reg_rms(dff).mean(0).cpu())
             for r, v in enumerate(b.tolist()):
                 toks[r].append(v)
                 if v != _NUL_ID:
@@ -4935,26 +4944,64 @@ def _free_run():
                         w = txt.split()
                         bg = list(zip(w, w[1:]))
                         reps.append(_rep1(txt)); d2s.append(len(set(bg)) / len(bg) if bg else 0.0)
-                rms = torch.stack(win['rms']).mean(0).tolist()
-                if win['n']:
-                    g = float(np.mean(win['n']))
-                    flu = 100.0 * (fs - g) / (fs - fr) if fs > fr else float('nan')
-                    coh = float(np.mean(np.array(win['n0']) - np.array(win['n'])))
-                    js = f'chunks {len(win["n"]):4d} nats {g:.4f} fluency {flu:5.1f}% coh {coh:+.4f}'
-                else:
-                    js = 'chunks    0' + ' ' * 37
-                print(f'FREE tokens {lo:8d}-{t + 1:<8d} {js} rep1 '
-                      f'{np.mean(reps) if reps else float("nan"):.3f} distinct2 '
-                      f'{np.mean(d2s) if d2s else float("nan"):.3f} nul {100 * np.mean(nul):4.1f}% '
-                      f'rms {"/".join(f"{v:.4f}" for v in rms)} wall {time.time() - t0:.0f}s',
-                      flush=True)
+                g = float(np.mean(win['n'])) if win['n'] else float('nan')
+                out.append(dict(lo=lo, hi=t + 1, chunks=len(win['n']), nats=g,
+                                fluency=100.0 * (fs - g) / (fs - fr) if fs > fr else float('nan'),
+                                coh=float(np.mean(np.array(win['n0']) - np.array(win['n'])))
+                                if win['n'] else float('nan'),
+                                rep1=float(np.mean(reps)) if reps else float('nan'),
+                                distinct2=float(np.mean(d2s)) if d2s else float('nan'),
+                                nul=100.0 * float(np.mean(nul)),
+                                rms=torch.stack(win['rms']).mean(0).tolist()))
                 win = dict(n=[], n0=[], rms=[])
-    if args.free_save:
+                yield out[-1], toks
+
+
+def _free_run():
+    """--free_run: _free_streams over --free_rows streams of N tokens, a FREE line per window."""
+    R, N, W, C = args.free_rows, args.free_run, args.free_window, args.free_chunk
+    fr, fs, na = _free_anchors(C)
+    print(f'FREE anchors: {na} held-out chunk pairs, real {fr:.4f} shuffled {fs:.4f} '
+          f'nats/token; {R} streams x {N} tokens, window {W}, chunk {C}', flush=True)
+    t0, toks = time.time(), None
+    for w, toks in _free_streams(R, N, W, C):
+        js = (f'chunks {w["chunks"]:4d} nats {w["nats"]:.4f} fluency {w["fluency"]:5.1f}% '
+              f'coh {w["coh"]:+.4f}') if w['chunks'] else 'chunks    0' + ' ' * 37
+        print(f'FREE tokens {w["lo"]:8d}-{w["hi"]:<8d} {js} rep1 {w["rep1"]:.3f} distinct2 '
+              f'{w["distinct2"]:.3f} nul {w["nul"]:4.1f}% rms '
+              f'{"/".join(f"{v:.4f}" for v in w["rms"])} wall {time.time() - t0:.0f}s', flush=True)
+    if args.free_save and toks:
         with open(args.free_save, 'w') as f:
             for r in range(R):
                 print(f'===== stream {r} ({len(toks[r])} tokens) =====\n{_decode_plain(toks[r])}\n',
                       file=f)
         print(f'FREE: text saved to {args.free_save}')
+
+
+def _free_eval(step):
+    """EVALL: --free_run in short, during training: --free_rows streams of --eval_free tokens
+    from one zero state, never reset (the same seed every eval, so evals are paired). Per
+    --free_window window, fluency (each chunk judged after the one before; real held-out
+    text 100%, shuffled 0%); drift = last window minus first; and over the run coh, rep1,
+    the <NUL> share and the slowest register's RMS in the last window."""
+    t0 = time.time()
+    dev = next(model.parameters()).device
+    with _EvalState(), torch.random.fork_rng(devices=[dev] if dev.type == 'cuda' else []):
+        torch.manual_seed(1234)
+        ws = [w for w, _ in _free_streams(args.free_rows, args.eval_free, args.free_window,
+                                          args.free_chunk)]
+    ws = [w for w in ws if w['chunks']]
+    if not ws:
+        return
+    fl = [w['fluency'] for w in ws]
+    _eval_results['free'] = dict(fluency=fl, drift=fl[-1] - fl[0],
+                                 coh=float(np.mean([w['coh'] for w in ws])),
+                                 rep1=float(np.mean([w['rep1'] for w in ws])))
+    _emit(f'EVALL step {step:10} streams {args.free_rows} tokens {args.eval_free} | fluency '
+          f'{"/".join(f"{v:.1f}" for v in fl)} drift {fl[-1] - fl[0]:+.1f} | coh '
+          f'{_eval_results["free"]["coh"]:+.4f} rep1 {_eval_results["free"]["rep1"]:.3f} nul '
+          f'{np.mean([w["nul"] for w in ws]):.1f}% rms1 {ws[-1]["rms"][0]:.4f} '
+          f'wall {time.time() - t0:.0f}s')
 
 
 def _prompt_tune():
