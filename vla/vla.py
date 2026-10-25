@@ -444,6 +444,11 @@ parser.add_argument('--eval_recent', default=0, type=int, metavar='K',
                          'the model last read them), and K held-out ones: loss on them, on their '
                          'continuation after --eval_gen_prompt tokens, and EVALG delta from that '
                          'prefix -- does the model know what it read recently better than old?')
+parser.add_argument('--doc_score',  default=None, metavar='OUT',
+                    help='load, score every record in --doc_log_file and the first --eval_docs '
+                         'held-out documents (cut to --doc_log_len) with this checkpoint, one '
+                         'JSON line each to OUT (kind, start / end step, nats per token), exit. '
+                         'Two checkpoints\' files, paired by record, give a forgetting curve')
 parser.add_argument('--eval_wp',    default=0,    type=int, metavar='N',
                     help='GENW: N fixed WritingPrompts prompts continued at every eval, for reading')
 parser.add_argument('--eval_wp_len', default=256, type=int, metavar='C', help='GENW tokens')
@@ -627,7 +632,8 @@ _continuous = {k.strip() for k in args.continuous.split(',') if k.strip()}   # e
 if _continuous - {'text', 'image', 'video'}:
     raise SystemExit(f'--continuous {args.continuous}: kinds are text, image and video')
 
-_ONESHOT = args.generate or args.eval or args.vis or args.push or args.free_run or args.prompt_tune
+_ONESHOT = (args.generate or args.eval or args.vis or args.push or args.free_run or
+            args.prompt_tune or args.doc_score)
 
 # ── checkpoint ────────────────────────────────────────────────────────────────
 
@@ -5135,6 +5141,22 @@ def _prompt_tune():
 
 if args.free_run:
     _free_run()
+    raise SystemExit(0)
+
+if args.doc_score:
+    _recs = _load_doc_records()
+    _held = [q[:args.doc_log_len] for q in (_doc_tokens(d) for d in _eval_docs(_eval_corpus_names()[0]))
+             if len(q) >= 2]
+    _rows = [(list(q[:-1]), list(q[1:])) for _, _, q, _ in _recs] + [(q[:-1], q[1:]) for q in _held]
+    _ce = _ce_pairs(_rows)
+    with open(args.doc_score, 'w') as f:
+        for k, c in enumerate(_ce):
+            r = dict(kind='train', start=int(_recs[k][0]), end=int(_recs[k][1])) if k < len(_recs) \
+                else dict(kind='heldout', idx=k - len(_recs))
+            r.update(n=len(c), nats=float(c.mean()), step=_start_step)
+            print(json.dumps(r), file=f)
+    print(f'--doc_score: {len(_recs)} training records, {len(_held)} held-out documents at step '
+          f'{_start_step} -> {args.doc_score}')
     raise SystemExit(0)
 
 if args.prompt_tune:

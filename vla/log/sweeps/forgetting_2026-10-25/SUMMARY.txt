@@ -1,0 +1,17 @@
+pre step 7900000, now step 8600000; held-out improvement +0.0097 +- 0.0028 (n 400); memory = training doc improvement - held-out improvement, nats/token
+age    0K-  10K n   10 mean age    5.2K  memory +0.1058 +- 0.0093
+age   10K-  30K n   20 mean age   20.2K  memory +0.0640 +- 0.0136
+age   30K- 100K n   70 mean age   65.2K  memory +0.0414 +- 0.0074
+age  100K- 300K n  200 mean age  200.2K  memory +0.0299 +- 0.0051
+age  300K-    +   n  400 mean age  500.2K  memory +0.0137 +- 0.0040
+
+
+Method: vla.py --doc_score scores the 712 training documents v461 recorded (--doc_log 100, 1 in 10 kept, first 384 tokens, read
+between steps 7.90M and 8.60M) and 400 held-out fineweb documents, with checkpoint/v460...step7900000.pt (before any of them was
+read) and with v461 at 8.60M. memory = a document's improvement minus the held-out improvement: what the weights hold about that
+document specifically. Paired by document, so doc difficulty cancels (EVALR's unpaired bands carry +-0.02 noise from it).
+
+Reading: a long power-law tail, not a 2K-step imprint that vanishes. memory ~ 0.106 x (age / 5K)^-0.44:
+  5K +0.106, 20K +0.064, 65K +0.041, 200K +0.030, 500K +0.014 (3.4 sigma). Held-out (generalized) improvement over the same 700K steps: +0.010.
+EVALR (unpaired) had read the 50K+ bands as ~0; the pairing shows a residual that is still there half a million steps later.
+Caveat: one "now" checkpoint, so this is cross-sectional (each age bin is different documents).
