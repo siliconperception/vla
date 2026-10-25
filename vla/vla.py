@@ -467,6 +467,9 @@ parser.add_argument('--doc_ablate', default='', metavar='K1,K2,...',
                     help='--doc_score: registers K (1 = the slowest) read as their mean state over '
                          'the held-out documents, as in EVALI\'s ablations: is what the weights '
                          'remember about a document keyed on the slow context?')
+parser.add_argument('--doc_tokens', action='store_true',
+                    help='--doc_score: also write each document\'s per-token nats (ce), for loss by '
+                         'position in the document')
 parser.add_argument('--eval_wp',    default=0,    type=int, metavar='N',
                     help='GENW: N fixed WritingPrompts prompts continued at every eval, for reading')
 parser.add_argument('--eval_wp_len', default=256, type=int, metavar='C', help='GENW tokens')
@@ -5194,6 +5197,8 @@ if args.doc_score:
             r = dict(kind='train', start=int(_recs[k][0]), end=int(_recs[k][1])) if k < len(_recs) \
                 else dict(kind='heldout', idx=k - len(_recs))
             r.update(n=len(c), nats=float(c.mean()), step=_start_step, ablate=args.doc_ablate)
+            if args.doc_tokens:
+                r['ce'] = [round(float(x), 4) for x in c]
             print(json.dumps(r), file=f)
     print(f'--doc_score: {len(_recs)} training records, {len(_held)} held-out documents at step '
           f'{_start_step} -> {args.doc_score}')

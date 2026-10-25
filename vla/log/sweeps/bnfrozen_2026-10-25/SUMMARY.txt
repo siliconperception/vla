@@ -1,0 +1,23 @@
+heldout: 400 documents; nats/token by position (base start; others as change vs base, +- s.e.)
+    position  tokens            start             v463             v464
+    0-4         1600            5.625    -0.018 +-0.010    +0.002 +-0.011
+    4-16        4800            5.038    -0.007 +-0.008    +0.010 +-0.008
+   16-64       19200            4.713    -0.001 +-0.004    +0.043 +-0.005
+   64-256      76800            4.593    +0.003 +-0.002    +0.066 +-0.003
+  256-1024    236969            4.578    +0.005 +-0.002    +0.086 +-0.003
+
+train: 1291 documents; nats/token by position (base start; others as change vs base, +- s.e.)
+    position  tokens            start             v463             v464
+    0-4         5164            5.709    +0.000 +-0.006    -0.154 +-0.008
+    4-16       15492            5.040    -0.012 +-0.004    -0.135 +-0.005
+   16-64       61965            4.719    -0.005 +-0.002    -0.093 +-0.003
+   64-256     205500            4.622    +0.003 +-0.002    -0.070 +-0.003
+  256-1024     95657            4.615    -0.002 +-0.003    -0.074 +-0.005
+
+Reading (2026-10-25). Held-out EVAL (400 docs): start 4.585, v463 4.592, v464 (--bn_frozen) 4.657.
+- The guess "frozen BN hurts document starts" is refuted: the held-out loss is unchanged on the first 16 tokens and
+  grows with position (+0.04 at 16-64, +0.07 at 64-256, +0.09 at 256-1024). What degrades is the long-running state.
+- The train rows are v464's own recorded documents (v463 never saw them, so its column is a second held-out set, ~0).
+  v464 improved on them (memory of the document), by less late in the document, where the held-out loss is worst.
+- Register std (dff_std) and grad norm show no drift between the two runs, so it is not a blow-up of the state scale.
+- Open: why the online training loss of v464 does not show the same +0.07-0.09.
