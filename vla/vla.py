@@ -468,6 +468,11 @@ parser.add_argument('--doc_ablate', default='', metavar='K1,K2,...',
                     help='--doc_score: registers K (1 = the slowest) read as their mean state over '
                          'the held-out documents, as in EVALI\'s ablations: is what the weights '
                          'remember about a document keyed on the slow context?')
+parser.add_argument('--step_tokens', default=0, type=int, metavar='N',
+                    help='at every STEP line, a TOK line: row 0\'s last N text-stream input tokens '
+                         'and the token sampled at each from its prediction, as GEN samples (--temperature, '
+                         '--min_p); observation only, with its own random generator, so training\'s draws '
+                         'are unchanged')
 parser.add_argument('--doc_tokens', action='store_true',
                     help='--doc_score: also write each document\'s per-token nats (ce), for loss by '
                          'position in the document')
@@ -5928,6 +5933,8 @@ def _on_sigterm(signum, frame):
 
 
 signal.signal(signal.SIGTERM, _on_sigterm)
+_tok_buf = collections.deque(maxlen=args.step_tokens or 1)   # --step_tokens
+_tok_gen = torch.Generator(device=args.device).manual_seed(0) if args.step_tokens else None
 
 try:
     while True:
@@ -6081,6 +6088,12 @@ try:
                         (torch.rand(x.shape, device=x.device) < args.text_feed)
                 x = torch.where(fb, _own, x)
         logits, _ = model(x, flag=flag & ~_continuous_row, img=img, aud=aud)
+        if args.step_tokens:         # row 0's text-stream input and argmax prediction, kept on the GPU
+            with torch.no_grad():
+                lg = (logits[0, 0] if logits.dim() > 2 else logits[0]).detach().float()[None]
+                pr = _truncate(F.softmax(lg / max(args.temperature, 1e-6), dim=-1))
+                _tok_buf.append(torch.stack([x[0, 0] if x.dim() > 1 else x[0],
+                                             torch.multinomial(pr, 1, generator=_tok_gen)[0, 0]]))
         if model.streams == 3:
             ce_all = F.cross_entropy(logits.reshape(-1, logits.shape[-1]), y.reshape(-1),
                                      reduction='none').view(y.shape)
@@ -6173,6 +6186,10 @@ try:
                 v = torch.stack(a[-args.monitor:]).float().cpu().numpy()
                 line += f' loss_{n} {np.nanmean(v) if np.isfinite(v).any() else float("nan"):6.3f}'
             _emit(line)
+            if _tok_buf:
+                t = torch.stack(list(_tok_buf)).tolist()
+                _emit(f'TOK step {i:10} in: {_printable(_decode_plain([a for a, _ in t]))} || sampled: '
+                      f'{_printable(_decode_plain([b for _, b in t]))}')
             del larr[:-args.monitor], garr[:-args.monitor]   # keep host RAM flat
             for a in carr.values():
                 del a[:-args.monitor]
