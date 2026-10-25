@@ -444,6 +444,14 @@ parser.add_argument('--eval_recent', default=0, type=int, metavar='K',
                          'the model last read them), and K held-out ones: loss on them, on their '
                          'continuation after --eval_gen_prompt tokens, and EVALG delta from that '
                          'prefix -- does the model know what it read recently better than old?')
+parser.add_argument('--weight_ema', default='', metavar='T1,T2,...',
+                    help='keep a running average of the weights (and BatchNorm statistics) with '
+                         'each time constant T (steps), updated every step, saved in the '
+                         'checkpoint; at every eval, EVAL lines for each average (corpus '
+                         '<name>~emaTK). Training is unchanged: these are slow copies to measure')
+parser.add_argument('--use_ema', default=0, type=int, metavar='T',
+                    help='after --load, replace the weights by the checkpoint\'s --weight_ema '
+                         'average with time constant T (for --eval, --doc_score, --generate...)')
 parser.add_argument('--doc_score',  default=None, metavar='OUT',
                     help='load, score every record in --doc_log_file and the first --eval_docs '
                          'held-out documents (cut to --doc_log_len) with this checkpoint, one '
@@ -2846,6 +2854,13 @@ else:
             print('--inner_voice: the checkpoint\'s <NUL> logit (text_dec.nul) is dropped', flush=True)
     if _surp_init is not None and float(model.surp_mean) == 0:
         model.surp_mean.fill_(_surp_init)
+    if args.use_ema:
+        _e = (_loaded_ckpt or {}).get('weight_ema', {}).get(args.use_ema)
+        if _e is None:
+            raise SystemExit(f'--use_ema {args.use_ema}: {args.load} has no such average '
+                             f'(it has {sorted((_loaded_ckpt or {}).get("weight_ema", {}))})')
+        model.load_state_dict(_e, strict=False)
+        print(f'--use_ema: weights replaced by the T={args.use_ema} running average', flush=True)
 model = model.to(args.device)
 _tokenizer = model.tok
 _NUL_ID = model.nul_id
@@ -5207,7 +5222,53 @@ if _loaded_ckpt is not None and _loaded_ckpt.get('optimizer'):
         print(f'optimizer state restored ({len(osd["state"])} tensors)', flush=True)
     else:
         print('WARNING: optimizer state NOT restored: parameter groups differ', flush=True)
+
+# --weight_ema: slow copies of the trainable weights and the float buffers (BatchNorm stats)
+_live = {n: p for n, p in model.named_parameters() if p.requires_grad}
+_live.update({n: b for n, b in model.named_buffers() if b.is_floating_point()})
+_wema = {}
+for _T in [int(float(t)) for t in args.weight_ema.split(',') if t]:
+    _c = ((_loaded_ckpt or {}).get('weight_ema') or {}).get(_T)
+    if _c is not None and set(_c) == set(_live):
+        _wema[_T] = {n: _c[n].to(_live[n].device).clone() for n in _live}
+        print(f'--weight_ema: T={_T} average restored from the checkpoint', flush=True)
+    else:
+        _wema[_T] = {n: t.detach().clone() for n, t in _live.items()}
+        print(f'--weight_ema: T={_T} average starts from the loaded weights', flush=True)
+_wema_lists = {T: ([e[n] for n in _live], [_live[n] for n in _live]) for T, e in _wema.items()}
+if _wema:
+    print(f'--weight_ema: {sum(t.numel() for t in _live.values()) / 1e6:.1f}M values per average',
+          flush=True)
 _loaded_ckpt = None
+
+
+def _wema_step():
+    with torch.no_grad():
+        for T, (e, live) in _wema_lists.items():
+            torch._foreach_lerp_(e, [t.detach() for t in live], 1.0 / T)
+
+
+def _wema_swap(T):
+    """Exchange the live weights with the T average (twice restores them)."""
+    with torch.no_grad():
+        for e, live in zip(*_wema_lists[T]):
+            tmp = live.detach().clone()
+            live.copy_(e)
+            e.copy_(tmp)
+
+
+def _wema_eval(step):
+    """EVAL (held-out loss) for each --weight_ema average, as corpus <name>~emaTK."""
+    for T in _wema:
+        _wema_swap(T)
+        try:
+            for corpus in [c for c in _eval_corpus_names() if c not in _MEDIA_DATASETS][:1]:
+                _score(step, corpus, _eval_docs(corpus), tag=f'{corpus}~ema{T // 1000}K',
+                       bands=False)
+        except Exception as e:
+            print(f'WARNING: --weight_ema eval failed at step {step}: {e!r}', flush=True)
+        finally:
+            _wema_swap(T)
 
 
 def _lr_factor(step):
@@ -5314,7 +5375,8 @@ def _save(i, n_examples):
     torch.save({'saved_args': vars(args), 'state_dict': model.state_dict(), 'log': log,
                 'step': i, 'examples': n_examples, 'examples_by': dict(_n_by),
                 'lr': optimizer.param_groups[0]['lr'],
-                'optimizer': optimizer.state_dict()}, args.save)
+                'optimizer': optimizer.state_dict(),
+                'weight_ema': {T: dict(e) for T, e in _wema.items()}}, args.save)
 
 
 def _gen_lines(i):
@@ -5857,6 +5919,7 @@ try:
         if args.eval_interval and i > 0 and ((i % args.eval_interval == 0 and i > _start_step) or
                                              (i == _start_step and args.eval_at_start)):
             _heldout_eval(i)
+            _wema_eval(i)
 
         if i % args.checkpoint == 0:
             _save(i, n_examples)
@@ -6019,6 +6082,7 @@ try:
                     p.grad.mul_(args.clip / gnorm)
         _pt('grad_norm')
         optimizer.step()
+        _wema_step()
         _pt('optimizer')
         # recompute this step's state with the updated weights (eval-mode BatchNorm), so the
         # state carried forward is the one the model would compute at inference
