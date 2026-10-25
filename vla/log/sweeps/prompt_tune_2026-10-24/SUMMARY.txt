@@ -1,0 +1,22 @@
+--prompt_tune on v460 (copy of checkpoint/v460_v455_shards14_40M.pt, ~7.88M): EVALG's 50 held-out fineweb prompts (128 tokens), 128-token continuations, judge Qwen2.5-1.5B.
+pnll / cont = the model's own nats/token on the prompt / on the REAL continuation after it (teacher-forced). judge/fluency/delta = a sampled continuation as in EVALG.
+tune = initial registers optimized by Adam (lr 0.01, 200 steps, batch 8), BPTT through the prompt, weights frozen; cap = per-register RMS <= cap x natural (after a cold read).
+
+method          pnll    cont    fluency  delta    rep1
+none (no prompt)   -     4.804   50.4%   -0.130   0.118
+cold (EVALG)     4.724   4.597   53.9%   -0.037   0.121
+warm256          5.043   4.686   56.6%   -0.060   0.118
+tune cap 1       1.137   4.789   55.6%   +0.018   0.120
+tune cap 3       0.055   5.380   50.9%   +0.014   0.130
+tune no cap      0.015   6.428   45.4%   +0.054   0.130
+real continuation                         +0.542
+
+Reading:
+- The state CAN encode the prompt: 4.72 -> 1.14 nats/token within natural register levels, 0.015 uncapped (memorized).
+- But the tuned state does not carry the prompt forward as context. The real continuation gets WORSE as the prompt fit improves:
+  cold 4.597, cap1 4.789 (= no prompt, 4.804), cap3 5.380, uncapped 6.428. Tuning finds an unnatural state that replays the prompt.
+- Judge delta moves only from -0.04 to +0.02..+0.05, against +0.54 for the real continuation; fluency falls with the cap.
+- Warm start (free-run 256 tokens, then the prompt) is worse than cold on every model-side measure.
+- Teacher-forced, a cold read of the prompt does help the model: cont 4.804 -> 4.597 (-0.21 nats). The prompt's information gets in; it's
+  sampling that loses it (EVALG delta ~ 0).
+Cost: 31 min, about 9 GB; it halved v460's speed (23 -> 11.5 steps/s) while running.
