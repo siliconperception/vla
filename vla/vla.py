@@ -420,6 +420,12 @@ parser.add_argument('--eval_gen_len', default=96, type=int, metavar='C', help='c
 parser.add_argument('--eval_cloze', default=0,    type=int, metavar='N',
                     help='EVALC on N Story Cloze stories (xstory_cloze en): share where the '
                          'right ending costs fewer nats than the wrong one after the 4-sentence story')
+parser.add_argument('--eval_pairs', default=0,    type=int, metavar='N',
+                    help='EVALM: minimal pairs, each sentence read from a zero state; share '
+                         'where the acceptable one costs fewer nats. Up to N pairs from each of '
+                         'BLiMP (grammar, spread over its 67 paradigms) and ComVE (which '
+                         'statement makes sense). Winogrande was tried and dropped: it sits at '
+                         'chance up to pythia-160m (Qwen2.5-1.5B 63.7%)')
 parser.add_argument('--eval_hold',  default=0,    type=int, metavar='N',
                     help='EVALH on N samples from <NUL>: does the second half follow the first '
                          '(self), beyond generic priming (cross), and when re-read (own)')
@@ -4610,6 +4616,61 @@ def _cloze_eval(step):
           f'margin {m:+.4f} wall {time.time() - t0:.1f}s')
 
 
+_pair_sets = {}              # name -> [(ids a, ids b, group)], a the acceptable one
+
+
+def _sentence(t):
+    """A ComVE statement in one form: stripped, capitalized, closed by one period (its pairs
+    differ in final punctuation about a third of the time, which would score as sense)."""
+    t = t.strip().rstrip('.').strip()
+    return t[:1].upper() + t[1:] + '.'
+
+
+def _load_pairs():
+    from datasets import get_dataset_config_names, load_dataset
+    N = args.eval_pairs
+    bl = []
+    cfgs = get_dataset_config_names('nyu-mll/blimp')
+    for c in cfgs:
+        for ex in load_dataset('nyu-mll/blimp', c, split='train').select(range(-(-N // len(cfgs)))):
+            bl.append((_prompt_ids(ex['sentence_good']), _prompt_ids(ex['sentence_bad']), ex['field']))
+    cv = []
+    for ex in load_dataset('tasksource/ComVE', split='test').select(range(min(N, 999))):
+        ch = [_sentence(t) for t in ex['choices_list']]
+        cv.append((_prompt_ids(ch[ex['labels']]), _prompt_ids(ch[1 - ex['labels']]), 'comve'))
+    _pair_sets.update(blimp=bl, comve=cv)
+    print(f'--eval_pairs: BLiMP {len(bl)}, ComVE {len(cv)} pairs', flush=True)
+
+
+def _pairs_eval(step):
+    """EVALM: minimal pairs from a zero state, the model's own regime: the only context is the
+    sentence itself. acc: the acceptable one has the lower summed nats; acc_tok: per token;
+    margin: unacceptable minus acceptable, nats per token. BLiMP is also split by field."""
+    t0 = time.time()
+    if not _pair_sets:
+        _load_pairs()
+    out, res = [], {}
+    for name, pairs in _pair_sets.items():
+        rows = [(q[:-1], q[1:]) for a, b, _ in pairs for q in (a, b)]
+        ce = _ce_pairs(rows)
+        right, tok, marg, grp = [], [], [], collections.defaultdict(list)
+        for k, (a, b, g) in enumerate(pairs):
+            ca, cb = ce[2 * k], ce[2 * k + 1]
+            right.append(ca.sum() < cb.sum())
+            tok.append(ca.mean() < cb.mean())
+            marg.append(cb.mean() - ca.mean())
+            grp[g].append(right[-1])
+        res[name] = dict(n=len(pairs), acc=100.0 * np.mean(right), acc_tok=100.0 * np.mean(tok),
+                         margin=float(np.mean(marg)))
+        out.append(f'{name} n{len(pairs)} acc {res[name]["acc"]:.1f}% acc_tok '
+                   f'{res[name]["acc_tok"]:.1f}% margin {res[name]["margin"]:+.4f}')
+        if name == 'blimp':
+            out[-1] += ' (' + ' '.join(f'{g} {100.0 * np.mean(v):.1f}'
+                                       for g, v in sorted(grp.items())) + ')'
+    _eval_results['pairs'] = res
+    _emit(f'EVALM step {step:10} ' + ' | '.join(out) + f' | wall {time.time() - t0:.1f}s')
+
+
 _WP_SRC = ('euclaise/writingprompts', 'test')
 _wp_prompts = []             # fixed prompt texts, the same at every eval
 
@@ -4701,7 +4762,8 @@ def _heldout_eval(step):
                 except Exception as e:
                     print(f'WARNING: {fn.__name__} failed at step {step} on "{corpus}": {e!r}',
                           flush=True)
-    for fn, on in ((_cloze_eval, args.eval_cloze), (_hold_eval, args.eval_hold),   # corpus-free
+    for fn, on in ((_cloze_eval, args.eval_cloze), (_pairs_eval, args.eval_pairs),  # corpus-free
+                   (_hold_eval, args.eval_hold),
                    (_wp_samples, args.eval_wp)):
         if on and not _eval_failed.get(fn.__name__):
             try:
