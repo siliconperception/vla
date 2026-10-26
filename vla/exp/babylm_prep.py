@@ -2,6 +2,7 @@
 one shuffled parquet of documents for vla.py's 'babylm' corpus.
 
 usage: python exp/babylm_prep.py [--src DIR] [--dst /data/babylm2026_nat] [--chunk 0] [--stream_words 500000] [--seq 0]
+                                [--files '*.train.txt']
 
 Documents are the source's own: the hub copy's '= = = name = = =' lines mark transcripts, books, articles
 and films (in every file; bnc_spoken's one marks a CHILDES transcript appended at its end), and a file
@@ -21,7 +22,8 @@ lanes, since reverted); the rest go to DST/docs/train.parquet (corpus 'babylm').
 DST/train.parquet (v473's 'babylm1k' data: --chunk 1000 --stream_words 0). --seq S > 0 with --chunk keeps
 a document's pieces in order: up to S consecutive pieces make one row, the pieces joined by '\x1e'
 (vla.py reads them back to back, each an example of its own; corpus 'babylmseq': --dst /data/babylm2026_seq
---chunk 1000 --stream_words 0 --seq 16)."""
+--chunk 1000 --stream_words 0 --seq 16). The official dev split, for vla.py's eval-only corpus 'babylmdev':
+--src <BabyLM-dev snapshot> --files '*.dev' --dst /data/babylm2026_dev --chunk 1000 --stream_words 0."""
 import argparse, glob, os, random, re
 import pyarrow as pa, pyarrow.parquet as pq
 
@@ -31,6 +33,7 @@ ap.add_argument('--dst', default='/data/babylm2026_nat')
 ap.add_argument('--stream_words', type=int, default=500000, help='a longer unmarked document is a stream (0 = none)')
 ap.add_argument('--chunk', type=int, default=0, help='cut documents into pieces of about N words (0 = never)')
 ap.add_argument('--seq', type=int, default=0, help='with --chunk: up to S consecutive pieces per row, in order')
+ap.add_argument('--files', default='*.train.txt', help='source file pattern (the dev split: *.dev)')
 ap.add_argument('--seed', type=int, default=0)
 a = ap.parse_args()
 src = a.src or glob.glob('/data/huggingface/hub/datasets--BabyLM-community--BabyLM-2026-Strict/snapshots/*/')[0]
@@ -100,7 +103,7 @@ def chunks(lines, n):
 
 
 rows, streams = [], []
-for path in sorted(glob.glob(os.path.join(src, '*.train.txt'))):
+for path in sorted(glob.glob(os.path.join(src, a.files))):
     name = os.path.basename(path).split('.')[0]
     lines = open(path, encoding='utf-8', errors='replace').read().split('\n')
     docs = docs_of(lines, True)

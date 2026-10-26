@@ -2049,7 +2049,9 @@ _LOCAL_PARQUET = {
     'babylm':   '/data/babylm2026_nat/docs',  # exp/babylm_prep.py: BabyLM 2026 Strict, marked documents
     'babylm1k': '/data/babylm2026_docs',      # v473: the same cut into ~1000-word pieces (--chunk 1000)
     'babylmseq': '/data/babylm2026_seq',      # the same pieces, up to 16 of a document in order per row (--seq 16)
+    'babylmdev': '/data/babylm2026_dev',      # BabyLM's official dev split as ~1000-word pieces: eval only
 }
+_EVAL_ONLY = {'babylmdev'}                  # a held-out split as a whole: --eval_corpora only, never --mix
 
 # Train-only corpora: a fixed 1/_HOLDOUT_MOD of documents, chosen by a hash of the text, is
 # held out for eval and skipped in training (deterministic, streaming-compatible).
@@ -2107,6 +2109,8 @@ def _local_files(name):
 
 def _load_corpus(name, streaming, shards=None):
     from datasets import load_dataset, DownloadConfig
+    if name in _EVAL_ONLY:
+        raise SystemExit(f'{name} is a held-out split: --eval_corpora only, not --mix/--dataset')
     if name in _LOCAL_PARQUET:
         files = _local_files(name)
         print(f'{name}: {len(files)} local parquet file(s) from {_LOCAL_PARQUET[name]}', flush=True)
@@ -3942,7 +3946,7 @@ def _build_eval_docs(corpus):
         return _build_video_eval(corpus)
     hf, cfg, split, col = _eval_source(corpus)
     hashed = corpus in _HASH_HOLDOUT
-    if hashed and corpus in _LOCAL_PARQUET:
+    if corpus in _LOCAL_PARQUET:
         hf = _LOCAL_PARQUET[corpus]
         rows = load_dataset('parquet', data_files={'train': _local_files(corpus)}, split='train', streaming=True)
     elif hashed and corpus in _HUB_SUBSET:
