@@ -2048,12 +2048,14 @@ _HUB_SUBSET = {
 _LOCAL_PARQUET = {
     'babylm':   '/data/babylm2026_nat/docs',  # exp/babylm_prep.py: BabyLM 2026 Strict, marked documents
     'babylm1k': '/data/babylm2026_docs',      # v473: the same cut into ~1000-word pieces (--chunk 1000)
+    'babylmseq': '/data/babylm2026_seq',      # the same pieces, up to 16 of a document in order per row (--seq 16)
 }
 
 # Train-only corpora: a fixed 1/_HOLDOUT_MOD of documents, chosen by a hash of the text, is
 # held out for eval and skipped in training (deterministic, streaming-compatible).
 _HASH_HOLDOUT = {'swiki', 'fwedu', 'fineweb', 'fwcrawl', 'cosmo', 'cosmoweb', 'smolcosmo',
-                 'smolfwedu', 'strangetb', 'sebooks', 'dclmedu', 'littlec', 'simplestories', 'babylm', 'babylm1k'}
+                 'smolfwedu', 'strangetb', 'sebooks', 'dclmedu', 'littlec', 'simplestories', 'babylm', 'babylm1k',
+                 'babylmseq'}
 _HOLDOUT_MOD = 32
 
 # Corpora with a real held-out split; a triple is a held-out set in another repo.
@@ -2156,8 +2158,14 @@ def _make_iter(ds, streaming, seed, shuffle=True):
     return iter(split.to_iterable_dataset(num_shards=64).shuffle(buffer_size=10000, seed=seed))
 
 
+_PIECE_SEP = '\x1e'          # a row of consecutive pieces of one document (exp/babylm_prep.py --seq)
+
+
 def clip_text(text):
-    """A document or caption as (input, target) pairs over [_NULL] tokens."""
+    """A document or caption as (input, target) pairs over [_NULL] tokens; a row of pieces
+    joined by _PIECE_SEP as each piece's pairs back to back (a <NUL> opens every piece)."""
+    if _PIECE_SEP in text:
+        return [st for piece in text.split(_PIECE_SEP) for st in clip_text(piece)]
     full = [_NULL] + _tokenizer.encode(text)
     return [(full[i], full[i + 1]) for i in range(len(full) - 1)]
 
@@ -2807,7 +2815,8 @@ def worker(stop, q, datasets):
                     slot.pos = stagger.randrange(len(steps))
                 if img is not None:
                     new_imgs.append((r, img))
-        flags = [slot.pos == 0 for slot in slots]
+        # an example starts at a clip's first step, or at a later piece's <NUL> (--seq rows)
+        flags = [slot.pos == 0 or (slot.media is None and slot.steps[slot.pos][0] == _NULL) for slot in slots]
         xy = [slot.steps[slot.pos] for slot in slots]
         idx, shown = [], []
         for j, r in enumerate(_VIDEO_ROWS):
@@ -3953,7 +3962,7 @@ def _build_eval_docs(corpus):
         text = _corpus_text(corpus, ex) if corpus in _TEXT_DATASETS else ex.get(col, '') or ''
         if not text.strip() or (hashed and not _is_heldout(text)):
             continue
-        steps = clip_text(text)
+        steps = clip_text(text.split(_PIECE_SEP)[0])      # a row of pieces: its first
         if len(steps) >= _eval_minlen(corpus):
             docs.append(steps[:_EVAL_MAXLEN])
         if len(docs) >= args.eval_docs:
