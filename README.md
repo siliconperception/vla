@@ -3,9 +3,12 @@
 `vla.py` is a language model with no attention and no positional encoding. Its memory is a small stack of
 2-D register grids (here 5 registers of 512 × 7 × 7). Every clock tick, one convolutional network reads the
 current token (and, in multimodal runs, the current image and sound) together with the registers, and writes
-the registers back. One set of small convolution kernels is reused at every grid position and every tick, so a
-few million weights drive a state of hundreds of thousands of values. The design target is a single-chip
-vision-language-action model running at 100 Hz or more.
+the registers back.
+
+The design target is a vision-language-action model on a single chip running at 100 Hz or more. Single chip
+means no external components: no off-chip memory, every weight stored on the chip itself. That is possible
+because a CNN is parameter-efficient: one set of small convolution kernels is reused at every grid position
+and every tick, so a few million weights drive a state of hundreds of thousands of values.
 
 ![One clock tick of the VLA](docs/figures/vla_v451.svg)
 

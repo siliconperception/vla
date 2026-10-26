@@ -39,8 +39,8 @@ K registers R_1 … R_K, each N × S × S, together N·K·S·S = 125,440 values.
    over training (a stored buffer, fixed at inference).
 2. **Mix.** X = Conv1×1( concat(T, I, A, T_voice, T_image, R̂_1 … R̂_K) ), from 256 + 2048 + 256 + 2·256 + 5·512
    = 5,632 channels to C = 384.
-3. **Update.** For d = 1 … D: X ← ReLU( BN_d( Conv3×3_d(X) ) ), C → C, zero padding. BN_d is a fixed per-channel
-   affine map at inference (running mean and variance, no learned scale or shift).
+3. **Update.** For d = 1 … D: X ← ReLU( BN_d( Conv3×3_d(X) ) ), C → C, zero padding. At inference BN_d normalizes
+   each channel with its stored running mean and variance (no learned scale or shift).
 4. **Project.** O = Conv1×1(X), C → N.
 5. **Write** (a Laplacian-pyramid cascade). With S_0 = 0 and S_k = R'_1 + … + R'_k:
    - for k = 1 … K−1: R'_k = R_k + (O − S_{k−1} − R_k) / W_k

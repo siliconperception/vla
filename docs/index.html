@@ -68,8 +68,11 @@
     <h1>A recurrent CNN vision-language-action model</h1>
     <p class="lede">No attention, no positional encoding. The model's memory is a stack of 2-D register grids;
     every clock tick one small convolutional network reads the current token together with the registers and
-    writes the registers back. The same kernels run at every grid position and every tick, which is what makes it
-    a candidate for a single chip running at 100&nbsp;Hz or more.</p>
+    writes the registers back.</p>
+    <p class="lede">The target is a vision-language-action model on a single chip at 100&nbsp;Hz or more, with no
+    external components: no off-chip memory, every weight stored on the chip itself. A CNN makes that possible
+    because it is parameter-efficient: the same small kernels run at every grid position and every tick, so a few
+    million weights drive a state of hundreds of thousands of values.</p>
     <nav class="links">
       <a href="https://github.com/siliconperception/vla">Code on GitHub</a>
       <a href="https://huggingface.co/siliconperception/vla">Model on Hugging Face</a>
@@ -89,7 +92,7 @@
 
   <div class="facts">
     <div class="fact"><b>125,440</b><span>values of state: 5 registers × 512 channels × 7 × 7</span></div>
-    <div class="fact"><b>20.1 M</b><span>trained parameters (plus a frozen token embedding and output layer)</span></div>
+    <div class="fact"><b>20.1 M</b><span>trained parameters, small enough to keep every weight on-chip</span></div>
     <div class="fact"><b>128 s → 1 tick</b><span>register time scales, from slow topic to the current word</span></div>
     <div class="fact"><b>0 attention</b><span>layers; the gradient stops at the registers (no backpropagation through time)</span></div>
   </div>

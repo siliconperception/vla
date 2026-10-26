@@ -20,7 +20,9 @@ datasets:
 A language model with no attention and no positional encoding. Its memory is five 2-D registers of
 512 × 7 × 7. Every tick, one convolutional network reads the current token together with the registers and
 writes the registers back. It is the text-trained core of a vision-language-action design aimed at a single chip
-running at 100 Hz or more.
+running at 100 Hz or more with no external components: no off-chip memory, every weight stored on the chip. A CNN
+makes that possible because it is parameter-efficient: the same small kernels run at every grid position and
+every tick.
 
 Code, functional spec and figures: [github.com/siliconperception/vla](https://github.com/siliconperception/vla)
 

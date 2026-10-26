@@ -271,7 +271,7 @@ parser.add_argument('--dec_width',  default=256,  type=int, help='text decoder t
 parser.add_argument('--bn_frozen', action='store_true',
                     help='train with BatchNorm in eval mode: its running statistics normalize and '
                          'are not updated (no batch statistics), as a batch-1 continual learner '
-                         'and the FPGA (BatchNorm folded into the convs) would run')
+                         'would run')
 parser.add_argument('--bn_momentum', default=0.1, type=float,
                     help='ContextCNN BatchNorm running-statistics momentum (0 = cumulative)')
 parser.add_argument('--init',       default='zero', choices=['zero', 'gaussian', 'relu'],
