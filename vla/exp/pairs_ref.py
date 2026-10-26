@@ -1,14 +1,20 @@
 """EVALM's minimal pairs (BLiMP / ComVE / Winogrande, as vla.py --eval_pairs builds them) scored
 by a reference HF causal LM, each sentence from a bare document start, for calibration.
-usage: python exp/pairs_ref.py MODEL [N]"""
+usage: python exp/pairs_ref.py MODEL [N] [--trust] (--trust: the model's own code from its repo)"""
 import sys, collections
 import numpy as np, torch
 from datasets import get_dataset_config_names, load_dataset
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-name, N = sys.argv[1], int(sys.argv[2]) if len(sys.argv) > 2 else 1000
-tok = AutoTokenizer.from_pretrained(name)
-lm = AutoModelForCausalLM.from_pretrained(name, dtype=torch.float32).cuda().eval()
+trust = '--trust' in sys.argv
+argv = [a for a in sys.argv if a != '--trust']
+name, N = argv[1], int(argv[2]) if len(argv) > 2 else 1000
+tok = AutoTokenizer.from_pretrained(name, trust_remote_code=trust)
+lm = AutoModelForCausalLM.from_pretrained(name, dtype=torch.float32, trust_remote_code=trust).cuda().eval()
+n_all = sum(p.numel() for p in lm.parameters())
+emb = {id(m.weight): m.weight.numel() for m in (lm.get_input_embeddings(), lm.get_output_embeddings()) if m is not None}
+params = f'params {n_all / 1e6:.1f}M, {(n_all - sum(emb.values())) / 1e6:.1f}M without token embedding/lm_head'
+
 bos = tok.bos_token_id if tok.bos_token_id is not None else tok.eos_token_id
 enc = lambda t: tok.encode(t, add_special_tokens=False)
 
@@ -37,7 +43,8 @@ for ex in rows.select(range(min(N, len(rows)))):
 @torch.no_grad()
 def ce(q):
     x = torch.tensor([q]).cuda()
-    lp = torch.log_softmax(lm(x).logits[0, :-1].float(), -1)
+    o = lm(x)
+    lp = torch.log_softmax((o.logits if hasattr(o, 'logits') else o[0])[0, :-1].float(), -1)
     return (-lp.gather(1, x[0, 1:, None])[:, 0]).cpu().numpy()
 
 
@@ -53,4 +60,4 @@ for s, pairs in sets.items():
     if s == 'blimp':
         o += ' (' + ' '.join(f'{g} {100 * np.mean(v):.1f}' for g, v in sorted(grp.items())) + ')'
     out.append(o)
-print(f'REF {name}: ' + ' | '.join(out))
+print(f'REF {name} ({params}): ' + ' | '.join(out))
