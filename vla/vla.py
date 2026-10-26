@@ -30,6 +30,7 @@ import datetime
 import glob
 import io
 import itertools
+import shutil
 import textwrap
 import json
 import math
@@ -49,6 +50,8 @@ import numpy as np
 import torch ; print('torch', torch.__version__)
 import torch.nn as nn
 from torch.nn import functional as F
+
+_DATA = os.environ.get('VLA_DATA', '/data')   # root of the local corpora and features (prep scripts write here)
 
 NUL_TEXT = '<NUL>'          # how _NULL renders where it is named (GEN prompts, sample panel)
 DOT_TEXT = '\xb7'           # how any other unprintable character renders
@@ -88,16 +91,16 @@ def _eval_minlen(corpus):
 # Image-caption corpora: a local directory of parquet files (see exp/img_prep.py,
 # exp/caption_prep.py) with an encoded 'image', an 'id', a 'class' and the caption column(s).
 _IMAGE_DATASETS = {
-    'imagenet21k': dict(dir='/data/imagenet21k_recap', caption='recaption',    # synthetic
+    'imagenet21k': dict(dir=_DATA + '/imagenet21k_recap', caption='recaption',    # synthetic
                         eval_group0=True),   # its eval set reads only row group 0 per file
-    'redcaps':     dict(dir='/data/redcaps5m', caption='caption'),     # Reddit post titles
-    'redcaps25':   dict(dir='/data/redcaps5m_25', caption='caption'),  # its first 25 shards
-    'coco':        dict(dir='/data/coco_captions', caption='caption'), # 5 human captions/image
+    'redcaps':     dict(dir=_DATA + '/redcaps5m', caption='caption'),     # Reddit post titles
+    'redcaps25':   dict(dir=_DATA + '/redcaps5m_25', caption='caption'),  # its first 25 shards
+    'coco':        dict(dir=_DATA + '/coco_captions', caption='caption'), # 5 human captions/image
     # Wikipedia images: one example = the human caption, a newline, the Gemini description
-    'wit':         dict(dir='/data/wit_1m_recap', caption=('caption', 'gemini_caption')),
+    'wit':         dict(dir=_DATA + '/wit_1m_recap', caption=('caption', 'gemini_caption')),
     # wit filtered (exp/wit_score.py, exp/wit_filter.py): fineweb-edu classifier >= 2.5 on
     # the example text AND CLIP ViT-L/14 image-vs-human-caption >= 0.25
-    'witq':        dict(dir='/data/witq', caption=('caption', 'gemini_caption')),
+    'witq':        dict(dir=_DATA + '/witq', caption=('caption', 'gemini_caption')),
 }
 
 
@@ -127,8 +130,8 @@ _IMAGINE_MODELS = {
 # the last _AUD_WIN Mimi frames of sound at that time. train/eval: file globs; eval None =
 # the id-hash held-out 1/_HOLDOUT_MOD of the training files.
 _VIDEO_DATASETS = {
-    'finevideo': dict(dir='/data/finevideo_feat', train='train-*.parquet', eval=None),
-    'valor':     dict(dir='/data/valor_feat', train='train-*.parquet', eval='test-*.parquet'),
+    'finevideo': dict(dir=_DATA + '/finevideo_feat', train='train-*.parquet', eval=None),
+    'valor':     dict(dir=_DATA + '/valor_feat', train='train-*.parquet', eval='test-*.parquet'),
 }                           # valor: deprecated 2026-10-17 (25k short clips, over-repeated)
 _VID_EVAL_CLIPS = 64        # held-out videos per video eval corpus (decoded frames stay in RAM) ...
 _VID_EVAL_MAXLEN = 512      # ... each its opening window of at most this many tokens
@@ -164,14 +167,14 @@ _LM_SD = [
 # sidecar corpus holds (exp/audio_prep.py) as 16 kHz FLAC joined to the video rows by id
 _QN_URL = ('https://api.ngc.nvidia.com/v2/models/nvidia/nemo/stt_en_quartznet15x5/versions/'
            '1.0.0rc1/files/stt_en_quartznet15x5.nemo')
-_QN_DIR = '/data/huggingface/quartznet'
+_QN_DIR = _DATA + '/huggingface/quartznet'
 _QN_SR = 16000
 _QN_HOP = int(_QN_SR / _AUD_RATE)      # samples per audio grid cell (1280)
 _QN_WIN = 8 * _QN_SR        # each grid is computed from the last 8 s heard (it looks both ways)
 _QN_FRAMES = 4              # quartznet: sound heard is counted in its 20 ms frames, 4 per grid cell
-_AUD_SIDECAR = {'finevideo': '/data/finevideo_audio'}
-_VCAP_SIDECAR = {'finevideo': '/data/finevideo_vcap'}   # --fifo3: visual captions (exp/vcap_prep.py)
-_ALIGN_SIDECAR = {'finevideo': '/data/finevideo_align'}  # --speech_align: word times (exp/align_prep.py)
+_AUD_SIDECAR = {'finevideo': _DATA + '/finevideo_audio'}
+_VCAP_SIDECAR = {'finevideo': _DATA + '/finevideo_vcap'}   # --fifo3: visual captions (exp/vcap_prep.py)
+_ALIGN_SIDECAR = {'finevideo': _DATA + '/finevideo_align'}  # --speech_align: word times (exp/align_prep.py)
 _VCAP_SAME = 0.6             # --fifo3: a caption whose word overlap (Jaccard) with one of the last 3
                              # kept exceeds this repeats it and is dropped
 
@@ -649,9 +652,13 @@ parser.add_argument('--delay',      default=0.1,  type=float, help='--vis second
 parser.add_argument('--cmap',       default='viridis', help='--vis colormap')
 parser.add_argument('--push',       default=False, action='store_true',
                     help='push the --load checkpoint to the hub as --hub_repo, exit')
-parser.add_argument('--hub_repo',   default='siliconperception/VLA')
+parser.add_argument('--hub_repo',   default='siliconperception/vla',
+                    help="--push target; '-' writes --push_dir only")
 parser.add_argument('--private',    default=False, action='store_true', help='--push: private repo')
-parser.add_argument('--pretrained', default=None, nargs='?', const='siliconperception/VLA',
+parser.add_argument('--push_dir',   default=None, help='--push: local folder written first (default ./<repo name>)')
+parser.add_argument('--card',       default=None, help='--push: model card (markdown) uploaded as README.md')
+parser.add_argument('--hub_tag',    default=None, help='--push: tag the pushed commit (e.g. the run name)')
+parser.add_argument('--pretrained', default=None, nargs='?', const='siliconperception/vla',
                     metavar='REPO', help='load weights + architecture from a hub repo')
 parser.add_argument('--revision',   default=None, help='--pretrained: branch, tag or commit')
 parser.add_argument('--verbose',    default=False, action='store_true',
@@ -724,15 +731,34 @@ _aud_switch = None           # --load with another --audio_encoder: (old, new)
 _start_step = 0
 _start_exs = 0
 _start_exs_by = {}            # corpus -> examples trained, for the STEP ex_/ep_ columns
+_HUB_ARGS = 'vla_args.json'  # --push: the checkpoint's saved_args, step and examples beside model.safetensors
+
+
+def _hub_checkpoint(repo, revision=None):
+    """--pretrained: a pushed repo (hub id or local folder) as the dict --load reads from a .pt."""
+    from safetensors.torch import load_file
+    if os.path.isdir(repo):
+        get = lambda f: os.path.join(repo, f)
+    else:
+        from huggingface_hub import hf_hub_download
+        get = lambda f: hf_hub_download(repo, f, revision=revision)
+    meta = json.load(open(get(_HUB_ARGS)))
+    return dict(meta, state_dict=load_file(get('model.safetensors')))
+
+
 if args.pretrained and args.load:
     print(f'--pretrained overrides --load {args.load}')
     args.load = None
-if args.load:
+if args.pretrained:
+    print(f'loading {args.pretrained} from the hub...')
+    _loaded_ckpt = _hub_checkpoint(args.pretrained, args.revision)
+elif args.load:
     _loaded_ckpt = torch.load(args.load, map_location='cpu', weights_only=True)
+if _loaded_ckpt is not None:
     _saved = _loaded_ckpt['saved_args']
     _bad = {k: _saved[k] for k, v in _FIXED_ARCH.items() if k in _saved and _saved[k] != v}
     if _bad:
-        raise SystemExit(f'{args.load} is not a v395-type checkpoint: {_bad}')
+        raise SystemExit(f'{args.load or args.pretrained} is not a v395-type checkpoint: {_bad}')
     _aud_given = (args.audio_encoder if any(a == '--audio_encoder' or a.startswith('--audio_encoder=')
                                             for a in sys.argv) else None)
     for k in _ARCH_ARGS:
@@ -2046,12 +2072,12 @@ _HUB_SUBSET = {
 
 # Local document parquets (a 'text' column) written by a prep script: name -> directory.
 _LOCAL_PARQUET = {
-    'babylm':   '/data/babylm2026_nat/docs',  # exp/babylm_prep.py: BabyLM 2026 Strict, marked documents
-    'babylm1k': '/data/babylm2026_docs',      # v473: the same cut into ~1000-word pieces (--chunk 1000)
-    'babylmseq': '/data/babylm2026_seq2',     # the same pieces, up to 16 of a document in order per row (--seq 16;
+    'babylm':   _DATA + '/babylm2026_nat/docs',  # exp/babylm_prep.py: BabyLM 2026 Strict, marked documents
+    'babylm1k': _DATA + '/babylm2026_docs',      # v473: the same cut into ~1000-word pieces (--chunk 1000)
+    'babylmseq': _DATA + '/babylm2026_seq2',     # the same pieces, up to 16 of a document in order per row (--seq 16;
                                               # Switchboard hidden in simple_wiki cut out, v476 on)
-    'babylmseq0': '/data/babylm2026_seq',     # v475's build (that Switchboard labelled simple_wiki, tabs kept)
-    'babylmdev': '/data/babylm2026_dev',      # BabyLM's official dev split as ~1000-word pieces: eval only
+    'babylmseq0': _DATA + '/babylm2026_seq',     # v475's build (that Switchboard labelled simple_wiki, tabs kept)
+    'babylmdev': _DATA + '/babylm2026_dev',      # BabyLM's official dev split as ~1000-word pieces: eval only
 }
 _EVAL_ONLY = {'babylmdev'}                  # a held-out split as a whole: --eval_corpora only, never --mix
 
@@ -2874,55 +2900,43 @@ def _corpus_size(name):
 
 # ── build / load the model ────────────────────────────────────────────────────
 
-if args.pretrained:
-    if not hasattr(VLAModel, 'from_pretrained'):
-        raise SystemExit('--pretrained requires huggingface_hub')
-    print(f'loading {args.pretrained} from the hub...')
-    model = VLAModel.from_pretrained(args.pretrained, revision=args.revision)
-    args.context, args.n_hidden, args.c_context = model.S, model.n_hidden, model.c_context
-    args.ctx_ema = ','.join(f'{w:g}' for w in model.windows)
-    args.ctx_read_norm, args.init = model.read_norm, model.init_mode
-    args.image_encoder = model.image_encoder
-    args.audio_encoder = getattr(model, 'audio_encoder', 'none')
-    _emit(f'ARGS (pretrained) {args}')
-else:
-    model = VLAModel(S=args.context, n_hidden=args.n_hidden, c_context=args.c_context,
-                     depth=args.depth, kernel=args.kernel, tokenizer=args.tokenizer,
-                     windows=[float(w) for w in str(args.ctx_ema).split(',') if w.strip()],
-                     read_norm=args.ctx_read_norm,
-                     dec_kernels=[int(k) for k in str(args.dec_tree_kernels).split(',') if k.strip()],
-                     dec_width=args.dec_width, bn_momentum=args.bn_momentum, init=args.init,
-                     image_encoder=args.image_encoder, audio_encoder=args.audio_encoder,
-                     nul_head=not args.inner_voice and (
-                         bool(args.clock_hz) or (_loaded_ckpt is not None and
-                                                 'text_dec.nul.weight' in _loaded_ckpt['state_dict'])),
-                     streams=args.streams, text_nul=args.fifo3,
-                     surprise=_surprise)
-    if _loaded_ckpt is not None:
-        _sd = _upgrade_state_dict(_loaded_ckpt['state_dict'])
-        if _aud_switch:
-            _sd = _switch_audio_state_dict(_sd, model, *_aud_switch)
-        if model.streams == 3 and 'voc_dec.proj.weight' not in _sd:
-            _sd = _widen_state_dict(_sd, model)
-        missing, unexpected = model.load_state_dict(_sd, strict=False)
-        bad = [k for k in missing if not re.match(r'(text|voc|img)_dec\.nul\.|surp_mean$|gain_mean$', k)] + \
-              [k for k in unexpected if not ((args.inner_voice or model.streams == 3)
-                                             and k.startswith('text_dec.nul.'))]
-        if bad:
-            raise SystemExit(f'{args.load} does not fit this model: {bad[:6]}')
-        if [k for k in missing if k not in ('surp_mean', 'gain_mean')]:
-            print('text_dec.nul (the <NUL> logit) is new: zero-initialized', flush=True)
-        if unexpected:
-            print('--inner_voice: the checkpoint\'s <NUL> logit (text_dec.nul) is dropped', flush=True)
-    if _surp_init is not None and float(model.surp_mean) == 0:
-        model.surp_mean.fill_(_surp_init)
-    if args.use_ema:
-        _e = (_loaded_ckpt or {}).get('weight_ema', {}).get(args.use_ema)
-        if _e is None:
-            raise SystemExit(f'--use_ema {args.use_ema}: {args.load} has no such average '
-                             f'(it has {sorted((_loaded_ckpt or {}).get("weight_ema", {}))})')
-        model.load_state_dict(_e, strict=False)
-        print(f'--use_ema: weights replaced by the T={args.use_ema} running average', flush=True)
+model = VLAModel(S=args.context, n_hidden=args.n_hidden, c_context=args.c_context,
+                 depth=args.depth, kernel=args.kernel, tokenizer=args.tokenizer,
+                 windows=[float(w) for w in str(args.ctx_ema).split(',') if w.strip()],
+                 read_norm=args.ctx_read_norm,
+                 dec_kernels=[int(k) for k in str(args.dec_tree_kernels).split(',') if k.strip()],
+                 dec_width=args.dec_width, bn_momentum=args.bn_momentum, init=args.init,
+                 image_encoder=args.image_encoder, audio_encoder=args.audio_encoder,
+                 nul_head=not args.inner_voice and (
+                     bool(args.clock_hz) or (_loaded_ckpt is not None and
+                                             'text_dec.nul.weight' in _loaded_ckpt['state_dict'])),
+                 streams=args.streams, text_nul=args.fifo3,
+                 surprise=_surprise)
+if _loaded_ckpt is not None:
+    _sd = _upgrade_state_dict(_loaded_ckpt['state_dict'])
+    if _aud_switch:
+        _sd = _switch_audio_state_dict(_sd, model, *_aud_switch)
+    if model.streams == 3 and 'voc_dec.proj.weight' not in _sd:
+        _sd = _widen_state_dict(_sd, model)
+    missing, unexpected = model.load_state_dict(_sd, strict=False)
+    bad = [k for k in missing if not re.match(r'(text|voc|img)_dec\.nul\.|surp_mean$|gain_mean$', k)] + \
+          [k for k in unexpected if not ((args.inner_voice or model.streams == 3)
+                                         and k.startswith('text_dec.nul.'))]
+    if bad:
+        raise SystemExit(f'{args.load} does not fit this model: {bad[:6]}')
+    if [k for k in missing if k not in ('surp_mean', 'gain_mean')]:
+        print('text_dec.nul (the <NUL> logit) is new: zero-initialized', flush=True)
+    if unexpected:
+        print('--inner_voice: the checkpoint\'s <NUL> logit (text_dec.nul) is dropped', flush=True)
+if _surp_init is not None and float(model.surp_mean) == 0:
+    model.surp_mean.fill_(_surp_init)
+if args.use_ema:
+    _e = (_loaded_ckpt or {}).get('weight_ema', {}).get(args.use_ema)
+    if _e is None:
+        raise SystemExit(f'--use_ema {args.use_ema}: {args.load} has no such average '
+                         f'(it has {sorted((_loaded_ckpt or {}).get("weight_ema", {}))})')
+    model.load_state_dict(_e, strict=False)
+    print(f'--use_ema: weights replaced by the T={args.use_ema} running average', flush=True)
 model = model.to(args.device)
 _tokenizer = model.tok
 _NUL_ID = model.nul_id
@@ -3214,11 +3228,26 @@ if args.image:
 if args.push:
     if args.load is None and args.pretrained is None:
         raise SystemExit('--push requires --load (nothing to push but random weights)')
-    local = os.path.basename(args.hub_repo)
-    print(f'saving {args.load or args.pretrained} to ./{local} ...')
-    model.to('cpu').save_pretrained(local)
-    print(f'pushing to https://huggingface.co/{args.hub_repo} ...')
-    model.push_to_hub(args.hub_repo, private=args.private or None)
+    from safetensors.torch import save_file
+    local = args.push_dir or os.path.basename(args.hub_repo)
+    os.makedirs(local, exist_ok=True)
+    print(f'saving {args.load or args.pretrained} to {local}/ ...')
+    save_file({k: v.detach().cpu().clone().contiguous() for k, v in model.state_dict().items()},
+              os.path.join(local, 'model.safetensors'))     # clone: the decoders share one lm_head
+    with open(os.path.join(local, _HUB_ARGS), 'w') as f:
+        json.dump({k: _loaded_ckpt.get(k) for k in ('saved_args', 'step', 'examples', 'examples_by')},
+                  f, indent=1, default=str)
+    if args.card:
+        shutil.copy(args.card, os.path.join(local, 'README.md'))
+    if args.hub_repo != '-':
+        from huggingface_hub import HfApi
+        api = HfApi()
+        print(f'pushing to https://huggingface.co/{args.hub_repo} ...')
+        api.create_repo(args.hub_repo, private=args.private, exist_ok=True)
+        api.upload_folder(repo_id=args.hub_repo, folder_path=local,
+                          commit_message=f'{os.path.basename(args.load or args.pretrained)} step {_start_step}')
+        if args.hub_tag:
+            api.create_tag(args.hub_repo, tag=args.hub_tag)
     print('done')
     raise SystemExit(0)
 
