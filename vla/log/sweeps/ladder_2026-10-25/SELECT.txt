@@ -1,6 +1,0 @@
-run                ctx_tau         EVAL EVALL fl  drift     own    held         old-bin memory guard
-v468_tau64_250K    64,16,4,1     4.5745     80.4   -3.7  +0.269 +0.0046  +0.0257 +-0.0027 @  175K pass
-v469_tau128_250K   128,32,8,2    4.6116     87.2   +7.1  +0.303 +0.0242  +0.0227 +-0.0031 @  175K pass
-v470_tau32_250K    32,8,2,0.5    4.5648     86.1   +4.0  +0.264 +0.0315  +0.0197 +-0.0030 @  175K pass
-winner v468_tau64_250K: EVAL within 0.01 of the best (v468_tau64_250K, v470_tau32_250K); highest old-bin memory +0.0257
-DECISION v468_tau64_250K 64,16,4,1

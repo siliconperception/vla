@@ -1,0 +1,15 @@
+# Tested with Python 3.13 and these versions (CUDA 13.0 wheels for torch/torchvision/torchaudio).
+torch>=2.14
+torchvision>=0.29
+transformers>=5.20
+datasets>=5.1
+huggingface_hub>=1.33
+safetensors>=0.8
+numpy>=2.5
+pyarrow>=26
+Pillow>=13
+# images and video corpora, audio features, plots: only for those features
+av>=19
+soundfile>=0.14
+torchaudio>=2.11
+matplotlib>=3.11

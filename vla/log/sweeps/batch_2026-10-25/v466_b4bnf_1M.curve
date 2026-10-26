@@ -1,5 +1,0 @@
-batch 4, pre step 8723091, now step 8973091; 1467 training docs; held-out improvement -0.0782 +- 0.0028
-age     0K-   30K tokens  n    49  memory +0.2826 +- 0.0225
-age    30K-  100K tokens  n   100  memory +0.1754 +- 0.0097
-age   100K-  300K tokens  n   322  memory +0.1552 +- 0.0065
-age   300K-  infK tokens  n   996  memory +0.1132 +- 0.0040

@@ -1,0 +1,17 @@
+# Weights and run output stay local: checkpoints are published to Hugging Face, logs are the lab record.
+checkpoint/
+log/
+*.pt
+lab/
+__pycache__/
+*.pyc
+tools/.run/
+# Never commit credentials.
+HF_TOKEN
+*.token
+.env
+# Archived projects keep their own untracked build products and checkpoints.
+archive/dev/checkpoint.pt*
+archive/dev/c4/
+doit
+.claude/settings.local.json

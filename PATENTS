@@ -1,0 +1,11 @@
+Patent notice
+
+Silicon Perception Inc owns pending US patent application US-20260010766-A1,
+which concerns implementing convolutional neural networks in silicon.
+
+The MIT License in LICENSE covers the software in this repository and the
+model weights published with it. It grants no license, express or implied,
+under US-20260010766-A1, under any patent that issues from it or claims
+priority to it, or under any other patent of Silicon Perception Inc.
+
+For hardware licensing, contact Silicon Perception Inc.
