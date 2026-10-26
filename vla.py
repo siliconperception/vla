@@ -650,6 +650,24 @@ parser.add_argument('--video_seconds', default=0.0, type=float,
                     help='--video: stop after this many seconds (0: until x or the window closes)')
 parser.add_argument('--video_save', default=None, metavar='PNG',
                     help='--video: write the window to PNG on exit')
+parser.add_argument('--teach',      default=0, type=int, metavar='N',
+                    help='active learning: load, run N teaching episodes at batch 1 on held-out qaipt pages, '
+                         'report, exit (weights are never saved). Each episode reads a page from a zero '
+                         'state, asks a question (--teach_ask), force-feeds the answer and takes SGD steps '
+                         'on the answer tokens only (BatchNorm in inference mode, the gradient through '
+                         'the register writes over the answer span), then quizzes it closed book')
+parser.add_argument('--teach_ask',  default='data', choices=['data', 'model'],
+                    help="--teach: 'data' = the page's own first Q/A pair; 'model' = the model writes the "
+                         'question after "Q:" and --teach_teacher answers it from the page')
+parser.add_argument('--teach_teacher', default='Qwen/Qwen2.5-1.5B-Instruct', metavar='MODEL',
+                    help='--teach_ask model: the instruction-tuned LM that answers the questions')
+parser.add_argument('--teach_lr',   default=1e-3, type=float, help='--teach: SGD learning rate')
+parser.add_argument('--teach_steps', default=1, type=int, help='--teach: SGD steps per answer')
+parser.add_argument('--teach_control', default=100, type=int, metavar='N',
+                    help='--teach: untaught held-out Q/A pairs scored before and after the session')
+parser.add_argument('--teach_skip', default=1000, type=int, metavar='N',
+                    help='--teach: skip the first N held-out pages (the EVALQ set)')
+parser.add_argument('--teach_json', default=None, help='--teach: write every episode as JSON')
 parser.add_argument('--eval',       default=False, action='store_true',
                     help='load, run the held-out eval protocol (EVAL lines + table), exit')
 parser.add_argument('--eval_json',  default=None, help='--eval: also write results as JSON')
@@ -679,7 +697,7 @@ if _continuous - {'text', 'image', 'video'}:
     raise SystemExit(f'--continuous {args.continuous}: kinds are text, image and video')
 
 _ONESHOT = (args.generate or args.eval or args.vis or args.push or args.free_run or
-            args.prompt_tune or args.doc_score)
+            args.prompt_tune or args.doc_score or args.teach)
 
 # ── checkpoint ────────────────────────────────────────────────────────────────
 
@@ -5354,6 +5372,146 @@ if args.doc_score:
 
 if args.prompt_tune:
     _prompt_tune()
+    raise SystemExit(0)
+
+def _teach_pages(n):
+    """The held-out qaipt pages after the first --teach_skip, as (page, [(q, a)])."""
+    import pyarrow.parquet as pq
+    out, seen = [], 0
+    for f in _local_files('qaipt'):
+        for text in pq.read_table(f, columns=['text']).column(0).to_pylist():
+            if not _is_heldout(text):
+                continue
+            seen += 1
+            if seen <= args.teach_skip:
+                continue
+            page, sep, rest = text.partition('\n\nQ: ')
+            pairs = [tuple(x.split('\nA: ', 1)) for x in rest.split('\n\nQ: ')] if sep else []
+            pairs = [qa for qa in pairs if len(qa) == 2 and qa[0].strip() and qa[1].strip()]
+            if pairs and len(_tokenizer.encode(page)) < _QA_MAXLEN - 64:
+                out.append((page, pairs))
+            if len(out) >= n:
+                return out
+    return out
+
+
+class _Teacher:
+    """--teach_ask model: an instruction-tuned LM answers a question from the page, in a few words."""
+
+    def __init__(self, name):
+        from transformers import AutoModelForCausalLM, AutoTokenizer
+        self.tok = AutoTokenizer.from_pretrained(name)
+        self.lm = AutoModelForCausalLM.from_pretrained(name, dtype=torch.bfloat16).to(args.device).eval()
+
+    @torch.no_grad()
+    def answer(self, page, q):
+        msgs = [{'role': 'system', 'content': 'Answer the question from the text. Reply with only the answer, '
+                                              'a few words, not a sentence.'},
+                {'role': 'user', 'content': f'Text:\n{page[:4000]}\n\nQuestion: {q}'}]
+        prompt = self.tok.apply_chat_template(msgs, add_generation_prompt=True, tokenize=False)
+        enc = self.tok(prompt, return_tensors='pt').to(args.device)
+        out = self.lm.generate(**enc, max_new_tokens=24, do_sample=False)
+        return self.tok.decode(out[0, enc['input_ids'].shape[1]:], skip_special_tokens=True).strip().split('\n')[0]
+
+
+def _closed_ce(qas):
+    """Mean nats per answer token of each (q, a), closed book from a zero state."""
+    rows = [_qa_tokens(None, [qa]) for qa in qas]
+    ce = _ce_pairs([(x, y) for x, y, _ in rows])
+    return [float(c[np.array(m, dtype=bool)].mean()) for c, (_, _, m) in zip(ce, rows)]
+
+
+def _teach():
+    """--teach: see its help. Episodes run in order on one set of weights, so later quizzes of earlier
+    answers measure forgetting."""
+    dev = args.device
+    model.eval()                                   # BatchNorm and the read scale: inference statistics
+    params = [p for p in model.parameters() if p.requires_grad]
+    opt = torch.optim.SGD(params, lr=args.teach_lr)
+    pages = _teach_pages(args.teach + args.teach_control)
+    eps, ctrl = pages[:args.teach], [prs[0] for _, prs in pages[args.teach:]]
+    teacher = _Teacher(args.teach_teacher) if args.teach_ask == 'model' else None
+    ctrl_before = _closed_ce(ctrl) if ctrl else []
+
+    def feed(ids, dff, grad=False):
+        """Step through ids from dff -> (list of logits, final dff)."""
+        out = []
+        with torch.set_grad_enabled(grad):
+            for b in ids:
+                dff, o = model.step(torch.tensor([b], device=dev), dff)
+                out.append(model.text_dec(o))
+                if not grad:
+                    dff = dff.detach()
+        return out, dff
+
+    rec = []
+    for k, (page, pairs) in enumerate(eps):
+        t0 = time.time()
+        _, page_dff = feed([_NULL] + _tokenizer.encode(page), model.new_state(1, dev))
+        if args.teach_ask == 'data':
+            q, a = pairs[0]
+            q_ids = _tokenizer.encode('\n\nQ: ' + q)
+        else:                                      # the model asks: sample after "Q:" until a newline
+            q_ids = _tokenizer.encode('\n\nQ:')
+            lg, dff = feed(q_ids, page_dff)
+            for _ in range(40):
+                b = torch.multinomial(_truncate(F.softmax(lg[-1][0].float(), dim=-1)), 1).item()
+                if '\n' in _tokenizer.decode([b]):
+                    break
+                q_ids.append(b)
+                lg, dff = feed([b], dff)
+            q = _tokenizer.decode(q_ids).replace('Q:', '', 1).strip()
+            if len(q) < 3:
+                _emit(f'TEACH ep {k:4d} | (no question: {_printable(q)!r}) skipped')
+                continue
+            a = teacher.answer(page, q)
+            if not a:
+                _emit(f'TEACH ep {k:4d} | Q: {_printable(q)} | (no answer) skipped')
+                continue
+        _, dff = feed(q_ids[:-1], page_dff)        # the state before the question's last token
+        head, ans = _tokenizer.encode('\nA:'), _tokenizer.encode(' ' + a)
+        xs, ys = [q_ids[-1]] + head + ans[:-1], head + ans
+        mask = torch.tensor([0.0] * len(head) + [1.0] * len(ans), device=dev)
+        y = torch.tensor(ys, device=dev)
+        closed_before = _closed_ce([(q, a)])[0]
+        start = dff.detach()
+        open_before = None
+        for _ in range(args.teach_steps):
+            lg, _ = feed(xs, start, grad=True)
+            ce = F.cross_entropy(torch.cat(lg).float(), y, reduction='none')
+            loss = (ce * mask).sum() / mask.sum()
+            if open_before is None:
+                open_before = float(loss)
+            opt.zero_grad()
+            loss.backward()
+            opt.step()
+        with torch.no_grad():
+            lg, _ = feed(xs, start)
+            open_after = float((F.cross_entropy(torch.cat(lg).float(), y, reduction='none') * mask).sum() / mask.sum())
+        closed_after = _closed_ce([(q, a)])[0]
+        rec.append(dict(ep=k, q=q, a=a, open_before=open_before, open_after=open_after,
+                        closed_before=closed_before, closed_after=closed_after))
+        _emit(f'TEACH ep {k:4d} | Q: {_printable(q)[:80]} | A: {_printable(a)[:40]} | open {open_before:.2f} -> '
+              f'{open_after:.2f} | closed {closed_before:.2f} -> {closed_after:.2f} | {time.time() - t0:.1f}s')
+    if not rec:
+        raise SystemExit('--teach: no episode ran')
+    finals = _closed_ce([(r['q'], r['a']) for r in rec])
+    for r, f in zip(rec, finals):
+        r['closed_final'] = f
+    ctrl_after = _closed_ce(ctrl) if ctrl else []
+    m = lambda key: float(np.mean([r[key] for r in rec]))
+    _emit(f'TEACHSUM episodes {len(rec)} ask {args.teach_ask} lr {args.teach_lr:g} steps {args.teach_steps} | '
+          f'closed before {m("closed_before"):.3f} after {m("closed_after"):.3f} end {m("closed_final"):.3f} | '
+          f'open before {m("open_before"):.3f} after {m("open_after"):.3f} | control '
+          f'{np.mean(ctrl_before) if ctrl else float("nan"):.3f} -> {np.mean(ctrl_after) if ctrl else float("nan"):.3f}')
+    if args.teach_json:
+        with open(args.teach_json, 'w') as f:
+            json.dump(dict(args={k: v for k, v in vars(args).items() if k.startswith('teach')}, episodes=rec,
+                           control_before=ctrl_before, control_after=ctrl_after), f, indent=1)
+
+
+if args.teach:
+    _teach()
     raise SystemExit(0)
 
 if args.eval:
