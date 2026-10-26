@@ -667,6 +667,9 @@ parser.add_argument('--teach_control', default=100, type=int, metavar='N',
                     help='--teach: untaught held-out Q/A pairs scored before and after the session')
 parser.add_argument('--teach_skip', default=1000, type=int, metavar='N',
                     help='--teach: skip the first N held-out pages (the EVALQ set)')
+parser.add_argument('--teach_para', default=True, action=argparse.BooleanOptionalAction,
+                    help='--teach: also quiz a paraphrase of each question, written by --teach_teacher '
+                         '(and, with --teach_control, the taught answer after an unrelated question)')
 parser.add_argument('--teach_json', default=None, help='--teach: write every episode as JSON')
 parser.add_argument('--eval',       default=False, action='store_true',
                     help='load, run the held-out eval protocol (EVAL lines + table), exit')
@@ -5413,12 +5416,67 @@ class _Teacher:
         out = self.lm.generate(**enc, max_new_tokens=24, do_sample=False)
         return self.tok.decode(out[0, enc['input_ids'].shape[1]:], skip_special_tokens=True).strip().split('\n')[0]
 
+    @torch.no_grad()
+    def paraphrase(self, q):
+        """q reworded, same meaning; None when the rewrite is empty or the same question."""
+        msgs = [{'role': 'system', 'content': 'Rewrite the question with different words but the same meaning, '
+                                              'so it has the same answer. Reply with only the new question.'},
+                {'role': 'user', 'content': q}]
+        prompt = self.tok.apply_chat_template(msgs, add_generation_prompt=True, tokenize=False)
+        enc = self.tok(prompt, return_tensors='pt').to(args.device)
+        out = self.lm.generate(**enc, max_new_tokens=48, do_sample=False)
+        p = self.tok.decode(out[0, enc['input_ids'].shape[1]:], skip_special_tokens=True).strip().split('\n')[0]
+        return p if p and _norm_answer(p) != _norm_answer(q) else None
 
-def _closed_ce(qas):
-    """Mean nats per answer token of each (q, a), closed book from a zero state."""
+
+def _norm_answer(s):
+    """SQuAD answer normalization: lower case, no punctuation, no articles, single spaces."""
+    s = re.sub(r'[^\w\s]', ' ', s.lower())
+    return ' '.join(w for w in s.split() if w not in ('a', 'an', 'the'))
+
+
+def _f1(pred, gold):
+    p, g = _norm_answer(pred).split(), _norm_answer(gold).split()
+    common = sum((collections.Counter(p) & collections.Counter(g)).values())
+    if not p or not g or not common:
+        return float(p == g)
+    prec, rec = common / len(p), common / len(g)
+    return 2 * prec * rec / (prec + rec)
+
+
+def _quiz(qas):
+    """Closed book, from a zero state, for each (q, a): ce, nats per answer token; acc, the share of
+    answer tokens that are the top prediction (teacher-forced); em and f1 of the greedy answer (up to the
+    first newline) against a, SQuAD-normalized."""
+    dev = args.device
     rows = [_qa_tokens(None, [qa]) for qa in qas]
-    ce = _ce_pairs([(x, y) for x, y, _ in rows])
-    return [float(c[np.array(m, dtype=bool)].mean()) for c, (_, _, m) in zip(ce, rows)]
+    out = []
+    with _EvalState(), torch.no_grad():
+        for (q, a), (xs, ys, m) in zip(qas, rows):
+            dff = model.new_state(1, dev)
+            lg = []
+            for b in xs:
+                dff, o = model.step(torch.tensor([b], device=dev), dff)
+                lg.append(model.text_dec(o))
+            lg = torch.cat(lg).float()
+            y, mk = torch.tensor(ys, device=dev), torch.tensor(m, device=dev, dtype=torch.bool)
+            ce = F.cross_entropy(lg, y, reduction='none')[mk]
+            acc = (lg.argmax(-1) == y)[mk].float()
+            n_q = len(xs) - int(mk.sum()) + 1            # inputs up to and including the "A:" head
+            dff = model.new_state(1, dev)
+            for b in xs[:n_q]:
+                dff, o = model.step(torch.tensor([b], device=dev), dff)
+            gen = []
+            for _ in range(int(mk.sum()) + 8):
+                t = int(model.text_dec(o)[0].argmax())
+                if t == _NUL_ID or '\n' in _tokenizer.decode([t]):
+                    break
+                gen.append(t)
+                dff, o = model.step(torch.tensor([t], device=dev), dff)
+            g = _tokenizer.decode(gen).strip()
+            out.append(dict(ce=float(ce.clamp(max=30).mean()), acc=float(acc.mean()), gen=g,
+                            em=float(_norm_answer(g) == _norm_answer(a)), f1=_f1(g, a)))
+    return out
 
 
 def _teach():
@@ -5430,8 +5488,8 @@ def _teach():
     opt = torch.optim.SGD(params, lr=args.teach_lr)
     pages = _teach_pages(args.teach + args.teach_control)
     eps, ctrl = pages[:args.teach], [prs[0] for _, prs in pages[args.teach:]]
-    teacher = _Teacher(args.teach_teacher) if args.teach_ask == 'model' else None
-    ctrl_before = _closed_ce(ctrl) if ctrl else []
+    teacher = _Teacher(args.teach_teacher) if args.teach_ask == 'model' or args.teach_para else None
+    ctrl_before = _quiz(ctrl) if ctrl else []
 
     def feed(ids, dff, grad=False):
         """Step through ids from dff -> (list of logits, final dff)."""
@@ -5473,7 +5531,10 @@ def _teach():
         xs, ys = [q_ids[-1]] + head + ans[:-1], head + ans
         mask = torch.tensor([0.0] * len(head) + [1.0] * len(ans), device=dev)
         y = torch.tensor(ys, device=dev)
-        closed_before = _closed_ce([(q, a)])[0]
+        para = teacher.paraphrase(q) if args.teach_para else None
+        other = ctrl[k % len(ctrl)][0] if ctrl else None   # an unrelated question: is it the Q -> A link or
+        quiz = [(q, a)] + ([(para, a)] if para else []) + ([(other, a)] if other else [])   # just the answer?
+        before = _quiz(quiz)
         start = dff.detach()
         open_before = None
         for _ in range(args.teach_steps):
@@ -5488,26 +5549,48 @@ def _teach():
         with torch.no_grad():
             lg, _ = feed(xs, start)
             open_after = float((F.cross_entropy(torch.cat(lg).float(), y, reduction='none') * mask).sum() / mask.sum())
-        closed_after = _closed_ce([(q, a)])[0]
-        rec.append(dict(ep=k, q=q, a=a, open_before=open_before, open_after=open_after,
-                        closed_before=closed_before, closed_after=closed_after))
-        _emit(f'TEACH ep {k:4d} | Q: {_printable(q)[:80]} | A: {_printable(a)[:40]} | open {open_before:.2f} -> '
-              f'{open_after:.2f} | closed {closed_before:.2f} -> {closed_after:.2f} | {time.time() - t0:.1f}s')
+        after = _quiz(quiz)
+        rec.append(dict(ep=k, q=q, a=a, para=para, other=other, open_before=open_before, open_after=open_after,
+                        orig=dict(before=before[0], after=after[0]),
+                        para_quiz=dict(before=before[1], after=after[1]) if para else None,
+                        other_quiz=dict(before=before[-1], after=after[-1]) if other else None))
+        pq = f' | para {before[1]["ce"]:.2f} -> {after[1]["ce"]:.2f} em {after[1]["em"]:.0f}' if para else ''
+        _emit(f'TEACH ep {k:4d} | Q: {_printable(q)[:70]} | A: {_printable(a)[:30]} | open {open_before:.2f} -> '
+              f'{open_after:.2f} | closed {before[0]["ce"]:.2f} -> {after[0]["ce"]:.2f} em {after[0]["em"]:.0f} '
+              f'({_printable(after[0]["gen"])[:30]}){pq} | {time.time() - t0:.1f}s')
     if not rec:
         raise SystemExit('--teach: no episode ran')
-    finals = _closed_ce([(r['q'], r['a']) for r in rec])
-    for r, f in zip(rec, finals):
-        r['closed_final'] = f
-    ctrl_after = _closed_ce(ctrl) if ctrl else []
-    m = lambda key: float(np.mean([r[key] for r in rec]))
-    _emit(f'TEACHSUM episodes {len(rec)} ask {args.teach_ask} lr {args.teach_lr:g} steps {args.teach_steps} | '
-          f'closed before {m("closed_before"):.3f} after {m("closed_after"):.3f} end {m("closed_final"):.3f} | '
-          f'open before {m("open_before"):.3f} after {m("open_after"):.3f} | control '
-          f'{np.mean(ctrl_before) if ctrl else float("nan"):.3f} -> {np.mean(ctrl_after) if ctrl else float("nan"):.3f}')
+    end = _quiz([(r['q'], r['a']) for r in rec])
+    for r, e in zip(rec, end):
+        r['orig']['end'] = e
+    pr = [r for r in rec if r['para_quiz']]
+    for r, e in zip(pr, _quiz([(r['para'], r['a']) for r in pr])):
+        r['para_quiz']['end'] = e
+    orr = [r for r in rec if r['other_quiz']]
+    for r, e in zip(orr, _quiz([(r['other'], r['a']) for r in orr])):
+        r['other_quiz']['end'] = e
+    ctrl_after = _quiz(ctrl) if ctrl else []
+
+    def row(name, qs, keys=('before', 'after', 'end')):
+        cols = []
+        for metric, fmt in (('ce', '{:.3f}'), ('acc', '{:.3f}'), ('em', '{:.3f}'), ('f1', '{:.3f}')):
+            cols.append(f'{metric} ' + ' / '.join(fmt.format(np.mean([x[k][metric] for x in qs])) for k in keys))
+        return f'TEACHSUM {name:8} n {len(qs):4d} | ' + ' | '.join(cols)
+
+    _emit(f'TEACHSUM episodes {len(rec)} ask {args.teach_ask} lr {args.teach_lr:g} steps {args.teach_steps} '
+          f'(closed book from a zero state: before / right after its lesson / end of session)')
+    _emit(row('original', [r['orig'] for r in rec]))
+    if pr:
+        _emit(row('paraphr', [r['para_quiz'] for r in pr]))
+    if orr:
+        _emit(row('unrelatd', [r['other_quiz'] for r in orr]))
+    if ctrl:
+        _emit(row('control', [dict(before=b, after=a2) for b, a2 in zip(ctrl_before, ctrl_after)], ('before', 'after')))
     if args.teach_json:
         with open(args.teach_json, 'w') as f:
             json.dump(dict(args={k: v for k, v in vars(args).items() if k.startswith('teach')}, episodes=rec,
-                           control_before=ctrl_before, control_after=ctrl_after), f, indent=1)
+                           control=[dict(qa=c, before=b, after=a2) for c, b, a2 in zip(ctrl, ctrl_before, ctrl_after)]),
+                      f, indent=1)
 
 
 if args.teach:
