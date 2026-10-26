@@ -2082,6 +2082,7 @@ _LOCAL_PARQUET = {
                                               # Switchboard hidden in simple_wiki cut out, v476 on)
     'babylmseq0': _DATA + '/babylm2026_seq',     # v475's build (that Switchboard labelled simple_wiki, tabs kept)
     'babylmdev': _DATA + '/babylm2026_dev',      # BabyLM's official dev split as ~1000-word pieces: eval only
+    'qaipt':     _DATA + '/qa_ipt',              # tools/qa_prep.py: RefinedWeb pages + synthesized Q/A pairs (ODC-BY)
 }
 _EVAL_ONLY = {'babylmdev'}                  # a held-out split as a whole: --eval_corpora only, never --mix
 
@@ -2089,7 +2090,7 @@ _EVAL_ONLY = {'babylmdev'}                  # a held-out split as a whole: --eva
 # held out for eval and skipped in training (deterministic, streaming-compatible).
 _HASH_HOLDOUT = {'swiki', 'fwedu', 'fineweb', 'fwcrawl', 'cosmo', 'cosmoweb', 'smolcosmo',
                  'smolfwedu', 'strangetb', 'sebooks', 'dclmedu', 'littlec', 'simplestories', 'babylm', 'babylm1k',
-                 'babylmseq', 'babylmseq0'}
+                 'babylmseq', 'babylmseq0', 'qaipt'}
 _HOLDOUT_MOD = 32
 
 # Corpora with a real held-out split; a triple is a held-out set in another repo.
