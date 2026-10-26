@@ -2036,10 +2036,15 @@ _HUB_SUBSET = {
     'fwcrawl':   ('HuggingFaceFW/fineweb', 'data/CC-MAIN-2025-26'),
 }
 
+# Local document parquets (a 'text' column) written by a prep script: name -> directory.
+_LOCAL_PARQUET = {
+    'babylm': '/data/babylm2026_docs',      # exp/babylm_prep.py: BabyLM 2026 Strict, 100M words
+}
+
 # Train-only corpora: a fixed 1/_HOLDOUT_MOD of documents, chosen by a hash of the text, is
 # held out for eval and skipped in training (deterministic, streaming-compatible).
 _HASH_HOLDOUT = {'swiki', 'fwedu', 'fineweb', 'fwcrawl', 'cosmo', 'cosmoweb', 'smolcosmo',
-                 'smolfwedu', 'strangetb', 'sebooks', 'dclmedu', 'littlec', 'simplestories'}
+                 'smolfwedu', 'strangetb', 'sebooks', 'dclmedu', 'littlec', 'simplestories', 'babylm'}
 _HOLDOUT_MOD = 32
 
 # Corpora with a real held-out split; a triple is a held-out set in another repo.
@@ -2082,8 +2087,19 @@ def _shard_files(hf, cfg, n):
     return par[:n]
 
 
+def _local_files(name):
+    files = sorted(glob.glob(os.path.join(_LOCAL_PARQUET[name], '*.parquet')))
+    if not files:
+        raise SystemExit(f'{name}: no parquet under {_LOCAL_PARQUET[name]}; run its prep script first')
+    return files
+
+
 def _load_corpus(name, streaming, shards=None):
     from datasets import load_dataset, DownloadConfig
+    if name in _LOCAL_PARQUET:
+        files = _local_files(name)
+        print(f'{name}: {len(files)} local parquet file(s) from {_LOCAL_PARQUET[name]}', flush=True)
+        return load_dataset('parquet', data_files={'train': files}, streaming=streaming)
     if name in _HUB_SUBSET:
         files = _hub_subset_files(name)
         if not files:
@@ -3907,7 +3923,10 @@ def _build_eval_docs(corpus):
         return _build_video_eval(corpus)
     hf, cfg, split, col = _eval_source(corpus)
     hashed = corpus in _HASH_HOLDOUT
-    if hashed and corpus in _HUB_SUBSET:
+    if hashed and corpus in _LOCAL_PARQUET:
+        hf = _LOCAL_PARQUET[corpus]
+        rows = load_dataset('parquet', data_files={'train': _local_files(corpus)}, split='train', streaming=True)
+    elif hashed and corpus in _HUB_SUBSET:
         files = _hub_subset_files(corpus)
         files = files[:args.shards] if args.shards else files    # the training subset
         rows = load_dataset('parquet', data_files={'train': files}, split='train', streaming=True)

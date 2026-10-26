@@ -105,3 +105,13 @@ Examples of what this would have caught by itself:
 - v467's first-person voice traced to its last training documents.
 - v469's EVALL fluency rising instead of falling.
 - The STARTUP time jumping to 436 s with eval_at_start.
+
+## 7. Bet tracker (kept current until every bet is closed)
+
+| # | Bet | Status | Result / decision rule |
+|---|---|---|---|
+| 1 | Yardstick: reference LMs on EVALM | **closed** 2026-10-26 (log/sweeps/yardstick_2026-10-26) | v472 ≈ pythia-14m ≈ babyllama-10m (BLiMP ~69, ComVE ~65); babyllama-100m 74.1 / 68.8; TinyStories-33M best small ComVE 70.1 |
+| 2 | v472 continued on BabyLM | **running**: v473 `v473_v472_babylm`, launched 2026-10-26 09:42 from v472 step 9726244, 1.5M steps (≈ 3 passes of ≈ 480K steps; ≈ 20 h). Data: exp/babylm_prep.py → /data/babylm2026_docs (200K docs, 96.7M words, 1/32 held out) | Watch EVALM per pass (BLiMP / ComVE vs 68.5 / 65.7), held-out babylm and fineweb, EVALH, EVALC, GEN samples. Success: ≥ +2 on BLiMP or ComVE (> 1 sd) without losing the free-running quality |
+| 3 | Gradient horizon: truncated BPTT over k = 4–16 ticks | open (needs code) | Score on EVALG delta and EVALC (prompt uptake) |
+| 4 | BabyLM from scratch (or capacity test / 2× widening) | open, after 2 and 3 | Depends on 2 and 3 |
+| 5 | Short warm-starts: register clock decimation (`--ctx_every` revisited); batch-1-capable normalization | open | 3c-style score |
