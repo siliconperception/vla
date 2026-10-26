@@ -1,0 +1,24 @@
+--doc_score: 9981 training records, 400 held-out documents at step 8723091 -> log/sweeps/ladder_2026-10-25/v468_tau64_250K_pre.jsonl
+--doc_score: 9981 training records, 400 held-out documents at step 8973091 -> log/sweeps/ladder_2026-10-25/v468_tau64_250K_now.jsonl
+== v468_tau64_250K ctx_tau 64,16,4,1
+pre step 8723091, now step 8973091; held-out improvement +0.0046 +- 0.0026 (n 400); memory = training doc improvement - held-out improvement, nats/token
+age    0K-  10K n  400 mean age    5.0K  memory +0.1239 +- 0.0056
+age   10K-  30K n  800 mean age   20.0K  memory +0.0734 +- 0.0038
+age   30K- 100K n 2803 mean age   65.0K  memory +0.0407 +- 0.0029
+age  100K- 300K n 5978 mean age  174.9K  memory +0.0257 +- 0.0027
+--doc_score: 9989 training records, 400 held-out documents at step 8723091 -> log/sweeps/ladder_2026-10-25/v469_tau128_250K_pre.jsonl
+--doc_score: 9989 training records, 400 held-out documents at step 8973091 -> log/sweeps/ladder_2026-10-25/v469_tau128_250K_now.jsonl
+== v469_tau128_250K ctx_tau 128,32,8,2
+pre step 8723091, now step 8973091; held-out improvement +0.0242 +- 0.0029 (n 400); memory = training doc improvement - held-out improvement, nats/token
+age    0K-  10K n  402 mean age    5.0K  memory +0.1221 +- 0.0058
+age   10K-  30K n  799 mean age   20.0K  memory +0.0729 +- 0.0040
+age   30K- 100K n 2796 mean age   65.0K  memory +0.0425 +- 0.0032
+age  100K- 300K n 5992 mean age  174.8K  memory +0.0227 +- 0.0031
+--doc_score: 9988 training records, 400 held-out documents at step 8723091 -> log/sweeps/ladder_2026-10-25/v470_tau32_250K_pre.jsonl
+--doc_score: 9988 training records, 400 held-out documents at step 8973091 -> log/sweeps/ladder_2026-10-25/v470_tau32_250K_now.jsonl
+== v470_tau32_250K ctx_tau 32,8,2,0.5
+pre step 8723091, now step 8973091; held-out improvement +0.0315 +- 0.0030 (n 400); memory = training doc improvement - held-out improvement, nats/token
+age    0K-  10K n  400 mean age    5.0K  memory +0.1223 +- 0.0057
+age   10K-  30K n  797 mean age   20.0K  memory +0.0669 +- 0.0039
+age   30K- 100K n 2803 mean age   65.0K  memory +0.0400 +- 0.0032
+age  100K- 300K n 5988 mean age  174.9K  memory +0.0197 +- 0.0030

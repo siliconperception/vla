@@ -24,3 +24,13 @@ For more details see ps(1).
 2026-10-25 15:58:39 queue5.sh and v471 stopped by the user ('not what I was expecting'); nothing queued
 2026-10-25 16:00:04 queue6.sh: v471 resumes plainly (user: restart normally), then v469, v470, selection, v472
 2026-10-25 16:00:04 resume v471_b1bnf_lr1e5_1M at 8875129 for 847962 steps
+2026-10-25 17:00:50 done v471_b1bnf_lr1e5_1M: 97231 STEP lines, 1281 records; scoring
+2026-10-25 17:00:50 start v469_tau128_250K ctx_tau 128,32,8,2 steps 250000
+2026-10-25 20:03:58 done v469_tau128_250K: 89731 STEP lines, 9989 records; scoring + evaluating
+2026-10-25 20:03:58 start v470_tau32_250K ctx_tau 32,8,2,0.5 steps 250000
+2026-10-25 20:21:25 post-run done for v469_tau128_250K
+2026-10-25 21:35:27 queue6.sh stopped (user: 'i like v469 better'); queue7.sh: after v470, v472 from v469 (128,32,8,2), v470 scored alongside
+2026-10-25 23:14:27 done v470_tau32_250K: 89731 STEP lines, 9988 records; scoring + evaluating
+2026-10-25 23:14:27 launching v472_tau128_40M from checkpoint/v469_tau128_250K.pt with ctx_tau 128,32,8,2 (user's pick; no weight EMA)
+2026-10-25 23:28:17 post-run done for v470_tau32_250K
+2026-10-25 23:28:18 select.py (record only): DECISION v468_tau64_250K 64,16,4,1
