@@ -430,7 +430,7 @@ parser.add_argument('--eval_cloze', default=0,    type=int, metavar='N',
                     help='EVALC on N Story Cloze stories (xstory_cloze en): share where the '
                          'right ending costs fewer nats than the wrong one after the 4-sentence story')
 parser.add_argument('--eval_pairs', default=0,    type=int, metavar='N',
-                    help='EVALM (every --eval_rare-th eval): minimal pairs, each sentence read '
+                    help='EVALM (every eval): minimal pairs, each sentence read '
                          'from a zero state; share '
                          'where the acceptable one costs fewer nats. Up to N pairs from each of '
                          'BLiMP (grammar, spread over its 67 paradigms) and ComVE (which '
@@ -2048,7 +2048,9 @@ _HUB_SUBSET = {
 _LOCAL_PARQUET = {
     'babylm':   '/data/babylm2026_nat/docs',  # exp/babylm_prep.py: BabyLM 2026 Strict, marked documents
     'babylm1k': '/data/babylm2026_docs',      # v473: the same cut into ~1000-word pieces (--chunk 1000)
-    'babylmseq': '/data/babylm2026_seq',      # the same pieces, up to 16 of a document in order per row (--seq 16)
+    'babylmseq': '/data/babylm2026_seq2',     # the same pieces, up to 16 of a document in order per row (--seq 16;
+                                              # Switchboard hidden in simple_wiki cut out, v476 on)
+    'babylmseq0': '/data/babylm2026_seq',     # v475's build (that Switchboard labelled simple_wiki, tabs kept)
     'babylmdev': '/data/babylm2026_dev',      # BabyLM's official dev split as ~1000-word pieces: eval only
 }
 _EVAL_ONLY = {'babylmdev'}                  # a held-out split as a whole: --eval_corpora only, never --mix
@@ -2057,7 +2059,7 @@ _EVAL_ONLY = {'babylmdev'}                  # a held-out split as a whole: --eva
 # held out for eval and skipped in training (deterministic, streaming-compatible).
 _HASH_HOLDOUT = {'swiki', 'fwedu', 'fineweb', 'fwcrawl', 'cosmo', 'cosmoweb', 'smolcosmo',
                  'smolfwedu', 'strangetb', 'sebooks', 'dclmedu', 'littlec', 'simplestories', 'babylm', 'babylm1k',
-                 'babylmseq'}
+                 'babylmseq', 'babylmseq0'}
 _HOLDOUT_MOD = 32
 
 # Corpora with a real held-out split; a triple is a held-out set in another repo.
@@ -4938,7 +4940,7 @@ def _heldout_eval(step):
                 except Exception as e:
                     print(f'WARNING: {fn.__name__} failed at step {step} on "{corpus}": {e!r}',
                           flush=True)
-    for fn, on in ((_cloze_eval, args.eval_cloze), (_pairs_eval, args.eval_pairs and rare),  # corpus-free
+    for fn, on in ((_cloze_eval, args.eval_cloze), (_pairs_eval, args.eval_pairs),  # corpus-free
                    (_hold_eval, args.eval_hold), (_free_eval, args.eval_free and rare),
                    (_wp_samples, args.eval_wp)):
         if on and not _eval_failed.get(fn.__name__):
