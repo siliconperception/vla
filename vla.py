@@ -378,6 +378,10 @@ parser.add_argument('--eval_at_start', action='store_true',
 parser.add_argument('--profile', default=0, type=int, metavar='N',
                     help='time each part of the training step (GPU synchronized) over N steps '
                          'after 50 of warm-up, print the table and exit')
+parser.add_argument('--bptt', default=1, type=int, metavar='K',
+                    help='truncated backpropagation through time: K steps run forward keeping the graph '
+                         'through the register writes, then one backward of their mean loss and one '
+                         'optimizer step (the gradient horizon grows from 1 token to up to K); 1 = off')
 parser.add_argument('--lr_restart', action='store_true',
                     help='coswarm: rise over --lr_period steps from this run\'s first step '
                          '(a resumed run warms up again) instead of from global step 0')
@@ -1939,11 +1943,11 @@ class VLAModel(nn.Module, _HubMixin):
         o = self.linout(self.context(x))
         return self._write(o, dff, gain), o
 
-    def forward(self, idx, targets=None, flag=None, img=None, aud=None, keep=0.0):
+    def forward(self, idx, targets=None, flag=None, img=None, aud=None, keep=0.0, graph=False):
         """idx [B] current tokens; targets [B] next tokens or None; flag [B] rows starting a
         document (their registers reset, or are scaled by keep if nonzero: --reset_scale);
         img [B, 2048, S, S] image grid and aud [B, 512, S, S] audio grid, or None (zeros).
-        Advances self.dff by one step."""
+        Advances self.dff by one step; graph (--bptt): self.dff keeps its autograd graph."""
         B, dev = idx.shape[0], idx.device
         if self.dff is None or self.dff.shape[0] != B or self.dff.device != dev:
             self.dff = self.new_state(B, dev)
@@ -1954,7 +1958,7 @@ class VLAModel(nn.Module, _HubMixin):
             else:
                 self.dff[flag] = self.new_state(int(flag.sum()), dev)
         new, o = self.step(idx, self.dff, img, aud)
-        self.dff = new.detach().clone()
+        self.dff = new if graph else new.detach().clone()
         if self.streams == 3 and idx.dim() == 1:     # a one-stream caller: the text stream
             logits = self.text_dec(o)
         else:
@@ -5913,6 +5917,7 @@ class _Imaginer:
 _imaginer = _Imaginer(_SYNTH_ROWS) if _SYNTH_ROWS else None
 
 larr, garr = [], []
+_blk, _blk_start = [], None      # --bptt: the current block's (loss, inputs) and its starting state
 _rows_t = {}                 # each corpus's training rows as a device index tensor
 
 
@@ -6029,6 +6034,9 @@ try:
                   f'{1000 * tot / args.profile:.1f} ms/step')
             for k, v in sorted(_prof.items(), key=lambda kv: -kv[1]):
                 print(f'PROFILE {k:<12} {1000 * v / args.profile:8.2f} ms  {100 * v / tot:5.1f}%')
+            if args.device != 'cpu':
+                print(f'PROFILE peak GPU memory {torch.cuda.max_memory_allocated() / 2**30:.2f} GiB '
+                      f'(--bptt {args.bptt}, batch {args.batch})')
             break
         if _stop_req:                # SIGTERM: save this step's weights and exit cleanly
             _save(i, n_examples)
@@ -6168,7 +6176,10 @@ try:
                     fb |= (x >= 0) & _text_row & \
                         (torch.rand(x.shape, device=x.device) < args.text_feed)
                 x = torch.where(fb, _own, x)
-        logits, _ = model(x, flag=flag & ~_continuous_row, img=img, aud=aud, keep=args.reset_scale)
+        if args.bptt > 1 and not _blk:            # --bptt: a block starts from a detached state
+            _blk_start = model.dff
+        logits, _ = model(x, flag=flag & ~_continuous_row, img=img, aud=aud, keep=args.reset_scale,
+                          graph=args.bptt > 1)
         if args.step_tokens:         # row 0's text-stream input and argmax prediction, kept on the GPU
             with torch.no_grad():
                 lg = (logits[0, 0] if logits.dim() > 2 else logits[0]).detach().float()[None]
@@ -6200,28 +6211,38 @@ try:
             print(f'\n*** HALT: non-finite loss at step {i}: {loss.item()} dff_max '
                   f'{float(model.dff.abs().max())} logit_max {float(logits.detach().abs().max())}')
             break
-        loss.backward()
-        _pt('backward')
-        gnorm = _grad_norm()
-        garr.append(gnorm)
-        if not math.isfinite(gnorm):
-            print(f'\n*** HALT: non-finite grad at step {i}')
-            break
-        if args.clip and gnorm > args.clip:
-            for p in model.parameters():
-                if p.grad is not None:
-                    p.grad.mul_(args.clip / gnorm)
-        _pt('grad_norm')
-        optimizer.step()
-        _wema_step()
-        _pt('optimizer')
-        # recompute this step's state with the updated weights (eval-mode BatchNorm), so the
-        # state carried forward is the one the model would compute at inference
-        model.dff = dff_prev
-        model.eval()
-        with torch.no_grad():
-            model(x, flag=flag & ~_continuous_row, img=img, aud=aud, keep=args.reset_scale)
-        _pt('recompute')
+        if args.bptt > 1:            # --bptt: hold the step until its block is complete
+            _blk.append((loss, x, flag & ~_continuous_row, img, aud))
+        if args.bptt == 1 or len(_blk) == args.bptt:
+            if args.bptt > 1:
+                loss_b = sum(t[0] for t in _blk) / len(_blk)
+                loss_b.backward()
+            else:
+                loss.backward()
+            _pt('backward')
+            gnorm = _grad_norm()
+            garr.append(gnorm)
+            if not math.isfinite(gnorm):
+                print(f'\n*** HALT: non-finite grad at step {i}')
+                break
+            if args.clip and gnorm > args.clip:
+                for p in model.parameters():
+                    if p.grad is not None:
+                        p.grad.mul_(args.clip / gnorm)
+            _pt('grad_norm')
+            optimizer.step()
+            _wema_step()
+            _pt('optimizer')
+            # recompute this step's (--bptt: the block's) states with the updated weights
+            # (eval-mode BatchNorm), so the state carried forward is the one the model would
+            # compute at inference
+            model.dff = _blk_start if args.bptt > 1 else dff_prev
+            model.eval()
+            with torch.no_grad():
+                for _, xb, fb, ib, ab in (_blk or [(None, x, flag & ~_continuous_row, img, aud)]):
+                    model(xb, flag=fb, img=ib, aud=ab, keep=args.reset_scale)
+            _blk = []
+            _pt('recompute')
 
         larr.append(loss.detach())   # 0-d GPU tensors, read once per --monitor (no sync per step)
         if carr:
