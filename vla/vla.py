@@ -2038,13 +2038,23 @@ _HUB_SUBSET = {
 
 # Local document parquets (a 'text' column) written by a prep script: name -> directory.
 _LOCAL_PARQUET = {
-    'babylm': '/data/babylm2026_docs',      # exp/babylm_prep.py: BabyLM 2026 Strict, 100M words
+    'babylm':   '/data/babylm2026_nat/docs',  # exp/babylm_prep.py: BabyLM 2026 Strict, marked documents
+    'babylm1k': '/data/babylm2026_docs',      # v473: the same cut into ~1000-word pieces (--chunk 1000)
 }
+
+# Lane corpora: a directory of unmarked text streams (<name>.txt, one line per line). Each of the corpus's
+# rows is dealt to a stream in proportion to its characters, enters it at a random line with a zero state and
+# reads on in blocks without resetting; the end of a stream (a real boundary) resets and starts it over.
+# The last 1/_HOLDOUT_MOD of every stream's lines is held out: lanes never read it, eval scores windows of it.
+_LANE_STREAMS = {
+    'babylm_lanes': '/data/babylm2026_nat/streams',  # exp/babylm_prep.py: BNC, OpenSubtitles, a Wiki stretch
+}
+_LANE_BLOCK = 200                       # lines tokenized at a time
 
 # Train-only corpora: a fixed 1/_HOLDOUT_MOD of documents, chosen by a hash of the text, is
 # held out for eval and skipped in training (deterministic, streaming-compatible).
 _HASH_HOLDOUT = {'swiki', 'fwedu', 'fineweb', 'fwcrawl', 'cosmo', 'cosmoweb', 'smolcosmo',
-                 'smolfwedu', 'strangetb', 'sebooks', 'dclmedu', 'littlec', 'simplestories', 'babylm'}
+                 'smolfwedu', 'strangetb', 'sebooks', 'dclmedu', 'littlec', 'simplestories', 'babylm', 'babylm1k'}
 _HOLDOUT_MOD = 32
 
 # Corpora with a real held-out split; a triple is a held-out set in another repo.
@@ -2662,10 +2672,10 @@ _anchors = []
 _epoch = {n: 1 for n, _ in _MIX}
 
 
-def _text_tally(name, n_tokens, sample):
+def _text_tally(name, n_tokens, sample, examples=1):
     with _text_lock:
         st = _text_stats[name]
-        st['examples'] += 1
+        st['examples'] += examples
         st['tokens'] += n_tokens
         st['sample'] = sample
         if name not in _MEDIA_DATASETS and len(_anchors) < 24:
@@ -2691,13 +2701,66 @@ def _sample_window(text, n=240):
 
 class _Slot:
     """One batch row: the document it is currently reading (and a video's media)."""
-    __slots__ = ['steps', 'pos', 'media', 'shown']
+    __slots__ = ['steps', 'pos', 'media', 'shown', 'cont', 'src']
 
     def __init__(self):
-        self.steps, self.pos, self.media, self.shown = [], 0, None, -1
+        self.steps, self.pos, self.media, self.shown, self.cont, self.src = [], 0, None, -1, False, ''
 
-    def load(self, steps, media=None):
-        self.steps, self.pos, self.media, self.shown = steps, 0, media, -1
+    def load(self, steps, media=None, cont=False, src=''):
+        """cont: the steps continue the previous ones (a lane's next block), so no reset at pos 0."""
+        self.steps, self.pos, self.media, self.shown, self.cont, self.src = steps, 0, media, -1, cont, src
+
+
+class _Lanes:
+    """The streams of a lane corpus (see _LANE_STREAMS), their training and held-out lines."""
+
+    def __init__(self, name):
+        files = sorted(glob.glob(os.path.join(_LANE_STREAMS[name], '*.txt')))
+        if not files:
+            raise SystemExit(f'{name}: no streams under {_LANE_STREAMS[name]}; run its prep script first')
+        self.names, self.train, self.held = [], [], []
+        for f in files:
+            ls = open(f, encoding='utf-8').read().split('\n')
+            ls = [x for x in ls if x.strip()]
+            cut = len(ls) - len(ls) // _HOLDOUT_MOD
+            self.names.append(os.path.basename(f)[:-4])
+            self.train.append(ls[:cut])
+            self.held.append(ls[cut:])
+        print(f'{name}: {len(files)} streams, ' + ', '.join(
+            f'{n} {len(t)} lines' for n, t in zip(self.names, self.train)), flush=True)
+
+    def deal(self, rows):
+        """Stream index per row, in proportion to training characters (~ tokens; largest remainder)."""
+        size = [sum(map(len, t)) for t in self.train]
+        exact = [x / sum(size) * rows for x in size]
+        cnt = [int(e) for e in exact]
+        for k in sorted(range(len(size)), key=lambda k: exact[k] - cnt[k], reverse=True):
+            if sum(cnt) < rows:
+                cnt[k] += 1
+        return [k for k, c in enumerate(cnt) for _ in range(c)]
+
+
+class _Lane:
+    """One row's reading of one stream: enters at a random line, then serves blocks that continue it."""
+
+    def __init__(self, lanes, k, rng):
+        self.lines, self.name, self.rng = lanes.train[k], lanes.names[k], rng
+        self.at, self.prev = None, None
+
+    def next(self):
+        """-> (steps, cont, text): cont False at an entry (the row's state resets there)."""
+        if self.at is None or self.at >= len(self.lines):
+            self.at = self.rng.randrange(len(self.lines)) if self.at is None else 0
+            self.prev = None
+        block = self.lines[self.at:self.at + _LANE_BLOCK]
+        self.at += len(block)
+        text = '\n'.join(block)
+        if self.prev is None:
+            full = [_NULL] + _tokenizer.encode(text)
+        else:
+            full = [self.prev] + _tokenizer.encode('\n' + text)
+        cont, self.prev = self.prev is not None, full[-1]
+        return [(full[j], full[j + 1]) for j in range(len(full) - 1)], cont, text
 
 
 def worker(stop, q, datasets):
@@ -2768,6 +2831,8 @@ def worker(stop, q, datasets):
                     pass
 
     for name in dict.fromkeys(n for n, _ in _MIX):
+        if name in _LANE_STREAMS:
+            continue
         cq = clip_qs[name] = queue.Queue(maxsize=2 * max(1, args.workers))
         build = (image_builder(name, cq) if name in _IMAGE_DATASETS
                  else video_builder(name, cq) if name in _VIDEO_DATASETS
@@ -2775,12 +2840,22 @@ def worker(stop, q, datasets):
         for _ in range(max(1, args.workers)):
             threading.Thread(target=run, args=(name, build, cq), daemon=True).start()
 
+    global _ROW_SLOTS
     names = [n for n, k in _MIX for _ in range(k)]
-    slots = [_Slot() for _ in names]
+    slots = _ROW_SLOTS = [_Slot() for _ in names]
     stagger = random.Random(args.seed)
+    lane_of = {}                             # row -> _Lane
+    for name, lanes in _lanes.items():
+        rows = [r for r, n in enumerate(names) if n == name]
+        for r, k in zip(rows, lanes.deal(len(rows))):
+            lane_of[r] = _Lane(lanes, k, random.Random(args.seed * 1000 + r))
     while not stop.is_set():
         new_imgs = []
         for r, slot in enumerate(slots):
+            while slot.pos >= len(slot.steps) and r in lane_of:
+                steps, cont, text = lane_of[r].next()
+                slot.load(steps, cont=cont, src=lane_of[r].name)
+                _text_tally(names[r], len(steps), text, 0 if cont else 1)
             while slot.pos >= len(slot.steps):
                 try:
                     steps, img = clip_qs[names[r]].get(timeout=0.5)
@@ -2797,7 +2872,7 @@ def worker(stop, q, datasets):
                     slot.pos = stagger.randrange(len(steps))
                 if img is not None:
                     new_imgs.append((r, img))
-        flags = [slot.pos == 0 for slot in slots]
+        flags = [slot.pos == 0 and not slot.cont for slot in slots]
         xy = [slot.steps[slot.pos] for slot in slots]
         idx, shown = [], []
         for j, r in enumerate(_VIDEO_ROWS):
@@ -2816,12 +2891,14 @@ def worker(stop, q, datasets):
         q.put(([x for x, _ in xy], [y for _, y in xy], flags, new_imgs, (idx, shown)))
 
 
-hf_datasets = {}
+hf_datasets, _lanes, _ROW_SLOTS = {}, {}, []
 if not _ONESHOT:
     print('loading datasets...')
     _t_data = time.time()
     for name in dict.fromkeys(n for n, _ in _MIX):
-        if name not in _MEDIA_DATASETS:
+        if name in _LANE_STREAMS:
+            _lanes[name] = _Lanes(name)
+        elif name not in _MEDIA_DATASETS:
             hf_datasets[name] = _load_corpus(name, args.streaming, args.shards)
     _t_data = time.time() - _t_data
     print('datasets ready')
@@ -3913,6 +3990,29 @@ def _build_video_eval(corpus):
     return docs
 
 
+def _build_lane_eval(corpus):
+    """--eval_docs windows of a lane corpus's held-out lines (each stream's last 1/_HOLDOUT_MOD), dealt to
+    the streams by size; a window is whole lines reaching _EVAL_MAXLEN tokens, scored from a zero state."""
+    lanes = _lanes.get(corpus) or _Lanes(corpus)
+    docs, per = [], collections.Counter(lanes.deal(args.eval_docs))
+    for k in range(len(lanes.names)):
+        held, at, n = lanes.held[k], 0, per[k]
+        for _ in range(n):
+            text, steps = '', []
+            while at < len(held) and len(steps) < _EVAL_MAXLEN:
+                text = (text + '\n' if text else '') + held[at]
+                at += 1
+                if at % 8 == 0 or at == len(held):
+                    steps = clip_text(text)
+            steps = clip_text(text) if text else []
+            if len(steps) >= _eval_minlen(corpus):
+                docs.append(steps[:_EVAL_MAXLEN])
+    docs.sort(key=len)
+    print(f'eval set: {corpus} ({_LANE_STREAMS[corpus]}, held-out tails): {len(docs)} windows, '
+          f'{sum(len(d) for d in docs)} tokens', flush=True)
+    return docs
+
+
 def _build_eval_docs(corpus):
     """The first --eval_docs held-out documents of `corpus`, framed like training clips,
     clipped to _EVAL_MAXLEN, sorted by length."""
@@ -3921,6 +4021,8 @@ def _build_eval_docs(corpus):
         return _build_image_eval(corpus)
     if corpus in _VIDEO_DATASETS:
         return _build_video_eval(corpus)
+    if corpus in _LANE_STREAMS:
+        return _build_lane_eval(corpus)
     hf, cfg, split, col = _eval_source(corpus)
     hashed = corpus in _HASH_HOLDOUT
     if hashed and corpus in _LOCAL_PARQUET:
@@ -5572,10 +5674,19 @@ def _gen_lines(i):
         except queue.Full:
             pass
     with _text_lock:
-        samples = {n: st['sample'] for n, st in _text_stats.items() if st['sample']}
+        samples = {n: st['sample'] for n, st in _text_stats.items() if st['sample'] and n in _MEDIA_DATASETS}
     for n, smp in samples.items():
-        lab = 'SAMPLE' if n == (_text_names or [None])[0] else n
-        lines.append(f'TXT-{lab}: {_printable(_sample_window(smp))}')
+        lines.append(f'TXT-{n}: {_printable(_sample_window(smp))}')
+    # TXT-SAMPLE: what a random text row (documents and lanes alike, so the draw follows the batch's
+    # shares) has just read, labelled with its corpus, lane stream and row
+    rows = [r for r, n in enumerate(_ROW_CORPUS) if n not in _MEDIA_DATASETS]
+    if rows and len(_ROW_SLOTS) == len(_ROW_CORPUS):
+        r = random.Random(i).choice(rows)
+        sl = _ROW_SLOTS[r]
+        steps, pos = sl.steps, sl.pos
+        txt = _decode_plain([y for _, y in steps[max(0, pos - 96):pos]]) if steps else ''
+        src = f'{_ROW_CORPUS[r]}' + (f':{sl.src}' if sl.src else '') + f' row {r}'
+        lines.append(f'TXT-SAMPLE: [{src}] {_printable(txt[-240:])}')
     return lines
 
 
