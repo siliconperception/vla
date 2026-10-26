@@ -490,6 +490,10 @@ parser.add_argument('--doc_tokens', action='store_true',
 parser.add_argument('--eval_wp',    default=0,    type=int, metavar='N',
                     help='GENW: N fixed WritingPrompts prompts continued at every eval, for reading')
 parser.add_argument('--eval_wp_len', default=256, type=int, metavar='C', help='GENW tokens')
+parser.add_argument('--eval_qa',    default=0,    type=int, metavar='N',
+                    help='EVALQ (every eval): N held-out qaipt pages; nats per ANSWER token, from a zero '
+                         'state, open book (the page, then its Q/A pairs) and closed book (the pairs '
+                         'alone); gain = closed - open, what reading the page is worth')
 parser.add_argument('--eval_rare',  default=10,   type=int, metavar='N',
                     help='run the slow or low-value evals only at every Nth eval: EVALX, EVALI, '
                          'the video "-off" variant and EVALB of video corpora (0 = every eval)')
@@ -4854,6 +4858,64 @@ def _load_pairs():
     print(f'--eval_pairs: BLiMP {len(bl)}, ComVE {len(cv)} pairs', flush=True)
 
 
+_qa_rows = []                # EVALQ: (open inputs, targets, answer mask), then the closed-book row
+_QA_MAXLEN = 1024            # EVALQ: tokens per row; a pair that would not fit is left out
+
+
+def _qa_tokens(page, pairs):
+    """[_NULL] + page + its pairs as one row of (inputs, targets, mask over answer targets);
+    page None: the pairs alone (closed book)."""
+    ids, mask = [_NULL], [0]
+    if page is not None:
+        ids += _tokenizer.encode(page)
+        mask += [0] * (len(ids) - 1)
+    for k, (q, a) in enumerate(pairs):
+        head = _tokenizer.encode(('' if page is None and k == 0 else '\n\n') + f'Q: {q}\nA:')
+        ans = _tokenizer.encode(' ' + a)
+        if len(ids) + len(head) + len(ans) > _QA_MAXLEN:
+            break
+        ids += head + ans
+        mask += [0] * len(head) + [1] * len(ans)
+    return ids[:-1], ids[1:], mask[1:]
+
+
+def _load_qa():
+    """The first --eval_qa held-out qaipt pages (with at least one pair that fits)."""
+    import pyarrow.parquet as pq
+    for f in _local_files('qaipt'):
+        for text in pq.read_table(f, columns=['text']).column(0).to_pylist():
+            if not _is_heldout(text):
+                continue
+            page, sep, rest = text.partition('\n\nQ: ')
+            pairs = [tuple(x.split('\nA: ', 1)) for x in rest.split('\n\nQ: ')] if sep else []
+            pairs = [qa for qa in pairs if len(qa) == 2]
+            o, c = _qa_tokens(page, pairs), _qa_tokens(None, pairs)
+            if sum(o[2]) and sum(c[2]) and sum(o[2]) == sum(c[2]):
+                _qa_rows.append((o, c))
+            if len(_qa_rows) >= args.eval_qa:
+                break
+        if len(_qa_rows) >= args.eval_qa:
+            break
+    print(f'--eval_qa: {len(_qa_rows)} held-out qaipt pages, '
+          f'{sum(sum(o[2]) for o, _ in _qa_rows)} answer tokens', flush=True)
+
+
+def _qa_eval(step):
+    """EVALQ: answer tokens of held-out Q/A pages, open book and closed book (see --eval_qa)."""
+    t0 = time.time()
+    if not _qa_rows:
+        _load_qa()
+    ce = _ce_pairs([(x, y) for o, c in _qa_rows for x, y, _ in (o, c)])
+    res = {}
+    for j, name in enumerate(('open', 'closed')):
+        v = np.concatenate([ce[2 * k + j][np.array(r[j][2], dtype=bool)] for k, r in enumerate(_qa_rows)])
+        res[name] = float(v.mean())
+    res['gain'] = res['closed'] - res['open']
+    _eval_results['qa'] = res
+    _emit(f'EVALQ step {step:10} pages {len(_qa_rows)} | answer nats open {res["open"]:.4f} '
+          f'closed {res["closed"]:.4f} gain {res["gain"]:+.4f} | wall {time.time() - t0:.1f}s')
+
+
 def _pairs_eval(step):
     """EVALM: minimal pairs from a zero state, the model's own regime: the only context is the
     sentence itself. acc: the acceptable one has the lower summed nats; acc_tok: per token;
@@ -4974,7 +5036,7 @@ def _heldout_eval(step):
                 except Exception as e:
                     print(f'WARNING: {fn.__name__} failed at step {step} on "{corpus}": {e!r}',
                           flush=True)
-    for fn, on in ((_cloze_eval, args.eval_cloze), (_pairs_eval, args.eval_pairs),  # corpus-free
+    for fn, on in ((_cloze_eval, args.eval_cloze), (_pairs_eval, args.eval_pairs), (_qa_eval, args.eval_qa),  # corpus-free
                    (_hold_eval, args.eval_hold), (_free_eval, args.eval_free and rare),
                    (_wp_samples, args.eval_wp)):
         if on and not _eval_failed.get(fn.__name__):
