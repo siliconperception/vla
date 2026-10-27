@@ -4,10 +4,11 @@
 #
 # Each step the current token is embedded, broadcast over an SxS grid and concatenated with
 # the K DFF registers; one 1x1 conv (ctx_cat) reads that concat into a conv chain
-# (ContextCNN), a 1x1 (linout) projects the result back to register width, and the registers
-# are written as a Laplacian-pyramid cascade: register k blends toward what registers 1..k-1
-# missed, at its own rate 1/W_k. The text decoder reads the layer output to next-token logits
-# through a frozen, borrowed lm_head. No attention, no positional encoding.
+# (ContextCNN), a 1x1 (linout; --linout_kernel K: KxK) projects the result back to register
+# width, and the registers are written as a Laplacian-pyramid cascade: register k blends
+# toward what registers 1..k-1 missed, at its own rate 1/W_k. The text decoder reads the
+# layer output to next-token logits through a frozen, borrowed lm_head. No attention, no
+# positional encoding.
 #
 # Images: a frozen ResNet-50 turns a 224x224 crop of the image into a [2048, 7, 7] feature map
 # that is concatenated with the token grid. An image-caption example is the caption alone,
@@ -254,6 +255,9 @@ parser.add_argument('--c_context',  default=384,  type=int,
                          'projects it back up to --n_hidden')
 parser.add_argument('--depth',      default=8,    type=int, help='ContextCNN conv layers')
 parser.add_argument('--kernel',     default=3,    type=int, help='ContextCNN kernel (odd)')
+parser.add_argument('--linout_kernel', default=1, type=int, metavar='K',
+                    help='linout kernel (odd): KxK, padded, mixes neighbouring positions on the '
+                         'way back into the registers; restored by --load')
 parser.add_argument('--tokenizer',  default='pythia31m', choices=sorted(_TOKENIZERS),
                     help='borrowed vocabulary, token embedding and lm_head (frozen)')
 parser.add_argument('--ctx_ema',    default='256,64,16,4,1', metavar='W1,W2,...',
@@ -713,7 +717,7 @@ _ONESHOT = (args.generate or args.eval or args.vis or args.push or args.free_run
 
 _ARCH_ARGS = ('context', 'n_hidden', 'c_context', 'depth', 'kernel', 'tokenizer', 'ctx_ema',
               'ctx_read_norm', 'dec_tree_kernels', 'dec_width', 'bn_momentum', 'init',
-              'image_encoder', 'audio_encoder', 'streams')
+              'image_encoder', 'audio_encoder', 'streams', 'linout_kernel')
 
 
 def _parse_mix():
@@ -752,7 +756,7 @@ if args.audio_encoder is None:
 # Checkpoints from before this rewrite carry every option the old script had. Those listed
 # here are now fixed behaviour, so a checkpoint is loadable only if it used these values,
 # i.e. if it is v395-type (or later, where the key is absent).
-_FIXED_ARCH = dict(n_layers=1, linout=True, linout_kernel=1, linin=False, ctx_mix='none',
+_FIXED_ARCH = dict(n_layers=1, linout=True, linin=False, ctx_mix='none',
                    ctx_first='blend', ctx_resid=True, ctx_resid_mode='sum', ctx_chain=False,
                    ctx_cat_in=True, ctx_cat_narrow=True, ctx_cat_kernel=1, ctx_cat_spatial=False,
                    no_text_proj=True, tok_norm=True, tok_gain=1.0, ctx_read_norm_mode='running',
@@ -1741,7 +1745,7 @@ class VLAModel(nn.Module, _HubMixin):
                  tokenizer='pythia31m', windows=(256, 64, 16, 4, 1), read_norm=1.0,
                  dec_kernels=(3, 3, 3), dec_width=256, bn_momentum=0.1, init='zero',
                  image_encoder='none', audio_encoder='none', nul_head=False, streams=1,
-                 text_nul=False, surprise=None):
+                 text_nul=False, surprise=None, linout_kernel=1):
         super().__init__()
         from transformers import AutoModelForCausalLM
         repo = _TOKENIZERS[tokenizer]
@@ -1798,11 +1802,16 @@ class VLAModel(nn.Module, _HubMixin):
                 o += w
             self.ctx_cat.bias.zero_()
 
-        # linout: c_context -> n_hidden, semi-orthogonal (norm-preserving, dense and signed)
-        self.linout = nn.Conv2d(c_context, n_hidden, 1)
+        # linout: c_context -> n_hidden, semi-orthogonal (norm-preserving, dense and signed) at
+        # the centre tap of its K x K kernel, the other taps zero
+        lk = int(linout_kernel)
+        if lk < 1 or lk % 2 == 0:
+            raise SystemExit(f'--linout_kernel {lk}: must be odd')
+        self.linout = nn.Conv2d(c_context, n_hidden, lk, padding=lk // 2)
         with torch.no_grad():
-            self.linout.weight.copy_(
-                nn.init.orthogonal_(torch.empty(n_hidden, c_context)).view(n_hidden, c_context, 1, 1))
+            self.linout.weight.zero_()
+            self.linout.weight[:, :, lk // 2, lk // 2] = nn.init.orthogonal_(
+                torch.empty(n_hidden, c_context))
             self.linout.bias.zero_()
 
         self.img_enc = ImageEncoder(self.image_encoder) if self.img_width else None   # frozen
@@ -2948,7 +2957,7 @@ model = VLAModel(S=args.context, n_hidden=args.n_hidden, c_context=args.c_contex
                      bool(args.clock_hz) or (_loaded_ckpt is not None and
                                              'text_dec.nul.weight' in _loaded_ckpt['state_dict'])),
                  streams=args.streams, text_nul=args.fifo3,
-                 surprise=_surprise)
+                 surprise=_surprise, linout_kernel=args.linout_kernel)
 if _loaded_ckpt is not None:
     _sd = _upgrade_state_dict(_loaded_ckpt['state_dict'])
     if _aud_switch:
