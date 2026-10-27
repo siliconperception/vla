@@ -475,6 +475,13 @@ parser.add_argument('--doc_score',  default=None, metavar='OUT',
                          'held-out documents (cut to --doc_log_len) with this checkpoint, one '
                          'JSON line each to OUT (kind, start / end step, nats per token), exit. '
                          'Two checkpoints\' files, paired by record, give a forgetting curve')
+parser.add_argument('--state_pca',  default=0, type=int, metavar='N',
+                    help='load, read the first --eval_docs held-out documents and keep N register '
+                         'states (every --state_pca_stride ticks after the first 64, from up to '
+                         'N/--eval_docs+1 per document), then print a PCA of each register and of the '
+                         'whole state (STATEPCA lines), exit: how much of the state is used')
+parser.add_argument('--state_pca_stride', default=16, type=int, metavar='T',
+                    help='--state_pca: ticks between kept states of one document')
 parser.add_argument('--doc_ablate', default='', metavar='K1,K2,...',
                     help='--doc_score: registers K (1 = the slowest) read as their mean state over '
                          'the held-out documents, as in EVALI\'s ablations: is what the weights '
@@ -700,7 +707,7 @@ if _continuous - {'text', 'image', 'video'}:
     raise SystemExit(f'--continuous {args.continuous}: kinds are text, image and video')
 
 _ONESHOT = (args.generate or args.eval or args.vis or args.push or args.free_run or
-            args.prompt_tune or args.doc_score or args.teach)
+            args.prompt_tune or args.doc_score or args.teach or args.state_pca)
 
 # ── checkpoint ────────────────────────────────────────────────────────────────
 
@@ -5371,6 +5378,63 @@ if args.doc_score:
             print(json.dumps(r), file=f)
     print(f'--doc_score: {len(_recs)} training records, {len(_held)} held-out documents at step '
           f'{_start_step} -> {args.doc_score}')
+    raise SystemExit(0)
+
+if args.state_pca:
+    # states from held-out documents: the first 64 ticks of each skipped, then one every stride
+    _held = [_doc_tokens(d) for d in _eval_docs(_eval_corpus_names()[0])]
+    _held = [q for q in _held if len(q) > 65]
+    _per = args.state_pca // len(_held) + 1
+    _cut = 64 + _per * args.state_pca_stride
+    _keep, _K, _C = [], model.K, model.n_hidden
+    with _EvalState(), torch.no_grad():
+        for _c, _X, _Y, _M in _batches([(q[:_cut], q[1:_cut + 1]) for q in _held]):
+            model.dff = None
+            for _t in range(_X.shape[1]):
+                model(_X[:, _t])
+                if _t >= 64 and (_t - 64) % args.state_pca_stride == 0:
+                    _m = _M[:, _t].bool()
+                    if _m.any():
+                        _keep.append(model.dff[_m].half().cpu())
+    _S = torch.cat(_keep)[:args.state_pca]                       # [N, K*C, S, S]
+    _N, _P = _S.shape[0], _S.shape[-1] ** 2
+    _dev = next(model.parameters()).device
+
+    def _spec(ev):
+        """Eigenvalues (descending) -> participation ratio, components for 90% / 99% of variance."""
+        ev = ev.clamp(min=0).double().sort(descending=True).values
+        cum = ev.cumsum(0) / ev.sum()
+        return (float(ev.sum() ** 2 / (ev ** 2).sum()), int((cum < 0.9).sum()) + 1,
+                int((cum < 0.99).sum()) + 1)
+
+    _out, _Gall = [], torch.zeros(_N, _N, dtype=torch.float64)
+    for _k in range(_K):
+        _R = _S[:, _k * _C:(_k + 1) * _C].float()                 # [N, C, S, S]
+        _R = _R - _R.mean(0, keepdim=True)
+        _tot = float((_R ** 2).sum() / _N)
+        _sp = float((_R.mean((2, 3), keepdim=True) ** 2).sum() * _P / _N) / max(_tot, 1e-30)
+        _F = _R.reshape(_N, -1)
+        _G = torch.zeros(_N, _N, dtype=torch.float32, device=_dev)
+        for _j in range(0, _F.shape[1], 4096):
+            _b = _F[:, _j:_j + 4096].to(_dev)
+            _G += _b @ _b.T
+        _G = _G.double().cpu()
+        _Gall += _G
+        _full = _spec(torch.linalg.eigvalsh(_G))
+        _V = _R.permute(0, 2, 3, 1).reshape(-1, _C).to(_dev)        # every position a sample
+        _chan = _spec(torch.linalg.eigvalsh((_V.T @ _V).double().cpu()))
+        _o = dict(register=_k + 1, window=model.windows[_k], var=_tot, spatial_mean_frac=_sp,
+                  full_pr=_full[0], full_n90=_full[1], full_n99=_full[2], full_dim=_F.shape[1],
+                  chan_pr=_chan[0], chan_n90=_chan[1], chan_n99=_chan[2], chan_dim=_C)
+        _out.append(_o)
+        print(f'STATEPCA step {_start_step:10d} DFF_{_k + 1} w={model.windows[_k]:g} var {_tot:9.3f} '
+              f'spatial-mean {_sp * 100:5.1f}% | full {_F.shape[1]}: PR {_full[0]:7.1f} '
+              f'n90 {_full[1]:5d} n99 {_full[2]:5d} | channels {_C}: PR {_chan[0]:6.1f} '
+              f'n90 {_chan[1]:4d} n99 {_chan[2]:4d}', flush=True)
+    _all = _spec(torch.linalg.eigvalsh(_Gall))
+    print(f'STATEPCA step {_start_step:10d} ALL {_K * _C * _P} values: PR {_all[0]:7.1f} n90 {_all[1]:5d} '
+          f'n99 {_all[2]:5d} | N {_N} states from {len(_held)} documents, stride {args.state_pca_stride} '
+          f'(rank <= N)', flush=True)
     raise SystemExit(0)
 
 if args.prompt_tune:
