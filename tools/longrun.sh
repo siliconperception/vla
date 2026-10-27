@@ -22,7 +22,7 @@
 # dataset shuffle and therefore fresh documents rather than a replay of what was already
 # trained on.  For a corpus the size of the Pile that is the desired behaviour.
 set -u
-cd "$(dirname "$0")/.."
+cd "${VLA_ROOT:-$(dirname "$0")/..}"   # VLA_ROOT: set by launch.sh
 # 1B TOKENS = 4,000,000 steps at batch 250 is the STANDARD BUDGET for every experiment
 # (2026-08-31).  Both numbers are still positional, but a missing or non-numeric argument now
 # falls back to the standard rather than erroring, so `longrun.sh <mnem> -- <overrides>` and

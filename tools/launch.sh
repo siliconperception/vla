@@ -12,6 +12,7 @@
 # job is executing a copy, and the edit takes effect on the NEXT launch.
 set -u
 cd "$(dirname "$0")/.."
+export VLA_ROOT=$PWD       # the snapshot runs from tools/.run/, so drivers cd here, not to $0/..
 SRC=$1; shift
 [ -f "$SRC" ] || { echo "launch: no such driver: $SRC" >&2; exit 1; }
 mkdir -p tools/.run

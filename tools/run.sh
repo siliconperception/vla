@@ -38,7 +38,7 @@ M=$1; shift
 S=4000000
 case "${1:-}" in ''|*[!0-9]*) ;; *) S=$1; shift ;; esac
 [ "${1:-}" = "--" ] && shift
-cd "$(dirname "$0")/.."
+cd "${VLA_ROOT:-$(dirname "$0")/..}"   # VLA_ROOT: set by launch.sh
 mkdir -p checkpoint
 # a resumed run rebuilds log/exp.$M from its checkpoint's copy; the previous log (with any lines
 # written after that checkpoint) is kept as .prev rather than deleted
