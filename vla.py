@@ -262,6 +262,10 @@ parser.add_argument('--learn_win', default=False, action=argparse.BooleanOptiona
                          'every past tick, not only the --bptt block; restored by --load')
 parser.add_argument('--win_lr',     default=3e-4, type=float, metavar='LR',
                     help='--learn_win: Adam learning rate of the log-windows theta')
+parser.add_argument('--learn_regs', default='', metavar='K1,K2,...',
+                    help='--learn_win: learn only these registers\' windows (1 = the first in the '
+                         'cascade); the others stay at their --ctx_ema/--ctx_tau window. Default: '
+                         'all but the plain copies. Restored by --load')
 parser.add_argument('--linout_kernel', default=1, type=int, metavar='K',
                     help='linout kernel (odd): KxK, padded, mixes neighbouring positions on the '
                          'way back into the registers; restored by --load')
@@ -724,7 +728,8 @@ _ONESHOT = (args.generate or args.eval or args.vis or args.push or args.free_run
 
 _ARCH_ARGS = ('context', 'n_hidden', 'c_context', 'depth', 'kernel', 'tokenizer', 'ctx_ema',
               'ctx_read_norm', 'dec_tree_kernels', 'dec_width', 'bn_momentum', 'init',
-              'image_encoder', 'audio_encoder', 'streams', 'linout_kernel', 'learn_win')
+              'image_encoder', 'audio_encoder', 'streams', 'linout_kernel', 'learn_win',
+              'learn_regs')
 
 
 def _parse_mix():
@@ -1752,7 +1757,8 @@ class VLAModel(nn.Module, _HubMixin):
                  tokenizer='pythia31m', windows=(256, 64, 16, 4, 1), read_norm=1.0,
                  dec_kernels=(3, 3, 3), dec_width=256, bn_momentum=0.1, init='zero',
                  image_encoder='none', audio_encoder='none', nul_head=False, streams=1,
-                 text_nul=False, surprise=None, linout_kernel=1, learn_win=False):
+                 text_nul=False, surprise=None, linout_kernel=1, learn_win=False,
+                 learn_regs=()):
         super().__init__()
         from transformers import AutoModelForCausalLM
         repo = _TOKENIZERS[tokenizer]
@@ -1834,15 +1840,19 @@ class VLAModel(nn.Module, _HubMixin):
         self.surprise = tuple(surprise) if surprise else None
         if self.surprise and self.windows[-1] != 1:
             raise SystemExit('--write_surprise needs a plain-copy last register (window 1)')
-        # --learn_win: W_k = 1 + exp(theta_k) for every register but the plain copies. etr holds
-        # the sensitivities d r_k / d a_j (a = 1/W) as (k, j) -> [B, n_hidden, S, S], advanced by
-        # _write while etr_on (the training loop's own forwards), reset with the registers; read
+        # --learn_win: W_k = 1 + exp(theta_k) for every register but the plain copies (--learn_regs:
+        # only those). etr holds the sensitivities d r_k / d a_j (a = 1/W) as (k, j) ->
+        # [B, n_hidden, S, S], advanced by _write while etr_on (the training loop's own forwards),
+        # reset with the registers; read
         # into the gradient on the ticks with etr_inject (--bptt: the last of each block, since
         # autograd keeps every trace a read uses until the block's backward)
         if learn_win:
             if self.surprise:
                 raise SystemExit('--learn_win does not combine with --write_surprise')
-            self.learn = [k for k, w in enumerate(self._windows) if w > 1]
+            if any(not 1 <= k <= len(self._windows) or self._windows[k - 1] <= 1 for k in learn_regs):
+                raise SystemExit(f'--learn_regs {learn_regs}: not a register with a window over 1')
+            self.learn = [k for k, w in enumerate(self._windows)
+                          if w > 1 and (not learn_regs or k + 1 in learn_regs)]
             self.win_theta = nn.Parameter(torch.tensor([math.log(self._windows[k] - 1)
                                                         for k in self.learn]))
         self.etr, self.etr_on, self.etr_inject = None, False, False
@@ -3028,7 +3038,8 @@ model = VLAModel(S=args.context, n_hidden=args.n_hidden, c_context=args.c_contex
                                              'text_dec.nul.weight' in _loaded_ckpt['state_dict'])),
                  streams=args.streams, text_nul=args.fifo3,
                  surprise=_surprise, linout_kernel=args.linout_kernel,
-                 learn_win=args.learn_win)
+                 learn_win=args.learn_win,
+                 learn_regs=[int(k) for k in str(args.learn_regs or '').split(',') if k.strip()])
 if _loaded_ckpt is not None:
     _sd = _upgrade_state_dict(_loaded_ckpt['state_dict'])
     if _aud_switch:
