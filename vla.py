@@ -1836,14 +1836,16 @@ class VLAModel(nn.Module, _HubMixin):
             raise SystemExit('--write_surprise needs a plain-copy last register (window 1)')
         # --learn_win: W_k = 1 + exp(theta_k) for every register but the plain copies. etr holds
         # the sensitivities d r_k / d a_j (a = 1/W) as (k, j) -> [B, n_hidden, S, S], advanced by
-        # _write while etr_on (the training loop's own forwards), reset with the registers
+        # _write while etr_on (the training loop's own forwards), reset with the registers; read
+        # into the gradient on the ticks with etr_inject (--bptt: the last of each block, since
+        # autograd keeps every trace a read uses until the block's backward)
         if learn_win:
             if self.surprise:
                 raise SystemExit('--learn_win does not combine with --write_surprise')
             self.learn = [k for k, w in enumerate(self._windows) if w > 1]
             self.win_theta = nn.Parameter(torch.tensor([math.log(self._windows[k] - 1)
                                                         for k in self.learn]))
-        self.etr, self.etr_on = None, False
+        self.etr, self.etr_on, self.etr_inject = None, False, False
         self.register_buffer('surp_mean', torch.zeros(()))     # running mean surprise; 0 = unset
         self.register_buffer('gain_mean', torch.zeros(()))     # 'rat': running mean gain; 0 = unset
         self.dff = None              # [B, K*n_hidden, S, S], detached; None until first step
@@ -2039,7 +2041,7 @@ class VLAModel(nn.Module, _HubMixin):
         """One token for every row: -> (new registers, layer output). No detach."""
         gain = self._gain(idx, dff) if self.surprise else None
         inj = None
-        if self.learn and self.etr_on and self.etr and torch.is_grad_enabled():
+        if self.learn and self.etr_inject and self.etr and torch.is_grad_enabled():
             # value 0, gradient d loss/d a_j = <d loss/d r_k, d r_k/d a_j> summed over registers
             a = self._rates()
             d = a - a.detach()
@@ -6634,9 +6636,10 @@ try:
         if args.bptt == 1:
             _etr_start = model.etr
         model.etr_on = bool(model.learn)
+        model.etr_inject = model.etr_on and len(_blk) == args.bptt - 1
         logits, _ = model(x, flag=flag & ~_continuous_row, img=img, aud=aud, keep=args.reset_scale,
                           graph=args.bptt > 1)
-        model.etr_on = False
+        model.etr_on = model.etr_inject = False
         if args.step_tokens:         # row 0's text-stream input and argmax prediction, kept on the GPU
             with torch.no_grad():
                 lg = (logits[0, 0] if logits.dim() > 2 else logits[0]).detach().float()[None]
