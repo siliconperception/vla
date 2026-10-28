@@ -255,6 +255,13 @@ parser.add_argument('--c_context',  default=384,  type=int,
                          'projects it back up to --n_hidden')
 parser.add_argument('--depth',      default=8,    type=int, help='ContextCNN conv layers')
 parser.add_argument('--kernel',     default=3,    type=int, help='ContextCNN kernel (odd)')
+parser.add_argument('--learn_win', default=False, action=argparse.BooleanOptionalAction,
+                    help='learn the register windows (all but plain copies, window 1): W = 1 + '
+                         'exp(theta), theta trained by Adam at --win_lr from a forward-mode '
+                         'sensitivity trace dr/da carried with the registers, so the gradient sees '
+                         'every past tick, not only the --bptt block; restored by --load')
+parser.add_argument('--win_lr',     default=3e-4, type=float, metavar='LR',
+                    help='--learn_win: Adam learning rate of the log-windows theta')
 parser.add_argument('--linout_kernel', default=1, type=int, metavar='K',
                     help='linout kernel (odd): KxK, padded, mixes neighbouring positions on the '
                          'way back into the registers; restored by --load')
@@ -717,7 +724,7 @@ _ONESHOT = (args.generate or args.eval or args.vis or args.push or args.free_run
 
 _ARCH_ARGS = ('context', 'n_hidden', 'c_context', 'depth', 'kernel', 'tokenizer', 'ctx_ema',
               'ctx_read_norm', 'dec_tree_kernels', 'dec_width', 'bn_momentum', 'init',
-              'image_encoder', 'audio_encoder', 'streams', 'linout_kernel')
+              'image_encoder', 'audio_encoder', 'streams', 'linout_kernel', 'learn_win')
 
 
 def _parse_mix():
@@ -1745,14 +1752,15 @@ class VLAModel(nn.Module, _HubMixin):
                  tokenizer='pythia31m', windows=(256, 64, 16, 4, 1), read_norm=1.0,
                  dec_kernels=(3, 3, 3), dec_width=256, bn_momentum=0.1, init='zero',
                  image_encoder='none', audio_encoder='none', nul_head=False, streams=1,
-                 text_nul=False, surprise=None, linout_kernel=1):
+                 text_nul=False, surprise=None, linout_kernel=1, learn_win=False):
         super().__init__()
         from transformers import AutoModelForCausalLM
         repo = _TOKENIZERS[tokenizer]
         lm = AutoModelForCausalLM.from_pretrained(repo, dtype=torch.float32)
         self.S, self.n_hidden, self.c_context = S, n_hidden, c_context
-        self.windows = [float(w) for w in windows]
-        if not self.windows or min(self.windows) < 1:
+        self._windows = [float(w) for w in windows]
+        self.learn = []              # --learn_win: indices of the learned windows
+        if not self._windows or min(self._windows) < 1:
             raise SystemExit(f'--ctx_ema {windows}: windows must be >= 1 token')
         self.K = len(self.windows)
         self.read_norm = float(read_norm)
@@ -1826,11 +1834,38 @@ class VLAModel(nn.Module, _HubMixin):
         self.surprise = tuple(surprise) if surprise else None
         if self.surprise and self.windows[-1] != 1:
             raise SystemExit('--write_surprise needs a plain-copy last register (window 1)')
+        # --learn_win: W_k = 1 + exp(theta_k) for every register but the plain copies. etr holds
+        # the sensitivities d r_k / d a_j (a = 1/W) as (k, j) -> [B, n_hidden, S, S], advanced by
+        # _write while etr_on (the training loop's own forwards), reset with the registers
+        if learn_win:
+            if self.surprise:
+                raise SystemExit('--learn_win does not combine with --write_surprise')
+            self.learn = [k for k, w in enumerate(self._windows) if w > 1]
+            self.win_theta = nn.Parameter(torch.tensor([math.log(self._windows[k] - 1)
+                                                        for k in self.learn]))
+        self.etr, self.etr_on = None, False
         self.register_buffer('surp_mean', torch.zeros(()))     # running mean surprise; 0 = unset
         self.register_buffer('gain_mean', torch.zeros(()))     # 'rat': running mean gain; 0 = unset
         self.dff = None              # [B, K*n_hidden, S, S], detached; None until first step
         self._ablate = None          # --eval_info: registers read as their mean ...
         self._read_mean = None       # ... which is this [1, K*n_hidden, S, S] tensor
+
+    @property
+    def windows(self):
+        if not self.learn:
+            return self._windows
+        w = list(self._windows)
+        for k, v in zip(self.learn, (1 + self.win_theta.detach().exp()).tolist()):
+            w[k] = v
+        return w
+
+    def _rates(self):
+        """[K] write rates 1/W; --learn_win: those of the learned windows carry the gradient."""
+        if not self.learn:
+            return self.rate
+        a = self.rate.clone()
+        a[self.learn] = torch.sigmoid(-self.win_theta)
+        return a
 
     def pretrained_params(self):
         """The borrowed embedding and lm_head, deduplicated (tiny8m ties them)."""
@@ -1915,9 +1950,11 @@ class VLAModel(nn.Module, _HubMixin):
             return self.text_dec(o)
         return torch.stack([self.text_dec(o), self.voc_dec(o), self.img_dec(o)], dim=1)
 
-    def _read(self, dff):
-        """The K registers as ctx_cat reads them."""
+    def _read(self, dff, inj=None):
+        """The K registers as ctx_cat reads them (inj: --learn_win's per-register addends)."""
         regs = list(dff.chunk(self.K, dim=1))
+        if inj is not None:
+            regs = [r + e for r, e in zip(regs, inj)]
         if self._ablate:
             mu = self._read_mean.chunk(self.K, dim=1)
             regs = [mu[k].expand_as(r) if k in self._ablate else r for k, r in enumerate(regs)]
@@ -1939,13 +1976,34 @@ class VLAModel(nn.Module, _HubMixin):
         just written. gain [B] (--write_surprise) scales the rate of every register but the
         plain copy, capped at 1."""
         new = []
+        rates = self._rates().detach()
         for k, p in enumerate(dff.chunk(self.K, dim=1)):
             inp = o - sum(new) if k else o
-            r = self.rate[k]
+            r = rates[k]
             if gain is not None and self.windows[k] > 1:
                 r = (r * gain).clamp(max=1.0).view(-1, 1, 1, 1)
             new.append(p + r * (inp - p))
+        if self.learn and self.etr_on:
+            self._advance_traces(o.detach(), dff.detach(), [n.detach() for n in new], rates)
         return torch.cat(new, dim=1)
+
+    @torch.no_grad()
+    def _advance_traces(self, o, dff, new, a):
+        """--learn_win: e_kj <- (1 - a_k) e_kj + [k = j] (inp_k - r_k) - a_k sum_{i<k} e'_ij, the
+        exact sensitivity of the cascade write to rate a_j (the layer output held fixed)."""
+        old, E = self.etr or {}, {}
+        for k, p in enumerate(dff.chunk(self.K, dim=1)):
+            for j in self.learn:
+                if j > k:
+                    continue
+                e = (1 - a[k]) * old[(k, j)] if (k, j) in old else torch.zeros_like(p)
+                if k == j:
+                    e = e + ((o - sum(new[:k]) if k else o) - p)
+                up = [E[(i, j)] for i in range(j, k)]
+                if up:
+                    e = e - a[k] * sum(up)
+                E[(k, j)] = e
+        self.etr = E
 
     @torch.no_grad()
     def _gain(self, idx, dff):
@@ -1980,7 +2038,14 @@ class VLAModel(nn.Module, _HubMixin):
     def step(self, idx, dff, img=None, aud=None):
         """One token for every row: -> (new registers, layer output). No detach."""
         gain = self._gain(idx, dff) if self.surprise else None
-        x = self.ctx_cat(torch.cat(self._inputs(idx, img, aud) + self._read(dff), dim=1))
+        inj = None
+        if self.learn and self.etr_on and self.etr and torch.is_grad_enabled():
+            # value 0, gradient d loss/d a_j = <d loss/d r_k, d r_k/d a_j> summed over registers
+            a = self._rates()
+            d = a - a.detach()
+            inj = [sum((d[j] * e for (kk, j), e in self.etr.items() if kk == k),
+                       torch.zeros((), device=dff.device)) for k in range(self.K)]
+        x = self.ctx_cat(torch.cat(self._inputs(idx, img, aud) + self._read(dff, inj), dim=1))
         o = self.linout(self.context(x))
         return self._write(o, dff, gain), o
 
@@ -1998,6 +2063,9 @@ class VLAModel(nn.Module, _HubMixin):
                 self.dff[flag] = self.dff[flag] * keep
             else:
                 self.dff[flag] = self.new_state(int(flag.sum()), dev)
+            if self.etr and self.etr_on:    # a fresh (or scaled) register has a fresh trace
+                m = torch.where(flag, keep, 1.0).view(-1, 1, 1, 1).to(dev)
+                self.etr = {kj: e * m for kj, e in self.etr.items()}
         new, o = self.step(idx, self.dff, img, aud)
         self.dff = new if graph else new.detach().clone()
         if self.streams == 3 and idx.dim() == 1:     # a one-stream caller: the text stream
@@ -2957,7 +3025,8 @@ model = VLAModel(S=args.context, n_hidden=args.n_hidden, c_context=args.c_contex
                      bool(args.clock_hz) or (_loaded_ckpt is not None and
                                              'text_dec.nul.weight' in _loaded_ckpt['state_dict'])),
                  streams=args.streams, text_nul=args.fifo3,
-                 surprise=_surprise, linout_kernel=args.linout_kernel)
+                 surprise=_surprise, linout_kernel=args.linout_kernel,
+                 learn_win=args.learn_win)
 if _loaded_ckpt is not None:
     _sd = _upgrade_state_dict(_loaded_ckpt['state_dict'])
     if _aud_switch:
@@ -2965,7 +3034,9 @@ if _loaded_ckpt is not None:
     if model.streams == 3 and 'voc_dec.proj.weight' not in _sd:
         _sd = _widen_state_dict(_sd, model)
     missing, unexpected = model.load_state_dict(_sd, strict=False)
-    bad = [k for k in missing if not re.match(r'(text|voc|img)_dec\.nul\.|surp_mean$|gain_mean$', k)] + \
+    if 'win_theta' in missing:
+        print(f'--learn_win: windows start at {model.windows}', flush=True)
+    bad = [k for k in missing if not re.match(r'(text|voc|img)_dec\.nul\.|surp_mean$|gain_mean$|win_theta$', k)] + \
           [k for k in unexpected if not ((args.inner_voice or model.streams == 3)
                                          and k.startswith('text_dec.nul.'))]
     if bad:
@@ -5702,7 +5773,10 @@ if args.eval:
 
 # ── optimizer / schedule ──────────────────────────────────────────────────────
 
-_trainable = [p for p in model.parameters() if p.requires_grad]
+_trainable = [p for n, p in model.named_parameters() if p.requires_grad and n != 'win_theta']
+_win_opt = torch.optim.Adam([model.win_theta], lr=args.win_lr) if model.learn else None
+if _win_opt is not None and _loaded_ckpt is not None and _loaded_ckpt.get('win_optimizer'):
+    _win_opt.load_state_dict(_loaded_ckpt['win_optimizer'])
 _bn_layers = [m for m in model.modules() if isinstance(m, nn.BatchNorm2d)]
 optimizer = torch.optim.SGD(_trainable, lr=args.lr_max, momentum=args.momentum,
                             weight_decay=args.weight_decay)
@@ -5855,7 +5929,7 @@ _vid_rec = False             # --sample_vis: record the next example to start in
 def _grad_norm():
     """The global gradient norm, one host sync (not one per parameter tensor: behind a GPU
     shared with another process each sync waits its turn)."""
-    g = [p.grad.detach() for p in model.parameters() if p.grad is not None and p.requires_grad]
+    g = [p.grad.detach() for p in _trainable if p.grad is not None]
     return float(torch.linalg.vector_norm(torch.stack(torch._foreach_norm(g)))) if g else 0.0
 
 
@@ -5869,6 +5943,7 @@ def _save(i, n_examples):
                 'step': i, 'examples': n_examples, 'examples_by': dict(_n_by),
                 'lr': optimizer.param_groups[0]['lr'],
                 'optimizer': optimizer.state_dict(),
+                'win_optimizer': _win_opt.state_dict() if _win_opt is not None else None,
                 'weight_ema': {T: dict(e) for T, e in _wema.items()}}, args.save)
 
 
@@ -6295,6 +6370,7 @@ _imaginer = _Imaginer(_SYNTH_ROWS) if _SYNTH_ROWS else None
 
 larr, garr = [], []
 _blk, _blk_start = [], None      # --bptt: the current block's (loss, inputs) and its starting state
+_etr_start = None                # --learn_win: the sensitivity traces at that start
 _rows_t = {}                 # each corpus's training rows as a device index tensor
 
 
@@ -6554,9 +6630,13 @@ try:
                         (torch.rand(x.shape, device=x.device) < args.text_feed)
                 x = torch.where(fb, _own, x)
         if args.bptt > 1 and not _blk:            # --bptt: a block starts from a detached state
-            _blk_start = model.dff
+            _blk_start, _etr_start = model.dff, model.etr
+        if args.bptt == 1:
+            _etr_start = model.etr
+        model.etr_on = bool(model.learn)
         logits, _ = model(x, flag=flag & ~_continuous_row, img=img, aud=aud, keep=args.reset_scale,
                           graph=args.bptt > 1)
+        model.etr_on = False
         if args.step_tokens:         # row 0's text-stream input and argmax prediction, kept on the GPU
             with torch.no_grad():
                 lg = (logits[0, 0] if logits.dim() > 2 else logits[0]).detach().float()[None]
@@ -6608,16 +6688,22 @@ try:
                         p.grad.mul_(args.clip / gnorm)
             _pt('grad_norm')
             optimizer.step()
+            if _win_opt is not None:
+                _win_opt.step()
+                _win_opt.zero_grad()
             _wema_step()
             _pt('optimizer')
             # recompute this step's (--bptt: the block's) states with the updated weights
             # (eval-mode BatchNorm), so the state carried forward is the one the model would
             # compute at inference
             model.dff = _blk_start if args.bptt > 1 else dff_prev
+            model.etr = _etr_start
+            model.etr_on = bool(model.learn)
             model.eval()
             with torch.no_grad():
                 for _, xb, fb, ib, ab in (_blk or [(None, x, flag & ~_continuous_row, img, aud)]):
                     model(xb, flag=fb, img=ib, aud=ab, keep=args.reset_scale)
+            model.etr_on = False
             _blk = []
             _pt('recompute')
 
@@ -6659,6 +6745,8 @@ try:
                              np.mean(garr[-args.monitor:]), optimizer.param_groups[0]['lr'],
                              flat.mean().item(), flat.std().item(), flat.abs().max().item())
             line += _ex_ep()
+            if model.learn:
+                line += ' win ' + '/'.join(f'{w:.1f}' for w in model.windows)
             if _imaginer is not None:
                 line += _imaginer.stats()
             for n, a in carr.items():
