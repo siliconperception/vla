@@ -1,0 +1,408 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="2040" height="1140" viewBox="0 0 2040 1140" font-family="Helvetica, Arial, sans-serif">
+<defs>
+<marker id="arr_f48fb1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0,0 L 10,5 L 0,10 z" fill="#f48fb1"/></marker>
+<marker id="arr_e0e0e0" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0,0 L 10,5 L 0,10 z" fill="#e0e0e0"/></marker>
+<marker id="arr_fff176" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0,0 L 10,5 L 0,10 z" fill="#fff176"/></marker>
+<marker id="arr_212121" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0,0 L 10,5 L 0,10 z" fill="#212121"/></marker>
+<marker id="arr_64b5f6" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0,0 L 10,5 L 0,10 z" fill="#64b5f6"/></marker>
+<marker id="arr_ffb74d" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0,0 L 10,5 L 0,10 z" fill="#ffb74d"/></marker>
+<marker id="arr_ce93d8" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0,0 L 10,5 L 0,10 z" fill="#ce93d8"/></marker>
+<marker id="arr_bcaaa4" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0,0 L 10,5 L 0,10 z" fill="#bcaaa4"/></marker>
+<marker id="arr_81c784" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0,0 L 10,5 L 0,10 z" fill="#81c784"/></marker>
+<marker id="arr_90a4ae" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0,0 L 10,5 L 0,10 z" fill="#90a4ae"/></marker>
+<marker id="arr_4dd0e1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0,0 L 10,5 L 0,10 z" fill="#4dd0e1"/></marker>
+<marker id="arr_b0b0b0" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0,0 L 10,5 L 0,10 z" fill="#b0b0b0"/></marker>
+<pattern id="hatch" width="6" height="6" patternUnits="userSpaceOnUse" patternTransform="rotate(45)"><line x1="0" y1="0" x2="0" y2="6" stroke="#757575" stroke-width="1.2"/></pattern>
+</defs>
+<rect width="2040" height="1140" fill="#ffffff"/>
+<text x="30" y="34" font-size="20" text-anchor="start" font-weight="bold" fill="#212121">VLA v485 — one clock tick (40 ms), three token streams, learned register windows</text>
+<text x="30" y="54" font-size="12" text-anchor="start" font-weight="normal" fill="#424242">n_hidden 512 · c_context 384 · 7×7 grid · depth 8 · linout 3×3 · 5 DFFs, learned windows from 512 / 64 / 16 / 4 / 1 ticks · 25 Hz clock · reset per example · frozen ResNet-50 at 2 Hz + fixed log-mel at 25 Hz · 3 token streams · batch 250 · SGD 0.04 · BPTT 16 · FineWeb</text>
+<rect x="532" y="140" width="14" height="300" rx="2" fill="#90a4ae" stroke="#424242" stroke-width="1.2"/>
+<rect x="30" y="140" width="70" height="40" rx="3" fill="#ffffff" stroke="#424242" stroke-width="1.3"/>
+<text x="65" y="157" font-size="10" text-anchor="middle" font-weight="bold" fill="#212121">frame</text>
+<text x="65" y="170" font-size="8" text-anchor="middle" font-weight="normal" fill="#555">2 fps · 3×224×224</text>
+<path d="M 100,160 L 184,160" fill="none" stroke="#212121" stroke-width="1.6" marker-end="url(#arr_212121)"/>
+<rect x="186" y="140" width="132" height="40" rx="2" fill="#b0b0b0" stroke="#424242" stroke-width="1.2"/>
+<rect x="186" y="140" width="132" height="40" rx="2" fill="url(#hatch)" stroke="none"/>
+<rect x="194" y="145" width="116" height="30" rx="2" fill="#ffffff" fill-opacity="0.85" stroke="none"/>
+<text x="252" y="158" font-size="9.5" text-anchor="middle" font-weight="bold" fill="#212121">ResNet-50 (frozen)</text>
+<text x="252" y="170" font-size="8" text-anchor="middle" font-weight="normal" fill="#424242">a1_in1k · 4.1G MAC</text>
+<path d="M 318,160 L 402,160" fill="none" stroke="#212121" stroke-width="1.6" marker-end="url(#arr_212121)"/>
+<rect x="404" y="149" width="40" height="22" rx="3" fill="#bcaaa4" stroke="#424242" stroke-width="1.2"/>
+<text x="424" y="164" font-size="8.5" text-anchor="middle" font-weight="bold" fill="#212121">RMS</text>
+<path d="M 444,160 L 530,160" fill="none" stroke="#212121" stroke-width="1.6" marker-end="url(#arr_212121)"/>
+<text x="487" y="155" font-size="8" text-anchor="middle" font-weight="normal" fill="#555">2048×7×7</text>
+<text x="487" y="173" font-size="8" text-anchor="middle" font-weight="normal" fill="#555">image grid</text>
+<text x="30" y="194" font-size="8" text-anchor="start" font-weight="normal" fill="#555">the frame on screen, refreshed at 2 Hz (--vision_hz) and held until the</text>
+<text x="30" y="204" font-size="8" text-anchor="start" font-weight="normal" fill="#555">next refresh · one crop offset per example · text rows: image grid = 0</text>
+<rect x="30" y="220" width="70" height="40" rx="3" fill="#ffffff" stroke="#424242" stroke-width="1.3"/>
+<text x="65" y="237" font-size="10" text-anchor="middle" font-weight="bold" fill="#212121">audio</text>
+<text x="65" y="250" font-size="8" text-anchor="middle" font-weight="normal" fill="#555">16 kHz clean</text>
+<path d="M 100,240 L 184,240" fill="none" stroke="#212121" stroke-width="1.6" marker-end="url(#arr_212121)"/>
+<rect x="186" y="220" width="132" height="40" rx="2" fill="#fff9c4" stroke="#424242" stroke-width="1.2"/>
+<text x="252" y="238" font-size="9.5" text-anchor="middle" font-weight="bold" fill="#212121">log-mel (fixed, no weights)</text>
+<text x="252" y="250" font-size="8" text-anchor="middle" font-weight="normal" fill="#424242">64 mels · 10 ms hop · fixed μ/σ</text>
+<path d="M 318,240 L 402,240" fill="none" stroke="#212121" stroke-width="1.6" marker-end="url(#arr_212121)"/>
+<rect x="404" y="229" width="40" height="22" rx="3" fill="#bcaaa4" stroke="#424242" stroke-width="1.2"/>
+<text x="424" y="244" font-size="8.5" text-anchor="middle" font-weight="bold" fill="#212121">RMS</text>
+<path d="M 444,240 L 530,240" fill="none" stroke="#212121" stroke-width="1.6" marker-end="url(#arr_212121)"/>
+<text x="487" y="235" font-size="8" text-anchor="middle" font-weight="normal" fill="#555">256×7×7</text>
+<text x="487" y="253" font-size="8" text-anchor="middle" font-weight="normal" fill="#555">audio grid</text>
+<text x="539" y="112" font-size="9.5" text-anchor="middle" font-weight="bold" fill="#212121">concat</text>
+<text x="539" y="124" font-size="9" text-anchor="middle" font-weight="normal" fill="#555">3×256+2048+256+5×512</text>
+<text x="539" y="135" font-size="9" text-anchor="middle" font-weight="normal" fill="#555">= 5632</text>
+<rect x="570" y="230.0" width="22" height="200" rx="2" fill="#64b5f6" stroke="#424242" stroke-width="1.2"/>
+<path d="M 546,330 L 568,330" fill="none" stroke="#212121" stroke-width="1.6" marker-end="url(#arr_212121)"/>
+<text x="581" y="330" font-size="9.5" text-anchor="middle" fill="#212121" transform="rotate(-90 581 330)">ctx_cat 1×1  5632→384</text>
+<text x="581" y="446" font-size="9" text-anchor="middle" font-weight="normal" fill="#555">384×7×7</text>
+<text x="581" y="458" font-size="8.5" text-anchor="middle" font-weight="normal" fill="#777">106.0M MAC</text>
+<path d="M 592,330 L 638,330" fill="none" stroke="#212121" stroke-width="1.6" marker-end="url(#arr_212121)"/>
+<rect x="640" y="280.0" width="26" height="100" rx="2" fill="#81c784" stroke="#424242" stroke-width="1.2"/>
+<path d="M 666,330 L 688,330" fill="none" stroke="#212121" stroke-width="1.3" marker-end="url(#arr_212121)"/>
+<rect x="690" y="280.0" width="26" height="100" rx="2" fill="#81c784" stroke="#424242" stroke-width="1.2"/>
+<path d="M 716,330 L 738,330" fill="none" stroke="#212121" stroke-width="1.3" marker-end="url(#arr_212121)"/>
+<rect x="740" y="280.0" width="26" height="100" rx="2" fill="#81c784" stroke="#424242" stroke-width="1.2"/>
+<path d="M 766,330 L 788,330" fill="none" stroke="#212121" stroke-width="1.3" marker-end="url(#arr_212121)"/>
+<rect x="790" y="280.0" width="26" height="100" rx="2" fill="#81c784" stroke="#424242" stroke-width="1.2"/>
+<path d="M 816,330 L 838,330" fill="none" stroke="#212121" stroke-width="1.3" marker-end="url(#arr_212121)"/>
+<rect x="840" y="280.0" width="26" height="100" rx="2" fill="#81c784" stroke="#424242" stroke-width="1.2"/>
+<path d="M 866,330 L 888,330" fill="none" stroke="#212121" stroke-width="1.3" marker-end="url(#arr_212121)"/>
+<rect x="890" y="280.0" width="26" height="100" rx="2" fill="#81c784" stroke="#424242" stroke-width="1.2"/>
+<path d="M 916,330 L 938,330" fill="none" stroke="#212121" stroke-width="1.3" marker-end="url(#arr_212121)"/>
+<rect x="940" y="280.0" width="26" height="100" rx="2" fill="#81c784" stroke="#424242" stroke-width="1.2"/>
+<path d="M 966,330 L 988,330" fill="none" stroke="#212121" stroke-width="1.3" marker-end="url(#arr_212121)"/>
+<rect x="990" y="280.0" width="26" height="100" rx="2" fill="#81c784" stroke="#424242" stroke-width="1.2"/>
+<text x="828" y="266" font-size="10.5" text-anchor="middle" font-weight="bold" fill="#212121">ContextCNN: 8 × (conv 3×3 + BN + ReLU), 384→384</text>
+<text x="828" y="396" font-size="9" text-anchor="middle" font-weight="normal" fill="#555">384×7×7 throughout · 8 × 65.0M = 520M MAC</text>
+<path d="M 1016,330 L 1038,330" fill="none" stroke="#212121" stroke-width="1.6" marker-end="url(#arr_212121)"/>
+<rect x="1040" y="280.0" width="22" height="100" rx="2" fill="#64b5f6" stroke="#424242" stroke-width="1.2"/>
+<text x="1051" y="330" font-size="9.5" text-anchor="middle" fill="#212121" transform="rotate(-90 1051 330)">linout 3×3  384→512</text>
+<text x="1051" y="272" font-size="9" text-anchor="middle" font-weight="bold" fill="#212121">shared</text>
+<text x="1051" y="394" font-size="8.5" text-anchor="middle" font-weight="normal" fill="#555">pad 1</text>
+<text x="1051" y="406" font-size="8.5" text-anchor="middle" font-weight="normal" fill="#777">86.7M MAC</text>
+<path d="M 1062,330 L 1090,330" fill="none" stroke="#212121" stroke-width="1.6"/>
+<circle cx="1090" cy="330" r="3.5" fill="#212121"/>
+<path d="M 1090,330 L 1090,960" fill="none" stroke="#212121" stroke-width="1.4"/>
+<text x="1098" y="460" font-size="9" text-anchor="start" font-weight="normal" fill="#424242">linout output (x) to all 5 registers</text>
+<circle cx="1090" cy="528" r="3" fill="#212121"/>
+<path d="M 1090,528 L 1040,528" fill="none" stroke="#212121" stroke-width="1.4" marker-end="url(#arr_212121)"/>
+<circle cx="1020" cy="528" r="18" fill="#fff176" stroke="#424242" stroke-width="1.4"/>
+<text x="1020" y="526" font-size="8.5" text-anchor="middle" font-weight="bold" fill="#212121">EMA</text>
+<text x="1020" y="537" font-size="8.5" text-anchor="middle" font-weight="bold" fill="#212121">/W₁</text>
+<path d="M 1002,528 L 926,528" fill="none" stroke="#212121" stroke-width="1.4" marker-end="url(#arr_212121)"/>
+<rect x="880" y="506" width="44" height="44" rx="1" fill="#ffffff" stroke="#212121" stroke-width="1.6"/>
+<text x="888" y="520" font-size="9" text-anchor="middle" font-weight="bold" fill="#212121">Q</text>
+<text x="916" y="520" font-size="9" text-anchor="middle" font-weight="bold" fill="#212121">D</text>
+<polyline points="924,535 917,540 924,545" fill="none" stroke="#212121" stroke-width="1.2"/>
+<text x="902" y="533" font-size="9" text-anchor="middle" font-weight="bold" fill="#212121">DFF_1</text>
+<circle cx="902" cy="550" r="2.6" fill="#fff" stroke="#212121" stroke-width="1.2"/>
+<text x="902" y="500" font-size="8" text-anchor="middle" font-weight="normal" fill="#555">512×7×7 state</text>
+<path d="M 868,528 L 868,556 L 1020,556 L 1020,548" fill="none" stroke="#212121" stroke-width="1.0" stroke-dasharray="4 3" marker-end="url(#arr_212121)"/>
+<path d="M 878,528 L 726,528" fill="none" stroke="#212121" stroke-width="1.5" marker-end="url(#arr_212121)"/>
+<rect x="680" y="517" width="44" height="22" rx="3" fill="#bcaaa4" stroke="#424242" stroke-width="1.2"/>
+<text x="702" y="532" font-size="8.5" text-anchor="middle" font-weight="bold" fill="#212121">norm</text>
+<path d="M 680,528 L 522,528 L 522,430 L 530,430" fill="none" stroke="#212121" stroke-width="1.3" marker-end="url(#arr_212121)"/>
+<circle cx="975" cy="528" r="2.6" fill="#212121"/>
+<path d="M 975,528 L 975,576" fill="none" stroke="#212121" stroke-width="1.2"/>
+<circle cx="975" cy="576" r="2.8" fill="#212121"/>
+<path d="M 975,576 L 950,576 L 950,674" fill="none" stroke="#212121" stroke-width="1.2" marker-end="url(#arr_212121)"/>
+<path d="M 975,576 L 1066,576 L 1066,624" fill="none" stroke="#212121" stroke-width="1.2" marker-end="url(#arr_212121)"/>
+<text x="996" y="572" font-size="8.5" text-anchor="start" font-weight="bold" fill="#555">S_1</text>
+<text x="1102" y="525" font-size="9.5" text-anchor="start" font-weight="normal" fill="#424242">r ← r + (x − r)/W₁</text>
+<text x="1102" y="538" font-size="8.5" text-anchor="start" font-weight="normal" fill="#777">W1 learned, from 512 ticks = 20 s (slow: topic within an example) · 25K MAC</text>
+<circle cx="1090" cy="636" r="3" fill="#212121"/>
+<path d="M 1090,636 L 1077,636" fill="none" stroke="#212121" stroke-width="1.4" marker-end="url(#arr_212121)"/>
+<circle cx="1066" cy="636" r="10" fill="#fff" stroke="#424242" stroke-width="1.4"/>
+<text x="1066" y="641" font-size="14" text-anchor="middle" font-weight="bold" fill="#212121">−</text>
+<path d="M 1056,636 L 1040,636" fill="none" stroke="#212121" stroke-width="1.4" marker-end="url(#arr_212121)"/>
+<circle cx="1020" cy="636" r="18" fill="#fff176" stroke="#424242" stroke-width="1.4"/>
+<text x="1020" y="634" font-size="8.5" text-anchor="middle" font-weight="bold" fill="#212121">EMA</text>
+<text x="1020" y="645" font-size="8.5" text-anchor="middle" font-weight="bold" fill="#212121">/W₂</text>
+<path d="M 1002,636 L 926,636" fill="none" stroke="#212121" stroke-width="1.4" marker-end="url(#arr_212121)"/>
+<rect x="880" y="614" width="44" height="44" rx="1" fill="#ffffff" stroke="#212121" stroke-width="1.6"/>
+<text x="888" y="628" font-size="9" text-anchor="middle" font-weight="bold" fill="#212121">Q</text>
+<text x="916" y="628" font-size="9" text-anchor="middle" font-weight="bold" fill="#212121">D</text>
+<polyline points="924,643 917,648 924,653" fill="none" stroke="#212121" stroke-width="1.2"/>
+<text x="902" y="641" font-size="9" text-anchor="middle" font-weight="bold" fill="#212121">DFF_2</text>
+<circle cx="902" cy="658" r="2.6" fill="#fff" stroke="#212121" stroke-width="1.2"/>
+<text x="902" y="608" font-size="8" text-anchor="middle" font-weight="normal" fill="#555">512×7×7 state</text>
+<path d="M 868,636 L 868,664 L 1020,664 L 1020,656" fill="none" stroke="#212121" stroke-width="1.0" stroke-dasharray="4 3" marker-end="url(#arr_212121)"/>
+<path d="M 878,636 L 726,636" fill="none" stroke="#212121" stroke-width="1.5" marker-end="url(#arr_212121)"/>
+<rect x="680" y="625" width="44" height="22" rx="3" fill="#bcaaa4" stroke="#424242" stroke-width="1.2"/>
+<text x="702" y="640" font-size="8.5" text-anchor="middle" font-weight="bold" fill="#212121">norm</text>
+<path d="M 680,636 L 512,636 L 512,414 L 530,414" fill="none" stroke="#212121" stroke-width="1.3" marker-end="url(#arr_212121)"/>
+<circle cx="975" cy="636" r="2.6" fill="#212121"/>
+<path d="M 975,636 L 975,684 L 960,684" fill="none" stroke="#212121" stroke-width="1.2" marker-end="url(#arr_212121)"/>
+<circle cx="950" cy="684" r="9" fill="#fff" stroke="#424242" stroke-width="1.4"/>
+<text x="950" y="688.5" font-size="13" text-anchor="middle" font-weight="bold" fill="#212121">+</text>
+<path d="M 950,693 L 950,702" fill="none" stroke="#212121" stroke-width="1.2"/>
+<circle cx="950" cy="702" r="2.8" fill="#212121"/>
+<path d="M 950,702 L 950,782" fill="none" stroke="#212121" stroke-width="1.2" marker-end="url(#arr_212121)"/>
+<path d="M 950,702 L 1066,702 L 1066,732" fill="none" stroke="#212121" stroke-width="1.2" marker-end="url(#arr_212121)"/>
+<text x="996" y="698" font-size="8.5" text-anchor="start" font-weight="bold" fill="#555">S_2</text>
+<text x="1102" y="633" font-size="9.5" text-anchor="start" font-weight="normal" fill="#424242">r ← r + ((x − S_1) − r)/W₂</text>
+<text x="1102" y="646" font-size="8.5" text-anchor="start" font-weight="normal" fill="#777">W2 learned, from 64 ticks = 2.6 s · 25K MAC + 25K subtract</text>
+<circle cx="1090" cy="744" r="3" fill="#212121"/>
+<path d="M 1090,744 L 1077,744" fill="none" stroke="#212121" stroke-width="1.4" marker-end="url(#arr_212121)"/>
+<circle cx="1066" cy="744" r="10" fill="#fff" stroke="#424242" stroke-width="1.4"/>
+<text x="1066" y="749" font-size="14" text-anchor="middle" font-weight="bold" fill="#212121">−</text>
+<path d="M 1056,744 L 1040,744" fill="none" stroke="#212121" stroke-width="1.4" marker-end="url(#arr_212121)"/>
+<circle cx="1020" cy="744" r="18" fill="#fff176" stroke="#424242" stroke-width="1.4"/>
+<text x="1020" y="742" font-size="8.5" text-anchor="middle" font-weight="bold" fill="#212121">EMA</text>
+<text x="1020" y="753" font-size="8.5" text-anchor="middle" font-weight="bold" fill="#212121">/W₃</text>
+<path d="M 1002,744 L 926,744" fill="none" stroke="#212121" stroke-width="1.4" marker-end="url(#arr_212121)"/>
+<rect x="880" y="722" width="44" height="44" rx="1" fill="#ffffff" stroke="#212121" stroke-width="1.6"/>
+<text x="888" y="736" font-size="9" text-anchor="middle" font-weight="bold" fill="#212121">Q</text>
+<text x="916" y="736" font-size="9" text-anchor="middle" font-weight="bold" fill="#212121">D</text>
+<polyline points="924,751 917,756 924,761" fill="none" stroke="#212121" stroke-width="1.2"/>
+<text x="902" y="749" font-size="9" text-anchor="middle" font-weight="bold" fill="#212121">DFF_3</text>
+<circle cx="902" cy="766" r="2.6" fill="#fff" stroke="#212121" stroke-width="1.2"/>
+<text x="902" y="716" font-size="8" text-anchor="middle" font-weight="normal" fill="#555">512×7×7 state</text>
+<path d="M 868,744 L 868,772 L 1020,772 L 1020,764" fill="none" stroke="#212121" stroke-width="1.0" stroke-dasharray="4 3" marker-end="url(#arr_212121)"/>
+<path d="M 878,744 L 726,744" fill="none" stroke="#212121" stroke-width="1.5" marker-end="url(#arr_212121)"/>
+<rect x="680" y="733" width="44" height="22" rx="3" fill="#bcaaa4" stroke="#424242" stroke-width="1.2"/>
+<text x="702" y="748" font-size="8.5" text-anchor="middle" font-weight="bold" fill="#212121">norm</text>
+<path d="M 680,744 L 502,744 L 502,398 L 530,398" fill="none" stroke="#212121" stroke-width="1.3" marker-end="url(#arr_212121)"/>
+<circle cx="975" cy="744" r="2.6" fill="#212121"/>
+<path d="M 975,744 L 975,792 L 960,792" fill="none" stroke="#212121" stroke-width="1.2" marker-end="url(#arr_212121)"/>
+<circle cx="950" cy="792" r="9" fill="#fff" stroke="#424242" stroke-width="1.4"/>
+<text x="950" y="796.5" font-size="13" text-anchor="middle" font-weight="bold" fill="#212121">+</text>
+<path d="M 950,801 L 950,810" fill="none" stroke="#212121" stroke-width="1.2"/>
+<circle cx="950" cy="810" r="2.8" fill="#212121"/>
+<path d="M 950,810 L 950,890" fill="none" stroke="#212121" stroke-width="1.2" marker-end="url(#arr_212121)"/>
+<path d="M 950,810 L 1066,810 L 1066,840" fill="none" stroke="#212121" stroke-width="1.2" marker-end="url(#arr_212121)"/>
+<text x="996" y="806" font-size="8.5" text-anchor="start" font-weight="bold" fill="#555">S_3</text>
+<text x="1102" y="741" font-size="9.5" text-anchor="start" font-weight="normal" fill="#424242">r ← r + ((x − S_2) − r)/W₃</text>
+<text x="1102" y="754" font-size="8.5" text-anchor="start" font-weight="normal" fill="#777">W3 learned, from 16 ticks = 0.64 s · 25K MAC + 25K subtract</text>
+<circle cx="1090" cy="852" r="3" fill="#212121"/>
+<path d="M 1090,852 L 1077,852" fill="none" stroke="#212121" stroke-width="1.4" marker-end="url(#arr_212121)"/>
+<circle cx="1066" cy="852" r="10" fill="#fff" stroke="#424242" stroke-width="1.4"/>
+<text x="1066" y="857" font-size="14" text-anchor="middle" font-weight="bold" fill="#212121">−</text>
+<path d="M 1056,852 L 1040,852" fill="none" stroke="#212121" stroke-width="1.4" marker-end="url(#arr_212121)"/>
+<circle cx="1020" cy="852" r="18" fill="#fff176" stroke="#424242" stroke-width="1.4"/>
+<text x="1020" y="850" font-size="8.5" text-anchor="middle" font-weight="bold" fill="#212121">EMA</text>
+<text x="1020" y="861" font-size="8.5" text-anchor="middle" font-weight="bold" fill="#212121">/W₄</text>
+<path d="M 1002,852 L 926,852" fill="none" stroke="#212121" stroke-width="1.4" marker-end="url(#arr_212121)"/>
+<rect x="880" y="830" width="44" height="44" rx="1" fill="#ffffff" stroke="#212121" stroke-width="1.6"/>
+<text x="888" y="844" font-size="9" text-anchor="middle" font-weight="bold" fill="#212121">Q</text>
+<text x="916" y="844" font-size="9" text-anchor="middle" font-weight="bold" fill="#212121">D</text>
+<polyline points="924,859 917,864 924,869" fill="none" stroke="#212121" stroke-width="1.2"/>
+<text x="902" y="857" font-size="9" text-anchor="middle" font-weight="bold" fill="#212121">DFF_4</text>
+<circle cx="902" cy="874" r="2.6" fill="#fff" stroke="#212121" stroke-width="1.2"/>
+<text x="902" y="824" font-size="8" text-anchor="middle" font-weight="normal" fill="#555">512×7×7 state</text>
+<path d="M 868,852 L 868,880 L 1020,880 L 1020,872" fill="none" stroke="#212121" stroke-width="1.0" stroke-dasharray="4 3" marker-end="url(#arr_212121)"/>
+<path d="M 878,852 L 726,852" fill="none" stroke="#212121" stroke-width="1.5" marker-end="url(#arr_212121)"/>
+<rect x="680" y="841" width="44" height="22" rx="3" fill="#bcaaa4" stroke="#424242" stroke-width="1.2"/>
+<text x="702" y="856" font-size="8.5" text-anchor="middle" font-weight="bold" fill="#212121">norm</text>
+<path d="M 680,852 L 492,852 L 492,382 L 530,382" fill="none" stroke="#212121" stroke-width="1.3" marker-end="url(#arr_212121)"/>
+<circle cx="975" cy="852" r="2.6" fill="#212121"/>
+<path d="M 975,852 L 975,900 L 960,900" fill="none" stroke="#212121" stroke-width="1.2" marker-end="url(#arr_212121)"/>
+<circle cx="950" cy="900" r="9" fill="#fff" stroke="#424242" stroke-width="1.4"/>
+<text x="950" y="904.5" font-size="13" text-anchor="middle" font-weight="bold" fill="#212121">+</text>
+<path d="M 950,909 L 950,918" fill="none" stroke="#212121" stroke-width="1.2"/>
+<circle cx="950" cy="918" r="2.8" fill="#212121"/>
+<path d="M 950,918 L 1066,918 L 1066,948" fill="none" stroke="#212121" stroke-width="1.2" marker-end="url(#arr_212121)"/>
+<text x="996" y="914" font-size="8.5" text-anchor="start" font-weight="bold" fill="#555">S_4</text>
+<text x="1102" y="849" font-size="9.5" text-anchor="start" font-weight="normal" fill="#424242">r ← r + ((x − S_3) − r)/W₄</text>
+<text x="1102" y="862" font-size="8.5" text-anchor="start" font-weight="normal" fill="#777">W4 learned, from 4 ticks = 0.16 s · 25K MAC + 25K subtract</text>
+<circle cx="1090" cy="960" r="3" fill="#212121"/>
+<path d="M 1090,960 L 1077,960" fill="none" stroke="#212121" stroke-width="1.4" marker-end="url(#arr_212121)"/>
+<circle cx="1066" cy="960" r="10" fill="#fff" stroke="#424242" stroke-width="1.4"/>
+<text x="1066" y="965" font-size="14" text-anchor="middle" font-weight="bold" fill="#212121">−</text>
+<path d="M 1056,960 L 1040,960" fill="none" stroke="#212121" stroke-width="1.4" marker-end="url(#arr_212121)"/>
+<circle cx="1020" cy="960" r="18" fill="#fff176" stroke="#424242" stroke-width="1.4"/>
+<text x="1020" y="958" font-size="8.5" text-anchor="middle" font-weight="bold" fill="#212121">W=1</text>
+<text x="1020" y="969" font-size="8.5" text-anchor="middle" font-weight="bold" fill="#212121">copy</text>
+<path d="M 1002,960 L 926,960" fill="none" stroke="#212121" stroke-width="1.4" marker-end="url(#arr_212121)"/>
+<rect x="880" y="938" width="44" height="44" rx="1" fill="#ffffff" stroke="#212121" stroke-width="1.6"/>
+<text x="888" y="952" font-size="9" text-anchor="middle" font-weight="bold" fill="#212121">Q</text>
+<text x="916" y="952" font-size="9" text-anchor="middle" font-weight="bold" fill="#212121">D</text>
+<polyline points="924,967 917,972 924,977" fill="none" stroke="#212121" stroke-width="1.2"/>
+<text x="902" y="965" font-size="9" text-anchor="middle" font-weight="bold" fill="#212121">DFF_5</text>
+<circle cx="902" cy="982" r="2.6" fill="#fff" stroke="#212121" stroke-width="1.2"/>
+<text x="902" y="932" font-size="8" text-anchor="middle" font-weight="normal" fill="#555">512×7×7 state</text>
+<path d="M 878,960 L 726,960" fill="none" stroke="#212121" stroke-width="1.5" marker-end="url(#arr_212121)"/>
+<rect x="680" y="949" width="44" height="22" rx="3" fill="#bcaaa4" stroke="#424242" stroke-width="1.2"/>
+<text x="702" y="964" font-size="8.5" text-anchor="middle" font-weight="bold" fill="#212121">norm</text>
+<path d="M 680,960 L 482,960 L 482,366 L 530,366" fill="none" stroke="#212121" stroke-width="1.3" marker-end="url(#arr_212121)"/>
+<text x="1102" y="957" font-size="9.5" text-anchor="start" font-weight="normal" fill="#424242">r ← x − S_4</text>
+<text x="1102" y="970" font-size="8.5" text-anchor="start" font-weight="normal" fill="#777">W5 = 1 (plain write, no MAC) · 25K subtract · S_1..S_4: 3×25K adds</text>
+<text x="702" y="511" font-size="8" text-anchor="middle" font-weight="normal" fill="#555">r_k / σ_k (running)</text>
+<text x="940" y="1004" font-size="8.5" text-anchor="middle" font-weight="normal" fill="#212121" font-style="italic">dashed: old state r (Q) into each EMA · open circle R: reset to 0 at every example start (--continuous '', --init zero) · S_k: running sum of the new values</text>
+<text x="622" y="474" font-size="10" text-anchor="start" font-weight="bold" fill="#212121">DFF_1 … DFF_5 (state at t−1)</text>
+<text x="622" y="487" font-size="9" text-anchor="start" font-weight="normal" fill="#212121">each read through its own 512-channel block of ctx_cat</text>
+<rect x="1476" y="708" width="520" height="422" rx="6" fill="#fafafa" stroke="#bdbdbd"/>
+<text x="1490" y="726" font-size="12" text-anchor="start" font-weight="bold" fill="#212121">Legend</text>
+<rect x="1490" y="735" width="12" height="22" rx="2" fill="#b0b0b0" stroke="#424242" stroke-width="1.2"/>
+<rect x="1490" y="735" width="12" height="22" rx="2" fill="url(#hatch)" stroke="none"/>
+<text x="1512" y="750" font-size="10" text-anchor="start" font-weight="normal" fill="#212121">frozen: embedding / inverse embedding (pythia-31m, shared by the 3 streams), ResNet-50</text>
+<rect x="1490" y="761" width="12" height="22" rx="2" fill="#ce93d8" stroke="#424242" stroke-width="1.2"/>
+<text x="1512" y="776" font-size="10" text-anchor="start" font-weight="normal" fill="#212121">replicate (upsample 1×1 → 7×7 grid)</text>
+<rect x="1490" y="787" width="12" height="22" rx="2" fill="#90a4ae" stroke="#424242" stroke-width="1.2"/>
+<text x="1512" y="802" font-size="10" text-anchor="start" font-weight="normal" fill="#212121">channel concatenation (3 token grids + image + audio grids + 5 registers)</text>
+<rect x="1490" y="813" width="12" height="22" rx="2" fill="#64b5f6" stroke="#424242" stroke-width="1.2"/>
+<text x="1512" y="828" font-size="10" text-anchor="start" font-weight="normal" fill="#212121">conv 1×1 / 3×3 (linear): ctx_cat 1×1, linout 3×3</text>
+<rect x="1490" y="839" width="12" height="22" rx="2" fill="#81c784" stroke="#424242" stroke-width="1.2"/>
+<text x="1512" y="854" font-size="10" text-anchor="start" font-weight="normal" fill="#212121">conv 3×3 + BatchNorm + ReLU</text>
+<rect x="1490" y="865" width="12" height="22" rx="2" fill="#4dd0e1" stroke="#424242" stroke-width="1.2"/>
+<text x="1512" y="880" font-size="10" text-anchor="start" font-weight="normal" fill="#212121">conv 3×3 unpadded (linear, no BN/ReLU): the 3 decoder trees 7→5→3→1</text>
+<rect x="1490" y="891" width="12" height="22" rx="2" fill="#ffffff" stroke="#424242" stroke-width="1.2"/>
+<text x="1512" y="906" font-size="10" text-anchor="start" font-weight="normal" fill="#212121">media input: video frame (2 Hz) / 16 kHz clean sound (log-mel, a new cell every tick)</text>
+<rect x="1490" y="917" width="12" height="22" rx="2" fill="#f48fb1" stroke="#424242" stroke-width="1.2"/>
+<text x="1512" y="932" font-size="10" text-anchor="start" font-weight="normal" fill="#212121">softmax + sample (all 3: + &lt;NUL&gt; logit → no word)</text>
+<circle cx="1496" cy="958" r="9" fill="#fff176" stroke="#424242"/>
+<text x="1512" y="962" font-size="10" text-anchor="start" font-weight="normal" fill="#212121">EMA multiply-accumulate, rate 1/W_k (learned, from 512, 64, 16, 4 ticks; DFF_5 is a plain write)</text>
+<circle cx="1496" cy="986" r="9" fill="#fff" stroke="#424242"/>
+<text x="1496" y="991" font-size="12" text-anchor="middle" font-weight="bold" fill="#212121">−</text>
+<text x="1512" y="990" font-size="10" text-anchor="start" font-weight="normal" fill="#212121">subtractor (−) / adder (+): x minus S_k, the running sum of the slower registers</text>
+<rect x="1490" y="1006" width="12" height="16" rx="2" fill="#bcaaa4" stroke="#424242" stroke-width="1.2"/>
+<text x="1512" y="1018" font-size="10" text-anchor="start" font-weight="normal" fill="#212121">read scale 1/σ_k (running RMS; constant at inference) · RMS: per-position norm</text>
+<polygon points="1490,1032 1502,1036 1502,1048 1490,1052" fill="#e0e0e0" stroke="#424242"/>
+<text x="1512" y="1046" font-size="10" text-anchor="start" font-weight="normal" fill="#212121">multiplexer</text>
+<rect x="1489" y="1062" width="15" height="15" rx="1" fill="#fff" stroke="#212121" stroke-width="1.4"/>
+<text x="1512" y="1074" font-size="10" text-anchor="start" font-weight="normal" fill="#212121">D flip-flop, clocked once per 40 ms tick; R = synchronous reset to 0 at an example start</text>
+<path d="M 1490,1098 L 1504,1098" fill="none" stroke="#212121" stroke-width="1.6" marker-end="url(#arr_212121)"/>
+<text x="1512" y="1102" font-size="10" text-anchor="start" font-weight="normal" fill="#212121">data / state path (labelled where it matters)</text>
+<path d="M 1490,1116 L 1504,1116" fill="none" stroke="#212121" stroke-width="1.1" stroke-dasharray="4 3" marker-end="url(#arr_212121)"/>
+<text x="1512" y="1120" font-size="10" text-anchor="start" font-weight="normal" fill="#212121">old register value r into its EMA</text>
+<polygon points="56,284 90,289 90,303 56,308" fill="#e0e0e0" stroke="#424242" stroke-width="1.2"/>
+<path d="M 32,302 L 54,302" fill="none" stroke="#212121" stroke-width="1.3" marker-end="url(#arr_212121)"/>
+<path d="M 90,296 L 148,296" fill="none" stroke="#212121" stroke-width="1.5" marker-end="url(#arr_212121)"/>
+<rect x="150" y="284" width="40" height="24" rx="1" fill="#ffffff" stroke="#212121" stroke-width="1.5"/>
+<polyline points="150,297 155,301 150,305" fill="none" stroke="#212121" stroke-width="1.1"/>
+<text x="170" y="299" font-size="8.5" text-anchor="middle" font-weight="bold" fill="#212121">text</text>
+<path d="M 190,296 L 272,296" fill="none" stroke="#212121" stroke-width="1.5" marker-end="url(#arr_212121)"/>
+<text x="231" y="293" font-size="7" text-anchor="middle" font-weight="normal" fill="#555">text id</text>
+<path d="M 378,296 L 446,296" fill="none" stroke="#212121" stroke-width="1.5" marker-end="url(#arr_212121)"/>
+<path d="M 470,296 L 530,296" fill="none" stroke="#212121" stroke-width="1.5" marker-end="url(#arr_212121)"/>
+<polygon points="56,314 90,319 90,333 56,338" fill="#e0e0e0" stroke="#424242" stroke-width="1.2"/>
+<path d="M 32,332 L 54,332" fill="none" stroke="#212121" stroke-width="1.3" marker-end="url(#arr_212121)"/>
+<path d="M 90,326 L 148,326" fill="none" stroke="#212121" stroke-width="1.5" marker-end="url(#arr_212121)"/>
+<rect x="150" y="314" width="40" height="24" rx="1" fill="#ffffff" stroke="#212121" stroke-width="1.5"/>
+<polyline points="150,327 155,331 150,335" fill="none" stroke="#212121" stroke-width="1.1"/>
+<text x="170" y="329" font-size="8.5" text-anchor="middle" font-weight="bold" fill="#212121">voice</text>
+<path d="M 190,326 L 272,326" fill="none" stroke="#212121" stroke-width="1.5" marker-end="url(#arr_212121)"/>
+<text x="231" y="323" font-size="7" text-anchor="middle" font-weight="normal" fill="#555">voice id</text>
+<path d="M 378,326 L 446,326" fill="none" stroke="#212121" stroke-width="1.5" marker-end="url(#arr_212121)"/>
+<path d="M 470,326 L 530,326" fill="none" stroke="#212121" stroke-width="1.5" marker-end="url(#arr_212121)"/>
+<polygon points="56,344 90,349 90,363 56,368" fill="#e0e0e0" stroke="#424242" stroke-width="1.2"/>
+<path d="M 32,362 L 54,362" fill="none" stroke="#212121" stroke-width="1.3" marker-end="url(#arr_212121)"/>
+<path d="M 90,356 L 148,356" fill="none" stroke="#212121" stroke-width="1.5" marker-end="url(#arr_212121)"/>
+<rect x="150" y="344" width="40" height="24" rx="1" fill="#ffffff" stroke="#212121" stroke-width="1.5"/>
+<polyline points="150,357 155,361 150,365" fill="none" stroke="#212121" stroke-width="1.1"/>
+<text x="170" y="359" font-size="8.5" text-anchor="middle" font-weight="bold" fill="#212121">image</text>
+<path d="M 190,356 L 272,356" fill="none" stroke="#212121" stroke-width="1.5" marker-end="url(#arr_212121)"/>
+<text x="231" y="353" font-size="7" text-anchor="middle" font-weight="normal" fill="#555">image id</text>
+<path d="M 378,356 L 446,356" fill="none" stroke="#212121" stroke-width="1.5" marker-end="url(#arr_212121)"/>
+<path d="M 470,356 L 530,356" fill="none" stroke="#212121" stroke-width="1.5" marker-end="url(#arr_212121)"/>
+<text x="40" y="391" font-size="7.5" text-anchor="start" font-weight="normal" fill="#555">data (training)</text>
+<text x="40" y="400" font-size="7.5" text-anchor="start" font-weight="normal" fill="#555">/ prompt (text)</text>
+<text x="30" y="272" font-size="8" text-anchor="start" font-weight="normal" fill="#555">last 196 frames heard (1.96 s), 4 per 40 ms cell, a new cell every tick (25 Hz), row-major 7×7 · text rows: 0</text>
+<text x="170" y="383" font-size="9" text-anchor="middle" font-weight="bold" fill="#212121">3 autoregressive DFFs</text>
+<text x="170" y="395" font-size="8" text-anchor="middle" font-weight="normal" fill="#555">(text / voice / image token id)</text>
+<text x="170" y="412" font-size="8" text-anchor="middle" font-weight="normal" fill="#555">example start (id −1): all 3 token</text>
+<text x="170" y="423" font-size="8" text-anchor="middle" font-weight="normal" fill="#555">grids, image, audio = 0</text>
+<text x="170" y="437" font-size="8" text-anchor="middle" font-weight="normal" fill="#555">after own &lt;NUL&gt;: no word (zero grid)</text>
+<rect x="274" y="282" width="104" height="88" rx="2" fill="#b0b0b0" stroke="#424242" stroke-width="1.2"/>
+<rect x="274" y="282" width="104" height="88" rx="2" fill="url(#hatch)" stroke="none"/>
+<rect x="279" y="300" width="94" height="52" rx="2" fill="#ffffff" fill-opacity="0.85" stroke="none"/>
+<text x="326" y="318" font-size="9.5" text-anchor="middle" font-weight="bold" fill="#212121">tok_embed (frozen)</text>
+<text x="326" y="331" font-size="7.5" text-anchor="middle" font-weight="normal" fill="#424242">pythia-31m · 50304×256</text>
+<text x="326" y="343" font-size="7.5" text-anchor="middle" font-weight="normal" fill="#424242">shared by 3 streams</text>
+<rect x="448" y="282" width="22" height="88" rx="2" fill="#ce93d8" stroke="#424242" stroke-width="1.2"/>
+<text x="459" y="326" font-size="9.5" text-anchor="middle" font-weight="normal" fill="#212121" transform="rotate(-90 459 326)">replicate ×3</text>
+<text x="456" y="384" font-size="9" text-anchor="middle" font-weight="normal" fill="#555">3 × 256×7×7</text>
+<text x="500" y="291" font-size="7" text-anchor="middle" font-weight="normal" fill="#555">text</text>
+<text x="500" y="321" font-size="7" text-anchor="middle" font-weight="normal" fill="#555">voice</text>
+<text x="500" y="351" font-size="7" text-anchor="middle" font-weight="normal" fill="#555">image</text>
+<text x="650" y="205" font-size="8.5" text-anchor="middle" font-weight="normal" fill="#777">log-mel hearing (no weights);</text>
+<text x="650" y="216" font-size="8.5" text-anchor="middle" font-weight="normal" fill="#777">unused by v485’s text-only</text>
+<text x="650" y="227" font-size="8.5" text-anchor="middle" font-weight="normal" fill="#777">training data</text>
+<path d="M 1090,190 L 1090,330" fill="none" stroke="#212121" stroke-width="1.4"/>
+<text x="1160" y="116" font-size="9" text-anchor="middle" font-weight="bold" fill="#212121">3 decoder trees (linear, no pad)</text>
+<text x="1160" y="127" font-size="7.5" text-anchor="middle" font-weight="normal" fill="#777">512×7×7 → 5×5 → 3×3 → 256 · 35M MAC, 2.36M weights each</text>
+<circle cx="1090" cy="190" r="3" fill="#212121"/>
+<path d="M 1090,190 L 1106,190" fill="none" stroke="#212121" stroke-width="1.5" marker-end="url(#arr_212121)"/>
+<rect x="1108" y="156" width="22" height="68" rx="2" fill="#4dd0e1" stroke="#424242" stroke-width="1.2"/>
+<text x="1119" y="190" font-size="9" text-anchor="middle" font-weight="normal" fill="#212121" transform="rotate(-90 1119 190)">3×3 7→5</text>
+<rect x="1144" y="156" width="22" height="68" rx="2" fill="#4dd0e1" stroke="#424242" stroke-width="1.2"/>
+<text x="1155" y="190" font-size="9" text-anchor="middle" font-weight="normal" fill="#212121" transform="rotate(-90 1155 190)">3×3 5→3</text>
+<path d="M 1130,190 L 1142,190" fill="none" stroke="#212121" stroke-width="1.4" marker-end="url(#arr_212121)"/>
+<rect x="1180" y="156" width="22" height="68" rx="2" fill="#4dd0e1" stroke="#424242" stroke-width="1.2"/>
+<text x="1191" y="190" font-size="9" text-anchor="middle" font-weight="normal" fill="#212121" transform="rotate(-90 1191 190)">3×3 3→1</text>
+<path d="M 1166,190 L 1178,190" fill="none" stroke="#212121" stroke-width="1.4" marker-end="url(#arr_212121)"/>
+<text x="1155" y="152" font-size="9" text-anchor="middle" font-weight="bold" fill="#212121">text_dec</text>
+<path d="M 1202,190 L 1260,190" fill="none" stroke="#212121" stroke-width="1.5" marker-end="url(#arr_212121)"/>
+<text x="1231" y="203" font-size="7" text-anchor="middle" font-weight="normal" fill="#555">+ &lt;NUL&gt; logit</text>
+<rect x="1320" y="167" width="66" height="46" rx="6" fill="#f48fb1" stroke="#424242" stroke-width="1.2"/>
+<path d="M 1284,190 L 1318,190" fill="none" stroke="#212121" stroke-width="1.5" marker-end="url(#arr_212121)"/>
+<text x="1353" y="184" font-size="9.5" text-anchor="middle" font-weight="bold" fill="#212121">softmax</text>
+<text x="1353" y="197" font-size="9.5" text-anchor="middle" font-weight="bold" fill="#212121">sample</text>
+<text x="1353" y="208" font-size="7.5" text-anchor="middle" font-weight="normal" fill="#424242">THINK</text>
+<path d="M 1386,190 L 1400,190 L 1400,100 L 22,100 L 22,290 L 54,290" fill="none" stroke="#212121" stroke-width="1.6" marker-end="url(#arr_212121)"/>
+<circle cx="1090" cy="290" r="3" fill="#212121"/>
+<path d="M 1090,290 L 1106,290" fill="none" stroke="#212121" stroke-width="1.5" marker-end="url(#arr_212121)"/>
+<rect x="1108" y="256" width="22" height="68" rx="2" fill="#4dd0e1" stroke="#424242" stroke-width="1.2"/>
+<text x="1119" y="290" font-size="9" text-anchor="middle" font-weight="normal" fill="#212121" transform="rotate(-90 1119 290)">3×3 7→5</text>
+<rect x="1144" y="256" width="22" height="68" rx="2" fill="#4dd0e1" stroke="#424242" stroke-width="1.2"/>
+<text x="1155" y="290" font-size="9" text-anchor="middle" font-weight="normal" fill="#212121" transform="rotate(-90 1155 290)">3×3 5→3</text>
+<path d="M 1130,290 L 1142,290" fill="none" stroke="#212121" stroke-width="1.4" marker-end="url(#arr_212121)"/>
+<rect x="1180" y="256" width="22" height="68" rx="2" fill="#4dd0e1" stroke="#424242" stroke-width="1.2"/>
+<text x="1191" y="290" font-size="9" text-anchor="middle" font-weight="normal" fill="#212121" transform="rotate(-90 1191 290)">3×3 3→1</text>
+<path d="M 1166,290 L 1178,290" fill="none" stroke="#212121" stroke-width="1.4" marker-end="url(#arr_212121)"/>
+<text x="1155" y="252" font-size="9" text-anchor="middle" font-weight="bold" fill="#212121">voc_dec</text>
+<path d="M 1202,290 L 1260,290" fill="none" stroke="#212121" stroke-width="1.5" marker-end="url(#arr_212121)"/>
+<text x="1231" y="303" font-size="7" text-anchor="middle" font-weight="normal" fill="#555">+ &lt;NUL&gt; logit</text>
+<rect x="1320" y="267" width="66" height="46" rx="6" fill="#f48fb1" stroke="#424242" stroke-width="1.2"/>
+<path d="M 1284,290 L 1318,290" fill="none" stroke="#212121" stroke-width="1.5" marker-end="url(#arr_212121)"/>
+<text x="1353" y="284" font-size="9.5" text-anchor="middle" font-weight="bold" fill="#212121">softmax</text>
+<text x="1353" y="297" font-size="9.5" text-anchor="middle" font-weight="bold" fill="#212121">sample</text>
+<text x="1353" y="308" font-size="7.5" text-anchor="middle" font-weight="normal" fill="#424242">HEAR</text>
+<path d="M 1386,290 L 1408,290 L 1408,92 L 15,92 L 15,320 L 54,320" fill="none" stroke="#212121" stroke-width="1.6" marker-end="url(#arr_212121)"/>
+<circle cx="1090" cy="390" r="3" fill="#212121"/>
+<path d="M 1090,390 L 1106,390" fill="none" stroke="#212121" stroke-width="1.5" marker-end="url(#arr_212121)"/>
+<rect x="1108" y="356" width="22" height="68" rx="2" fill="#4dd0e1" stroke="#424242" stroke-width="1.2"/>
+<text x="1119" y="390" font-size="9" text-anchor="middle" font-weight="normal" fill="#212121" transform="rotate(-90 1119 390)">3×3 7→5</text>
+<rect x="1144" y="356" width="22" height="68" rx="2" fill="#4dd0e1" stroke="#424242" stroke-width="1.2"/>
+<text x="1155" y="390" font-size="9" text-anchor="middle" font-weight="normal" fill="#212121" transform="rotate(-90 1155 390)">3×3 5→3</text>
+<path d="M 1130,390 L 1142,390" fill="none" stroke="#212121" stroke-width="1.4" marker-end="url(#arr_212121)"/>
+<rect x="1180" y="356" width="22" height="68" rx="2" fill="#4dd0e1" stroke="#424242" stroke-width="1.2"/>
+<text x="1191" y="390" font-size="9" text-anchor="middle" font-weight="normal" fill="#212121" transform="rotate(-90 1191 390)">3×3 3→1</text>
+<path d="M 1166,390 L 1178,390" fill="none" stroke="#212121" stroke-width="1.4" marker-end="url(#arr_212121)"/>
+<text x="1155" y="352" font-size="9" text-anchor="middle" font-weight="bold" fill="#212121">img_dec</text>
+<path d="M 1202,390 L 1260,390" fill="none" stroke="#212121" stroke-width="1.5" marker-end="url(#arr_212121)"/>
+<text x="1231" y="403" font-size="7" text-anchor="middle" font-weight="normal" fill="#555">+ &lt;NUL&gt; logit</text>
+<rect x="1320" y="367" width="66" height="46" rx="6" fill="#f48fb1" stroke="#424242" stroke-width="1.2"/>
+<path d="M 1284,390 L 1318,390" fill="none" stroke="#212121" stroke-width="1.5" marker-end="url(#arr_212121)"/>
+<text x="1353" y="384" font-size="9.5" text-anchor="middle" font-weight="bold" fill="#212121">softmax</text>
+<text x="1353" y="397" font-size="9.5" text-anchor="middle" font-weight="bold" fill="#212121">sample</text>
+<text x="1353" y="408" font-size="7.5" text-anchor="middle" font-weight="normal" fill="#424242">SEE</text>
+<path d="M 1386,390 L 1416,390 L 1416,84 L 8,84 L 8,350 L 54,350" fill="none" stroke="#212121" stroke-width="1.6" marker-end="url(#arr_212121)"/>
+<rect x="1262" y="150" width="22" height="280" rx="2" fill="#b0b0b0" stroke="#424242" stroke-width="1.2"/>
+<rect x="1262" y="150" width="22" height="280" rx="2" fill="url(#hatch)" stroke="none"/>
+<text x="1273" y="290" font-size="9.5" text-anchor="middle" font-weight="normal" fill="#212121" transform="rotate(-90 1273 290)">lmhead 256→50304 (frozen, shared)</text>
+<text x="1273" y="446" font-size="8.5" text-anchor="middle" font-weight="normal" fill="#777">3 × 12.9M MAC</text>
+<text x="720" y="77" font-size="10.5" text-anchor="middle" font-weight="bold" fill="#212121">inference: each stream's sample → its next input · training: its previous dataset target (no self-feedback) · after a &lt;NUL&gt;: no word</text>
+<text x="1450" y="140" font-size="10.5" text-anchor="start" font-weight="bold" fill="#212121">v485 vs v451: linout 3×3 (was 1×1), learned register windows, truncated BPTT over 16 ticks, text-only data</text>
+<text x="1450" y="166" font-size="9.5" text-anchor="start" font-weight="normal" fill="#424242">windows: W_k = 1 + exp(θ_k); θ trained by Adam from a forward-mode trace dr/da carried with the</text>
+<text x="1450" y="180" font-size="9.5" text-anchor="start" font-weight="normal" fill="#424242">registers, so the window gradient sees every past tick, not only the 16-tick BPTT block</text>
+<text x="1450" y="194" font-size="9.5" text-anchor="start" font-weight="normal" fill="#424242">BPTT: 16 ticks forward with the graph through the register writes, one backward, states recomputed</text>
+<text x="1450" y="214" font-size="9.5" text-anchor="start" font-weight="normal" fill="#424242">streams: text = THINK, voice = HEAR, image = SEE; each has its own token DFF, ctx_cat block,</text>
+<text x="1450" y="228" font-size="9.5" text-anchor="start" font-weight="normal" fill="#424242">decoder tree and &lt;NUL&gt; logit · v485 trains the text stream only (voice, image targets: &lt;NUL&gt;)</text>
+<text x="1450" y="242" font-size="9.5" text-anchor="start" font-weight="normal" fill="#424242">targets: text = the next FineWeb word; &lt;NUL&gt; weight 1, loss divided by word targets (--loss_norm words)</text>
+<text x="1450" y="256" font-size="9.5" text-anchor="start" font-weight="normal" fill="#424242">input: each stream reads its previous target (none after &lt;NUL&gt;) — never its own sample</text>
+<text x="1450" y="270" font-size="9.5" text-anchor="start" font-weight="normal" fill="#424242">hearing: log-mel of 16 kHz sound, 64 mels of 25 ms frames every 10 ms, fixed μ/σ; grid = last 1.96 s,</text>
+<text x="1450" y="284" font-size="9.5" text-anchor="start" font-weight="normal" fill="#424242">4 frames per cell (a shift register in hardware) · picture: ResNet-50 grid refreshed at 2 Hz</text>
+<text x="1450" y="304" font-size="9.5" text-anchor="start" font-weight="normal" fill="#424242">lineage: v451 (FineWeb + FineVideo) → v455 text-only → v472 (9.73M steps) → BPTT 16, lr 0.04 →</text>
+<text x="1450" y="318" font-size="9.5" text-anchor="start" font-weight="normal" fill="#424242">v480 windows 256/64/16/4/1 → v482 linout 3×3 (centre-tap, same function) → v485 learned windows</text>
+<text x="1450" y="332" font-size="9.5" text-anchor="start" font-weight="normal" fill="#424242">registers reset at every example start · rows: FineWeb sample-10BT, 14 shards (eval: hash hold-out)</text>
+<text x="1450" y="352" font-size="9.5" text-anchor="start" font-weight="normal" fill="#424242">batch 250 · SGD, lr 0.04 → 4e-4 (cosine restart, 20K steps), no clipping · Adam 3e-4 on θ</text>
+<text x="1450" y="366" font-size="9.5" text-anchor="start" font-weight="normal" fill="#424242">~17.5 steps/s on an RTX 4090 · 14.1 GiB peak at BPTT 16</text>
+<text x="1450" y="380" font-size="9.5" text-anchor="start" font-weight="normal" fill="#424242"></text>
+<text x="1450" y="394" font-size="9.5" text-anchor="start" font-weight="normal" fill="#424242"></text>
+<text x="1450" y="408" font-size="9.5" text-anchor="start" font-weight="normal" fill="#424242"></text>
+<text x="1490" y="639" font-size="10" text-anchor="start" font-weight="normal" fill="#212121">Per tick: ≈856M conv MAC (520M ContextCNN, 106M ctx_cat, 87M linout, 3 × 35M decoders, 3 × 13M lmhead)</text>
+<text x="1490" y="655" font-size="10" text-anchor="start" font-weight="normal" fill="#212121">+ 4.1G MAC frozen ResNet-50 per 2 Hz picture refresh · log-mel: 4 FFTs + 66K mel MAC per tick</text>
+<text x="1490" y="671" font-size="10" text-anchor="start" font-weight="normal" fill="#212121">+ 100K EMA MAC + 100K subtracts + 75K adds; state 5 × 512 × 7 × 7 = 125K values</text>
+<text x="1490" y="687" font-size="10" text-anchor="start" font-weight="normal" fill="#212121">Trainable 21.63M · frozen 49.3M (embed 12.9M, lmhead 12.9M, ResNet-50 23.5M) · audio: 0</text>
+</svg>

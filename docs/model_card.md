@@ -15,7 +15,7 @@ datasets:
 - HuggingFaceFV/finevideo
 ---
 
-# VLA (recurrent CNN), v472
+# VLA (recurrent CNN), v485
 
 A language model with no attention and no positional encoding. Its memory is five 2-D registers of
 512 × 7 × 7. Every tick, one convolutional network reads the current token together with the registers and
@@ -26,13 +26,23 @@ every tick.
 
 Code, functional spec and figures: [github.com/siliconperception/vla](https://github.com/siliconperception/vla)
 
-![One clock tick](https://raw.githubusercontent.com/siliconperception/vla/main/docs/figures/vla_v451.svg)
+![One clock tick](https://raw.githubusercontent.com/siliconperception/vla/main/docs/figures/vla_v485.svg)
 
 ## Use
 
 ```bash
 git clone https://github.com/siliconperception/vla && cd vla && pip install -r requirements.txt
-python vla.py --pretrained --generate --n 100 --prompt "The little girl" --device cuda
+for p in "The colors of the rainbow are" \
+         "The best way to learn a new language is" \
+         "My grandmother's recipe for apple pie starts with" \
+         "When you plant a vegetable garden, the first thing to do is" \
+         "The history of the bicycle began in"; do
+  python vla.py --pretrained --generate --n 120 --prompt "$p" --device cuda
+done
+
+# prompt tuning: fit the starting registers (weights frozen) until the model predicts the prompt,
+# then continue from them; prints the cold and the tuned continuation
+python vla.py --pretrained --generate --prompt_tune 200 --n 120 --prompt "The colors of the rainbow are" --device cuda
 ```
 
 `--pretrained` downloads `model.safetensors` and `vla_args.json` (the settings the weights were trained with)
@@ -42,27 +52,32 @@ and restores both. The weights are not a `transformers` model; load them through
 
 | | |
 |---|---|
-| Parameters | 69.3 M: 20.1 M trained, 49.3 M frozen (token embedding and output layer from pythia-31m, a ResNet-50) |
-| State | 5 registers × 512 × 7 × 7 = 125,440 values, windows 3200 / 800 / 200 / 50 / 1 ticks (128 s to one tick at 25 Hz) |
-| State update | 1×1 mix (5,632 → 384), 8 × (3×3 conv, BatchNorm, ReLU) at 384, 1×1 project (384 → 512), cascade write |
+| Parameters | 70.9 M: 21.6 M trained, 49.3 M frozen (token embedding and output layer from pythia-31m, a ResNet-50) |
+| State | 5 registers × 512 × 7 × 7 = 125,440 values |
+| Register windows | learned: 530 / 57 / 15 / 3.8 / 1 ticks (21 s, 2.3 s, 0.61 s, 0.15 s and one tick at 25 Hz) |
+| State update | 1×1 mix (5,632 → 384), 8 × (3×3 conv, BatchNorm, ReLU) at 384, 3×3 project (384 → 512), cascade write |
 | Readout | 3 decoders (text, voice, image), each a tree of three 3×3 convs and the frozen pythia-31m output layer |
 | Tokenizer | pythia-31m BPE (50,304) plus a `<NUL>` token ("say nothing this tick") |
 
 ## Training
 
-- 9.73 M steps × 250 rows, one token per row per step, plain SGD with a cyclic learning rate (1e-4 → 1e-2 over
-  20K steps), no backpropagation through time.
+- 10.18 M steps × 250 rows, one token per row per step, plain SGD.
+- Up to step 9.73 M (run v472): learning rate cycling 1e-4 → 1e-2, the gradient stopped at the registers.
+- Since then: learning rate 0.04, truncated backpropagation through time over 16 steps, the register projection
+  widened to 3×3 (from its 1×1 weights, the same function at the switch), and learned register windows (from
+  512 / 64 / 16 / 4). The windows are trained by Adam from a forward-mode sensitivity of the registers to their
+  rates, so their gradient sees every past step, not only the last 16.
 - Data across its lineage: FineWeb-Edu (SmolLM corpus), FineWeb sample-10BT, and FineVideo and VALOR (speech,
   captions and frames); text-only FineWeb in its latest phase.
 
-## Evaluation (at the published step, 9,726,244)
+## Evaluation (at the published step, 10,180,000)
 
 | | Score |
 |---|---|
-| FineWeb held-out (100 documents, nats/token) | 4.560 |
-| BabyLM 2026 dev (100 pieces, nats/token) | 4.600 |
-| BLiMP (1,005 pairs from all 67 paradigms) | 69.8 % |
-| ComVE (999 pairs, common-sense) | 65.2 % |
+| FineWeb held-out (100 documents, nats/token) | 4.527 |
+| BabyLM 2026 dev (100 pieces, nats/token) | 4.518 |
+| BLiMP (1,005 pairs from all 67 paradigms) | 70.1 % |
+| ComVE (999 pairs, common-sense) | 66.3 % |
 
 The BLiMP and ComVE pairs are scored the same way as for these reference models (each sentence read without
 context; the lower total loss wins):
@@ -73,13 +88,13 @@ context; the lower total loss wins):
 | pythia-31m | 31 M | 71.1 | 66.9 |
 | babyllama-10m-2024 | trained on 10 M words | 70.0 | 63.7 |
 | SmolLM2-135M | 135 M | 80.9 | 79.3 |
-| **this model** | 20.1 M trained | 69.8 | 65.2 |
+| **this model** | 21.6 M trained | 70.1 | 66.3 |
 
 ## Limits
 
 A small model: it writes fluent text that is often not factual or consistent. Not instruction-tuned, not safety
 filtered beyond its training corpora. The voice and image decoders are present but this checkpoint was last
-trained on text.
+trained on text. Training is continuing; this card describes the step above.
 
 ## License
 

@@ -10,10 +10,11 @@ means no external components: no off-chip memory, every weight stored on the chi
 because a CNN is parameter-efficient: one set of small convolution kernels is reused at every grid position
 and every tick, so a few million weights drive a state of hundreds of thousands of values.
 
-![One clock tick of the VLA](docs/figures/vla_v451.svg)
+![One clock tick of the VLA](docs/figures/vla_v485.svg)
 
-*One clock tick of the v451 design: three token streams (text, voice, image), a frozen image encoder at 2 Hz,
-fixed log-mel hearing at 25 Hz, and the five-register cascade. The published model is trained on text.*
+*One clock tick of the published model, v485: three token streams (text, voice, image), a frozen image encoder at
+2 Hz, fixed log-mel hearing at 25 Hz, and the five-register cascade with learned time scales. v485 is trained on
+text.*
 
 - **Model:** [huggingface.co/siliconperception/vla](https://huggingface.co/siliconperception/vla)
 - **Page:** [siliconperception.github.io/vla](https://siliconperception.github.io/vla/)
@@ -26,8 +27,18 @@ fixed log-mel hearing at 25 Hz, and the five-register cascade. The published mod
 git clone https://github.com/siliconperception/vla && cd vla
 pip install -r requirements.txt
 
-# generate from the published weights (downloads ~380 MB once)
-python vla.py --pretrained --generate --n 100 --prompt "The little girl" --device cuda
+# generate from the published weights (downloads ~390 MB once)
+for p in "The colors of the rainbow are" \
+         "The best way to learn a new language is" \
+         "My grandmother's recipe for apple pie starts with" \
+         "When you plant a vegetable garden, the first thing to do is" \
+         "The history of the bicycle began in"; do
+  python vla.py --pretrained --generate --n 120 --prompt "$p" --device cuda
+done
+
+# prompt tuning: fit the starting registers (weights frozen) until the model predicts the prompt,
+# then continue from them; prints the cold and the tuned continuation
+python vla.py --pretrained --generate --prompt_tune 200 --n 120 --prompt "The colors of the rainbow are" --device cuda
 
 # score them on held-out text (FineWeb is streamed from the Hugging Face hub)
 python vla.py --pretrained --eval --eval_corpora fineweb --eval_docs 100 --device cuda
@@ -42,15 +53,18 @@ Each tick (see [docs/spec](docs/spec/README.md) for the exact computation):
 1. The current token's embedding is RMS-normalized and broadcast over the 7 × 7 grid.
 2. That grid, the image and sound grids (zeros for text) and the registers, each read at a fixed scale, are
    concatenated and mixed by a 1 × 1 convolution.
-3. Eight 3 × 3 convolutions with BatchNorm and ReLU transform the result; a 1 × 1 convolution projects it to
+3. Eight 3 × 3 convolutions with BatchNorm and ReLU transform the result; a 3 × 3 convolution projects it to
    register width.
 4. The registers are written as a cascade: each slow register moves a fraction 1/W of the way toward what the
-   slower ones have not yet captured (W = 3200, 800, 200, 50 ticks), and the last register holds the remainder.
+   slower ones have not yet captured, and the last register holds the remainder. The windows W are learned; in
+   the published model they are 530, 57, 15 and 3.8 ticks (21 s down to 0.15 s at 25 Hz).
 5. A small tree of convolutions collapses the grid to one vector, and a frozen output layer gives the next-token
    probabilities.
 
-Training feeds one token per step to each of 250 rows and backpropagates through that step only: the registers
-are not differentiated through time.
+Training feeds one token per step to each of 250 rows and backpropagates through the last 16 steps (truncated
+backpropagation through time, `--bptt 16`). The windows are trained from a forward-mode sensitivity of the
+registers to their rates, carried along with the registers, so their gradient sees every past step rather than
+only the last 16 (`--learn_win`).
 
 ## Training your own
 
