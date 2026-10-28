@@ -1792,10 +1792,11 @@ class VLAModel(nn.Module, _HubMixin):
         for p in self.pretrained_params():
             p.requires_grad_(False)
 
-        # ctx_cat reads [input grids..., registers...]. It starts as [I, I, ..., I] onto the
-        # first outputs each block fits, i.e. the plain sum of the sources -- except the image
-        # and audio blocks, which start at zero, so a media model starts out as the text-only
-        # function and learns to read its senses.
+        # ctx_cat reads [input grids..., registers...]. It starts as I onto the first outputs
+        # each token grid fits, i.e. the plain sum of the token grids; the image and audio
+        # blocks start at zero, so a media model starts out as the text-only function and
+        # learns to read its senses, and so do the registers: read back at full strength from
+        # the start, the loop's gain per tick is over 1 and a --bptt 16 gradient explodes.
         self.image_encoder = image_encoder or 'none'
         self.audio_encoder = audio_encoder or 'none'
         self.img_width = 2048 if self.image_encoder != 'none' else 0
@@ -1810,7 +1811,7 @@ class VLAModel(nn.Module, _HubMixin):
             self.ctx_cat.weight.zero_()
             o = 0
             for i, w in enumerate(widths):
-                if i == 0 or i >= len(self.in_widths) - n_tok_extra:
+                if i == 0 or len(self.in_widths) - n_tok_extra <= i < len(self.in_widths):
                     n = min(w, c_context)
                     self.ctx_cat.weight[:n, o:o + n, 0, 0] = torch.eye(n)
                 o += w
