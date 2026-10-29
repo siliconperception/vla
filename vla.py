@@ -520,6 +520,13 @@ parser.add_argument('--doc_score',  default=None, metavar='OUT',
                          'held-out documents (cut to --doc_log_len) with this checkpoint, one '
                          'JSON line each to OUT (kind, start / end step, nats per token), exit. '
                          'Two checkpoints\' files, paired by record, give a forgetting curve')
+parser.add_argument('--attn_probe', default=0, type=int, metavar='N',
+                    help='--attn model: load, read the first N held-out documents of the first eval corpus '
+                         'and print, exit: ATTNAGE (each head\'s attention mass by slot age band and on the '
+                         'sink, against a uniform read of the written slots), TIMEPROBE (ridge readout of '
+                         'the position in the document from the newest ring entry and from the pooled '
+                         'layer output: held-out R^2), ATTNORDER (loss with "what followed" paired to a '
+                         'random slot, and with the query built from a random written slot, not the newest)')
 parser.add_argument('--state_pca',  default=0, type=int, metavar='N',
                     help='load, read the first --eval_docs held-out documents and keep N register '
                          'states (every --state_pca_stride ticks after the first 64, from up to '
@@ -756,7 +763,7 @@ if _continuous - {'text', 'image', 'video'}:
     raise SystemExit(f'--continuous {args.continuous}: kinds are text, image and video')
 
 _ONESHOT = (args.generate or args.eval or args.vis or args.push or args.free_run or
-            args.prompt_tune or args.doc_score or args.teach or args.state_pca)
+            args.prompt_tune or args.doc_score or args.teach or args.state_pca or args.attn_probe)
 
 # ── checkpoint ────────────────────────────────────────────────────────────────
 
@@ -1808,6 +1815,7 @@ class RecallAttention(nn.Module):
         self.v_next = nn.Linear(self.E, dk, bias=False)
         self.age = nn.Parameter(torch.randn(W, dk) * 0.02) if age else None
         self.out = nn.Linear(H * dk, c_out)
+        self.probe = None             # --attn_probe: an accumulator dict and the probe switches
 
     def read(self, tok, ring):
         """tok [B, c_tok] the current token (RMS-normalized), ring [B, W*R, S, S] -> [B, c_out].
@@ -1821,12 +1829,27 @@ class RecallAttention(nn.Module):
         B = ring.shape[0]
         e = ring.reshape(B, self.W, self.E)
         valid = e.abs().amax(-1) > 0
-        q = self.q(torch.cat([tok, e[:, -1]], 1)).view(B, self.H, self.dk)
+        pr = self.probe
+        newest = e[:, -1]
+        if pr is not None and pr.get('rand_newest') and bool(valid.any()):
+            j = torch.multinomial(valid.float() + 1e-9, 1)[:, 0]        # a random written slot
+            newest = e[torch.arange(B, device=e.device), j]
+        q = self.q(torch.cat([tok, newest], 1)).view(B, self.H, self.dk)
         k = self.k(e) if self.age is None else self.k(e) + self.age
         vn = self.v_next(e)
+        if pr is not None and pr.get('break_next'):
+            vn = vn[:, torch.randperm(self.W, device=e.device)]
         v = self.v(e) + torch.cat([vn[:, 1:], vn.new_zeros(B, 1, self.dk)], 1)
         sc = torch.einsum('bhd,bwd->bhw', q, k) / math.sqrt(self.dk)
         sc = torch.cat([sc.masked_fill(~valid[:, None], float('-inf')), sc.new_zeros(B, self.H, 1)], -1)
+        if pr is not None and 'mass' in pr:            # by slot (slot j has age W - j), + the sink
+            ps = sc.softmax(-1).float()
+            pr['mass'] += ps.sum(0)                                    # [H, W+1]
+            vf = valid.float()
+            pr['unif'] += torch.cat([vf, torch.ones_like(vf[:, :1])], 1).div(vf.sum(1, keepdim=True) + 1).sum(0)
+            pr['eff'] += (-(ps * ps.clamp(min=1e-30).log()).sum(-1)).exp().sum(0)   # [H] e^entropy
+            pr['nvalid'] += float((vf.sum(1) + 1).sum())
+            pr['reads'] += B
         p = sc.softmax(-1)[..., :-1]
         a = self.out(torch.einsum('bhw,bwd->bhd', p, v).reshape(B, self.H * self.dk))
         return a * torch.rsqrt(a.pow(2).mean(dim=1, keepdim=True) + 1e-12)    # RMSnorm, as the token grid
@@ -5713,6 +5736,81 @@ if args.doc_score:
             print(json.dumps(r), file=f)
     print(f'--doc_score: {len(_recs)} training records, {len(_held)} held-out documents at step '
           f'{_start_step} -> {args.doc_score}')
+    raise SystemExit(0)
+
+if args.attn_probe:
+    if model.attn is None:
+        raise SystemExit('--attn_probe needs an --attn model')
+    _at = model.attn
+    _docs = [_doc_tokens(d) for d in _eval_docs(_eval_corpus_names()[0])[:args.attn_probe]]
+    _rows = [(q[:-1], q[1:]) for q in _docs]
+    _dev = next(model.parameters()).device
+
+    def _probe_pass(flags, feats=False):
+        """Score _rows from a zero state with model.attn.probe = flags -> (mean token loss, features)."""
+        _at.probe = flags
+        tot, n, F_e, F_x, T_, D_ = 0.0, 0, [], [], [], []
+        try:
+            with _EvalState(), torch.no_grad():
+                for c0, (_c, X, Y, M) in zip(range(0, len(_rows), _EVAL_BATCH), _batches(_rows)):
+                    dff = model.new_state(X.shape[0], _dev)
+                    for t in range(X.shape[1]):
+                        dff, o = model.step(X[:, t], dff)
+                        lg = model.text_dec(o)
+                        m = M[:, t]
+                        ce = F.cross_entropy(lg.float(), Y[:, t].clamp(min=0), reduction='none')
+                        tot += float(ce[m].sum())
+                        n += int(m.sum())
+                        if feats and m.any():
+                            F_e.append(dff[m, -_at.R:].flatten(1).float().cpu())
+                            F_x.append(o[m].float().mean(dim=(2, 3)).cpu())
+                            T_.append(torch.full((int(m.sum()),), float(t)))
+                            D_.append(c0 + m.nonzero()[:, 0].cpu())
+        finally:
+            _at.probe = None
+        return tot / max(n, 1), (F_e, F_x, T_, D_)
+
+    # 1. ATTNAGE: attention mass by age band, per head, against a uniform read of the written slots
+    acc = dict(mass=torch.zeros(_at.H, _at.W + 1, device=_dev), unif=torch.zeros(_at.W + 1, device=_dev),
+               eff=torch.zeros(_at.H, device=_dev), nvalid=0.0, reads=0)
+    base, (F_e, F_x, T_, D_) = _probe_pass(acc, feats=True)
+    bands = ((1, 1), (2, 4), (5, 16), (17, 64), (65, 256), (257, _at.W))
+    ages = torch.arange(_at.W, 0, -1, device=_dev)                  # slot j holds age W - j
+    def _band(v):
+        return [float(v[:_at.W][(ages >= lo) & (ages <= hi)].sum()) for lo, hi in bands] + [float(v[_at.W])]
+    u = _band(acc['unif'])
+    lab = [f'{lo}' if lo == hi else f'{lo}-{hi}' for lo, hi in bands] + ['sink']
+    print(f'ATTNAGE step {_start_step} docs {len(_rows)} | mass share by age band (uniform-read share in brackets)')
+    print('ATTNAGE uniform ' + ' '.join(f'{l} {x / sum(u):.3f}' for l, x in zip(lab, u)))
+    print(f'ATTNAGE sharpness: slots + sink on offer per read {acc["nvalid"] / acc["reads"]:.1f}; effective '
+          f'slots read (e^entropy) per head ' + ' '.join(f'{float(x) / acc["reads"]:.1f}' for x in acc['eff']))
+    for h in range(_at.H):
+        mb = _band(acc['mass'][h])
+        print(f'ATTNAGE head {h} ' + ' '.join(f'{l} {x / sum(mb):.3f} (x{(x / sum(mb)) / max(ux / sum(u), 1e-9):.1f})'
+                                            for l, x, ux in zip(lab, mb, u)))
+
+    # 2. TIMEPROBE: ridge readout of the position in the document, fitted on half the documents
+    T_all, D_all = torch.cat(T_), torch.cat(D_)
+    fit = D_all % 2 == 0                                            # even documents fit, odd ones test
+    for name, Fs in (('newest entry', F_e), ('pooled layer output', F_x)):
+        Xf = torch.cat(Fs).double()
+        for tgt_name, tgt in (('t', T_all.double()), ('log(1+t)', torch.log1p(T_all.double()))):
+            mu, sd = Xf[fit].mean(0), Xf[fit].std(0) + 1e-6
+            Zt = torch.cat([(Xf - mu) / sd, torch.ones(len(Xf), 1, dtype=Xf.dtype)], 1)
+            A = Zt[fit]
+            w = torch.linalg.solve(A.T @ A + 1e-2 * len(A) * torch.eye(A.shape[1], dtype=A.dtype), A.T @ tgt[fit])
+            pred, y = Zt[~fit] @ w, tgt[~fit]
+            r2 = 1 - float(((pred - y) ** 2).sum() / ((y - y.mean()) ** 2).sum())
+            print(f'TIMEPROBE step {_start_step} {name:20} -> {tgt_name:9} held-out R2 {r2:.3f} '
+                  f'(fit {int(fit.sum())} ticks of the even documents, test {int((~fit).sum())} of the odd)')
+
+    # 3. ATTNORDER: what the ring's order is worth (no age table: only "what followed" and the newest)
+    ln, _ = _probe_pass(dict(break_next=True))
+    lq, _ = _probe_pass(dict(rand_newest=True))
+    lb, _ = _probe_pass(dict(break_next=True, rand_newest=True))
+    print(f'ATTNORDER step {_start_step} docs {len(_rows)} | base {base:.4f} | "what followed" random '
+          f'{ln:.4f} ({ln - base:+.4f}) | query from a random slot {lq:.4f} ({lq - base:+.4f}) | both '
+          f'{lb:.4f} ({lb - base:+.4f})')
     raise SystemExit(0)
 
 if args.state_pca:
