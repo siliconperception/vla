@@ -4786,6 +4786,8 @@ def _info_eval(step, corpus, docs):
     subset when K <= 3) and the loss rise d<set> over the base is reported; red ij = d ij -
     d i - d j is positive when i and j carry the same useful information."""
     K, C, S = model.K, model.n_hidden, model.S
+    if not K:                         # --ctx_tau none: no registers to measure
+        return
     D = K * C
     dev = next(model.parameters()).device
     t0 = time.time()
