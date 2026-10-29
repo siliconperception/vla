@@ -4,8 +4,8 @@ Guidance for Claude Code (claude.ai/code) in this repository.
 
 ## Project
 
-`vla.py` is the whole model: a recurrent CNN whose state is K 2-D register grids, trained one token per row per
-step with the gradient stopped at the registers. It trains, evaluates (`--eval`), generates (`--generate`),
+`vla.py` is the whole model: a recurrent CNN whose state is K 2-D register grids (plus, with `--attn`, a
+fixed-size recall ring), trained one token per row per step with truncated backpropagation through time. It trains, evaluates (`--eval`), generates (`--generate`),
 exports to the Hugging Face hub (`--push`) and loads from it (`--pretrained`). The model is specified in
 `docs/spec/README.md`; when the spec and the code disagree, fix the spec.
 

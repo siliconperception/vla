@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Recurrent CNN VLA</title>
-<meta name="description" content="A language model with no attention: a convolutional network that writes its memory into 2-D register grids, one tick at a time. Open source (MIT) by Silicon Perception Inc.">
+<meta name="description" content="A recurrent CNN vision-language-action model with a fixed-size state, designed for a single chip running at up to 500 Hz with deterministic latency. Open source (MIT) by Silicon Perception Inc.">
 <style>
   :root {
     --bg: #fbfaf7; --fg: #1d1d1f; --muted: #5f5f66; --rule: #e3e1db; --card: #ffffff;
@@ -59,6 +59,10 @@
   .note { color: var(--muted); font-size: 14px; }
   footer { border-top: 1px solid var(--rule); margin-top: 56px; padding-top: 20px; color: var(--muted); font-size: 14px; }
   a { color: var(--accent); }
+  .placeholder { background: var(--card); border: 1px dashed var(--rule); border-radius: 10px; padding: 16px 18px; }
+  .placeholder h3 { margin: 0 0 6px; font-size: 17px; }
+  .placeholder ol { margin: 8px 0 0; }
+  .tag { display: inline-block; font-size: 12px; letter-spacing: .04em; text-transform: uppercase; color: var(--muted); border: 1px solid var(--rule); border-radius: 999px; padding: 2px 10px; margin-bottom: 8px; }
 </style>
 </head>
 <body>
@@ -66,73 +70,82 @@
   <header>
     <p class="kicker">Silicon Perception Inc · open source</p>
     <h1>A recurrent CNN vision-language-action model</h1>
-    <p class="lede">No attention, no positional encoding. The model's memory is a stack of 2-D register grids;
-    every clock tick one small convolutional network reads the current token together with the registers and
-    writes the registers back.</p>
-    <p class="lede">The target is a vision-language-action model on a single chip at 100&nbsp;Hz or more, with no
-    external components: no off-chip memory, every weight stored on the chip itself. A CNN makes that possible
-    because it is parameter-efficient: the same small kernels run at every grid position and every tick, so a few
-    million weights drive a state of hundreds of thousands of values.</p>
+    <p class="lede">The goal is a vision-language-action model on a single chip that runs at very high frame rates,
+    up to 500&nbsp;Hz, with deterministic latency, so it can sit inside an embedded control loop. Single chip means
+    no external components: no off-chip memory, every weight stored on the chip itself.</p>
+    <p class="lede">Two properties make that possible. The model's state has a fixed size, so every tick does
+    exactly the same work and finishes in the same time, however long the model has been running. And a CNN is
+    parameter-efficient: the same small kernels run at every grid position and every tick, so about twenty million
+    weights drive a state of 150,528 values.</p>
     <nav class="links">
       <a href="https://github.com/siliconperception/vla">Code on GitHub</a>
-      <a href="https://huggingface.co/siliconperception/vla">Model on Hugging Face</a>
+      <a href="https://huggingface.co/siliconperception/vla_v502">Model on Hugging Face</a>
       <a href="https://github.com/siliconperception/vla/blob/main/docs/spec/README.md">Functional spec</a>
       <a href="https://github.com/siliconperception/vla/tree/main/paper">Paper (in preparation)</a>
     </nav>
   </header>
 
   <figure>
-    <a class="fig" href="figures/vla_v485.svg" title="Open the full-size figure">
-      <img src="figures/vla_v485.svg" alt="Block diagram of one 40 ms clock tick: token, image and audio grids and five registers are concatenated, mixed by a 1x1 convolution, transformed by eight 3x3 convolutions, projected, and written back into the registers as a cascade; three decoders produce text, voice and image tokens.">
+    <a class="fig" href="figures/vla_v502.svg" title="Open the full-size figure">
+      <img src="figures/vla_v502.svg" alt="Block diagram of one clock tick: token and audio grids, a recall grid read by attention from a ring of the last 1,024 entries, and two registers are concatenated, mixed by a 1x1 convolution, transformed by eight 3x3 convolutions and projected; the result is written back into the registers as a cascade and appended to the ring; three decoders produce text, voice and image tokens.">
     </a>
-    <figcaption>One 40&nbsp;ms clock tick of the published model (v485): three token streams (text, voice, image), a
-    frozen image encoder at 2&nbsp;Hz, fixed log-mel hearing at 25&nbsp;Hz, and the five-register cascade with
-    learned time scales. Select the figure to open it full size.</figcaption>
+    <figcaption>One clock tick of the published model (v502): three token streams (text, voice, image), two
+    registers (a 512-tick average and a one-tick copy), and a recall ring of the last 1,024 ticks read by one
+    attention step. The image encoder is drawn as the design intends; this model is trained on text. Select the
+    figure to open it full size.</figcaption>
   </figure>
 
   <div class="facts">
-    <div class="fact"><b>125,440</b><span>values of state: 5 registers × 512 channels × 7 × 7</span></div>
-    <div class="fact"><b>21.6 M</b><span>trained parameters, small enough to keep every weight on-chip</span></div>
-    <div class="fact"><b>21 s → 1 tick</b><span>learned register time scales, from topic to the current word</span></div>
-    <div class="fact"><b>0 attention</b><span>layers; trained with 16-tick truncated backpropagation through time</span></div>
+    <div class="fact"><b>500 Hz</b><span>target tick rate on one chip, with the same work every tick</span></div>
+    <div class="fact"><b>150,528</b><span>values of state, fixed in size: 2 registers and a 1,024-entry ring</span></div>
+    <div class="fact"><b>20.7 M</b><span>trained parameters, small enough to keep every weight on-chip</span></div>
+    <div class="fact"><b>0</b><span>positional encodings; the state is reset only at the start of an example</span></div>
   </div>
 
   <h2>How a tick works</h2>
   <ol>
     <li>The current token's embedding is normalized and copied to every position of a 7 × 7 grid.</li>
-    <li>That grid, the image and sound grids, and the five registers are concatenated and mixed by a 1 × 1 convolution.</li>
-    <li>Eight 3 × 3 convolutions with BatchNorm and ReLU transform the result, and a 3 × 3 convolution projects it to register width.</li>
-    <li>The registers are written as a cascade: each slow register moves 1/W of the way toward what the slower ones
-    have not yet captured; the last holds the remainder, so the registers always sum to the new output. The windows W are
-    learned: 530, 57, 15 and 3.8 ticks in the published model.</li>
+    <li>One attention read recalls from a ring holding a small entry for each of the last 1,024 ticks; the
+    result is normalized and copied to a grid like the token.</li>
+    <li>Those grids, the sound grid and the two registers (each normalized per position) are concatenated and mixed
+    by a 1 × 1 convolution.</li>
+    <li>Eight 3 × 3 convolutions with BatchNorm and ReLU transform the result, and a 3 × 3 convolution projects it to
+    register width.</li>
+    <li>The registers are written as a cascade: the first moves 1/512 of the way toward the new output, the second
+    holds the remainder, so the two always sum to it. A 1 × 1 convolution of the token and the output becomes the
+    ring's newest entry, and the oldest is dropped.</li>
     <li>A small tree of convolutions collapses the grid to one vector, and a frozen output layer gives the next token.</li>
   </ol>
 
   <h2>Results</h2>
-  <p>The published model (run v485) on minimal-pair tests, scored the same way for every model: each sentence is
-  read with no context, and the one with the lower total loss counts as the model's choice.</p>
-  <div class="tablewrap">
-  <table>
-    <thead><tr><th>Model</th><th>Size</th><th class="n">BLiMP (grammar)</th><th class="n">ComVE (common sense)</th></tr></thead>
-    <tbody>
-      <tr><td>pythia-14m</td><td>14 M</td><td class="n">69.7</td><td class="n">64.7</td></tr>
-      <tr><td>pythia-31m</td><td>31 M</td><td class="n">71.1</td><td class="n">66.9</td></tr>
-      <tr><td>babyllama-10m-2024</td><td>10 M words</td><td class="n">70.0</td><td class="n">63.7</td></tr>
-      <tr><td>SmolLM2-135M</td><td>135 M</td><td class="n">80.9</td><td class="n">79.3</td></tr>
-      <tr class="us"><td>VLA v485</td><td>21.6 M trained</td><td class="n">70.1</td><td class="n">66.3</td></tr>
-    </tbody>
-  </table>
+  <div class="placeholder">
+    <span class="tag">In preparation</span>
+    <h3>VLA against pythia-70m, at matched training tokens</h3>
+    <p>Pythia publishes checkpoints from the start of its training, so a small CNN with a fixed-size state can be
+    compared with a transformer at every point along the way, not only at the end. The plan:</p>
+    <ol>
+      <li><b>Same documents.</b> Score both models on the same held-out FineWeb documents, by the same rule
+      (nats per token, and per character, which does not depend on the tokenizer).</li>
+      <li><b>Loss against tokens seen.</b> One curve per model: the published VLA weights at each step pushed to
+      Hugging Face, and pythia-70m at its checkpoints from 2 M to 300 B tokens.</li>
+      <li><b>Use of context.</b> Loss by position in the document (tokens 0-63, 64-255, 256-1023): how much each
+      model gains from what it has already read.</li>
+      <li><b>Grammar and common sense.</b> BLiMP and ComVE minimal pairs at matched tokens.</li>
+      <li><b>Cost per token.</b> Weights, state and operations per token, next to the scores.</li>
+    </ol>
+    <p class="note">Pythia was trained on the Pile, not FineWeb; the comparison will show both models on both.
+    Interim scores for the current weights are on the <a href="https://huggingface.co/siliconperception/vla_v502">model card</a>.</p>
   </div>
-  <p class="note">BLiMP: 1,005 pairs spread over its 67 paradigms. ComVE: 999 pairs. Held-out FineWeb: 4.527 nats/token.</p>
 
   <h2>Samples</h2>
-  <p>From the prompt in bold, at the published step. Fluent, not factual:</p>
-  <blockquote><b>My grandmother's recipe for apple pie starts with</b> a very light blue color, just like every day.
-  For your more minimal visit to a little pizza, you may as well try the recipes I used to bake … The best grilled
-  salad is full of basil and spices.</blockquote>
-  <blockquote><b>When you plant a vegetable garden, the first thing to do is</b> stick to your first name, which I
-  purchased from the plant - which is one of my favorite plants in the country and the corresponding plant we have
-  here.</blockquote>
+  <p>From the prompt in bold, with the published weights (30 M tokens of training). Locally fluent, not yet
+  coherent:</p>
+  <blockquote><b>My grandmother's recipe for apple pie starts with</b> a couple of pieces of brownberries, and an
+  unpacked blackberry sauce. … The spices is creamy and a nice, stylish and gentle, long and gorgeous, and more
+  than 100 grams of pork …</blockquote>
+  <blockquote><b>The best way to learn a new language is</b> not a form of choice to all ages, but the
+  “satisfishing” to the future. We look forward to learning of a diverse social life of the world. It's a big
+  problem.</blockquote>
 
   <h2>Try it</h2>
 <pre><code>git clone https://github.com/siliconperception/vla && cd vla
