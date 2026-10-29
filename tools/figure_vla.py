@@ -1,16 +1,22 @@
 """Draw docs/figures/vla_<model>.svg: one clock tick of a VLA model, 16:9 (1920 x 1080).
 
-usage: python tools/figure_vla.py [--model v498|v499] [--out OUT]
+usage: python tools/figure_vla.py [--model v498|v499|v502] [--out OUT]
 
 v498: recurrent CNN + two order-2 Legendre memories (4096, 64 ticks) + copy + recall attention, never
-reset. v499: no registers, the recall attention's ring is the whole state, reset at each example."""
+reset. v499: no registers, the recall attention's ring is the whole state, reset at each example.
+v502: the residual cascade of an EMA (512 ticks) and the residual copy, read through per-sample RMSnorm,
++ recall attention, reset at each example."""
 import argparse
 
 ap = argparse.ArgumentParser()
-ap.add_argument('--model', default='v498', choices=('v498', 'v499'))
+ap.add_argument('--model', default='v498', choices=('v498', 'v499', 'v502'))
 ap.add_argument('--out', default=None)
 a = ap.parse_args()
-REGS = a.model == 'v498'                  # Legendre memories + copy (v499: the ring alone)
+LMU = a.model == 'v498'                   # Legendre memories + copy
+CASC = a.model == 'v502'                  # EMA + residual copy, RMSnorm reads
+REGS = LMU or CASC                        # (v499: the ring alone)
+CAT = {'v498': ('3×256 + 2048 + 256 + 256 + 5×512', 5888), 'v499': ('3×256 + 2048 + 256 + 256', 3328),
+       'v502': ('3×256 + 2048 + 256 + 256 + 2×512', 4352)}[a.model]
 
 W, H = 1920, 1080
 out = []
@@ -82,12 +88,18 @@ out.append('<defs><marker id="arr" viewBox="0 0 10 10" refX="9" refY="5" markerW
            '<pattern id="hatch" width="6" height="6" patternUnits="userSpaceOnUse" patternTransform="rotate(45)">'
            '<line x1="0" y1="0" x2="0" y2="6" stroke="#757575" stroke-width="1.2"/></pattern></defs>')
 out.append(f'<rect width="{W}" height="{H}" fill="#ffffff"/>')
-if REGS:
+if LMU:
     text(30, 38, 'VLA v498 — one clock tick (40 ms): recurrent CNN + Legendre memories + recall attention', 22,
          anchor='start', weight='bold')
     text(30, 62, 'n_hidden 512 · c_context 384 · 7×7 grid · depth 8 · 3 token streams · 25 Hz · state never reset '
          '(continuous) · 21.3M trainable · state 125,440 register + 100,352 ring values · image / audio encoders: '
          'future', 13, anchor='start', fill='#424242')
+elif CASC:
+    text(30, 38, 'VLA v502 — one clock tick (40 ms): recurrent CNN + residual EMA cascade + recall attention', 22,
+         anchor='start', weight='bold')
+    text(30, 62, 'n_hidden 512 · c_context 384 · 7×7 grid · depth 8 · 3 token streams · 25 Hz · RMSnorm reads · '
+         'reset at each example · 20.7M trainable · state 50,176 register + 100,352 ring values · image / audio '
+         'encoders: future', 13, anchor='start', fill='#424242')
 else:
     text(30, 38, 'VLA v499 — one clock tick (40 ms): recurrent CNN with recall attention as its only state', 22,
          anchor='start', weight='bold')
@@ -116,8 +128,7 @@ box(330, 400, 36, 34, COL['norm'], ['RMS'], size=10)
 
 # ── concat, ctx_cat, ContextCNN, linout ───────────────────────────────────────
 CX, CW = 500, 48
-box(CX, 150, CW, 900 if REGS else 510, COL['cat'],
-    ['concat  3×256 + 2048 + 256 + 256 + 5×512 = 5888' if REGS else 'concat  3×256 + 2048 + 256 + 256 = 3328'],
+box(CX, 150, CW, 900 if LMU else 760 if CASC else 510, COL['cat'], [f'concat  {CAT[0]} = {CAT[1]}'],
     size=12, vertical=True)
 for y, s in zip(ys, ('256×7×7', '', '')):
     line([(360, y), (CX, y)])
@@ -133,7 +144,7 @@ text(430, 485, 'image grid 2048×7×7', 10, fill=COL['soft'])
 text(430, ys[0] - 6, 'token grids', 10, fill=COL['soft'])
 
 line([(CX + CW, CY), (578, CY)])
-box(580, 220, 40, 240, COL['lin'], [f'ctx_cat 1×1 {5888 if REGS else 3328}→384'], vertical=True)
+box(580, 220, 40, 240, COL['lin'], [f'ctx_cat 1×1 {CAT[1]}→384'], vertical=True)
 x = 660
 line([(620, CY), (x, CY)])
 for k in range(8):
@@ -227,8 +238,43 @@ def lmu_group(y0, theta, secs, names):
     return reads
 
 
+def cascade():
+    """v502: DFF_1 an EMA of x over 512 ticks, DFF_2 the residual x - S_1 (S_1: DFF_1 as just written)."""
+    y0 = 668
+    out.append(f'<rect x="640" y="{y0}" width="560" height="236" rx="6" fill="#fffde7" stroke="#9e9e9e" '
+               f'stroke-dasharray="6,4"/>')
+    text(656, y0 + 20, 'residual cascade (Laplacian pyramid) · 2 × 512×7×7', 12, anchor='start', weight='bold')
+    text(656, y0 + 88, 'DFF_1: r ← r + (x − r)/512', 11, anchor='start')
+    text(656, y0 + 104, 'EMA, window 512 ticks (20.5 s)', 10.5, anchor='start', fill='#424242')
+    text(656, y0 + 204, 'DFF_2: r ← x − S_1', 11, anchor='start')
+    text(656, y0 + 220, 'residual copy (window 1)', 10.5, anchor='start', fill='#424242')
+    fx = 930
+    f1, f2 = y0 + 40, y0 + 156                     # the two flip-flops' tops
+    c1y = f1 + 23                                  # EMA circle, on DFF_1's D line
+    out.append(f'<circle cx="1120" cy="{c1y}" r="25" fill="{COL["lmu"]}" stroke="{COL["ink"]}" stroke-width="1.2"/>')
+    text(1120, c1y - 2, 'EMA', 11, weight='bold')
+    text(1120, c1y + 12, '/512', 10)
+    line([(BX, c1y), (1147, c1y)])
+    line([(1095, c1y), (fx + 66, c1y)])            # S_1 -> DFF_1's D
+    flop(fx, f1, 'DFF_1', size='')
+    line([(912, f1 + 16), (912, f1 + 64), (1120, f1 + 64), (1120, c1y + 27)], dash=True, color='#757575')
+    s2y = f2 + 23                                  # subtractor, on DFF_2's D line
+    out.append(f'<circle cx="1120" cy="{s2y}" r="15" fill="#ffffff" stroke="{COL["ink"]}" stroke-width="1.2"/>')
+    text(1120, s2y + 6, '−', 18, weight='bold')
+    line([(BX, s2y), (1137, s2y)])
+    dot(1050, c1y)
+    line([(1050, c1y), (1050, s2y - 40), (1120, s2y - 40), (1120, s2y - 17)])   # S_1 into the subtractor
+    text(1056, s2y - 46, 'S_1', 10.5, anchor='start', fill=COL['soft'])
+    line([(1105, s2y), (fx + 66, s2y)])
+    flop(fx, f2, 'DFF_2', size='')
+    line([(BX, AY + 26), (BX, s2y)], arrow=False)
+    return [(fx, f1 + 16, 912), (fx, f2 + 16)]
+
+
 reads = []
-if REGS:
+if CASC:
+    reads += cascade()
+if LMU:
     reads += lmu_group(668, 4096, '164 s', ('DFF_1', 'DFF_2'))
     reads += lmu_group(836, 64, '2.6 s', ('DFF_3', 'DFF_4'))
     flop(930, 1012, 'DFF_5', size='')
@@ -241,24 +287,29 @@ for k, (qx, qy, *bx) in enumerate(reads):                 # Q -> norm -> concat
     line([(qx, qy), (nx + 36, qy)])
     if bx:
         dot(bx[0], qy)
-    box(nx, qy - 13, 36, 26, COL['norm'], ['norm'], size=9.5)
+    box(nx, qy - 13, 36, 26, COL['rep'] if CASC else COL['norm'], ['RMS' if CASC else 'norm'], size=9.5)
     line([(nx, qy), (CX + CW + 2, qy)])
 
 # ── legend (lower left) ───────────────────────────────────────────────────────
 LY = 560
-out.append(f'<rect x="30" y="{LY}" width="440" height="{490 if REGS else 386}" rx="8" fill="#fafafa" stroke="#bdbdbd"/>')
+out.append(f'<rect x="30" y="{LY}" width="440" height="{490 if LMU else 504 if CASC else 386}" rx="8" fill="#fafafa" stroke="#bdbdbd"/>')
 text(48, LY + 26, 'Legend', 14, anchor='start', weight='bold')
 items = [(COL['frozen'], True, 'frozen: embedding / lmhead (pythia-31m), ResNet-50'),
-         (COL['rep'], False, 'RMS norm · replicate 1×1 → 7×7'),
+         (COL['rep'], False, 'RMS norm (per sample, per position) · replicate' if CASC else
+          'RMS norm · replicate 1×1 → 7×7'),
          (COL['cat'], False, 'channel concatenation'),
          (COL['lin'], False, 'conv 1×1 / 3×3 (linear): ctx_cat, linout'),
          (COL['cnn'], False, 'conv 3×3 + BatchNorm + ReLU'),
          (COL['dec'], False, 'decoder convs 7→5→3→1 (linear)'),
          (COL['smp'], False, 'softmax + sample (+ <NUL> logit)'),
          (COL['attn'], False, 'recall attention: entry write, MQA read'),
-         ('#fff3e0', False, 'ring of W = 1024 entries (fixed-size state)' if REGS else
+         ('#fff3e0', False, 'ring of W = 1024 entries (fixed-size state)' if LMU else
+          'ring of W = 1024 entries (fixed size), emptied per example' if CASC else
           'ring of W = 1024 entries: the whole state, emptied per example')]
-if REGS:
+if CASC:
+    items += [(COL['lmu'], False, 'EMA r ← r + (x − r)/W, W = 512 ticks'),
+              ('#ffffff', False, '(−) subtractor: x minus the EMA as just written')]
+if LMU:
     items += [(COL['lmu'], False, 'Legendre update m ← A·m + B·x (fixed A, B)'),
               (COL['norm'], False, 'read scale 1/σ_k (running RMS)')]
 items += [(COL['mel'], False, 'fixed DSP: log-mel'),
@@ -271,7 +322,8 @@ y = LY + 48 + 28 * len(items)
 if REGS:
     flop(48, y + 2, '', size='')
     text(124, y + 22, 'D flip-flop register, clocked every tick', 12, anchor='start')
-    text(124, y + 38, '(never reset: --continuous)', 11, anchor='start', fill=COL['soft'])
+    text(124, y + 38, '(never reset: --continuous)' if LMU else '(reset to 0 at each example)', 11,
+         anchor='start', fill=COL['soft'])
     y += 64
 else:
     y += 4
