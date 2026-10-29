@@ -283,6 +283,9 @@ parser.add_argument('--attn', default=0, type=int, metavar='W',
                          '(what followed); --attn_heads heads of --attn_dim share one key and value '
                          '(MQA); the result is one more ctx_cat input grid, starting at zero. '
                          '0 = off. Restored by --load')
+parser.add_argument('--attn_age', default=True, action=argparse.BooleanOptionalAction,
+                    help='--attn: add a learned age embedding to every key (--no-attn_age: keys from '
+                         'the entry\'s content only, no position signal); restored by --load')
 parser.add_argument('--attn_ch', default=2, type=int, metavar='R',
                     help='--attn: channels per entry (an entry is R x S x S values); restored by --load')
 parser.add_argument('--attn_heads', default=8, type=int, help='--attn: query heads; restored by --load')
@@ -759,7 +762,7 @@ _ONESHOT = (args.generate or args.eval or args.vis or args.push or args.free_run
 _ARCH_ARGS = ('context', 'n_hidden', 'c_context', 'depth', 'kernel', 'tokenizer', 'ctx_ema',
               'ctx_read_norm', 'dec_tree_kernels', 'dec_width', 'bn_momentum', 'init',
               'image_encoder', 'audio_encoder', 'streams', 'linout_kernel', 'learn_win',
-              'learn_regs', 'lmu', 'attn', 'attn_ch', 'attn_heads', 'attn_dim')
+              'learn_regs', 'lmu', 'attn', 'attn_ch', 'attn_heads', 'attn_dim', 'attn_age')
 
 
 def _parse_mix():
@@ -1789,12 +1792,12 @@ class RecallAttention(nn.Module):
     entry and appends one, so the state never grows, in training or inference (on chip: a ring
     buffer with a write pointer, the slot's age fixed by the pointer). An entry (R x S x S) is a
     1x1 conv of the token grid and the layer output. A read: one query per head from the current
-    token and the newest entry, keys k_j = K e_j + age_j and values v_j = V e_j + V' e_{j+1} (what
-    followed entry j: one layer can complete a repeat) shared by all heads (MQA); slots not written
-    since the reset are masked, and a sink (score 0, value 0) lets a head read nothing. The result
-    is RMS-normalized, as the token grid is."""
+    token and the newest entry, keys k_j = K e_j + age_j (--no-attn_age: K e_j) and values
+    v_j = V e_j + V' e_{j+1} (what followed entry j: one layer can complete a repeat) shared by all
+    heads (MQA); slots not written since the reset are masked, and a sink (score 0, value 0) lets a
+    head read nothing. The result is RMS-normalized, as the token grid is."""
 
-    def __init__(self, W, R, S, c_tok, n_hidden, H, dk, c_out):
+    def __init__(self, W, R, S, c_tok, n_hidden, H, dk, c_out, age=True):
         super().__init__()
         self.W, self.R, self.E, self.H, self.dk = W, R, R * S * S, H, dk
         self.entry = nn.Conv2d(c_tok + n_hidden, R, 1)
@@ -1802,7 +1805,7 @@ class RecallAttention(nn.Module):
         self.k = nn.Linear(self.E, dk)
         self.v = nn.Linear(self.E, dk)
         self.v_next = nn.Linear(self.E, dk, bias=False)
-        self.age = nn.Parameter(torch.randn(W, dk) * 0.02)
+        self.age = nn.Parameter(torch.randn(W, dk) * 0.02) if age else None
         self.out = nn.Linear(H * dk, c_out)
 
     def read(self, tok, ring):
@@ -1818,7 +1821,7 @@ class RecallAttention(nn.Module):
         e = ring.reshape(B, self.W, self.E)
         valid = e.abs().amax(-1) > 0
         q = self.q(torch.cat([tok, e[:, -1]], 1)).view(B, self.H, self.dk)
-        k = self.k(e) + self.age
+        k = self.k(e) if self.age is None else self.k(e) + self.age
         vn = self.v_next(e)
         v = self.v(e) + torch.cat([vn[:, 1:], vn.new_zeros(B, 1, self.dk)], 1)
         sc = torch.einsum('bhd,bwd->bhw', q, k) / math.sqrt(self.dk)
@@ -1853,7 +1856,7 @@ class VLAModel(nn.Module, _HubMixin):
                  dec_kernels=(3, 3, 3), dec_width=256, bn_momentum=0.1, init='zero',
                  image_encoder='none', audio_encoder='none', nul_head=False, streams=1,
                  text_nul=False, surprise=None, linout_kernel=1, learn_win=False,
-                 learn_regs=(), lmu=False, attn=0, attn_ch=2, attn_heads=8, attn_dim=64):
+                 learn_regs=(), lmu=False, attn=0, attn_ch=2, attn_heads=8, attn_dim=64, attn_age=True):
         super().__init__()
         from transformers import AutoModelForCausalLM
         repo = _TOKENIZERS[tokenizer]
@@ -1901,7 +1904,7 @@ class VLAModel(nn.Module, _HubMixin):
                           + [self.c_text] * (self.streams - 1))     # voice, image token grids
         # --attn: the recall grid sits between the inputs and the registers (a zero ctx_cat block)
         self.attn = (RecallAttention(int(attn), int(attn_ch), S, self.c_text, n_hidden, int(attn_heads),
-                                     int(attn_dim), self.c_text) if attn else None)
+                                     int(attn_dim), self.c_text, bool(attn_age)) if attn else None)
         self.att_width = self.c_text if attn else 0
         widths = self.in_widths + ([self.att_width] if attn else []) + [n_hidden] * self.K
         n_tok_extra = self.streams - 1
@@ -3185,7 +3188,7 @@ model = VLAModel(S=args.context, n_hidden=args.n_hidden, c_context=args.c_contex
                  learn_win=args.learn_win,
                  learn_regs=[int(k) for k in str(args.learn_regs or '').split(',') if k.strip()],
                  lmu=args.lmu, attn=args.attn, attn_ch=args.attn_ch, attn_heads=args.attn_heads,
-                 attn_dim=args.attn_dim)
+                 attn_dim=args.attn_dim, attn_age=args.attn_age)
 if _loaded_ckpt is not None:
     _sd = _upgrade_state_dict(_loaded_ckpt['state_dict'])
     if _aud_switch:
@@ -3305,13 +3308,14 @@ def _model_graph(model):
                 out.append(dict(name='(attention)', op=f'scores over {a.W} slots (unwritten masked) + a '
                                 f'sink, softmax, {a.H} heads x {a.dk} sharing one key/value (MQA)',
                                 inp=f'{a.H}x{a.dk}', out=f'{a.H * a.dk}', tr=0, fr=0))
+            age = f' + age embedding ({a.W}x{a.dk}, {a.age.numel():,})' if a.age is not None else ' (no age embedding)'
             r = dict(r, name={'attn.q': f'attn.q <- (token), newest of {ring}',
                               'attn.k': f'attn.k <- {ring}',
                               'attn.v': f'attn.v <- {ring}',
                               'attn.v_next': f'attn.v_next <- {ring}, shifted one slot',
                               'attn.entry': f'RING[t] <- RING[t-1] less its oldest, + attn.entry',
                               }.get(r['name'], r['name']),
-                     op=r['op'] + {'attn.k': f' + age embedding ({a.W}x{a.dk}, {a.age.numel():,})',
+                     op=r['op'] + {'attn.k': age,
                                    'attn.entry': ' of (token grid), linout',
                                    }.get(r['name'], ''))
         out.append(r)
