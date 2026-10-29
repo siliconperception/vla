@@ -199,12 +199,12 @@ def lmu_group(y0, theta, secs, names):
     line([(BX, cy), (cx + 27, cy)])
     line([(cx - 25, cy), (1030, cy)], arrow=False)
     reads = []
-    for nm, fy in zip(names, fys):
+    for i, (nm, fy) in enumerate(zip(names, fys)):
         flop(fx, fy, nm, size='')
         line([(1030, cy), (1030, fy + 23), (fx + 66, fy + 23)])            # A·m + B·x -> D
-        line([(fx, fy + 30), (900, fy + 30), (900, y0 + 154), (cx, y0 + 154), (cx, cy + 27)],
-             dash=True, color='#757575')                                    # Q -> the update
-        reads.append((fx, fy + 16))
+        bx = 912 - 14 * i                                                   # Q -> the update
+        line([(bx, fy + 16), (bx, y0 + 154), (cx, y0 + 154), (cx, cy + 27)], dash=True, color='#757575')
+        reads.append((fx, fy + 16, bx))
     return reads
 
 
@@ -216,9 +216,11 @@ text(1012, 1024, 'copy (window 1): r ← x', 11, anchor='start', weight='bold')
 line([(BX, 1035), (996, 1035)])
 reads.append((930, 1028))
 line([(BX, AY + 26), (BX, 1035)], arrow=False)
-for k, (qx, qy) in enumerate(reads):                      # Q -> norm -> concat
+for k, (qx, qy, *bx) in enumerate(reads):                 # Q -> norm -> concat
     nx = 590
     line([(qx, qy), (nx + 36, qy)])
+    if bx:
+        dot(bx[0], qy)
     box(nx, qy - 13, 36, 26, COL['norm'], ['norm'], size=9.5)
     line([(nx, qy), (CX + CW + 2, qy)])
 
