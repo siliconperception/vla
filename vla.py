@@ -266,6 +266,13 @@ parser.add_argument('--learn_regs', default='', metavar='K1,K2,...',
                     help='--learn_win: learn only these registers\' windows (1 = the first in the '
                          'cascade); the others stay at their --ctx_ema/--ctx_tau window. Default: '
                          'all but the plain copies. Restored by --load')
+parser.add_argument('--lmu', default=False, action=argparse.BooleanOptionalAction,
+                    help='the registers with a window over 1 (all the same window, THETA tokens) '
+                         'form one Legendre Memory Unit of order D = their number (Voelker et al. '
+                         '2019): per channel m <- A m + B o, the zero-order-hold discretization of '
+                         'THETA dm/dt = A m + B u, so m holds the last THETA tokens of the layer '
+                         'output as D shifted-Legendre coefficients; the window-1 registers hold o. '
+                         'Restored by --load')
 parser.add_argument('--linout_kernel', default=1, type=int, metavar='K',
                     help='linout kernel (odd): KxK, padded, mixes neighbouring positions on the '
                          'way back into the registers; restored by --load')
@@ -729,7 +736,7 @@ _ONESHOT = (args.generate or args.eval or args.vis or args.push or args.free_run
 _ARCH_ARGS = ('context', 'n_hidden', 'c_context', 'depth', 'kernel', 'tokenizer', 'ctx_ema',
               'ctx_read_norm', 'dec_tree_kernels', 'dec_width', 'bn_momentum', 'init',
               'image_encoder', 'audio_encoder', 'streams', 'linout_kernel', 'learn_win',
-              'learn_regs')
+              'learn_regs', 'lmu')
 
 
 def _parse_mix():
@@ -1737,6 +1744,22 @@ except ImportError:                                  # pragma: no cover
         pass
 
 
+def _lmu_matrices(d, theta):
+    """--lmu: (A [d, d], B [d]) float32, one token's zero-order-hold step of the Legendre Memory
+    Unit theta dm/dt = A m + B u: A_ij = (2i+1) (-1 if i < j else (-1)^(i-j+1)), B_i = (2i+1) (-1)^i.
+    m then approximates the input's last theta tokens as u(t - s) ~ sum_i m_i P_i(2 s/theta - 1),
+    P_i the Legendre polynomials."""
+    i = torch.arange(d, dtype=torch.float64)
+    r = (2 * i + 1).view(-1, 1)
+    sgn = (-1.0) ** (i.view(-1, 1) - i.view(1, -1) + 1)
+    Ac = r * torch.where(i.view(-1, 1) < i.view(1, -1), -torch.ones(d, d, dtype=torch.float64), sgn)
+    Bc = (2 * i + 1) * (-1.0) ** i
+    Ac, Bc = Ac / theta, Bc / theta
+    A = torch.linalg.matrix_exp(Ac)
+    B = torch.linalg.solve(Ac, (A - torch.eye(d, dtype=torch.float64)) @ Bc)
+    return A.float(), B.float()
+
+
 class VLAModel(nn.Module, _HubMixin):
     """One recurrent layer with K DFF registers, held concatenated as one
     [B, K*n_hidden, S, S] tensor (self.dff, detached every step: gradient horizon 1 token).
@@ -1758,7 +1781,7 @@ class VLAModel(nn.Module, _HubMixin):
                  dec_kernels=(3, 3, 3), dec_width=256, bn_momentum=0.1, init='zero',
                  image_encoder='none', audio_encoder='none', nul_head=False, streams=1,
                  text_nul=False, surprise=None, linout_kernel=1, learn_win=False,
-                 learn_regs=()):
+                 learn_regs=(), lmu=False):
         super().__init__()
         from transformers import AutoModelForCausalLM
         repo = _TOKENIZERS[tokenizer]
@@ -1837,6 +1860,18 @@ class VLAModel(nn.Module, _HubMixin):
         self.register_buffer('ctx_read_rms', torch.zeros(self.K))       # 0 = not measured yet
         self.register_buffer('rate', torch.tensor([min(1.0, 1.0 / w) for w in self.windows]),
                              persistent=False)
+        # --lmu: the registers with a window over 1 are one order-D Legendre memory (lmu_A [D, D],
+        # lmu_B [D]); the window-1 registers are plain copies of o
+        self.lmu = [k for k, w in enumerate(self._windows) if w > 1] if lmu else []
+        if lmu:
+            if learn_win or surprise:
+                raise SystemExit('--lmu does not combine with --learn_win or --write_surprise')
+            if not self.lmu or len({self._windows[k] for k in self.lmu}) != 1:
+                raise SystemExit(f'--lmu: the registers over window 1 need one shared window: '
+                                 f'{self._windows}')
+            A, B = _lmu_matrices(len(self.lmu), self._windows[self.lmu[0]])
+            self.register_buffer('lmu_A', A, persistent=False)
+            self.register_buffer('lmu_B', B, persistent=False)
         # --write_surprise ('rat', H) / ('clamp', LO, HI): the slow registers' write gain
         self.surprise = tuple(surprise) if surprise else None
         if self.surprise and self.windows[-1] != 1:
@@ -1987,7 +2022,15 @@ class VLAModel(nn.Module, _HubMixin):
     def _write(self, o, dff, gain=None):
         """Laplacian-pyramid cascade: register k blends toward o minus registers 1..k-1 as
         just written. gain [B] (--write_surprise) scales the rate of every register but the
-        plain copy, capped at 1."""
+        plain copy, capped at 1. --lmu: the Legendre memory instead, the copies holding o."""
+        if self.lmu:
+            regs = dff.chunk(self.K, dim=1)
+            m = torch.einsum('ij,j...->i...', self.lmu_A, torch.stack([regs[k] for k in self.lmu]))
+            m = m + self.lmu_B.view(-1, 1, 1, 1, 1) * o
+            new = [o] * self.K
+            for i, k in enumerate(self.lmu):
+                new[k] = m[i]
+            return torch.cat(new, dim=1)
         new = []
         rates = self._rates().detach()
         for k, p in enumerate(dff.chunk(self.K, dim=1)):
@@ -3040,7 +3083,8 @@ model = VLAModel(S=args.context, n_hidden=args.n_hidden, c_context=args.c_contex
                  streams=args.streams, text_nul=args.fifo3,
                  surprise=_surprise, linout_kernel=args.linout_kernel,
                  learn_win=args.learn_win,
-                 learn_regs=[int(k) for k in str(args.learn_regs or '').split(',') if k.strip()])
+                 learn_regs=[int(k) for k in str(args.learn_regs or '').split(',') if k.strip()],
+                 lmu=args.lmu)
 if _loaded_ckpt is not None:
     _sd = _upgrade_state_dict(_loaded_ckpt['state_dict'])
     if _aud_switch:
