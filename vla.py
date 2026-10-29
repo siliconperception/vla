@@ -703,6 +703,9 @@ parser.add_argument('--teach_json', default=None, help='--teach: write every epi
 parser.add_argument('--eval',       default=False, action='store_true',
                     help='load, run the held-out eval protocol (EVAL lines + table), exit')
 parser.add_argument('--eval_json',  default=None, help='--eval: also write results as JSON')
+parser.add_argument('--eval_dump',  default=None, metavar='FILE',
+                    help='--eval: also write each text eval corpus\'s documents as JSON token-id lists '
+                         '(the targets, the opening _NULL dropped), to score other models on the same set')
 parser.add_argument('--vis',        default=False, action='store_true',
                     help='live generation view: layer output and registers (std across '
                          'channels per grid cell) and P(next token); x exits')
@@ -5832,6 +5835,11 @@ if args.eval:
                        'minlen': _EVAL_MINLEN, 'maxlen': _EVAL_MAXLEN, 'thresh': _EVAL_THRESH,
                        'results': _eval_results}, f, indent=1)
         print(f'wrote {args.eval_json}')
+    if args.eval_dump:
+        with open(args.eval_dump, 'w') as f:
+            json.dump({c: [_doc_tokens(d)[1:] for d in docs] for c, docs in _eval_docs_cache.items()
+                       if c not in _MEDIA_DATASETS}, f)
+        print(f'wrote {args.eval_dump}')
     raise SystemExit(0)
 
 # ── optimizer / schedule ──────────────────────────────────────────────────────
