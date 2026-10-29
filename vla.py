@@ -273,6 +273,20 @@ parser.add_argument('--lmu', default=False, action=argparse.BooleanOptionalActio
                          'zero-order-hold discretization of THETA dm/dt = A m + B u, so m holds the '
                          'last THETA tokens of the layer output as D shifted-Legendre coefficients; '
                          'the window-1 registers hold o. Restored by --load')
+parser.add_argument('--attn', default=0, type=int, metavar='W',
+                    help='recall attention over the last W ticks, held in the recurrent state as a '
+                         'shift register of W fixed-size entries (no growth with sequence length, '
+                         'training and inference alike): each tick writes one entry (1x1 conv of the '
+                         'token grid and the layer output, --attn_ch channels of SxS) and reads with '
+                         'one query (from the token and the newest entry) over the W entries, keys '
+                         'with a learned age embedding, values from each entry and the one after it '
+                         '(what followed); --attn_heads heads of --attn_dim share one key and value '
+                         '(MQA); the result is one more ctx_cat input grid, starting at zero. '
+                         '0 = off. Restored by --load')
+parser.add_argument('--attn_ch', default=2, type=int, metavar='R',
+                    help='--attn: channels per entry (an entry is R x S x S values); restored by --load')
+parser.add_argument('--attn_heads', default=8, type=int, help='--attn: query heads; restored by --load')
+parser.add_argument('--attn_dim', default=64, type=int, help='--attn: key/value/head width; restored by --load')
 parser.add_argument('--linout_kernel', default=1, type=int, metavar='K',
                     help='linout kernel (odd): KxK, padded, mixes neighbouring positions on the '
                          'way back into the registers; restored by --load')
@@ -739,7 +753,7 @@ _ONESHOT = (args.generate or args.eval or args.vis or args.push or args.free_run
 _ARCH_ARGS = ('context', 'n_hidden', 'c_context', 'depth', 'kernel', 'tokenizer', 'ctx_ema',
               'ctx_read_norm', 'dec_tree_kernels', 'dec_width', 'bn_momentum', 'init',
               'image_encoder', 'audio_encoder', 'streams', 'linout_kernel', 'learn_win',
-              'learn_regs', 'lmu')
+              'learn_regs', 'lmu', 'attn', 'attn_ch', 'attn_heads', 'attn_dim')
 
 
 def _parse_mix():
@@ -1763,6 +1777,55 @@ def _lmu_matrices(d, theta):
     return A.float(), B.float()
 
 
+class RecallAttention(nn.Module):
+    """--attn W: exact recall over the last W ticks. Its memory is a fixed-size shift register of W
+    entries [B, W*R, S, S], part of the recurrent state (oldest first): every tick drops the oldest
+    entry and appends one, so the state never grows, in training or inference (on chip: a ring
+    buffer with a write pointer, the slot's age fixed by the pointer). An entry (R x S x S) is a
+    1x1 conv of the token grid and the layer output. A read: one query per head from the current
+    token and the newest entry, keys k_j = K e_j + age_j and values v_j = V e_j + V' e_{j+1} (what
+    followed entry j: one layer can complete a repeat) shared by all heads (MQA); slots not written
+    since the reset are masked, and a sink (score 0, value 0) lets a head read nothing. The result
+    is RMS-normalized, as the token grid is."""
+
+    def __init__(self, W, R, S, c_tok, n_hidden, H, dk, c_out):
+        super().__init__()
+        self.W, self.R, self.E, self.H, self.dk = W, R, R * S * S, H, dk
+        self.entry = nn.Conv2d(c_tok + n_hidden, R, 1)
+        self.q = nn.Linear(c_tok + self.E, H * dk)
+        self.k = nn.Linear(self.E, dk)
+        self.v = nn.Linear(self.E, dk)
+        self.v_next = nn.Linear(self.E, dk, bias=False)
+        self.age = nn.Parameter(torch.randn(W, dk) * 0.02)
+        self.out = nn.Linear(H * dk, c_out)
+
+    def read(self, tok, ring):
+        """tok [B, c_tok] the current token (RMS-normalized), ring [B, W*R, S, S] -> [B, c_out].
+        Training: recomputed in the backward pass (the W keys, values and scores of every BPTT tick
+        are not kept)."""
+        if torch.is_grad_enabled():
+            return torch.utils.checkpoint.checkpoint(self._read, tok, ring, use_reentrant=False)
+        return self._read(tok, ring)
+
+    def _read(self, tok, ring):
+        B = ring.shape[0]
+        e = ring.reshape(B, self.W, self.E)
+        valid = e.abs().amax(-1) > 0
+        q = self.q(torch.cat([tok, e[:, -1]], 1)).view(B, self.H, self.dk)
+        k = self.k(e) + self.age
+        vn = self.v_next(e)
+        v = self.v(e) + torch.cat([vn[:, 1:], vn.new_zeros(B, 1, self.dk)], 1)
+        sc = torch.einsum('bhd,bwd->bhw', q, k) / math.sqrt(self.dk)
+        sc = torch.cat([sc.masked_fill(~valid[:, None], float('-inf')), sc.new_zeros(B, self.H, 1)], -1)
+        p = sc.softmax(-1)[..., :-1]
+        a = self.out(torch.einsum('bhw,bwd->bhd', p, v).reshape(B, self.H * self.dk))
+        return a * torch.rsqrt(a.pow(2).mean(dim=1, keepdim=True) + 1e-12)    # RMSnorm, as the token grid
+
+    def write(self, ring, tok_grid, o):
+        """Drop the oldest entry, append this tick's."""
+        return torch.cat([ring[:, self.R:], self.entry(torch.cat([tok_grid, o], 1))], 1)
+
+
 class VLAModel(nn.Module, _HubMixin):
     """One recurrent layer with K DFF registers, held concatenated as one
     [B, K*n_hidden, S, S] tensor (self.dff, detached every step: gradient horizon 1 token).
@@ -1784,7 +1847,7 @@ class VLAModel(nn.Module, _HubMixin):
                  dec_kernels=(3, 3, 3), dec_width=256, bn_momentum=0.1, init='zero',
                  image_encoder='none', audio_encoder='none', nul_head=False, streams=1,
                  text_nul=False, surprise=None, linout_kernel=1, learn_win=False,
-                 learn_regs=(), lmu=False):
+                 learn_regs=(), lmu=False, attn=0, attn_ch=2, attn_heads=8, attn_dim=64):
         super().__init__()
         from transformers import AutoModelForCausalLM
         repo = _TOKENIZERS[tokenizer]
@@ -1830,7 +1893,11 @@ class VLAModel(nn.Module, _HubMixin):
         self.in_widths = ([self.c_text] + ([self.img_width] if self.img_width else [])
                           + ([self.aud_width] if self.aud_width else [])
                           + [self.c_text] * (self.streams - 1))     # voice, image token grids
-        widths = self.in_widths + [n_hidden] * self.K
+        # --attn: the recall grid sits between the inputs and the registers (a zero ctx_cat block)
+        self.attn = (RecallAttention(int(attn), int(attn_ch), S, self.c_text, n_hidden, int(attn_heads),
+                                     int(attn_dim), self.c_text) if attn else None)
+        self.att_width = self.c_text if attn else 0
+        widths = self.in_widths + ([self.att_width] if attn else []) + [n_hidden] * self.K
         n_tok_extra = self.streams - 1
         self.ctx_cat = nn.Conv2d(sum(widths), c_context, 1)
         with torch.no_grad():
@@ -1932,12 +1999,22 @@ class VLAModel(nn.Module, _HubMixin):
         return out
 
     def new_state(self, B, device):
+        """[B, K*n_hidden (+ --attn W*R), S, S]: the registers, then the recall entries (always
+        zero: an empty slot)."""
         shape = (B, self.n_hidden * self.K, self.S, self.S)
         if self.init_mode == 'gaussian':
-            return torch.randn(shape, device=device)
-        if self.init_mode == 'relu':
-            return torch.randn(shape, device=device).relu()
-        return torch.zeros(shape, device=device)
+            h = torch.randn(shape, device=device)
+        elif self.init_mode == 'relu':
+            h = torch.randn(shape, device=device).relu()
+        else:
+            h = torch.zeros(shape, device=device)
+        if self.attn is not None:
+            h = torch.cat([h, h.new_zeros(B, self.attn.W * self.attn.R, self.S, self.S)], 1)
+        return h
+
+    def regs(self, dff):
+        """The K registers of a state (--attn: without the recall entries)."""
+        return dff[:, :self.n_hidden * self.K] if self.attn is not None else dff
 
     def image_grid(self, views):
         """Encoder views [N, 3, 224, 224] -> image grid [N, 2048, S, S], each position
@@ -2100,7 +2177,9 @@ class VLAModel(nn.Module, _HubMixin):
         return torch.where(ok, g, torch.ones_like(g))
 
     def step(self, idx, dff, img=None, aud=None):
-        """One token for every row: -> (new registers, layer output). No detach."""
+        """One token for every row: -> (new state, layer output). No detach."""
+        ring = dff[:, self.n_hidden * self.K:] if self.attn is not None else None
+        dff = self.regs(dff)
         gain = self._gain(idx, dff) if self.surprise else None
         inj = None
         if self.learn and self.etr_inject and self.etr and torch.is_grad_enabled():
@@ -2109,9 +2188,16 @@ class VLAModel(nn.Module, _HubMixin):
             d = a - a.detach()
             inj = [sum((d[j] * e for (kk, j), e in self.etr.items() if kk == k),
                        torch.zeros((), device=dff.device)) for k in range(self.K)]
-        x = self.ctx_cat(torch.cat(self._inputs(idx, img, aud) + self._read(dff, inj), dim=1))
+        ins = self._inputs(idx, img, aud)
+        if self.attn is not None:
+            a = self.attn.read(ins[0][:, :, 0, 0], ring)
+            ins = ins + [a[:, :, None, None].expand(-1, -1, self.S, self.S)]
+        x = self.ctx_cat(torch.cat(ins + self._read(dff, inj), dim=1))
         o = self.linout(self.context(x))
-        return self._write(o, dff, gain), o
+        new = self._write(o, dff, gain)
+        if self.attn is not None:
+            new = torch.cat([new, self.attn.write(ring, ins[0], o)], 1)
+        return new, o
 
     def forward(self, idx, targets=None, flag=None, img=None, aud=None, keep=0.0, graph=False):
         """idx [B] current tokens; targets [B] next tokens or None; flag [B] rows starting a
@@ -3092,7 +3178,8 @@ model = VLAModel(S=args.context, n_hidden=args.n_hidden, c_context=args.c_contex
                  surprise=_surprise, linout_kernel=args.linout_kernel,
                  learn_win=args.learn_win,
                  learn_regs=[int(k) for k in str(args.learn_regs or '').split(',') if k.strip()],
-                 lmu=args.lmu)
+                 lmu=args.lmu, attn=args.attn, attn_ch=args.attn_ch, attn_heads=args.attn_heads,
+                 attn_dim=args.attn_dim)
 if _loaded_ckpt is not None:
     _sd = _upgrade_state_dict(_loaded_ckpt['state_dict'])
     if _aud_switch:
@@ -3199,10 +3286,32 @@ def _model_graph(model):
                 srcs.insert(2 if model.img_enc is not None else 1, '(audio grid)')
             if model.streams == 3:         # the voice and image streams' token grids
                 srcs[len(srcs) - model.K:len(srcs) - model.K] = ['(voice token grid)', '(image token grid)']
+            if model.attn is not None:
+                srcs[len(srcs) - model.K:len(srcs) - model.K] = ['(recall grid)']
             out.append(dict(name=', '.join(srcs), op='Concat (channels)',
-                            inp=f'{"+".join(map(str, model.in_widths))}+{model.K}x{model.n_hidden} x{S}x{S}',
+                            inp=f'{"+".join(map(str, model.in_widths + ([model.att_width] if model.attn else [])))}'
+                                f'+{model.K}x{model.n_hidden} x{S}x{S}',
                             out=r['inp'], tr=0, fr=0))
+        if r['name'].startswith('attn.'):
+            a = model.attn
+            ring = f'RING[t-1] ({a.W} entries of {a.R}x{S}x{S})'
+            if r['name'] == 'attn.out':
+                out.append(dict(name='(attention)', op=f'scores over {a.W} slots (unwritten masked) + a '
+                                f'sink, softmax, {a.H} heads x {a.dk} sharing one key/value (MQA)',
+                                inp=f'{a.H}x{a.dk}', out=f'{a.H * a.dk}', tr=0, fr=0))
+            r = dict(r, name={'attn.q': f'attn.q <- (token), newest of {ring}',
+                              'attn.k': f'attn.k <- {ring}',
+                              'attn.v': f'attn.v <- {ring}',
+                              'attn.v_next': f'attn.v_next <- {ring}, shifted one slot',
+                              'attn.entry': f'RING[t] <- RING[t-1] less its oldest, + attn.entry',
+                              }.get(r['name'], r['name']),
+                     op=r['op'] + {'attn.k': f' + age embedding ({a.W}x{a.dk}, {a.age.numel():,})',
+                                   'attn.entry': ' of (token grid), linout',
+                                   }.get(r['name'], ''))
         out.append(r)
+        if r['name'] == 'attn.out':
+            out.append(dict(name='(recall grid)', op=f'RMSnorm, replicate 1x1 -> {S}x{S}', inp=r['out'],
+                            out=f'{r["out"]}x{S}x{S}', tr=0, fr=0))
         if r['name'] == 'tok_embed':
             out.append(dict(name='(token grid)', op=f'RMSnorm, replicate 1x1 -> {S}x{S}',
                             inp=r['out'], out=f'{r["out"]}x{S}x{S}', tr=0, fr=0))
@@ -3280,7 +3389,7 @@ def _prompt_ids(text=''):
 
 def _reg_rms(h):
     """Each register's RMS per row: [b, n_hidden * K, S, S] -> [b, K]."""
-    return torch.stack([r.pow(2).mean(dim=(1, 2, 3)).sqrt() for r in h.chunk(model.K, dim=1)], 1)
+    return torch.stack([r.pow(2).mean(dim=(1, 2, 3)).sqrt() for r in model.regs(h).chunk(model.K, dim=1)], 1)
 
 
 def _tune_state(P, iters, cap, nat):
@@ -3906,7 +4015,7 @@ if args.vis:
         else:
             b = int(torch.multinomial(_truncate(prob), 1).item())
             cur = (cur + [b])[-2 * _VIS_WIN:]
-        maps = [o] + list(dff.chunk(model.K, dim=1))
+        maps = [o] + list(model.regs(dff).chunk(model.K, dim=1))
         for r, t in enumerate(maps):
             m = t[0].std(dim=0).float().cpu().numpy()
             vmax[r] = float(m.max()) if vmax[r] is None else max(float(m.max()), 0.98 * vmax[r])
@@ -4682,7 +4791,7 @@ def _info_eval(step, corpus, docs):
                 tot += (ce * m).sum().double()
                 ntok += int(m.sum())
                 if stats and m.any():
-                    z = model.dff[m].permute(0, 2, 3, 1).float()          # [b, S, S, D]
+                    z = model.regs(model.dff[m]).permute(0, 2, 3, 1).float()   # [b, S, S, D]
                     ps += z.sum(0).reshape(S * S, D).double()
                     z = z.reshape(-1, D)
                     s2 += (z.T @ z).double()
@@ -5516,7 +5625,7 @@ if args.doc_score:
                     model(_X[:, _t])
                     _m = _M[:, _t].bool()
                     if _m.any():
-                        _sum = _sum + model.dff[_m].double().sum(0, keepdim=True)
+                        _sum = _sum + model.regs(model.dff[_m]).double().sum(0, keepdim=True)
                         _n += int(_m.sum())
         model._read_mean = (_sum / _n).float().to(_dev)
         model._ablate = {int(k) - 1 for k in args.doc_ablate.split(',')}
@@ -5549,7 +5658,7 @@ if args.state_pca:
                 if _t >= 64 and (_t - 64) % args.state_pca_stride == 0:
                     _m = _M[:, _t].bool()
                     if _m.any():
-                        _keep.append(model.dff[_m].half().cpu())
+                        _keep.append(model.regs(model.dff[_m]).half().cpu())
     _S = torch.cat(_keep)[:args.state_pca]                       # [N, K*C, S, S]
     _N, _P = _S.shape[0], _S.shape[-1] ** 2
     _dev = next(model.parameters()).device
@@ -6818,7 +6927,7 @@ try:
                   f'{_t_data:6.1f}s)')
             _T0 = None
         if i % args.monitor == 0:
-            flat = model.dff.reshape(-1)
+            flat = model.regs(model.dff).reshape(-1)
             line = ('STEP {:10} wall {} loss {:12.9f} grad {:12.6f} lr {:10.9f} dff_mean {:12.5f} '
                     'dff_std {:12.5f} dff_max {:11.3f}'
                     ).format(i, datetime.datetime.now(), torch.stack(larr[-args.monitor:]).mean().item(),
