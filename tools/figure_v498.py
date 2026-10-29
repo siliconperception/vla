@@ -100,7 +100,7 @@ box(330, 400, 36, 34, COL['norm'], ['RMS'], size=10)
 
 # ── concat, ctx_cat, ContextCNN, linout ───────────────────────────────────────
 CX, CW = 500, 48
-box(CX, 150, CW, 420, COL['cat'], ['concat  3×256 + 2048 + 256 + 256 + 5×512 = 5888'], size=12, vertical=True)
+box(CX, 150, CW, 900, COL['cat'], ['concat  3×256 + 2048 + 256 + 256 + 5×512 = 5888'], size=12, vertical=True)
 for y, s in zip(ys, ('256×7×7', '', '')):
     line([(360, y), (CX, y)])
 line([(366, 417), (CX, 417)])
@@ -128,10 +128,10 @@ text(660 + (58 * 8 - 22) / 2, 452, '384×7×7 throughout', 11, fill=COL['soft'])
 LX = x
 line([(x - 22, CY), (LX, CY)])
 box(LX, 220, 40, 240, COL['lin'], ['linout 3×3 384→512'], vertical=True)
-BX = LX + 80                              # the linout output bus
+BX = LX + 110                             # the linout output bus
 line([(LX + 40, CY), (BX, CY)], arrow=False)
 dot(BX, CY)
-text(BX + 6, CY + 18, 'x = 512×7×7', 10, anchor='start', fill=COL['soft'])
+text(BX - 8, CY - 8, 'x = 512×7×7', 10, anchor='end', fill=COL['soft'])
 
 # ── decoders, lmhead, sampling ────────────────────────────────────────────────
 DX = BX + 70
@@ -179,7 +179,7 @@ box(630, AY - 6, 200, 64, COL['attn'], ['recall attention (MQA)', 'k = K·e (no 
 line([(RX, AY + 26), (832, AY + 26)])
 box(578, AY + 9, 36, 34, COL['rep'], ['RMS'], size=10)
 line([(630, AY + 26), (616, AY + 26)])
-line([(578, AY + 26), (CX + CW - 6, AY + 26), (CX + CW - 6, 572)])
+line([(578, AY + 26), (CX + CW + 2, AY + 26)])
 text(596, AY - 2, 'recall grid', 10, fill=COL['soft'])
 
 
@@ -220,8 +220,7 @@ for k, (qx, qy) in enumerate(reads):                      # Q -> norm -> concat
     nx = 590
     line([(qx, qy), (nx + 36, qy)])
     box(nx, qy - 13, 36, 26, COL['norm'], ['norm'], size=9.5)
-    vx = CX + 4 + 7 * k
-    line([(nx, qy), (vx, qy), (vx, 572)])
+    line([(nx, qy), (CX + CW + 2, qy)])
 
 # ── legend (lower left) ───────────────────────────────────────────────────────
 LY = 560
