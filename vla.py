@@ -479,6 +479,12 @@ parser.add_argument('--eval_pairs', default=0,    type=int, metavar='N',
                          'BLiMP (grammar, spread over its 67 paradigms) and ComVE (which '
                          'statement makes sense). Winogrande was tried and dropped: it sits at '
                          'chance up to pythia-160m (Qwen2.5-1.5B 63.7%)')
+parser.add_argument('--eval_warm',  default=0,    type=int, metavar='N',
+                    help='EVALW: N held-out documents of the first text corpus, each scored from a zero '
+                         'state (cold) and after another held-out document run through the same state '
+                         'with no reset, only the <NUL> opening the scored one between them (warm, as '
+                         'in --continuous training and in continuous inference); mean loss by position '
+                         'after the switch. 0 = off')
 parser.add_argument('--eval_hold',  default=0,    type=int, metavar='N',
                     help='EVALH on N samples from <NUL>: does the second half follow the first '
                          '(self), beyond generic priming (cross), and when re-read (own)')
@@ -4923,6 +4929,60 @@ def _gen_prompts(corpus, docs):
     return _gen_anchor[corpus]
 
 
+def _warm_eval(step, corpus, docs):
+    """EVALW: the first --eval_warm documents, each scored cold (zero state) and warm (the state
+    after the next document in the list, run through first with no reset: the scored document's
+    opening <NUL> is the only sign of the switch). Mean token loss over all scored tokens, then by
+    position band after the switch; d = warm - cold (negative: the carried state helps)."""
+    t0 = time.time()
+    sel = docs[:args.eval_warm]
+    n = len(sel)
+    bands = ((0, 16), (16, 64), (64, 256), (256, _EVAL_MAXLEN))
+    res = {}
+    for mode in ('cold', 'warm'):
+        rows = []
+        for i, d in enumerate(sel):
+            q = _doc_tokens(d)
+            pre = _doc_tokens(sel[(i + 1) % n]) if mode == 'warm' and n > 1 else []
+            seq = pre + q
+            rows.append((seq[:-1], seq[1:], len(pre)))
+        tot = torch.zeros(len(bands) + 1, dtype=torch.float64)
+        cnt = torch.zeros(len(bands) + 1, dtype=torch.float64)
+        with _EvalState(), torch.no_grad():
+            for c in range(0, n, _EVAL_BATCH):
+                chunk = rows[c:c + _EVAL_BATCH]
+                dev = next(model.parameters()).device
+                B, T = len(chunk), max(len(xs) for xs, _, _ in chunk)
+                X = torch.zeros(B, T, dtype=torch.long)
+                Y = torch.zeros(B, T, dtype=torch.long)
+                P = torch.full((B, T), -1, dtype=torch.long)       # position in the scored document
+                for r, (xs, ys, k) in enumerate(chunk):
+                    X[r, :len(xs)], Y[r, :len(ys)] = torch.tensor(xs), torch.tensor(ys)
+                    P[r, k:len(xs)] = torch.arange(len(xs) - k)
+                X, Y, P = X.to(dev), Y.to(dev), P.to(dev)
+                model.dff = None
+                for t in range(T):
+                    logits, _ = model(X[:, t])
+                    m = P[:, t] >= 0
+                    if not m.any():
+                        continue
+                    ce = F.cross_entropy(logits.float(), Y[:, t].clamp(min=0), reduction='none')
+                    ce = torch.where(torch.isfinite(ce), ce, torch.full_like(ce, 30.0)).clamp(max=30.0)
+                    for b, (lo, hi) in enumerate(bands):
+                        mb = m & (P[:, t] >= lo) & (P[:, t] < hi)
+                        tot[b] += float(ce[mb].sum())
+                        cnt[b] += float(mb.sum())
+                    tot[-1] += float(ce[m].sum())
+                    cnt[-1] += float(m.sum())
+        res[mode] = (tot / cnt.clamp(min=1)).tolist()
+    c, w = res['cold'], res['warm']
+    _eval_results[f'{corpus}~warm'] = dict(cold=c[-1], warm=w[-1])
+    _emit(f'EVALW step {step:10} corpus {corpus:8} docs {n} | cold {c[-1]:.4f} warm {w[-1]:.4f} '
+          f'd {w[-1] - c[-1]:+.4f} | ' + ' '.join(f'{lo}-{hi - 1} {c[b]:.3f}/{w[b]:.3f} ({w[b] - c[b]:+.3f})'
+                                                  for b, (lo, hi) in enumerate(bands))
+          + f' | wall {time.time() - t0:.1f}s')
+
+
 def _gen_eval(step, corpus, docs):
     """EVALG: continue held-out prompts; the judge scores the continuation given the prompt,
     against the document's real continuation (floor) and its words shuffled (ceiling).
@@ -5320,6 +5380,7 @@ def _heldout_eval(step):
             continue
         for fn, on in ((_reach_eval, args.eval_reach and rare), (_gen_eval, args.eval_gen),
                        (_recent_eval, args.eval_recent and corpus == text[0]),
+                       (_warm_eval, args.eval_warm and corpus == text[0]),
                        (_info_eval, args.eval_info and rare and corpus == text[0])):
             if on:
                 try:
