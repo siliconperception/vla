@@ -1,7 +1,16 @@
-"""Draw docs/figures/vla_v498.svg: one clock tick of the v498 model, 16:9 (1920 x 1080).
+"""Draw docs/figures/vla_<model>.svg: one clock tick of a VLA model, 16:9 (1920 x 1080).
 
-usage: python tools/figure_v498.py [OUT]"""
-import sys
+usage: python tools/figure_vla.py [--model v498|v499] [--out OUT]
+
+v498: recurrent CNN + two order-2 Legendre memories (4096, 64 ticks) + copy + recall attention, never
+reset. v499: no registers, the recall attention's ring is the whole state, reset at each example."""
+import argparse
+
+ap = argparse.ArgumentParser()
+ap.add_argument('--model', default='v498', choices=('v498', 'v499'))
+ap.add_argument('--out', default=None)
+a = ap.parse_args()
+REGS = a.model == 'v498'                  # Legendre memories + copy (v499: the ring alone)
 
 W, H = 1920, 1080
 out = []
@@ -73,11 +82,18 @@ out.append('<defs><marker id="arr" viewBox="0 0 10 10" refX="9" refY="5" markerW
            '<pattern id="hatch" width="6" height="6" patternUnits="userSpaceOnUse" patternTransform="rotate(45)">'
            '<line x1="0" y1="0" x2="0" y2="6" stroke="#757575" stroke-width="1.2"/></pattern></defs>')
 out.append(f'<rect width="{W}" height="{H}" fill="#ffffff"/>')
-text(30, 38, 'VLA v498 — one clock tick (40 ms): recurrent CNN + Legendre memories + recall attention', 22,
-     anchor='start', weight='bold')
-text(30, 62, 'n_hidden 512 · c_context 384 · 7×7 grid · depth 8 · 3 token streams · 25 Hz · state never reset '
-     '(continuous) · 21.3M trainable · state 125,440 register + 100,352 ring values · image / audio encoders: future', 13,
-     anchor='start', fill='#424242')
+if REGS:
+    text(30, 38, 'VLA v498 — one clock tick (40 ms): recurrent CNN + Legendre memories + recall attention', 22,
+         anchor='start', weight='bold')
+    text(30, 62, 'n_hidden 512 · c_context 384 · 7×7 grid · depth 8 · 3 token streams · 25 Hz · state never reset '
+         '(continuous) · 21.3M trainable · state 125,440 register + 100,352 ring values · image / audio encoders: '
+         'future', 13, anchor='start', fill='#424242')
+else:
+    text(30, 38, 'VLA v499 — one clock tick (40 ms): recurrent CNN with recall attention as its only state', 22,
+         anchor='start', weight='bold')
+    text(30, 62, 'n_hidden 512 · c_context 384 · 7×7 grid · depth 8 · 3 token streams · 25 Hz · no registers · '
+         'ring emptied at each example · 20.3M trainable · state 100,352 ring values · image / audio encoders: future',
+         13, anchor='start', fill='#424242')
 
 CY = 340                                  # main path centre line
 # ── inputs ────────────────────────────────────────────────────────────────────
@@ -100,7 +116,9 @@ box(330, 400, 36, 34, COL['norm'], ['RMS'], size=10)
 
 # ── concat, ctx_cat, ContextCNN, linout ───────────────────────────────────────
 CX, CW = 500, 48
-box(CX, 150, CW, 900, COL['cat'], ['concat  3×256 + 2048 + 256 + 256 + 5×512 = 5888'], size=12, vertical=True)
+box(CX, 150, CW, 900 if REGS else 510, COL['cat'],
+    ['concat  3×256 + 2048 + 256 + 256 + 5×512 = 5888' if REGS else 'concat  3×256 + 2048 + 256 + 256 = 3328'],
+    size=12, vertical=True)
 for y, s in zip(ys, ('256×7×7', '', '')):
     line([(360, y), (CX, y)])
 line([(366, 417), (CX, 417)])
@@ -115,7 +133,7 @@ text(430, 485, 'image grid 2048×7×7', 10, fill=COL['soft'])
 text(430, ys[0] - 6, 'token grids', 10, fill=COL['soft'])
 
 line([(CX + CW, CY), (578, CY)])
-box(580, 220, 40, 240, COL['lin'], ['ctx_cat 1×1 5888→384'], vertical=True)
+box(580, 220, 40, 240, COL['lin'], [f'ctx_cat 1×1 {5888 if REGS else 3328}→384'], vertical=True)
 x = 660
 line([(620, CY), (x, CY)])
 for k in range(8):
@@ -210,13 +228,14 @@ def lmu_group(y0, theta, secs, names):
 
 
 reads = []
-reads += lmu_group(668, 4096, '164 s', ('DFF_1', 'DFF_2'))
-reads += lmu_group(836, 64, '2.6 s', ('DFF_3', 'DFF_4'))
-flop(930, 1012, 'DFF_5', size='')
-text(1012, 1024, 'copy (window 1): r ← x', 11, anchor='start', weight='bold')
-line([(BX, 1035), (996, 1035)])
-reads.append((930, 1028))
-line([(BX, AY + 26), (BX, 1035)], arrow=False)
+if REGS:
+    reads += lmu_group(668, 4096, '164 s', ('DFF_1', 'DFF_2'))
+    reads += lmu_group(836, 64, '2.6 s', ('DFF_3', 'DFF_4'))
+    flop(930, 1012, 'DFF_5', size='')
+    text(1012, 1024, 'copy (window 1): r ← x', 11, anchor='start', weight='bold')
+    line([(BX, 1035), (996, 1035)])
+    reads.append((930, 1028))
+    line([(BX, AY + 26), (BX, 1035)], arrow=False)
 for k, (qx, qy, *bx) in enumerate(reads):                 # Q -> norm -> concat
     nx = 590
     line([(qx, qy), (nx + 36, qy)])
@@ -227,7 +246,7 @@ for k, (qx, qy, *bx) in enumerate(reads):                 # Q -> norm -> concat
 
 # ── legend (lower left) ───────────────────────────────────────────────────────
 LY = 560
-out.append(f'<rect x="30" y="{LY}" width="440" height="490" rx="8" fill="#fafafa" stroke="#bdbdbd"/>')
+out.append(f'<rect x="30" y="{LY}" width="440" height="{490 if REGS else 386}" rx="8" fill="#fafafa" stroke="#bdbdbd"/>')
 text(48, LY + 26, 'Legend', 14, anchor='start', weight='bold')
 items = [(COL['frozen'], True, 'frozen: embedding / lmhead (pythia-31m), ResNet-50'),
          (COL['rep'], False, 'RMS norm · replicate 1×1 → 7×7'),
@@ -237,23 +256,30 @@ items = [(COL['frozen'], True, 'frozen: embedding / lmhead (pythia-31m), ResNet-
          (COL['dec'], False, 'decoder convs 7→5→3→1 (linear)'),
          (COL['smp'], False, 'softmax + sample (+ <NUL> logit)'),
          (COL['attn'], False, 'recall attention: entry write, MQA read'),
-         ('#fff3e0', False, 'ring of W = 1024 entries (fixed-size state)'),
-         (COL['lmu'], False, 'Legendre update m ← A·m + B·x (fixed A, B)'),
-         (COL['norm'], False, 'read scale 1/σ_k (running RMS)'),
-         (COL['mel'], False, 'fixed DSP: log-mel'),
-         ('#ffffff', False, 'media input: video frame (2 Hz), sound (16 kHz)')]
+         ('#fff3e0', False, 'ring of W = 1024 entries (fixed-size state)' if REGS else
+          'ring of W = 1024 entries: the whole state, emptied per example')]
+if REGS:
+    items += [(COL['lmu'], False, 'Legendre update m ← A·m + B·x (fixed A, B)'),
+              (COL['norm'], False, 'read scale 1/σ_k (running RMS)')]
+items += [(COL['mel'], False, 'fixed DSP: log-mel'),
+          ('#ffffff', False, 'media input: video frame (2 Hz), sound (16 kHz)')]
 for i, (c, h, s) in enumerate(items):
     y = LY + 48 + 28 * i
     box(48, y, 26, 18, c, hatch=h, rx=2)
     text(86, y + 13, s, 12, anchor='start')
 y = LY + 48 + 28 * len(items)
-flop(48, y + 2, '', size='')
-text(124, y + 22, 'D flip-flop register, clocked every tick', 12, anchor='start')
-text(124, y + 38, '(never reset: --continuous)', 11, anchor='start', fill=COL['soft'])
-line([(48, y + 64), (80, y + 64)])
-text(86, y + 68, 'data / state path', 12, anchor='start')
-line([(250, y + 64), (282, y + 64)], dash=True, color='#757575')
-text(288, y + 68, 'old state into the update', 12, anchor='start')
+if REGS:
+    flop(48, y + 2, '', size='')
+    text(124, y + 22, 'D flip-flop register, clocked every tick', 12, anchor='start')
+    text(124, y + 38, '(never reset: --continuous)', 11, anchor='start', fill=COL['soft'])
+    y += 64
+else:
+    y += 4
+line([(48, y), (80, y)])
+text(86, y + 4, 'data / state path', 12, anchor='start')
+if REGS:
+    line([(250, y), (282, y)], dash=True, color='#757575')
+    text(288, y + 4, 'old state into the update', 12, anchor='start')
 
 out.append('</svg>')
-open(sys.argv[1] if len(sys.argv) > 1 else 'docs/figures/vla_v498.svg', 'w').write('\n'.join(out))
+open(a.out or f'docs/figures/vla_{a.model}.svg', 'w').write('\n'.join(out))
