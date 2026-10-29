@@ -155,9 +155,10 @@ for y, nm, kind in rows:
     box(SX, y - 28, 104, 56, COL['smp'], ['softmax', f'sample · {kind}'])
 # feedback: each stream's sample is its next input
 for i, (y, nm, kind) in enumerate(rows):
-    top = 88 + 12 * i
-    xr = SX + 104 + 22 + 14 * (2 - i)
-    line([(SX + 104, y), (xr, y), (xr, top), (22 + 4 * i, top), (22 + 4 * i, ys[i]), (40, ys[i])])
+    top = 114 - 13 * i                      # nested: THINK innermost, SEE outermost (no crossings)
+    xr = SX + 104 + 18 + 16 * i
+    xl = 34 - 7 * i
+    line([(SX + 104, y), (xr, y), (xr, top), (xl, top), (xl, ys[i]), (40, ys[i])])
 text(SX - 300, 82, 'each stream\'s sample → its next input (training: the dataset\'s)', 11, fill=COL['soft'])
 
 # ── recall attention ──────────────────────────────────────────────────────────
