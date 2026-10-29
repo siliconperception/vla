@@ -597,7 +597,8 @@ parser.add_argument('--clock_hz',   default=None, type=float, metavar='R',
 parser.add_argument('--ctx_tau',    default=None, metavar='SECONDS',
                     help='--clock_hz: register windows in seconds for all but the last '
                          '(plain-copy) register, e.g. 64,16,4,1 -> --ctx_ema of tau*R...,1; '
-                         'saved and restored like --clock_hz')
+                         '"none": no registers at all (needs --attn: the recall ring is the whole '
+                         'state); saved and restored like --clock_hz')
 parser.add_argument('--vision_hz',  default=None, type=float, metavar='V',
                     help='--clock_hz: the picture refreshes at V Hz and is held in between '
                          '(default: every stored frame; FineVideo frames are stored at 2 fps, so '
@@ -909,8 +910,8 @@ if args.inner_voice and not args.clock_hz:
 if args.ctx_tau:
     if not args.clock_hz:
         raise SystemExit('--ctx_tau needs --clock_hz')
-    args.ctx_ema = ','.join(f'{float(t) * args.clock_hz:g}' for t in str(args.ctx_tau).split(',')
-                            if t.strip()) + ',1'
+    args.ctx_ema = '' if str(args.ctx_tau) == 'none' else \
+        ','.join(f'{float(t) * args.clock_hz:g}' for t in str(args.ctx_tau).split(',') if t.strip()) + ',1'
 
 
 def _upgrade_state_dict(sd):
@@ -1864,8 +1865,8 @@ class VLAModel(nn.Module, _HubMixin):
         self.S, self.n_hidden, self.c_context = S, n_hidden, c_context
         self._windows = [float(w) for w in windows]
         self.learn = []              # --learn_win: indices of the learned windows
-        if not self._windows or min(self._windows) < 1:
-            raise SystemExit(f'--ctx_ema {windows}: windows must be >= 1 token')
+        if (not self._windows and not attn) or (self._windows and min(self._windows) < 1):
+            raise SystemExit(f'--ctx_ema {windows}: windows must be >= 1 token (no registers: --attn only)')
         self.K = len(self.windows)
         self.read_norm = float(read_norm)
         self.init_mode = init
@@ -2092,6 +2093,8 @@ class VLAModel(nn.Module, _HubMixin):
 
     def _read(self, dff, inj=None):
         """The K registers as ctx_cat reads them (inj: --learn_win's per-register addends)."""
+        if not self.K:                 # --ctx_tau none: the recall ring is the whole state
+            return []
         regs = list(dff.chunk(self.K, dim=1))
         if inj is not None:
             regs = [r + e for r, e in zip(regs, inj)]
@@ -2115,6 +2118,8 @@ class VLAModel(nn.Module, _HubMixin):
         """Laplacian-pyramid cascade: register k blends toward o minus registers 1..k-1 as
         just written. gain [B] (--write_surprise) scales the rate of every register but the
         plain copy, capped at 1. --lmu: the Legendre memory instead, the copies holding o."""
+        if not self.K:
+            return dff
         if self.lmu:
             regs = dff.chunk(self.K, dim=1)
             new = [o] * self.K
@@ -6992,7 +6997,7 @@ try:
                   f'{_t_data:6.1f}s)')
             _T0 = None
         if i % args.monitor == 0:
-            flat = model.regs(model.dff).reshape(-1)
+            flat = (model.regs(model.dff) if model.K else model.dff).reshape(-1)
             line = ('STEP {:10} wall {} loss {:12.9f} grad {:12.6f} lr {:10.9f} dff_mean {:12.5f} '
                     'dff_std {:12.5f} dff_max {:11.3f}'
                     ).format(i, datetime.datetime.now(), torch.stack(larr[-args.monitor:]).mean().item(),
