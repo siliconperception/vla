@@ -3207,11 +3207,19 @@ def _model_graph(model):
             out.append(dict(name='(token grid)', op=f'RMSnorm, replicate 1x1 -> {S}x{S}',
                             inp=r['out'], out=f'{r["out"]}x{S}x{S}', tr=0, fr=0))
         if r['name'] == 'linout':
+            lmu = {k: (gi, i, ks) for gi, ks in enumerate(model.lmu) for i, k in enumerate(ks)}
             for k, (g, w) in enumerate(zip(regs, model.windows)):
-                src = 'linout' + (f' - ({" + ".join(f"{q}[t]" for q in regs[:k])})' if k else '')
-                out.append(dict(name=f'{g}[t] <- {src}',
-                                op='Write (replace)' if w <= 1 else f'Write (EMA w={w:g})',
-                                inp=H, out=H, tr=0, fr=0))
+                if model.lmu:              # --lmu: term i of a Legendre memory, or a plain copy
+                    if k in lmu:
+                        gi, i, ks = lmu[k]
+                        src = (f'A{gi}[{i},:] ({regs[ks[0]]}..{regs[ks[-1]]})[t-1] + B{gi}[{i}] linout')
+                        op = f'Write (Legendre term {i} of {len(ks)}, w={w:g})'
+                    else:
+                        src, op = 'linout', 'Write (replace)'
+                else:
+                    src = 'linout' + (f' - ({" + ".join(f"{q}[t]" for q in regs[:k])})' if k else '')
+                    op = 'Write (replace)' if w <= 1 else f'Write (EMA w={w:g})'
+                out.append(dict(name=f'{g}[t] <- {src}', op=op, inp=H, out=H, tr=0, fr=0))
     # a long module name or op wraps onto continuation lines, so no line passes _GRAPH_WIDTH
     ws = max(max(len(r['inp']), len(r['out'])) for r in out)
     room = _GRAPH_WIDTH - (3 + 2 + 2 + 2 + ws + 4 + ws + 2 + 12)
