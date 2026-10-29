@@ -267,12 +267,12 @@ parser.add_argument('--learn_regs', default='', metavar='K1,K2,...',
                          'cascade); the others stay at their --ctx_ema/--ctx_tau window. Default: '
                          'all but the plain copies. Restored by --load')
 parser.add_argument('--lmu', default=False, action=argparse.BooleanOptionalAction,
-                    help='the registers with a window over 1 (all the same window, THETA tokens) '
-                         'form one Legendre Memory Unit of order D = their number (Voelker et al. '
-                         '2019): per channel m <- A m + B o, the zero-order-hold discretization of '
-                         'THETA dm/dt = A m + B u, so m holds the last THETA tokens of the layer '
-                         'output as D shifted-Legendre coefficients; the window-1 registers hold o. '
-                         'Restored by --load')
+                    help='the registers with a window over 1 form Legendre Memory Units '
+                         '(Voelker et al. 2019), one per distinct window THETA, of order D = the '
+                         'number of registers with that window: per channel m <- A m + B o, the '
+                         'zero-order-hold discretization of THETA dm/dt = A m + B u, so m holds the '
+                         'last THETA tokens of the layer output as D shifted-Legendre coefficients; '
+                         'the window-1 registers hold o. Restored by --load')
 parser.add_argument('--linout_kernel', default=1, type=int, metavar='K',
                     help='linout kernel (odd): KxK, padded, mixes neighbouring positions on the '
                          'way back into the registers; restored by --load')
@@ -1860,18 +1860,21 @@ class VLAModel(nn.Module, _HubMixin):
         self.register_buffer('ctx_read_rms', torch.zeros(self.K))       # 0 = not measured yet
         self.register_buffer('rate', torch.tensor([min(1.0, 1.0 / w) for w in self.windows]),
                              persistent=False)
-        # --lmu: the registers with a window over 1 are one order-D Legendre memory (lmu_A [D, D],
-        # lmu_B [D]); the window-1 registers are plain copies of o
-        self.lmu = [k for k, w in enumerate(self._windows) if w > 1] if lmu else []
+        # --lmu: the registers with a window over 1 are Legendre memories, one per distinct window
+        # (lmu_A<g> [D, D], lmu_B<g> [D] for the g-th, over the registers lmu[g]); the window-1
+        # registers are plain copies of o
+        self.lmu = []
         if lmu:
             if learn_win or surprise:
                 raise SystemExit('--lmu does not combine with --learn_win or --write_surprise')
-            if not self.lmu or len({self._windows[k] for k in self.lmu}) != 1:
-                raise SystemExit(f'--lmu: the registers over window 1 need one shared window: '
-                                 f'{self._windows}')
-            A, B = _lmu_matrices(len(self.lmu), self._windows[self.lmu[0]])
-            self.register_buffer('lmu_A', A, persistent=False)
-            self.register_buffer('lmu_B', B, persistent=False)
+            for w in dict.fromkeys(w for w in self._windows if w > 1):
+                g = len(self.lmu)
+                self.lmu.append([k for k, v in enumerate(self._windows) if v == w])
+                A, B = _lmu_matrices(len(self.lmu[g]), w)
+                self.register_buffer(f'lmu_A{g}', A, persistent=False)
+                self.register_buffer(f'lmu_B{g}', B, persistent=False)
+            if not self.lmu:
+                raise SystemExit(f'--lmu: no register with a window over 1: {self._windows}')
         # --write_surprise ('rat', H) / ('clamp', LO, HI): the slow registers' write gain
         self.surprise = tuple(surprise) if surprise else None
         if self.surprise and self.windows[-1] != 1:
@@ -2025,11 +2028,13 @@ class VLAModel(nn.Module, _HubMixin):
         plain copy, capped at 1. --lmu: the Legendre memory instead, the copies holding o."""
         if self.lmu:
             regs = dff.chunk(self.K, dim=1)
-            m = torch.einsum('ij,j...->i...', self.lmu_A, torch.stack([regs[k] for k in self.lmu]))
-            m = m + self.lmu_B.view(-1, 1, 1, 1, 1) * o
             new = [o] * self.K
-            for i, k in enumerate(self.lmu):
-                new[k] = m[i]
+            for g, ks in enumerate(self.lmu):
+                A, B = getattr(self, f'lmu_A{g}'), getattr(self, f'lmu_B{g}')
+                m = torch.einsum('ij,j...->i...', A, torch.stack([regs[k] for k in ks]))
+                m = m + B.view(-1, 1, 1, 1, 1) * o
+                for i, k in enumerate(ks):
+                    new[k] = m[i]
             return torch.cat(new, dim=1)
         new = []
         rates = self._rates().detach()
