@@ -299,6 +299,11 @@ parser.add_argument('--ctx_ema',    default='256,64,16,4,1', metavar='W1,W2,...'
                     help='register windows in tokens, slowest first: register k blends at '
                          'rate 1/W_k toward the layer output minus registers 1..k-1, so with a '
                          'last window of 1 the registers sum exactly to the output')
+parser.add_argument('--read_rmsnorm', default=False, action=argparse.BooleanOptionalAction,
+                    help='read each register through a per-sample RMSnorm over its channels at every grid '
+                         'position (as the token, image and recall grids), times --ctx_read_norm, instead '
+                         'of the running-RMS read scale (a batch statistic, fixed at inference); restored '
+                         'by --load')
 parser.add_argument('--ctx_read_norm', default=1.0, type=float, metavar='S',
                     help='read each register scaled to RMS S, using a running RMS per '
                          'register (momentum 0.01, updated in training only); 0 = off')
@@ -770,7 +775,7 @@ _ONESHOT = (args.generate or args.eval or args.vis or args.push or args.free_run
 _ARCH_ARGS = ('context', 'n_hidden', 'c_context', 'depth', 'kernel', 'tokenizer', 'ctx_ema',
               'ctx_read_norm', 'dec_tree_kernels', 'dec_width', 'bn_momentum', 'init',
               'image_encoder', 'audio_encoder', 'streams', 'linout_kernel', 'learn_win',
-              'learn_regs', 'lmu', 'attn', 'attn_ch', 'attn_heads', 'attn_dim', 'attn_age')
+              'learn_regs', 'lmu', 'attn', 'attn_ch', 'attn_heads', 'attn_dim', 'attn_age', 'read_rmsnorm')
 
 
 def _parse_mix():
@@ -1880,7 +1885,8 @@ class VLAModel(nn.Module, _HubMixin):
                  dec_kernels=(3, 3, 3), dec_width=256, bn_momentum=0.1, init='zero',
                  image_encoder='none', audio_encoder='none', nul_head=False, streams=1,
                  text_nul=False, surprise=None, linout_kernel=1, learn_win=False,
-                 learn_regs=(), lmu=False, attn=0, attn_ch=2, attn_heads=8, attn_dim=64, attn_age=True):
+                 learn_regs=(), lmu=False, attn=0, attn_ch=2, attn_heads=8, attn_dim=64, attn_age=True,
+                 read_rmsnorm=False):
         super().__init__()
         from transformers import AutoModelForCausalLM
         repo = _TOKENIZERS[tokenizer]
@@ -1892,6 +1898,7 @@ class VLAModel(nn.Module, _HubMixin):
             raise SystemExit(f'--ctx_ema {windows}: windows must be >= 1 token (no registers: --attn only)')
         self.K = len(self.windows)
         self.read_norm = float(read_norm)
+        self.read_rmsnorm = bool(read_rmsnorm)
         self.init_mode = init
         self.vocab, self.c_text = lm.config.vocab_size, lm.config.hidden_size
         self.tok = HFTokenizer(repo, self.vocab)
@@ -2124,6 +2131,8 @@ class VLAModel(nn.Module, _HubMixin):
         if self._ablate:
             mu = self._read_mean.chunk(self.K, dim=1)
             regs = [mu[k].expand_as(r) if k in self._ablate else r for k, r in enumerate(regs)]
+        if self.read_rmsnorm:          # per sample and grid position, over channels
+            return [r * (self.read_norm * torch.rsqrt(r.pow(2).mean(dim=1, keepdim=True) + 1e-6)) for r in regs]
         if self.read_norm > 0:
             run = self.ctx_read_rms
             if self.training or bool((run == 0).any()):
@@ -3216,7 +3225,7 @@ model = VLAModel(S=args.context, n_hidden=args.n_hidden, c_context=args.c_contex
                  learn_win=args.learn_win,
                  learn_regs=[int(k) for k in str(args.learn_regs or '').split(',') if k.strip()],
                  lmu=args.lmu, attn=args.attn, attn_ch=args.attn_ch, attn_heads=args.attn_heads,
-                 attn_dim=args.attn_dim, attn_age=args.attn_age)
+                 attn_dim=args.attn_dim, attn_age=args.attn_age, read_rmsnorm=args.read_rmsnorm)
 if _loaded_ckpt is not None:
     _sd = _upgrade_state_dict(_loaded_ckpt['state_dict'])
     if _aud_switch:
