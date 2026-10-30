@@ -299,6 +299,9 @@ parser.add_argument('--ctx_ema',    default='256,64,16,4,1', metavar='W1,W2,...'
                     help='register windows in tokens, slowest first: register k blends at '
                          'rate 1/W_k toward the layer output minus registers 1..k-1, so with a '
                          'last window of 1 the registers sum exactly to the output')
+parser.add_argument('--up_ema', default=None, metavar='W1,W2,...',
+                    help='--layers: register windows in tokens of every layer above the first (as many as '
+                         '--ctx_ema; default: --ctx_ema\'s). Saved and restored unless given')
 parser.add_argument('--layers', default=1, type=int, metavar='L',
                     help='recurrent layers in series, each a full state update (ctx_cat, --depth convs, '
                          'linout) with its own --ctx_ema registers. Layer l > 1 reads only the output of '
@@ -547,6 +550,14 @@ parser.add_argument('--state_pca',  default=0, type=int, metavar='N',
                          'whole state (STATEPCA lines), exit: how much of the state is used')
 parser.add_argument('--state_pca_stride', default=16, type=int, metavar='T',
                     help='--state_pca: ticks between kept states of one document')
+parser.add_argument('--traj', default=0, type=int, metavar='N',
+                    help='load, read the first --eval_docs held-out documents and print, for each '
+                         'layer\'s output and addend and every register, the shape of its '
+                         'trajectory after the first 64 ticks (TRAJ lines), exit: rms; channel '
+                         'and whole-state participation ratio; TwoNN intrinsic dimension of up to N '
+                         'states kept every --state_pca_stride ticks (neighbours within 128 ticks of '
+                         'the same document excluded); autocorrelation rho(L) = 1 - E|s_t - s_t-L|^2 '
+                         '/ 2 var at L = 1, 2, 4 .. 256, and the lag where it falls through 0.5')
 parser.add_argument('--doc_ablate', default='', metavar='K1,K2,...',
                     help='--doc_score: registers K (1 = the slowest) read as their mean state over '
                          'the held-out documents, as in EVALI\'s ablations: is what the weights '
@@ -776,7 +787,8 @@ if _continuous - {'text', 'image', 'video'}:
     raise SystemExit(f'--continuous {args.continuous}: kinds are text, image and video')
 
 _ONESHOT = (args.generate or args.eval or args.vis or args.push or args.free_run or
-            args.prompt_tune or args.doc_score or args.teach or args.state_pca or args.attn_probe)
+            args.prompt_tune or args.doc_score or args.teach or args.state_pca or args.attn_probe or
+            args.traj)
 
 # ── checkpoint ────────────────────────────────────────────────────────────────
 
@@ -879,7 +891,7 @@ if _loaded_ckpt is not None:
     _start_step = int(_loaded_ckpt.get('step', 0))
     _start_exs = int(_loaded_ckpt.get('examples', 0))
     _start_exs_by = dict(_loaded_ckpt.get('examples_by', {}))
-    for k in ('clock_hz', 'ctx_tau', 'vision_hz', 'audio_hz', 'inner_voice', 'min_p', 'top_k', 'voice_drop', 'caption_feed', 'text_feed', 'speech_delay', 'fifo3', 'nul_weight', 'loss_norm', 'speech_align', 'align_min', 'write_surprise'):     # restored unless given
+    for k in ('clock_hz', 'ctx_tau', 'vision_hz', 'audio_hz', 'inner_voice', 'min_p', 'top_k', 'voice_drop', 'caption_feed', 'text_feed', 'speech_delay', 'fifo3', 'nul_weight', 'loss_norm', 'speech_align', 'align_min', 'write_surprise', 'up_ema'):     # restored unless given
         if getattr(args, k) is None:
             setattr(args, k, _saved.get(k))
 args.clock_hz = float(args.clock_hz or 0)
@@ -1888,7 +1900,7 @@ class UpperLayer(nn.Module):
     its own registers (each RMS-normalized per position; the inputs, text or A/V alike, reach it
     only through the layers below), and returns its addend
     d = linout(context(ctx_cat(...))): the layer's output is the one below plus d, and its
-    registers hold d (the first layer's cascade, same windows). ctx_cat starts as I from the
+    registers hold d (the first layer's cascade, at the --up_ema windows). ctx_cat starts as I from the
     layer below's output (the other blocks zero) and linout at zero, so a new layer starts as the
     identity and a trained model it is added to keeps its function."""
 
@@ -1936,7 +1948,7 @@ class VLAModel(nn.Module, _HubMixin):
                  image_encoder='none', audio_encoder='none', nul_head=False, streams=1,
                  text_nul=False, surprise=None, linout_kernel=1, learn_win=False,
                  learn_regs=(), lmu=False, attn=0, attn_ch=2, attn_heads=8, attn_dim=64, attn_age=True,
-                 read_rmsnorm=False, layers=1):
+                 read_rmsnorm=False, layers=1, up_windows=None):
         super().__init__()
         from transformers import AutoModelForCausalLM
         repo = _TOKENIZERS[tokenizer]
@@ -2063,8 +2075,13 @@ class VLAModel(nn.Module, _HubMixin):
             raise SystemExit(f'--layers {layers}: at least 1')
         if layers > 1 and (lmu or learn_win or surprise):
             raise SystemExit('--layers over 1 does not combine with --lmu, --learn_win or --write_surprise')
+        self.up_windows = [float(w) for w in (up_windows or self._windows)]
+        if len(self.up_windows) != self.K or min(self.up_windows, default=1) < 1:
+            raise SystemExit(f'--up_ema {up_windows}: {self.K} windows >= 1 token, as --ctx_ema')
         self.up = nn.ModuleList(UpperLayer(n_hidden, c_context, depth, kernel, bn_momentum, lk, self.K)
                                 for _ in range(layers - 1))
+        self.register_buffer('up_rate', torch.tensor([min(1.0, 1.0 / w) for w in self.up_windows]),
+                             persistent=False)
         self.ring_off = n_hidden * self.K * layers   # the registers of every layer, then the ring
         self.dff = None              # [B, K*n_hidden, S, S], detached; None until first step
         self._ablate = None          # --eval_info: registers read as their mean ...
@@ -2212,11 +2229,11 @@ class VLAModel(nn.Module, _HubMixin):
 
     def _cascade(self, o, dff):
         """--layers: an upper layer's registers dff written from its addend o, as _write's cascade
-        (the same windows, no --learn_win / --write_surprise)."""
+        (at the --up_ema windows, no --learn_win / --write_surprise)."""
         new = []
         for k, p in enumerate(dff.chunk(self.K, dim=1)):
             inp = o - sum(new) if k else o
-            new.append(p + self.rate[k] * (inp - p))
+            new.append(p + self.up_rate[k] * (inp - p))
         return torch.cat(new, dim=1)
 
     def _write(self, o, dff, gain=None):
@@ -3306,7 +3323,8 @@ model = VLAModel(S=args.context, n_hidden=args.n_hidden, c_context=args.c_contex
                  learn_regs=[int(k) for k in str(args.learn_regs or '').split(',') if k.strip()],
                  lmu=args.lmu, attn=args.attn, attn_ch=args.attn_ch, attn_heads=args.attn_heads,
                  attn_dim=args.attn_dim, attn_age=args.attn_age, read_rmsnorm=args.read_rmsnorm,
-                 layers=args.layers)
+                 layers=args.layers,
+                 up_windows=[float(w) for w in str(args.up_ema).split(',') if w.strip()] if args.up_ema else None)
 if _loaded_ckpt is not None:
     _sd = _upgrade_state_dict(_loaded_ckpt['state_dict'])
     if _aud_switch:
@@ -3460,7 +3478,7 @@ def _model_graph(model):
         if m:
             L = int(m.group(1)) + 2
             ur = [f'L{L} DFF_{k + 1}' for k in range(model.K)]
-            for k, (g, w) in enumerate(zip(ur, model.windows)):
+            for k, (g, w) in enumerate(zip(ur, model.up_windows)):
                 src = r['name'] + (f' - ({" + ".join(f"{q}[t]" for q in ur[:k])})' if k else '')
                 out.append(dict(name=f'{g}[t] <- {src}', op='Write (replace)' if w <= 1 else
                                 f'Write (EMA w={w:g})', inp=H, out=H, tr=0, fr=0))
@@ -4141,7 +4159,7 @@ if args.vis:
         ax_p = fig.add_subplot(gs[:rows, 1])
     for r, ax in enumerate(axes):
         L, k = divmod(r - 1, model.K) if r else (0, 0)
-        w = model.windows[k] if r else None
+        w = (model.up_windows if L else model.windows)[k] if r else None
         ax.set_title('output' if r == 0 else
                      (f'L{L + 1} ' if nup else '') + f'DFF {k + 1}: ' +
                      ('copy (residual of the others)' if w == 1 and model.K > 1 else
@@ -5970,6 +5988,107 @@ if args.attn_probe:
     print(f'ATTNORDER step {_start_step} docs {len(_rows)} | base {base:.4f} | "what followed" random '
           f'{ln:.4f} ({ln - base:+.4f}) | query from a random slot {lq:.4f} ({lq - base:+.4f}) | both '
           f'{lb:.4f} ({lb - base:+.4f})')
+    raise SystemExit(0)
+
+if args.traj:
+    # every layer's output (o_l = o_l-1 + d_l) and addend d_l, and every register: is an upper
+    # layer's trajectory slower / lower-dimensional than the first's at the same clock?
+    _held = [_doc_tokens(d) for d in _eval_docs(_eval_corpus_names()[0])]
+    _held = [q for q in _held if len(q) > 65]
+    _K, _C, _S = model.K, model.n_hidden, model.S
+    _F, _dev = _C * _S * _S, next(model.parameters()).device
+    _lags = [2 ** i for i in range(9)]
+    _names = ['L1 out'] + [n for i in range(len(model.up)) for n in (f'L{i + 2} add', f'L{i + 2} out')]
+    _names += [f'L{l + 1} DFF {k + 1}' for l in range(1 + len(model.up)) for k in range(_K)]
+    _cap = {}
+    _hooks = [u.register_forward_hook(
+        lambda m, i, o, j=j: _cap.update({j: (i[0], o)})) for j, u in enumerate(model.up)]
+    _st = {n: dict(s=torch.zeros(_F, dtype=torch.float64, device=_dev), q=0.0, n=0,
+                   s2=torch.zeros(_C, _C, dtype=torch.float64, device=_dev),
+                   ps=torch.zeros(_S * _S, _C, dtype=torch.float64, device=_dev),
+                   d=[0.0] * len(_lags), dn=[0] * len(_lags), keep=[]) for n in _names}
+    _per = args.traj // len(_held) + 1
+    _meta = []                                       # (doc, tick) of each kept state
+    _RB = 16                                         # rows per pass: the lag ring is 257 x rows x F
+    with _EvalState(), torch.no_grad():
+        for _c0 in range(0, len(_held), _RB):
+            _rows = [(q, q[1:] + [0]) for q in _held[_c0:_c0 + _RB]]
+            for _, _X, _Y, _M in _batches(_rows):
+                model.dff = None
+                _ring = {n: torch.zeros(_lags[-1] + 1, _X.shape[0], _F, dtype=torch.half, device=_dev)
+                         for n in _names}
+                for _t in range(_X.shape[1]):
+                    _cap.clear()
+                    model(_X[:, _t])
+                    _sig = {}
+                    for j in range(len(model.up)):
+                        if j == 0:
+                            _sig['L1 out'] = _cap[0][0]
+                        _sig[f'L{j + 2} add'] = _cap[j][1]
+                        _sig[f'L{j + 2} out'] = _cap[j][0] + _cap[j][1]
+                    _regs = model.all_regs(model.dff).chunk(_K * (1 + len(model.up)), dim=1)
+                    for i, r in enumerate(_regs):
+                        _sig[f'L{i // _K + 1} DFF {i % _K + 1}'] = r
+                    _m = _M[:, _t].bool()
+                    _kp = (_t >= 64 and (_t - 64) % args.state_pca_stride == 0 and
+                           (_t - 64) // args.state_pca_stride < _per)
+                    if _kp:
+                        _meta += [(_c0 + int(r), _t) for r in _m.nonzero()[:, 0]]
+                    for n in _names:
+                        z = _sig[n].float()
+                        f = z.reshape(z.shape[0], -1)
+                        _ring[n][_t % len(_ring[n])] = f.half()
+                        if _t < 64 or not _m.any():
+                            continue
+                        st, f = _st[n], f[_m]
+                        st['s'] += f.sum(0).double()
+                        st['q'] += float((f.double() ** 2).sum())
+                        st['n'] += f.shape[0]
+                        p = z[_m].permute(0, 2, 3, 1)
+                        st['ps'] += p.sum(0).reshape(_S * _S, _C).double()
+                        p = p.reshape(-1, _C)
+                        st['s2'] += (p.T @ p).double()
+                        for li, L in enumerate(_lags):
+                            if _t - L >= 64:
+                                d = f - _ring[n][(_t - L) % len(_ring[n])][_m].float()
+                                st['d'][li] += float((d.double() ** 2).sum())
+                                st['dn'][li] += f.shape[0]
+                        if _kp:
+                            st['keep'].append(f.half().cpu())
+    for h in _hooks:
+        h.remove()
+    _doc = torch.tensor([m[0] for m in _meta], device=_dev)
+    _tk = torch.tensor([m[1] for m in _meta], device=_dev)
+    _near = (_doc[:, None] == _doc[None, :]) & ((_tk[:, None] - _tk[None, :]).abs() < 128)
+    print(f'TRAJ step {_start_step} docs {len(_held)} states {len(_meta)} (every '
+          f'{args.state_pca_stride} ticks after 64) | rms, channel PR (of {_C}), state PR, TwoNN dim, '
+          f'rho at lags {",".join(map(str, _lags))}, lag where rho < 0.5')
+    for n in _names:
+        st = _st[n]
+        mu = st['s'] / st['n']
+        var = st['q'] / st['n'] - float((mu ** 2).sum())           # E|s - mu|^2
+        pm = st['ps'] / st['n']                                      # [S*S, C] position means
+        cov = st['s2'] / (st['n'] * _S * _S) - pm.T @ pm / (_S * _S)
+        cov = (cov + cov.T) / 2
+        l = torch.linalg.eigvalsh(cov).clamp(min=0)
+        cpr = float(l.sum() ** 2 / (l.pow(2).sum() + 1e-300))
+        X = torch.cat(st['keep']).to(_dev).float()
+        X = X - X.mean(0, keepdim=True)
+        G = (X @ X.T).double()
+        l = torch.linalg.eigvalsh(G).clamp(min=0)
+        spr = float(l.sum() ** 2 / (l.pow(2).sum() + 1e-300))
+        dg = G.diagonal()
+        D2 = (dg[:, None] + dg[None, :] - 2 * G).clamp(min=0)
+        D2[_near] = float('inf')
+        r = D2.topk(2, dim=1, largest=False).values.sqrt()
+        ok = (r[:, 0] > 0) & torch.isfinite(r[:, 1])
+        dim = float(ok.sum() / (r[ok, 1] / r[ok, 0]).log().sum()) if ok.any() else float('nan')
+        rho = [1 - (st['d'][i] / st['dn'][i]) / (2 * var) if st['dn'][i] and var > 0 else float('nan')
+               for i in range(len(_lags))]
+        half = next((_lags[i - 1] * 2 ** ((rho[i - 1] - 0.5) / (rho[i - 1] - rho[i])) if i else 0.5 / (1 - rho[0])
+                     for i in range(len(_lags)) if rho[i] < 0.5), float('inf'))
+        print(f'TRAJ {n:10} rms {math.sqrt(max(var, 0) / _F):7.4f} | PR ch {cpr:6.1f} state {spr:6.1f} | '
+              f'twonn {dim:5.1f} | rho ' + ' '.join(f'{v:+.3f}' for v in rho) + f' | half {half:6.1f}')
     raise SystemExit(0)
 
 if args.state_pca:
