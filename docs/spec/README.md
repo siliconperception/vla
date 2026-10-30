@@ -68,7 +68,7 @@ The multimodal design adds an image grid (a frozen ResNet-50 feature map); this 
    pythia-31m output layer (E → V), plus one trained logit for `<NUL>` ("say nothing this tick").
 9. **Emit.** Each stream samples its next token or `<NUL>` by min-p sampling: only tokens with at least P times
    the top token's probability are kept. P is stored with the weights; training keeps adjusting it so that the
-   model's own text from `<NUL>` scores a fluency of 100 (P = 0.0339 at step 220,000).
+   model's own text from `<NUL>` scores a fluency of 100 (P = 0.0141 at step 1,000,000).
 
 ## Training (for reference)
 
