@@ -301,9 +301,10 @@ parser.add_argument('--ctx_ema',    default='256,64,16,4,1', metavar='W1,W2,...'
                          'last window of 1 the registers sum exactly to the output')
 parser.add_argument('--layers', default=1, type=int, metavar='L',
                     help='recurrent layers in series, each a full state update (ctx_cat, --depth convs, '
-                         'linout) with its own --ctx_ema registers. Layer l > 1 reads the token grid, '
-                         'the output of the layer below and its own registers (each RMS-normalized per '
-                         'position) and adds its output to the one below; the decoders read the sum. '
+                         'linout) with its own --ctx_ema registers. Layer l > 1 reads only the output of '
+                         'the layer below and its own registers (each RMS-normalized per position; no '
+                         'input reaches it directly) and adds its output to the one below; the decoders '
+                         'read the sum. '
                          'A new layer\'s linout starts at zero, so adding one to a --load checkpoint '
                          'starts from the same function. Restored by --load')
 parser.add_argument('--read_rmsnorm', default=False, action=argparse.BooleanOptionalAction,
@@ -1883,21 +1884,22 @@ def _rms_pos(x, eps=1e-6):
 
 
 class UpperLayer(nn.Module):
-    """--layers L: one of the layers above the first. Reads the token grid, the output of the
-    layer below and its own registers (each RMS-normalized per position), and returns its addend
+    """--layers L: one of the layers above the first. Reads only the output of the layer below and
+    its own registers (each RMS-normalized per position; the inputs, text or A/V alike, reach it
+    only through the layers below), and returns its addend
     d = linout(context(ctx_cat(...))): the layer's output is the one below plus d, and its
     registers hold d (the first layer's cascade, same windows). ctx_cat starts as I from the
     layer below's output (the other blocks zero) and linout at zero, so a new layer starts as the
     identity and a trained model it is added to keeps its function."""
 
-    def __init__(self, c_tok, n_hidden, c_context, depth, kernel, bn_momentum, linout_kernel, K):
+    def __init__(self, n_hidden, c_context, depth, kernel, bn_momentum, linout_kernel, K):
         super().__init__()
         self.K = K
-        self.ctx_cat = nn.Conv2d(c_tok + n_hidden + K * n_hidden, c_context, 1)
+        self.ctx_cat = nn.Conv2d(n_hidden + K * n_hidden, c_context, 1)
         with torch.no_grad():
             self.ctx_cat.weight.zero_()
             n = min(n_hidden, c_context)
-            self.ctx_cat.weight[:n, c_tok:c_tok + n, 0, 0] = torch.eye(n)
+            self.ctx_cat.weight[:n, :n, 0, 0] = torch.eye(n)
             self.ctx_cat.bias.zero_()
         self.context = ContextCNN(c_context, depth, kernel, bn_momentum)
         self.linout = nn.Conv2d(c_context, n_hidden, linout_kernel, padding=linout_kernel // 2)
@@ -1905,10 +1907,10 @@ class UpperLayer(nn.Module):
             self.linout.weight.zero_()
             self.linout.bias.zero_()
 
-    def forward(self, tok_grid, below, regs):
-        """tok_grid [B, c_tok, S, S], below [B, N, S, S], regs [B, K*N, S, S] -> d [B, N, S, S]."""
+    def forward(self, below, regs):
+        """below [B, N, S, S], regs [B, K*N, S, S] -> d [B, N, S, S]."""
         reads = [_rms_pos(r) for r in regs.chunk(self.K, dim=1)] if self.K else []
-        return self.linout(self.context(self.ctx_cat(torch.cat([tok_grid, _rms_pos(below)] + reads, 1))))
+        return self.linout(self.context(self.ctx_cat(torch.cat([_rms_pos(below)] + reads, 1))))
 
 
 class VLAModel(nn.Module, _HubMixin):
@@ -2061,8 +2063,8 @@ class VLAModel(nn.Module, _HubMixin):
             raise SystemExit(f'--layers {layers}: at least 1')
         if layers > 1 and (lmu or learn_win or surprise):
             raise SystemExit('--layers over 1 does not combine with --lmu, --learn_win or --write_surprise')
-        self.up = nn.ModuleList(UpperLayer(self.c_text, n_hidden, c_context, depth, kernel, bn_momentum,
-                                           lk, self.K) for _ in range(layers - 1))
+        self.up = nn.ModuleList(UpperLayer(n_hidden, c_context, depth, kernel, bn_momentum, lk, self.K)
+                                for _ in range(layers - 1))
         self.ring_off = n_hidden * self.K * layers   # the registers of every layer, then the ring
         self.dff = None              # [B, K*n_hidden, S, S], detached; None until first step
         self._ablate = None          # --eval_info: registers read as their mean ...
@@ -2316,7 +2318,7 @@ class VLAModel(nn.Module, _HubMixin):
         new = self._write(o, dff, gain)
         o1 = o
         for u, h in zip(self.up, ups):                 # --layers: in series, each adding to o
-            d = u(ins[0], o, h)
+            d = u(o, h)
             new = torch.cat([new, self._cascade(d, h)], 1)
             o = o + d
         if self.attn is not None:
@@ -3426,9 +3428,9 @@ def _model_graph(model):
         if m:
             L = int(m.group(1)) + 2
             ur = [f'L{L} DFF_{k + 1}[t-1]' for k in range(model.K)]
-            out.append(dict(name=', '.join(['(token grid)', f'o (layer {L - 1} output)'] + ur),
+            out.append(dict(name=', '.join([f'o (layer {L - 1} output)'] + ur),
                             op='RMSnorm per position (o, registers), Concat (channels)',
-                            inp=f'{model.c_text}+{model.n_hidden}+{model.K}x{model.n_hidden} x{S}x{S}',
+                            inp=f'{model.n_hidden}+{model.K}x{model.n_hidden} x{S}x{S}',
                             out=r['inp'], tr=0, fr=0))
         if r['name'].startswith('attn.'):
             a = model.attn
