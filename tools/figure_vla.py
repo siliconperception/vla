@@ -1,22 +1,23 @@
 """Draw docs/figures/vla_<model>.svg: one clock tick of a VLA model, 16:9 (1920 x 1080).
 
-usage: python tools/figure_vla.py [--model v498|v499|v502] [--out OUT]
+usage: python tools/figure_vla.py [--model v498|v499|v502|v505] [--out OUT]
 
 v498: recurrent CNN + two order-2 Legendre memories (4096, 64 ticks) + copy + recall attention, never
 reset. v499: no registers, the recall attention's ring is the whole state, reset at each example.
 v502: the residual cascade of an EMA (512 ticks) and the residual copy, read through per-sample RMSnorm,
-+ recall attention, reset at each example."""
++ recall attention, reset at each example. v505: two recurrent layers in series, each with that cascade, no
+recall attention; 1920 x 2160, two 16:9 panes: the whole tick on top, one layer zoomed in below."""
 import argparse
 
 ap = argparse.ArgumentParser()
-ap.add_argument('--model', default='v498', choices=('v498', 'v499', 'v502'))
+ap.add_argument('--model', default='v498', choices=('v498', 'v499', 'v502', 'v505'))
 ap.add_argument('--out', default=None)
 a = ap.parse_args()
 LMU = a.model == 'v498'                   # Legendre memories + copy
 CASC = a.model == 'v502'                  # EMA + residual copy, RMSnorm reads
 REGS = LMU or CASC                        # (v499: the ring alone)
 CAT = {'v498': ('3×256 + 2048 + 256 + 256 + 5×512', 5888), 'v499': ('3×256 + 2048 + 256 + 256', 3328),
-       'v502': ('3×256 + 2048 + 256 + 256 + 2×512', 4352)}[a.model]
+       'v502': ('3×256 + 2048 + 256 + 256 + 2×512', 4352), 'v505': ('', 0)}[a.model]
 
 W, H = 1920, 1080
 out = []
@@ -79,6 +80,280 @@ def flop(x, y, name, size='512×7×7'):
     text(x + 32, y + 30, name, 12, weight='bold')
     text(x + 32, y - 5, size, 9.5, fill=COL['soft'])
 
+
+DEFS = ('<defs><marker id="arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" '
+        'orient="auto-start-reverse"><path d="M 0,0 L 10,5 L 0,10 z" fill="#212121"/></marker>'
+        '<pattern id="hatch" width="6" height="6" patternUnits="userSpaceOnUse" patternTransform="rotate(45)">'
+        '<line x1="0" y1="0" x2="0" y2="6" stroke="#757575" stroke-width="1.2"/></pattern></defs>')
+
+
+def legend(x, y, items, flop_note, w=460):
+    """Legend box at (x, y): items [(fill, hatch, label)], then the register symbol and the line styles."""
+    h = 48 + 28 * len(items) + 64 + 24
+    out.append(f'<rect x="{x}" y="{y}" width="{w}" height="{h}" rx="8" fill="#fafafa" stroke="#bdbdbd"/>')
+    text(x + 18, y + 26, 'Legend', 14, anchor='start', weight='bold')
+    for i, (c, hch, s) in enumerate(items):
+        yy = y + 48 + 28 * i
+        box(x + 18, yy, 26, 18, c, hatch=hch, rx=2)
+        text(x + 56, yy + 13, s, 12, anchor='start')
+    yy = y + 48 + 28 * len(items)
+    flop(x + 18, yy + 2, '', size='')
+    text(x + 94, yy + 22, 'D flip-flop register, clocked every tick', 12, anchor='start')
+    text(x + 94, yy + 38, flop_note, 11, anchor='start', fill=COL['soft'])
+    yy += 70
+    line([(x + 18, yy), (x + 50, yy)])
+    text(x + 56, yy + 4, 'data / state path', 12, anchor='start')
+    line([(x + 220, yy), (x + 252, yy)], dash=True, color='#757575')
+    text(x + 258, yy + 4, 'old state into the update', 12, anchor='start')
+
+
+def layer_block(x0, y0, name, cat, ins, cy):
+    """Pane A: one recurrent layer as a 360 x 390 block at (x0, y0): concat, ctx_cat, 8 convs, linout and
+    its two registers fed back (the cascade itself is drawn in pane B). ins: the y of each input entering
+    the concat; cy: the main path. -> the output point."""
+    out.append(f'<rect x="{x0}" y="{y0}" width="360" height="390" rx="10" fill="#f5f9ff" stroke="{COL["ink"]}" '
+               f'stroke-width="1.6"/>')
+    text(x0 + 180, y0 - 12, name, 15, weight='bold')
+    cx = x0 + 22                                          # concat
+    box(cx, y0 + 24, 30, 250, COL['cat'], [f'concat {cat}'], size=10, vertical=True)
+    for y in ins:
+        line([(x0, y), (cx, y)])
+    line([(cx + 30, cy), (x0 + 72, cy)])
+    box(x0 + 72, cy - 70, 24, 140, COL['lin'], ['ctx_cat 1×1'], size=10, vertical=True)
+    xx = x0 + 112
+    line([(x0 + 96, cy), (xx, cy)])
+    for k in range(8):
+        box(xx, cy - 55, 13, 110, COL['cnn'], rx=2)
+        if k < 7:
+            line([(xx + 13, cy), (xx + 19, cy)], arrow=False)
+        xx += 19
+    text(x0 + 187, cy - 64, '8 × conv 3×3+BN+ReLU', 10.5)
+    line([(xx - 6, cy), (x0 + 276, cy)])
+    box(x0 + 276, cy - 70, 24, 140, COL['lin'], ['linout 3×3'], size=10, vertical=True)
+    bx = x0 + 326                                         # output tap
+    line([(x0 + 300, cy), (x0 + 360, cy)], arrow=False)
+    dot(bx, cy)
+    ry = y0 + 300                                         # the two registers
+    f1, f2 = x0 + 110, x0 + 210
+    dot(bx, ry - 10)
+    line([(bx, cy), (bx, ry + 23), (f2 + 66, ry + 23)])
+    line([(bx, ry - 10), (f1 + 82, ry - 10), (f1 + 82, ry + 23), (f1 + 66, ry + 23)])
+    flop(f1, ry, 'DFF_1', size='')
+    flop(f2, ry, 'DFF_2', size='')
+    text(f1 + 32, ry + 62, 'EMA 512', 10, fill=COL['soft'])
+    text(f2 + 32, ry + 62, 'copy', 10, fill=COL['soft'])
+    line([(f1, ry + 16), (cx + 10, ry + 16), (cx + 10, y0 + 276)], dash=True, color='#757575')
+    line([(f2, ry + 16), (f2 - 14, ry + 16), (f2 - 14, ry + 72), (cx + 20, ry + 72), (cx + 20, y0 + 276)],
+         dash=True, color='#757575')
+    return x0 + 360, cy
+
+
+def draw_v505():
+    """1920 x 2160: pane A (top, 16:9) the whole tick; pane B (bottom, 16:9) one recurrent layer."""
+    W5, H5 = 1920, 2160
+    out.append(f'<svg xmlns="http://www.w3.org/2000/svg" width="{W5}" height="{H5}" viewBox="0 0 {W5} {H5}" '
+               f'font-family="Helvetica, Arial, sans-serif">')
+    out.append(DEFS)
+    out.append(f'<rect width="{W5}" height="{H5}" fill="#ffffff"/>')
+
+    # ── pane A: the whole tick ──────────────────────────────────────────────
+    text(30, 38, 'VLA v505 — one clock tick (40 ms): two recurrent CNN layers in series', 22, anchor='start',
+         weight='bold')
+    text(30, 62, 'A · the whole tick.  n_hidden 512 · c_context 384 · 7×7 grid · depth 8 per layer · 3 token '
+         'streams · 25 Hz · each layer: EMA 512 + copy, RMSnorm reads · reset at each example · 33.2M trainable · '
+         'state 4 × 512×7×7 = 100,352 values', 13, anchor='start', fill='#424242')
+    ys = (300, 350, 400)
+    for y, nm in zip(ys, ('text', 'voice', 'image')):
+        mux(40, y)
+        line([(74, y), (128, y)])
+        text(100, y - 6, nm, 10, fill=COL['soft'])
+    box(130, 275, 150, 150, COL['frozen'], ['tok_embed (frozen)', 'pythia-31m 50304×256', 'shared by 3 streams'],
+        hatch=True)
+    for y in ys:
+        line([(280, y), (318, y)])
+    box(320, 275, 40, 150, COL['rep'], ['RMS · replicate 1×1→7×7'], size=11, vertical=True)
+    text(440, ys[0] - 8, 'token grids 3 × 256×7×7', 10, fill=COL['soft'])
+    box(40, 478, 90, 44, COL['media'], ['audio', '16 kHz'])
+    line([(130, 500), (158, 500)])
+    box(160, 478, 150, 44, COL['mel'], ['log-mel (fixed)', '64 mels · 10 ms hop'])
+    line([(310, 500), (328, 500)])
+    box(330, 483, 36, 34, COL['norm'], ['RMS'], size=10)
+    text(440, 492, 'audio grid 256×7×7', 10, fill=COL['soft'])
+    box(40, 560, 90, 44, COL['media'], ['frame', '2 fps'], dash=True)
+    line([(130, 582), (158, 582)], dash=True, color='#9e9e9e')
+    box(160, 560, 150, 44, COL['frozen'], ['image encoder', '(future)'], hatch=True, dash=True)
+    for y in ys:
+        line([(360, y), (520, y)], arrow=False)
+    line([(366, 500), (520, 500)], arrow=False)
+
+    CY = 430
+    o1 = layer_block(520, 250, 'LAYER 1', '3×256 + 256 + 2×512 = 2048', list(ys) + [500], CY)
+    BX = o1[0] + 40                                       # the o_1 tap
+    line([o1, (BX, CY)], arrow=False)
+    dot(BX, CY)
+    text(BX - 4, CY - 10, 'o₁', 13, anchor='end', weight='bold')
+    L2 = 1000
+    line([(BX, CY), (L2, CY)], arrow=False)
+    o2 = layer_block(L2, 250, 'LAYER 2', '512 + 2×512 = 1536', [CY], CY)
+    AX = o2[0] + 56                                       # the adder
+    line([o2, (AX - 18, CY)])
+    text(o2[0] + 22, CY - 10, 'd₂', 13, anchor='start', weight='bold')
+    out.append(f'<circle cx="{AX}" cy="{CY}" r="17" fill="#ffffff" stroke="{COL["ink"]}" stroke-width="1.3"/>')
+    text(AX, CY + 7, '+', 22, weight='bold')
+    line([(BX, CY), (BX, 710), (AX, 710), (AX, CY + 19)])       # o_1 around layer 2
+    text((BX + AX) / 2, 728, 'o₁: residual path around layer 2', 11, fill=COL['soft'])
+    zx0, zy0, zx1, zy1 = L2 - 16, 222, L2 + 376, 668     # zoom marker
+    out.append(f'<rect x="{zx0}" y="{zy0}" width="{zx1 - zx0}" height="{zy1 - zy0}" rx="14" fill="none" '
+               f'stroke="#e65100" stroke-width="2" stroke-dasharray="8,5"/>')
+    text(zx0 + 8, zy1 + 20, 'one layer, zoomed in: pane B ▼', 12, anchor='start', fill='#e65100', weight='bold')
+
+    OX = AX + 17                                          # decoders, lmhead, sampling
+    TX = OX + 40
+    text(OX + 6, CY - 10, 'o', 13, anchor='start', weight='bold')
+    rows = ((300, 'text_dec', 'THINK'), (CY, 'voc_dec', 'HEAR'), (560, 'img_dec', 'SEE'))
+    line([(OX, CY), (TX, CY)], arrow=False)
+    dot(TX, CY)
+    line([(TX, rows[0][0]), (TX, rows[2][0])], arrow=False)
+    DX = TX + 30
+    HX = DX + 160
+    for y, nm, kind in rows:
+        line([(TX, y), (DX, y)])
+        text(DX + 62, y - 40, nm, 11, weight='bold')
+        xx = DX
+        for lab in ('7→5', '5→3', '3→1'):
+            box(xx, y - 30, 30, 60, COL['dec'], [lab], size=10, vertical=True)
+            if xx < DX + 90:
+                line([(xx + 30, y), (xx + 46, y)])
+            xx += 46
+        line([(xx - 16, y), (HX, y)])
+    box(HX, 250, 40, 360, COL['frozen'], ['lmhead 256→50304 (frozen, shared)'], hatch=True, vertical=True)
+    SX = HX + 66
+    for y, nm, kind in rows:
+        line([(HX + 40, y), (SX, y)])
+        box(SX, y - 28, 96, 56, COL['smp'], ['softmax', f'sample · {kind}'], size=11)
+    for i, (y, nm, kind) in enumerate(rows):            # nested feedback, no crossings
+        top = 160 - 16 * i
+        xr = SX + 96 + 12 + 12 * i
+        xl = 30 - 8 * i
+        line([(SX + 96, y), (xr, y), (xr, top), (xl, top), (xl, ys[i]), (40, ys[i])])
+    text(1150, 104, 'each stream\'s sample → its next input (training: the dataset\'s)', 11, fill=COL['soft'])
+
+    legend(30, 738, [(COL['frozen'], True, 'frozen: embedding / lmhead (pythia-31m)'),
+                     (COL['rep'], False, 'RMS norm (per sample, per position) · replicate'),
+                     (COL['cat'], False, 'channel concatenation'),
+                     (COL['lin'], False, 'conv 1×1 / 3×3 (linear): ctx_cat, linout'),
+                     (COL['cnn'], False, 'conv 3×3 + BatchNorm + ReLU'),
+                     (COL['dec'], False, 'decoder convs 3×3, 7→5→3→1 (linear)'),
+                     (COL['smp'], False, 'softmax + sample (+ <NUL> logit)')],
+           '(every layer\'s, reset to 0 at each example)', w=470)
+    for i, s in enumerate(('Only layer 1 sees the inputs: text, voice and image tokens and sound reach layer 2',
+                           'only through o₁. Layer 2 adds d₂ to o₁, and the decoders read the sum o.',
+                           'Layer 2 started as the identity (linout zero-initialized): v505 began exactly as',
+                           'the one-layer v504 at step 1,127,936.')):
+        text(560, 820 + 20 * i + (10 if i > 1 else 0), s, 12.5, anchor='start', fill='#424242')
+
+    out.append('<line x1="0" y1="1080" x2="1920" y2="1080" stroke="#9e9e9e" stroke-width="2"/>')
+
+    # ── pane B: one layer ──────────────────────────────────────────────────
+    out.append('<g transform="translate(0,1080)">')
+    text(30, 46, 'B · one recurrent layer (layers 1 and 2 have the same structure; only their inputs differ)', 22,
+         anchor='start', weight='bold')
+    text(30, 70, 'its own weights · its own two registers (an EMA over 512 ticks, then the residual copy) · old '
+         'register values read through per-sample RMSnorm · registers reset to 0 at each example', 13,
+         anchor='start', fill='#424242')
+    CYb, CXb = 400, 560
+    box(60, 140, 400, 210, '#f5f9ff', [], rx=8)
+    text(80, 166, 'layer 1 inputs', 14, anchor='start', weight='bold')
+    for i, s in enumerate(('token grids (text, voice, image): 3 × 256×7×7, RMS',
+                           'audio grid (log-mel): 256×7×7, RMS',
+                           'image grid (encoder): future')):
+        text(80, 194 + 24 * i, s, 12, anchor='start', fill='#9e9e9e' if 'future' in s else COL['ink'])
+    text(80, 290, 'concat: 3×256 + 256 + 2×512 = 2048', 12, anchor='start', weight='bold')
+    text(80, 312, 'ctx_cat 1×1: 2048 → 384', 12, anchor='start')
+    box(60, 390, 400, 130, '#f5f9ff', [], rx=8)
+    text(80, 416, 'layer 2 input', 14, anchor='start', weight='bold')
+    text(80, 442, 'o₁ (layer 1 output): 512×7×7, RMS', 12, anchor='start')
+    text(80, 466, 'concat: 512 + 2×512 = 1536', 12, anchor='start', weight='bold')
+    text(80, 488, 'ctx_cat 1×1: 1536 → 384', 12, anchor='start')
+    line([(460, 245), (CXb, 245)])
+    line([(460, 455), (CXb, 455)])
+    box(CXb, 120, 50, 780, COL['cat'], ['concat: the layer\'s inputs + its 2 registers (RMS)'], size=12,
+        vertical=True)
+    line([(CXb + 50, CYb), (660, CYb)])
+    box(660, CYb - 150, 44, 300, COL['lin'], ['ctx_cat 1×1 → 384'], size=12, vertical=True)
+    x = 750
+    line([(704, CYb), (x, CYb)])
+    for k in range(8):
+        box(x, CYb - 100, 40, 200, COL['cnn'], [f'{k + 1}'], size=11)
+        if k < 7:
+            line([(x + 40, CYb), (x + 62, CYb)])
+        x += 62
+    text(750 + (62 * 8 - 22) / 2, CYb - 116, 'ContextCNN: 8 × (conv 3×3 + BN + ReLU), 384→384', 14, weight='bold')
+    text(750 + (62 * 8 - 22) / 2, CYb + 124, '384×7×7 throughout', 11, fill=COL['soft'])
+    LX = x
+    line([(x - 22, CYb), (LX, CYb)])
+    box(LX, CYb - 150, 44, 300, COL['lin'], ['linout 3×3 384→512'], size=12, vertical=True)
+    BXb = LX + 200
+    line([(LX + 44, CYb), (BXb, CYb)], arrow=False)
+    dot(BXb, CYb)
+    text(BXb - 8, CYb - 10, 'x = 512×7×7', 11, anchor='end', fill=COL['soft'])
+    line([(BXb, CYb), (1880, CYb)])
+    box(1560, CYb - 160, 320, 120, '#ffffff', [], rx=8)
+    text(1576, CYb - 132, 'the layer\'s output x', 13, anchor='start', weight='bold')
+    text(1576, CYb - 108, 'layer 1: o₁, to layer 2 and the adder', 12, anchor='start')
+    text(1576, CYb - 86, 'layer 2: d₂, added to o₁ to give o', 12, anchor='start')
+    text(1576, CYb - 64, 'o: to the three decoders', 12, anchor='start')
+
+    y0, fx, ex = 600, 1120, 1330                         # the register cascade
+    out.append(f'<rect x="800" y="{y0}" width="660" height="270" rx="6" fill="#fffde7" stroke="#9e9e9e" '
+               f'stroke-dasharray="6,4"/>')
+    text(816, y0 + 22, 'residual cascade (Laplacian pyramid) · 2 × 512×7×7', 13, anchor='start', weight='bold')
+    text(816, y0 + 92, 'DFF_1: r ← r + (x − r)/512', 12, anchor='start')
+    text(816, y0 + 110, 'EMA, window 512 ticks (20.5 s)', 11, anchor='start', fill='#424242')
+    text(816, y0 + 218, 'DFF_2: r ← x − S_1', 12, anchor='start')
+    text(816, y0 + 236, 'residual copy (window 1)', 11, anchor='start', fill='#424242')
+    f1, f2 = y0 + 44, y0 + 172
+    c1y, s2y = f1 + 23, f2 + 23
+    out.append(f'<circle cx="{ex}" cy="{c1y}" r="26" fill="{COL["lmu"]}" stroke="{COL["ink"]}" stroke-width="1.2"/>')
+    text(ex, c1y - 2, 'EMA', 11, weight='bold')
+    text(ex, c1y + 12, '/512', 10)
+    line([(BXb, CYb), (BXb, s2y)], arrow=False)
+    dot(BXb, c1y)
+    line([(BXb, c1y), (ex + 28, c1y)])
+    line([(ex - 26, c1y), (fx + 66, c1y)])
+    flop(fx, f1, 'DFF_1', size='')
+    line([(1100, f1 + 16), (1100, f1 + 76), (ex, f1 + 76), (ex, c1y + 28)], dash=True, color='#757575')
+    out.append(f'<circle cx="{ex}" cy="{s2y}" r="16" fill="#ffffff" stroke="{COL["ink"]}" stroke-width="1.2"/>')
+    text(ex, s2y + 6, '−', 18, weight='bold')
+    line([(BXb, s2y), (ex + 18, s2y)])
+    dot(1280, c1y)
+    line([(1280, c1y), (1280, s2y - 44), (ex, s2y - 44), (ex, s2y - 18)])
+    text(1286, s2y - 50, 'S_1', 11, anchor='start', fill=COL['soft'])
+    line([(ex - 16, s2y), (fx + 66, s2y)])
+    flop(fx, f2, 'DFF_2', size='')
+    for qy, d in ((f1 + 16, 1100), (f2 + 16, None)):      # Q -> RMS -> concat
+        line([(fx, qy), (702, qy)])
+        if d:
+            dot(d, qy)
+        box(664, qy - 13, 36, 26, COL['rep'], ['RMS'], size=9.5)
+        line([(664, qy), (CXb + 52, qy)])
+    text(700, f1 - 2, 'old registers (t−1)', 10.5, fill=COL['soft'])
+
+    legend(30, 600, [(COL['rep'], False, 'RMS norm (per sample, per position)'),
+                     (COL['cat'], False, 'channel concatenation'),
+                     (COL['lin'], False, 'conv 1×1 / 3×3 (linear)'),
+                     (COL['cnn'], False, 'conv 3×3 + BatchNorm + ReLU'),
+                     (COL['lmu'], False, 'EMA r ← r + (x − r)/W, W = 512 ticks'),
+                     ('#ffffff', False, '(−) subtractor: x minus the EMA as just written')],
+           '(reset to 0 at each example)', w=470)
+    out.append('</g>')
+    out.append('</svg>')
+    open(a.out or f'docs/figures/vla_{a.model}.svg', 'w').write('\n'.join(out))
+
+
+if a.model == 'v505':
+    draw_v505()
+    raise SystemExit(0)
 
 # ── canvas ────────────────────────────────────────────────────────────────────
 out.append(f'<svg xmlns="http://www.w3.org/2000/svg" width="{W}" height="{H}" viewBox="0 0 {W} {H}" '
