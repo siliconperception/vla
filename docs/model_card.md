@@ -66,19 +66,19 @@ continuing and new weights are pushed here from time to time, each tagged with i
 
 ## Training
 
-- From scratch: 120,000 steps × 250 rows, one token per row per step (30 M tokens), plain SGD.
+- From scratch: 220,000 steps × 250 rows, one token per row per step (55 M tokens), plain SGD.
 - Learning rate: a half-cosine rise from 4e-4 to 0.02 over the first 20,000 steps, then held. Truncated
   backpropagation through time over 16 steps; the loss is normalized per word rather than per token.
 - Data: FineWeb sample-10BT, text only. Every document starts from a zero state (registers and ring).
 
-## Evaluation (at the published step, 120,000)
+## Evaluation (at the published step, 220,000)
 
 | | Score |
 |---|---|
-| FineWeb held-out (100 documents, nats/token) | 5.402 |
-| BabyLM 2026 dev (100 pieces, nats/token) | 5.192 |
-| BLiMP (1,005 pairs from all 67 paradigms) | 64.1 % |
-| ComVE (999 pairs, common-sense) | 60.8 % |
+| FineWeb held-out (100 documents, nats/token) | 5.193 |
+| BabyLM 2026 dev (100 pieces, nats/token) | 5.005 |
+| BLiMP (1,005 pairs from all 67 paradigms) | 67.3 % |
+| ComVE (999 pairs, common-sense) | 61.3 % |
 
 The BLiMP and ComVE pairs are scored the same way as for these reference models (each sentence read without
 context; the lower total loss wins):
@@ -89,7 +89,7 @@ context; the lower total loss wins):
 | pythia-31m | 31 M | 71.1 | 66.9 |
 | babyllama-10m-2024 | trained on 10 M words | 70.0 | 63.7 |
 | SmolLM2-135M | 135 M | 80.9 | 79.3 |
-| **this model** | 20.7 M trained, 30 M tokens seen | 64.1 | 60.8 |
+| **this model** | 20.7 M trained, 55 M tokens seen | 67.3 | 61.3 |
 
 The reference models have seen far more text (pythia: 300 B tokens). A comparison with pythia-70m at matched
 training tokens is in preparation.
