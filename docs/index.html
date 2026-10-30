@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Recurrent CNN VLA</title>
-<meta name="description" content="A recurrent CNN vision-language-action model with a fixed-size state, designed for a single chip running at up to 500 Hz with deterministic latency. Open source (MIT) by Silicon Perception Inc.">
+<meta name="description" content="A recurrent CNN vision-language-action model with a fixed-size state, designed for a single battery-powered chip running at up to 500 Hz with low, deterministic latency. Open source (MIT) by Silicon Perception Inc.">
 <style>
   :root {
     --bg: #fbfaf7; --fg: #1d1d1f; --muted: #5f5f66; --rule: #e3e1db; --card: #ffffff;
@@ -70,13 +70,16 @@
   <header>
     <p class="kicker">Silicon Perception Inc · open source</p>
     <h1>A recurrent CNN vision-language-action model</h1>
-    <p class="lede">The goal is a vision-language-action model on a single chip that runs at very high frame rates,
-    up to 500&nbsp;Hz, with deterministic latency, so it can sit inside an embedded control loop. Single chip means
-    no external components: no off-chip memory, every weight stored on the chip itself.</p>
-    <p class="lede">Two properties make that possible. The model's state has a fixed size, so every tick does
-    exactly the same work and finishes in the same time, however long the model has been running. And a CNN is
-    parameter-efficient: the same small kernels run at every grid position and every tick, so about twenty million
-    weights drive a state of 150,528 values.</p>
+    <p class="lede">The applications this is for do not need superintelligence. They need conversational common
+    sense, grounded in and modulated by what the device perceives: sound, video, touch. But they need it fast:
+    frame rates up to 500&nbsp;Hz, with low and deterministic latency, so the model can sit inside an embedded control
+    loop, and on a power budget a battery can supply.</p>
+    <p class="lede">That rules out a large model streaming its weights from external DRAM. The goal is a
+    vision-language-action model on a single chip: a CNN is parameter-efficient enough that every weight fits in
+    on-chip SRAM, so there is no external memory, and the weights stay programmable. The same small kernels run at
+    every grid position and every tick, so about twenty million weights drive a state of 150,528 values.</p>
+    <p class="lede">The state also has a fixed size. Every tick does exactly the same work and finishes in the same
+    time, however long the model has been running.</p>
     <nav class="links">
       <a href="https://github.com/siliconperception/vla">Code on GitHub</a>
       <a href="https://huggingface.co/siliconperception/vla_v502">Model on Hugging Face</a>
@@ -98,7 +101,7 @@
   <div class="facts">
     <div class="fact"><b>500 Hz</b><span>target tick rate on one chip, with the same work every tick</span></div>
     <div class="fact"><b>150,528</b><span>values of state, fixed in size: 2 registers and a 1,024-entry ring</span></div>
-    <div class="fact"><b>20.7 M</b><span>trained parameters, small enough to keep every weight on-chip</span></div>
+    <div class="fact"><b>20.7 M</b><span>trained parameters, small enough to hold every weight in on-chip SRAM</span></div>
     <div class="fact"><b>0</b><span>positional encodings; the state is reset only at the start of an example</span></div>
   </div>
 
