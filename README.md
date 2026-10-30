@@ -5,12 +5,17 @@ grids of 512 × 7 × 7 and a ring holding a small entry for each of the last 1,0
 convolutional network reads the current token (and, in multimodal runs, the current image and sound), the
 registers and one attention read of the ring, writes the registers back and appends a new entry to the ring.
 
-The design target is a vision-language-action model on a single chip running at very high frame rates, up to
-500 Hz, with deterministic latency, so that it can sit inside an embedded control loop. Single chip means no
-external components: no off-chip memory, every weight stored on the chip itself. Two properties make that
-possible: the state never grows, so every tick does the same work in the same time; and a CNN is
-parameter-efficient, one set of small convolution kernels reused at every grid position and every tick, so about
-twenty million weights drive a state of 150,528 values.
+The intended applications do not need superintelligence. They need conversational common sense, grounded in and
+modulated by what the device perceives: sound, video, touch. But they need it fast: frame rates up to 500 Hz,
+with low and deterministic latency, so the model can sit inside an embedded control loop, and on a power budget a
+battery can supply.
+
+That rules out a large model streaming its weights from external DRAM. The design target is a
+vision-language-action model on a single chip: a CNN is parameter-efficient enough that every weight fits in
+on-chip SRAM, so there is no external memory, and the weights stay programmable. One set of small convolution
+kernels is reused at every grid position and every tick, so about twenty million weights drive a state of
+150,528 values. And the state never grows, so every tick does the same work in the same time, however long the
+model has been running.
 
 ![One clock tick of the VLA](docs/figures/vla_v502.svg)
 

@@ -17,10 +17,14 @@ datasets:
 A language model with a fixed-size state and no positional encoding. Its memory is two 2-D registers of
 512 × 7 × 7 and a ring holding a small entry for each of the last 1,024 ticks. Every tick, one convolutional
 network reads the current token, the registers and one attention read of the ring, writes the registers back
-and appends a new entry to the ring, dropping the oldest. It is the text-trained core of a vision-language-action
-design aimed at a single chip running at up to 500 Hz with deterministic latency, for embedded control, with no
-external components: no off-chip memory, every weight stored on the chip. The fixed-size state makes every tick
-the same work, and a CNN is parameter-efficient: the same small kernels run at every grid position and every tick.
+and appends a new entry to the ring, dropping the oldest.
+
+It is the text-trained core of a vision-language-action design. The intended applications do not need
+superintelligence; they need conversational common sense, grounded in and modulated by what the device perceives
+(sound, video, touch), at frame rates up to 500 Hz, with low and deterministic latency for embedded control, on a
+power budget a battery can supply. So the target is a single chip with no external DRAM: a CNN is
+parameter-efficient enough that every weight fits in on-chip SRAM, where the weights stay programmable, and the
+fixed-size state makes every tick the same work.
 
 Code, functional spec and figures: [github.com/siliconperception/vla](https://github.com/siliconperception/vla)
 
