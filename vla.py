@@ -3448,13 +3448,16 @@ def _tune_state(P, iters, cap, nat):
     """--prompt_tune: the initial registers h0 [b, ...] optimized by Adam (--prompt_tune_lr),
     BPTT through the prompt ids P [b, T] with the weights frozen, so the model predicts P
     from h0. cap > 0 holds each register's RMS to at most cap x nat [K] (its natural level)
-    after every step. -> (h0, 'iter:nats ...' at log points)."""
+    after every step. --attn: only the registers are tuned; the recall ring starts empty, as at
+    every example start. -> (h0, 'iter:nats ...' at log points)."""
     dev = P.device
-    h0 = torch.zeros_like(model.new_state(P.shape[0], dev), requires_grad=True)
+    full = model.new_state(P.shape[0], dev)
+    h0 = torch.zeros_like(model.regs(full), requires_grad=True)
+    ring = full[:, h0.shape[1]:]                 # empty (zero); no channels without --attn
     opt = torch.optim.Adam([h0], lr=args.prompt_tune_lr)
     log = []
     for it in range(iters + 1):
-        h, loss = h0, 0.0
+        h, loss = torch.cat([h0, ring], 1), 0.0
         for t in range(P.shape[1] - 1):
             h, o = model.step(P[:, t], h)
             loss = loss + F.cross_entropy(model.text_dec(o).float(), P[:, t + 1])
@@ -3470,7 +3473,7 @@ def _tune_state(P, iters, cap, nat):
             with torch.no_grad():
                 f = (cap * nat / _reg_rms(h0).clamp(min=1e-8)).clamp(max=1.0)
                 h0.mul_(f.repeat_interleave(model.n_hidden, 1)[:, :, None, None])
-    h0 = h0.detach()
+    h0 = torch.cat([h0.detach(), ring], 1)
     if dev.type == 'cuda':
         torch.cuda.empty_cache()             # BPTT's peak, returned to a GPU shared with a trainer
     return h0, ' '.join(log)
