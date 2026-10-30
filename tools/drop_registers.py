@@ -27,6 +27,8 @@ a = ap.parse_args()
 
 ck = torch.load(a.src, map_location='cpu', weights_only=True)
 sd, sa = ck['state_dict'], dict(ck['saved_args'])
+if int(sa.get('layers') or 1) > 1:
+    raise SystemExit('--layers over 1: only the first layer\'s registers are handled here')
 wins = [float(w) for w in str(sa['ctx_ema']).split(',')]
 K, N = len(wins), int(sa['n_hidden'])
 keep = sorted({int(k) - 1 for k in a.keep.split(',') if k.strip()}) if a.keep else list(range(K))

@@ -299,6 +299,13 @@ parser.add_argument('--ctx_ema',    default='256,64,16,4,1', metavar='W1,W2,...'
                     help='register windows in tokens, slowest first: register k blends at '
                          'rate 1/W_k toward the layer output minus registers 1..k-1, so with a '
                          'last window of 1 the registers sum exactly to the output')
+parser.add_argument('--layers', default=1, type=int, metavar='L',
+                    help='recurrent layers in series, each a full state update (ctx_cat, --depth convs, '
+                         'linout) with its own --ctx_ema registers. Layer l > 1 reads the token grid, '
+                         'the output of the layer below and its own registers (each RMS-normalized per '
+                         'position) and adds its output to the one below; the decoders read the sum. '
+                         'A new layer\'s linout starts at zero, so adding one to a --load checkpoint '
+                         'starts from the same function. Restored by --load')
 parser.add_argument('--read_rmsnorm', default=False, action=argparse.BooleanOptionalAction,
                     help='read each register through a per-sample RMSnorm over its channels at every grid '
                          'position (as the token, image and recall grids), times --ctx_read_norm, instead '
@@ -775,7 +782,8 @@ _ONESHOT = (args.generate or args.eval or args.vis or args.push or args.free_run
 _ARCH_ARGS = ('context', 'n_hidden', 'c_context', 'depth', 'kernel', 'tokenizer', 'ctx_ema',
               'ctx_read_norm', 'dec_tree_kernels', 'dec_width', 'bn_momentum', 'init',
               'image_encoder', 'audio_encoder', 'streams', 'linout_kernel', 'learn_win',
-              'learn_regs', 'lmu', 'attn', 'attn_ch', 'attn_heads', 'attn_dim', 'attn_age', 'read_rmsnorm')
+              'learn_regs', 'lmu', 'attn', 'attn_ch', 'attn_heads', 'attn_dim', 'attn_age', 'read_rmsnorm',
+              'layers')
 
 
 def _parse_mix():
@@ -1869,9 +1877,44 @@ class RecallAttention(nn.Module):
         return torch.cat([ring[:, self.R:], self.entry(torch.cat([tok_grid, o], 1))], 1)
 
 
+def _rms_pos(x, eps=1e-6):
+    """x [B, C, S, S] scaled to unit RMS over its channels at every grid position."""
+    return x * torch.rsqrt(x.pow(2).mean(dim=1, keepdim=True) + eps)
+
+
+class UpperLayer(nn.Module):
+    """--layers L: one of the layers above the first. Reads the token grid, the output of the
+    layer below and its own registers (each RMS-normalized per position), and returns its addend
+    d = linout(context(ctx_cat(...))): the layer's output is the one below plus d, and its
+    registers hold d (the first layer's cascade, same windows). ctx_cat starts as I from the
+    layer below's output (the other blocks zero) and linout at zero, so a new layer starts as the
+    identity and a trained model it is added to keeps its function."""
+
+    def __init__(self, c_tok, n_hidden, c_context, depth, kernel, bn_momentum, linout_kernel, K):
+        super().__init__()
+        self.K = K
+        self.ctx_cat = nn.Conv2d(c_tok + n_hidden + K * n_hidden, c_context, 1)
+        with torch.no_grad():
+            self.ctx_cat.weight.zero_()
+            n = min(n_hidden, c_context)
+            self.ctx_cat.weight[:n, c_tok:c_tok + n, 0, 0] = torch.eye(n)
+            self.ctx_cat.bias.zero_()
+        self.context = ContextCNN(c_context, depth, kernel, bn_momentum)
+        self.linout = nn.Conv2d(c_context, n_hidden, linout_kernel, padding=linout_kernel // 2)
+        with torch.no_grad():
+            self.linout.weight.zero_()
+            self.linout.bias.zero_()
+
+    def forward(self, tok_grid, below, regs):
+        """tok_grid [B, c_tok, S, S], below [B, N, S, S], regs [B, K*N, S, S] -> d [B, N, S, S]."""
+        reads = [_rms_pos(r) for r in regs.chunk(self.K, dim=1)] if self.K else []
+        return self.linout(self.context(self.ctx_cat(torch.cat([tok_grid, _rms_pos(below)] + reads, 1))))
+
+
 class VLAModel(nn.Module, _HubMixin):
     """One recurrent layer with K DFF registers, held concatenated as one
     [B, K*n_hidden, S, S] tensor (self.dff, detached every step: gradient horizon 1 token).
+    --layers L: L-1 UpperLayers in series above it, their registers after the first layer's.
 
     step:  inputs   token grid                                        [c_text, S, S]
                     image feature map (zeros for text-only rows)      [2048, S, S]
@@ -1891,7 +1934,7 @@ class VLAModel(nn.Module, _HubMixin):
                  image_encoder='none', audio_encoder='none', nul_head=False, streams=1,
                  text_nul=False, surprise=None, linout_kernel=1, learn_win=False,
                  learn_regs=(), lmu=False, attn=0, attn_ch=2, attn_heads=8, attn_dim=64, attn_age=True,
-                 read_rmsnorm=False):
+                 read_rmsnorm=False, layers=1):
         super().__init__()
         from transformers import AutoModelForCausalLM
         repo = _TOKENIZERS[tokenizer]
@@ -2012,6 +2055,15 @@ class VLAModel(nn.Module, _HubMixin):
         self.etr, self.etr_on, self.etr_inject = None, False, False
         self.register_buffer('surp_mean', torch.zeros(()))     # running mean surprise; 0 = unset
         self.register_buffer('gain_mean', torch.zeros(()))     # 'rat': running mean gain; 0 = unset
+        # --layers: the layers above the first; the state holds every layer's registers in turn
+        layers = int(layers or 1)
+        if layers < 1:
+            raise SystemExit(f'--layers {layers}: at least 1')
+        if layers > 1 and (lmu or learn_win or surprise):
+            raise SystemExit('--layers over 1 does not combine with --lmu, --learn_win or --write_surprise')
+        self.up = nn.ModuleList(UpperLayer(self.c_text, n_hidden, c_context, depth, kernel, bn_momentum,
+                                           lk, self.K) for _ in range(layers - 1))
+        self.ring_off = n_hidden * self.K * layers   # the registers of every layer, then the ring
         self.dff = None              # [B, K*n_hidden, S, S], detached; None until first step
         self._ablate = None          # --eval_info: registers read as their mean ...
         self._read_mean = None       # ... which is this [1, K*n_hidden, S, S] tensor
@@ -2046,7 +2098,7 @@ class VLAModel(nn.Module, _HubMixin):
     def new_state(self, B, device):
         """[B, K*n_hidden (+ --attn W*R), S, S]: the registers, then the recall entries (always
         zero: an empty slot)."""
-        shape = (B, self.n_hidden * self.K, self.S, self.S)
+        shape = (B, self.ring_off, self.S, self.S)
         if self.init_mode == 'gaussian':
             h = torch.randn(shape, device=device)
         elif self.init_mode == 'relu':
@@ -2058,8 +2110,13 @@ class VLAModel(nn.Module, _HubMixin):
         return h
 
     def regs(self, dff):
-        """The K registers of a state (--attn: without the recall entries)."""
-        return dff[:, :self.n_hidden * self.K] if self.attn is not None else dff
+        """The first layer's K registers of a state (without --layers' upper registers and --attn's
+        recall entries)."""
+        return dff[:, :self.n_hidden * self.K] if self.attn is not None or self.up else dff
+
+    def all_regs(self, dff):
+        """Every layer's registers (without --attn's recall entries)."""
+        return dff[:, :self.ring_off]
 
     def image_grid(self, views):
         """Encoder views [N, 3, 224, 224] -> image grid [N, 2048, S, S], each position
@@ -2151,6 +2208,15 @@ class VLAModel(nn.Module, _HubMixin):
             regs = [r * (self.read_norm / (sc[k] + 1e-12)) for k, r in enumerate(regs)]
         return regs
 
+    def _cascade(self, o, dff):
+        """--layers: an upper layer's registers dff written from its addend o, as _write's cascade
+        (the same windows, no --learn_win / --write_surprise)."""
+        new = []
+        for k, p in enumerate(dff.chunk(self.K, dim=1)):
+            inp = o - sum(new) if k else o
+            new.append(p + self.rate[k] * (inp - p))
+        return torch.cat(new, dim=1)
+
     def _write(self, o, dff, gain=None):
         """Laplacian-pyramid cascade: register k blends toward o minus registers 1..k-1 as
         just written. gain [B] (--write_surprise) scales the rate of every register but the
@@ -2229,7 +2295,9 @@ class VLAModel(nn.Module, _HubMixin):
 
     def step(self, idx, dff, img=None, aud=None):
         """One token for every row: -> (new state, layer output). No detach."""
-        ring = dff[:, self.n_hidden * self.K:] if self.attn is not None else None
+        ring = dff[:, self.ring_off:] if self.attn is not None else None
+        nk = self.n_hidden * self.K
+        ups = [dff[:, nk * (i + 1):nk * (i + 2)] for i in range(len(self.up))]
         dff = self.regs(dff)
         gain = self._gain(idx, dff) if self.surprise else None
         inj = None
@@ -2246,8 +2314,13 @@ class VLAModel(nn.Module, _HubMixin):
         x = self.ctx_cat(torch.cat(ins + self._read(dff, inj), dim=1))
         o = self.linout(self.context(x))
         new = self._write(o, dff, gain)
+        o1 = o
+        for u, h in zip(self.up, ups):                 # --layers: in series, each adding to o
+            d = u(ins[0], o, h)
+            new = torch.cat([new, self._cascade(d, h)], 1)
+            o = o + d
         if self.attn is not None:
-            new = torch.cat([new, self.attn.write(ring, ins[0], o)], 1)
+            new = torch.cat([new, self.attn.write(ring, ins[0], o1)], 1)
         return new, o
 
     def forward(self, idx, targets=None, flag=None, img=None, aud=None, keep=0.0, graph=False):
@@ -3230,7 +3303,8 @@ model = VLAModel(S=args.context, n_hidden=args.n_hidden, c_context=args.c_contex
                  learn_win=args.learn_win,
                  learn_regs=[int(k) for k in str(args.learn_regs or '').split(',') if k.strip()],
                  lmu=args.lmu, attn=args.attn, attn_ch=args.attn_ch, attn_heads=args.attn_heads,
-                 attn_dim=args.attn_dim, attn_age=args.attn_age, read_rmsnorm=args.read_rmsnorm)
+                 attn_dim=args.attn_dim, attn_age=args.attn_age, read_rmsnorm=args.read_rmsnorm,
+                 layers=args.layers)
 if _loaded_ckpt is not None:
     _sd = _upgrade_state_dict(_loaded_ckpt['state_dict'])
     if _aud_switch:
@@ -3238,6 +3312,11 @@ if _loaded_ckpt is not None:
     if model.streams == 3 and 'voc_dec.proj.weight' not in _sd:
         _sd = _widen_state_dict(_sd, model)
     missing, unexpected = model.load_state_dict(_sd, strict=False)
+    _new_up = sorted({k.split('.')[1] for k in missing if k.startswith('up.')})
+    if _new_up and not any(k.startswith(f'up.{i}.') for k in _sd for i in _new_up):
+        print(f'--layers {args.layers}: layer(s) {", ".join(str(int(i) + 2) for i in _new_up)} new, '
+              f'starting as the identity (linout zero)', flush=True)
+        missing = [k for k in missing if not k.startswith('up.')]
     if 'win_theta' in missing:
         print(f'--learn_win: windows start at {model.windows}', flush=True)
     bad = [k for k in missing if not re.match(r'(text|voc|img)_dec\.nul\.|surp_mean$|gain_mean$|win_theta$', k)] + \
@@ -3343,6 +3422,14 @@ def _model_graph(model):
                             inp=f'{"+".join(map(str, model.in_widths + ([model.att_width] if model.attn else [])))}'
                                 f'+{model.K}x{model.n_hidden} x{S}x{S}',
                             out=r['inp'], tr=0, fr=0))
+        m = re.match(r'up\.(\d+)\.ctx_cat$', r['name'])
+        if m:
+            L = int(m.group(1)) + 2
+            ur = [f'L{L} DFF_{k + 1}[t-1]' for k in range(model.K)]
+            out.append(dict(name=', '.join(['(token grid)', f'o (layer {L - 1} output)'] + ur),
+                            op='RMSnorm per position (o, registers), Concat (channels)',
+                            inp=f'{model.c_text}+{model.n_hidden}+{model.K}x{model.n_hidden} x{S}x{S}',
+                            out=r['inp'], tr=0, fr=0))
         if r['name'].startswith('attn.'):
             a = model.attn
             ring = f'RING[t-1] ({a.W} entries of {a.R}x{S}x{S})'
@@ -3367,6 +3454,16 @@ def _model_graph(model):
         if r['name'] == 'tok_embed':
             out.append(dict(name='(token grid)', op=f'RMSnorm, replicate 1x1 -> {S}x{S}',
                             inp=r['out'], out=f'{r["out"]}x{S}x{S}', tr=0, fr=0))
+        m = re.match(r'up\.(\d+)\.linout$', r['name'])
+        if m:
+            L = int(m.group(1)) + 2
+            ur = [f'L{L} DFF_{k + 1}' for k in range(model.K)]
+            for k, (g, w) in enumerate(zip(ur, model.windows)):
+                src = r['name'] + (f' - ({" + ".join(f"{q}[t]" for q in ur[:k])})' if k else '')
+                out.append(dict(name=f'{g}[t] <- {src}', op='Write (replace)' if w <= 1 else
+                                f'Write (EMA w={w:g})', inp=H, out=H, tr=0, fr=0))
+            out.append(dict(name=f'o <- o + {r["name"]} (layer {L} output)', op='Add', inp=H, out=H,
+                            tr=0, fr=0))
         if r['name'] == 'linout':
             lmu = {k: (gi, i, ks) for gi, ks in enumerate(model.lmu) for i, k in enumerate(ks)}
             for k, (g, w) in enumerate(zip(regs, model.windows)):
@@ -3440,8 +3537,9 @@ def _prompt_ids(text=''):
 
 
 def _reg_rms(h):
-    """Each register's RMS per row: [b, n_hidden * K, S, S] -> [b, K]."""
-    return torch.stack([r.pow(2).mean(dim=(1, 2, 3)).sqrt() for r in model.regs(h).chunk(model.K, dim=1)], 1)
+    """Each register's RMS per row, every layer's: [b, ...] -> [b, K * layers]."""
+    return torch.stack([r.pow(2).mean(dim=(1, 2, 3)).sqrt()
+                        for r in model.all_regs(h).chunk(model.K * (1 + len(model.up)), dim=1)], 1)
 
 
 def _tune_state(P, iters, cap, nat):
@@ -3452,7 +3550,7 @@ def _tune_state(P, iters, cap, nat):
     every example start. -> (h0, 'iter:nats ...' at log points)."""
     dev = P.device
     full = model.new_state(P.shape[0], dev)
-    h0 = torch.zeros_like(model.regs(full), requires_grad=True)
+    h0 = torch.zeros_like(model.all_regs(full), requires_grad=True)
     ring = full[:, h0.shape[1]:]                 # empty (zero); no channels without --attn
     opt = torch.optim.Adam([h0], lr=args.prompt_tune_lr)
     log = []
@@ -4020,7 +4118,8 @@ if args.vis:
     _VIS_WIN = 180                                   # ticker width in characters
     plt.style.use('dark_background')
     plt.ion()
-    rows = 1 + model.K
+    nup = len(model.up)
+    rows = 1 + model.K * (1 + nup)
     at = model.attn
     nb = 2 if at is not None else 0                  # --attn: ring and attention strips below
     fig = plt.figure(figsize=(max(7.5, _VIS_WIN * 7 * 0.602 / 72 * 1.05), 2.6 * rows + 1.8 * nb + 1.2))
@@ -4039,10 +4138,12 @@ if args.vis:
     else:
         ax_p = fig.add_subplot(gs[:rows, 1])
     for r, ax in enumerate(axes):
-        w = model.windows[r - 1] if r else None
+        L, k = divmod(r - 1, model.K) if r else (0, 0)
+        w = model.windows[k] if r else None
         ax.set_title('output' if r == 0 else
-                     f'DFF {r}: ' + ('copy (residual of the others)' if w == 1 and model.K > 1 else
-                                     f'{w:g}-token window'), fontsize=9, pad=3)
+                     (f'L{L + 1} ' if nup else '') + f'DFF {k + 1}: ' +
+                     ('copy (residual of the others)' if w == 1 and model.K > 1 else
+                      f'{w:g}-token window'), fontsize=9, pad=3)
     ax_p.set_title('P(next token)', fontsize=9, pad=3)
     ax_ring = ax_att = None
     if at is not None:
@@ -4086,8 +4187,8 @@ if args.vis:
         else:
             b = int(torch.multinomial(_truncate(prob), 1).item())
             cur = (cur + [b])[-2 * _VIS_WIN:]
-        regs = model.regs(dff)
-        maps = [o] + (list(regs.chunk(model.K, dim=1)) if model.K else [])
+        regs = model.all_regs(dff)
+        maps = [o] + (list(regs.chunk(model.K * (1 + nup), dim=1)) if model.K else [])
         for r, t in enumerate(maps):
             m = t[0].std(dim=0).float().cpu().numpy()
             vmax[r] = float(m.max()) if vmax[r] is None else max(float(m.max()), 0.98 * vmax[r])
@@ -4108,7 +4209,7 @@ if args.vis:
         img_p.set_clim(0, float(pg.max()) or 1e-9)
         extra = ''
         if at is not None:
-            ring = dff[0, model.n_hidden * model.K:].reshape(at.W, at.E).T.float().cpu().numpy()
+            ring = dff[0, model.ring_off:].reshape(at.W, at.E).T.float().cpu().numpy()
             a = float(np.abs(ring).max())
             rmax = a if rmax is None else max(a, 0.98 * rmax)
             if img_ring is None:
@@ -4121,7 +4222,7 @@ if args.vis:
             img_att.set_data(p.numpy())
             img_att.set_clim(0.0, float(p.max()) or 1e-9)
             eff = float((-(p * p.clamp(min=1e-30).log()).sum(-1)).exp().mean())
-            nfill = int((dff[0, model.n_hidden * model.K:].reshape(at.W, at.E).abs().amax(-1) > 0).sum())
+            nfill = int((dff[0, model.ring_off:].reshape(at.W, at.E).abs().amax(-1) > 0).sum())
             extra = (f'  ring {nfill:4d}/{at.W}  sink {float(p[:, -1].mean()):5.3f}  '
                      f'slots read {eff:6.1f}')
         ticker = ''.join(DOT_TEXT if c in '$\\' else c for c in _render(cur))[-_VIS_WIN:]
