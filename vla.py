@@ -1821,6 +1821,8 @@ class RecallAttention(nn.Module):
         self.age = nn.Parameter(torch.randn(W, dk) * 0.02) if age else None
         self.out = nn.Linear(H * dk, c_out)
         self.probe = None             # --attn_probe: an accumulator dict and the probe switches
+        self.keep = False             # --vis: keep the last read's weights in last_p [B, H, W+1]
+        self.last_p = None
 
     def read(self, tok, ring):
         """tok [B, c_tok] the current token (RMS-normalized), ring [B, W*R, S, S] -> [B, c_out].
@@ -1855,7 +1857,10 @@ class RecallAttention(nn.Module):
             pr['eff'] += (-(ps * ps.clamp(min=1e-30).log()).sum(-1)).exp().sum(0)   # [H] e^entropy
             pr['nvalid'] += float((vf.sum(1) + 1).sum())
             pr['reads'] += B
-        p = sc.softmax(-1)[..., :-1]
+        p = sc.softmax(-1)
+        if self.keep:
+            self.last_p = p
+        p = p[..., :-1]
         a = self.out(torch.einsum('bhw,bwd->bhd', p, v).reshape(B, self.H * self.dk))
         return a * torch.rsqrt(a.pow(2).mean(dim=1, keepdim=True) + 1e-12)    # RMSnorm, as the token grid
 
@@ -4013,9 +4018,12 @@ if args.vis:
     plt.style.use('dark_background')
     plt.ion()
     rows = 1 + model.K
-    fig = plt.figure(figsize=(max(7.5, _VIS_WIN * 7 * 0.602 / 72 * 1.05), 2.6 * rows + 1.2))
-    gs = fig.add_gridspec(rows, 2, width_ratios=[1, 1.5], top=0.84, bottom=0.04, left=0.03,
-                          right=0.98, hspace=0.25, wspace=0.10)
+    at = model.attn
+    nb = 2 if at is not None else 0                  # --attn: ring and attention strips below
+    fig = plt.figure(figsize=(max(7.5, _VIS_WIN * 7 * 0.602 / 72 * 1.05), 2.6 * rows + 1.8 * nb + 1.2))
+    gs = fig.add_gridspec(rows + nb, 2, width_ratios=[1, 1.5], height_ratios=[1] * rows + [0.8] * nb,
+                          top=0.84 if not nb else 0.88, bottom=0.04, left=0.03, right=0.98,
+                          hspace=0.35, wspace=0.10)
     axes = [fig.add_subplot(gs[r, 0]) for r in range(rows)]
     if _image is not None:                           # the prompt image above P(next token)
         ki = max(1, rows // 3)
@@ -4024,14 +4032,25 @@ if args.vis:
         ax_i.set_axis_off()
         ax_i.set_title(f'image  {os.path.basename(args.image)}  '
                        f'({_image.shape[2]}x{_image.shape[1]})', fontsize=9, pad=3)
-        ax_p = fig.add_subplot(gs[ki:, 1])
+        ax_p = fig.add_subplot(gs[ki:rows, 1])
     else:
-        ax_p = fig.add_subplot(gs[:, 1])
+        ax_p = fig.add_subplot(gs[:rows, 1])
     for r, ax in enumerate(axes):
-        ax.set_title('output' if r == 0 else f'DFF {r}: {model.windows[r - 1]:g}-token window',
-                     fontsize=9, pad=3)
+        w = model.windows[r - 1] if r else None
+        ax.set_title('output' if r == 0 else
+                     f'DFF {r}: ' + ('copy (residual of the others)' if w == 1 and model.K > 1 else
+                                     f'{w:g}-token window'), fontsize=9, pad=3)
     ax_p.set_title('P(next token)', fontsize=9, pad=3)
-    for ax in axes + [ax_p]:
+    ax_ring = ax_att = None
+    if at is not None:
+        at.keep = True
+        ax_ring = fig.add_subplot(gs[rows, :])
+        ax_ring.set_title(f'recall ring: {at.W} entries of {at.R}x{model.S}x{model.S} '
+                          f'(oldest left, newest right; empty slots are 0)', fontsize=9, pad=3)
+        ax_att = fig.add_subplot(gs[rows + 1, :])
+        ax_att.set_title(f'recall attention this tick: {at.H} heads over the {at.W} slots, '
+                         f'sink at the far right', fontsize=9, pad=3)
+    for ax in axes + [ax_p] + [x for x in (ax_ring, ax_att) if x is not None]:
         ax.set_xticks([])
         ax.set_yticks([])
     fig.text(0.03, 0.008, f'maps: std across the {model.n_hidden} channels at each of the '
@@ -4051,6 +4070,8 @@ if args.vis:
     dff = model.new_state(1, dev)
     bank = _bank([_image], dev) if _image is not None else None
     imgs, vmax, img_p, nstep = [None] * rows, [None] * rows, None, 0
+    img_ring = img_att = None
+    rmax = None
     while not _exit[0] and plt.fignum_exists(fig.number):
         with torch.no_grad():
             img = model.image_grid(_views(*bank)) if bank is not None else None
@@ -4062,12 +4083,15 @@ if args.vis:
         else:
             b = int(torch.multinomial(_truncate(prob), 1).item())
             cur = (cur + [b])[-2 * _VIS_WIN:]
-        maps = [o] + list(model.regs(dff).chunk(model.K, dim=1))
+        regs = model.regs(dff)
+        maps = [o] + (list(regs.chunk(model.K, dim=1)) if model.K else [])
         for r, t in enumerate(maps):
             m = t[0].std(dim=0).float().cpu().numpy()
             vmax[r] = float(m.max()) if vmax[r] is None else max(float(m.max()), 0.98 * vmax[r])
             if imgs[r] is None:
                 imgs[r] = axes[r].matshow(m, cmap=args.cmap)
+                axes[r].set_xticks([])
+                axes[r].set_yticks([])
             imgs[r].set_data(m)
             imgs[r].set_clim(0.0, vmax[r] or 1e-9)
         pg = np.zeros(PR * PC, dtype=np.float32)
@@ -4075,12 +4099,32 @@ if args.vis:
         pg = pg.reshape(PR, PC)
         if img_p is None:
             img_p = ax_p.matshow(pg, cmap=args.cmap)
+            ax_p.set_xticks([])
+            ax_p.set_yticks([])
         img_p.set_data(pg)
         img_p.set_clim(0, float(pg.max()) or 1e-9)
+        extra = ''
+        if at is not None:
+            ring = dff[0, model.n_hidden * model.K:].reshape(at.W, at.E).T.float().cpu().numpy()
+            a = float(np.abs(ring).max())
+            rmax = a if rmax is None else max(a, 0.98 * rmax)
+            if img_ring is None:
+                img_ring = ax_ring.imshow(ring, cmap='RdBu_r', aspect='auto', interpolation='nearest')
+            img_ring.set_data(ring)
+            img_ring.set_clim(-(rmax or 1e-9), rmax or 1e-9)
+            p = at.last_p[0].float().cpu()                     # [H, W+1]
+            if img_att is None:
+                img_att = ax_att.imshow(p.numpy(), cmap=args.cmap, aspect='auto', interpolation='nearest')
+            img_att.set_data(p.numpy())
+            img_att.set_clim(0.0, float(p.max()) or 1e-9)
+            eff = float((-(p * p.clamp(min=1e-30).log()).sum(-1)).exp().mean())
+            nfill = int((dff[0, model.n_hidden * model.K:].reshape(at.W, at.E).abs().amax(-1) > 0).sum())
+            extra = (f'  ring {nfill:4d}/{at.W}  sink {float(p[:, -1].mean()):5.3f}  '
+                     f'slots read {eff:6.1f}')
         ticker = ''.join(DOT_TEXT if c in '$\\' else c for c in _render(cur))[-_VIS_WIN:]
-        header.set_text(f'step {nstep:8d}  dff_std {float(dff.std()):6.4f}  dff_max '
-                        f'{float(dff.abs().max()):7.3f}  p_max {float(prob.max()):5.3f}  '
-                        f'T {args.temperature:.2f}\ngen: {ticker}')
+        header.set_text(f'step {nstep:8d}  reg_std {float(regs.std()) if model.K else 0:6.4f}  reg_max '
+                        f'{float(regs.abs().max()) if model.K else 0:7.3f}  p_max {float(prob.max()):5.3f}  '
+                        f'min_p {args.min_p:.4f}  T {args.temperature:.2f}{extra}\ngen: {ticker}')
         fig.canvas.draw()
         fig.canvas.flush_events()
         time.sleep(args.delay)
