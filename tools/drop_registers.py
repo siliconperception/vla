@@ -1,7 +1,7 @@
 """Rewrite a vla.py checkpoint keeping only some of its registers, e.g. the terms EVALI ablation
 shows unused.
 
-usage: python tools/drop_registers.py SRC DST --keep 1,2,5,6,7,8,9
+usage: python tools/drop_registers.py SRC DST [--keep 1,2,5,6,7,8,9] [--drop_attn]
 
 --keep lists the registers to keep, 1-based in --ctx_ema order (as EVALI numbers them). ctx_cat's
 read blocks of the dropped registers are deleted, and with them their running read RMS; --ctx_ema and
@@ -10,21 +10,26 @@ reads all the others), so only its trailing terms can go -- the kept ones must b
 order-d memory then approximates the order-D one's leading terms (term 0 almost exactly, term 1 at
 correlation ~0.9 and ~0.7 of the scale); their running read RMS is reset so it is measured afresh.
 Not the same function, then, unless only whole groups go. The optimizer state is kept only if empty
-(plain SGD); --weight_ema averages are dropped."""
+(plain SGD); --weight_ema averages are dropped.
+
+--drop_attn: remove the --attn recall attention. Its weights go, and so does ctx_cat's read block of
+the recall grid (the input block just before the registers); --attn becomes 0. The state loses its
+ring, so the rest of the network sees the recall grid as if it read zero."""
 import argparse
 import torch
 
 ap = argparse.ArgumentParser()
 ap.add_argument('src')
 ap.add_argument('dst')
-ap.add_argument('--keep', required=True)
+ap.add_argument('--keep', default=None, help='default: all')
+ap.add_argument('--drop_attn', action='store_true')
 a = ap.parse_args()
 
 ck = torch.load(a.src, map_location='cpu', weights_only=True)
 sd, sa = ck['state_dict'], dict(ck['saved_args'])
 wins = [float(w) for w in str(sa['ctx_ema']).split(',')]
 K, N = len(wins), int(sa['n_hidden'])
-keep = sorted({int(k) - 1 for k in a.keep.split(',') if k.strip()})
+keep = sorted({int(k) - 1 for k in a.keep.split(',') if k.strip()}) if a.keep else list(range(K))
 if not keep or keep[0] < 0 or keep[-1] >= K:
     raise SystemExit(f'--keep {a.keep}: registers are 1..{K}')
 
@@ -42,7 +47,17 @@ if sa.get('lmu'):
 
 cw = sd['ctx_cat.weight']
 off = cw.shape[1] - K * N
-sd['ctx_cat.weight'] = torch.cat([cw[:, :off]] + [cw[:, off + k * N: off + (k + 1) * N] for k in keep], 1)
+lead = cw[:, :off]
+if a.drop_attn:
+    if not sa.get('attn'):
+        raise SystemExit('--drop_attn: the checkpoint has no --attn')
+    G = sd['attn.out.weight'].shape[0]                 # the recall grid's channels
+    lead = cw[:, :off - G]
+    for k in [k for k in sd if k.startswith('attn.')]:
+        del sd[k]
+    sa['attn'] = 0
+    print(f'recall attention (W {ck["saved_args"]["attn"]}) removed, ctx_cat read block of {G} dropped')
+sd['ctx_cat.weight'] = torch.cat([lead] + [cw[:, off + k * N: off + (k + 1) * N] for k in keep], 1)
 rms = sd['ctx_read_rms'].clone()
 rms[reset] = 0                                          # 0 = not measured yet
 sd['ctx_read_rms'] = rms[keep]
