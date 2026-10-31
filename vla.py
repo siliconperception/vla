@@ -7421,10 +7421,12 @@ try:
             _T0 = None
         if i % args.monitor == 0:
             flat = (model.regs(model.dff) if model.K else model.dff).reshape(-1)
-            line = ('STEP {:10} wall {} loss {:12.9f} grad {:12.6f} lr {:10.9f} dff_mean {:12.5f} '
+            _g0 = optimizer.param_groups[0]      # momentum now (adamw: beta1)
+            line = ('STEP {:10} wall {} loss {:12.9f} grad {:12.6f} lr {:10.9f} mom {:6.4f} dff_mean {:12.5f} '
                     'dff_std {:12.5f} dff_max {:11.3f}'
                     ).format(i, datetime.datetime.now(), torch.stack(larr[-args.monitor:]).mean().item(),
-                             np.mean(garr[-args.monitor:]), optimizer.param_groups[0]['lr'],
+                             np.mean(garr[-args.monitor:]), _g0['lr'],
+                             _g0['betas'][0] if 'betas' in _g0 else _g0['momentum'],
                              flat.mean().item(), flat.std().item(), flat.abs().max().item())
             line += _ex_ep()
             if model.learn:
