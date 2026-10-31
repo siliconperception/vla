@@ -441,6 +441,8 @@ parser.add_argument('--lr_restart', action='store_true',
                     help='coswarm: rise over --lr_period steps from this run\'s first step '
                          '(a resumed run warms up again) instead of from global step 0')
 parser.add_argument('--momentum',   default=0.0,  type=float, help='SGD momentum')
+parser.add_argument('--nesterov', default=False, action=argparse.BooleanOptionalAction,
+                    help='Nesterov momentum (needs --momentum > 0)')
 parser.add_argument('--weight_decay', default=0.0, type=float, help='SGD weight decay')
 parser.add_argument('--run_steps',  default=None, type=int, help='stop after N steps of this run')
 parser.add_argument('--seed',       default=None, type=int)
@@ -6415,7 +6417,7 @@ if _win_opt is not None and _loaded_ckpt is not None and _loaded_ckpt.get('win_o
     _win_opt.load_state_dict(_loaded_ckpt['win_optimizer'])
 _bn_layers = [m for m in model.modules() if isinstance(m, nn.BatchNorm2d)]
 optimizer = torch.optim.SGD(_trainable, lr=args.lr_max, momentum=args.momentum,
-                            weight_decay=args.weight_decay)
+                            nesterov=args.nesterov, weight_decay=args.weight_decay)
 if _loaded_ckpt is not None and _loaded_ckpt.get('optimizer'):
     osd = optimizer.state_dict()
     ck = _loaded_ckpt['optimizer']
