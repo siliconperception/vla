@@ -22,12 +22,15 @@ average in layer 2) and a copy of the rest. Every tick, layer 1 reads the curren
 layer 2 reads layer 1's output and its own registers, each writes its registers back, and the sum of the two
 outputs is decoded into the next token.
 
-It is the text-trained core of a vision-language-action design. The intended applications do not need
-superintelligence; they need conversational common sense, grounded in and modulated by what the device perceives
-(sound, video, touch), at frame rates up to 500 Hz, with low and deterministic latency for embedded control, on a
-power budget a battery can supply. So the target is a single chip with no external DRAM: a CNN is
-parameter-efficient enough that every weight fits in on-chip SRAM, where the weights stay programmable, and the
-fixed-size state makes every tick the same work.
+It is the text-trained core of a vision-language-action design. Most commercial applications for autonomous,
+agile robots do not require superintelligence; they need conversational common sense, grounded in and modulated by
+what the device perceives (sound, video, touch). To achieve superhuman hand-eye coordination, they need it at frame
+rates up to 500 Hz, with low and deterministic latency for embedded control, on a power budget a battery can
+supply. So the target is a single chip with no external DRAM: a CNN is parameter-efficient enough that every weight
+fits in on-chip SRAM, where the weights stay programmable, and the fixed-size state makes every tick the same work.
+Leaving out external memory also saves power: no DRAM chips to keep refreshed, no high-speed interface driving
+signals between chips, and a weight read from on-chip SRAM takes on the order of a hundred times less energy than
+one fetched from off-chip DRAM.
 
 Code, functional spec and figures: [github.com/siliconperception/vla](https://github.com/siliconperception/vla)
 

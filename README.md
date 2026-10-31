@@ -6,14 +6,17 @@ and a copy of the rest. Every clock tick, layer 1 reads the current token (and, 
 image and sound) and its registers; layer 2 reads layer 1's output and its own registers; each writes its
 registers back, and the sum of the two layers' outputs is decoded into the next token.
 
-The intended applications do not need superintelligence. They need conversational common sense, grounded in and
-modulated by what the device perceives: sound, video, touch. But they need it fast: frame rates up to 500 Hz,
-with low and deterministic latency, so the model can sit inside an embedded control loop, and on a power budget a
-battery can supply.
+Most commercial applications for autonomous, agile robots do not require superintelligence. They need
+conversational common sense, grounded in and modulated by what the device perceives: sound, video, touch. To
+achieve superhuman hand-eye coordination, they need it at frame rates up to 500 Hz, with low and deterministic
+latency, so the model can sit inside an embedded control loop, and on a power budget a battery can supply.
 
 That rules out a large model streaming its weights from external DRAM. The design target is a
 vision-language-action model on a single chip: a CNN is parameter-efficient enough that every weight fits in
-on-chip SRAM, so there is no external memory, and the weights stay programmable. One set of small convolution
+on-chip SRAM, so there is no external memory, and the weights stay programmable. Leaving out external memory also
+saves power: there are no DRAM chips to keep refreshed and no high-speed interface driving signals between chips,
+and reading a weight from on-chip SRAM takes on the order of a hundred times less energy than fetching it from
+off-chip DRAM. One set of small convolution
 kernels is reused at every grid position and every tick, so about thirty million weights drive a state of
 100,352 values. And the state never grows, so every tick does the same work in the same time, however long the
 model has been running.

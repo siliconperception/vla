@@ -70,13 +70,17 @@
   <header>
     <p class="kicker">Silicon Perception Inc · open source</p>
     <h1>A recurrent CNN vision-language-action model</h1>
-    <p class="lede">The applications this is for do not need superintelligence. They need conversational common
-    sense, grounded in and modulated by what the device perceives: sound, video, touch. But they need it fast:
-    frame rates up to 500&nbsp;Hz, with low and deterministic latency, so the model can sit inside an embedded control
-    loop, and on a power budget a battery can supply.</p>
+    <p class="lede">Most commercial applications for autonomous, agile robots do not require superintelligence. They
+    need conversational common sense, grounded in and modulated by what the device perceives: sound, video, touch.
+    To achieve superhuman hand-eye coordination, they need it at frame rates up to 500&nbsp;Hz, with low and
+    deterministic latency, so the model can sit inside an embedded control loop, and on a power budget a battery
+    can supply.</p>
     <p class="lede">That rules out a large model streaming its weights from external DRAM. The goal is a
     vision-language-action model on a single chip: a CNN is parameter-efficient enough that every weight fits in
-    on-chip SRAM, so there is no external memory, and the weights stay programmable. The same small kernels run at
+    on-chip SRAM, so there is no external memory, and the weights stay programmable. Leaving out external memory also
+    saves power: there are no DRAM chips to keep refreshed and no high-speed interface driving signals between chips,
+    and reading a weight from on-chip SRAM takes on the order of a hundred times less energy than fetching it from
+    off-chip DRAM. The same small kernels run at
     every grid position and every tick, so about thirty million weights drive a state of 100,352 values.</p>
     <p class="lede">The state also has a fixed size. Every tick does exactly the same work and finishes in the same
     time, however long the model has been running.</p>
