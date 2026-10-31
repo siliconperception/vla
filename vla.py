@@ -443,6 +443,9 @@ parser.add_argument('--lr_restart', action='store_true',
 parser.add_argument('--momentum',   default=0.0,  type=float, help='SGD momentum')
 parser.add_argument('--nesterov', default=False, action=argparse.BooleanOptionalAction,
                     help='Nesterov momentum (needs --momentum > 0)')
+parser.add_argument('--optimizer', default='sgd', choices=['sgd', 'adamw'],
+                    help='sgd (--momentum, --nesterov) or adamw (--betas); --weight_decay applies to both')
+parser.add_argument('--betas', default='0.9,0.999', help='adamw: beta1,beta2')
 parser.add_argument('--weight_decay', default=0.0, type=float, help='SGD weight decay')
 parser.add_argument('--run_steps',  default=None, type=int, help='stop after N steps of this run')
 parser.add_argument('--seed',       default=None, type=int)
@@ -6416,12 +6419,20 @@ _win_opt = torch.optim.Adam([model.win_theta], lr=args.win_lr) if model.learn el
 if _win_opt is not None and _loaded_ckpt is not None and _loaded_ckpt.get('win_optimizer'):
     _win_opt.load_state_dict(_loaded_ckpt['win_optimizer'])
 _bn_layers = [m for m in model.modules() if isinstance(m, nn.BatchNorm2d)]
-optimizer = torch.optim.SGD(_trainable, lr=args.lr_max, momentum=args.momentum,
-                            nesterov=args.nesterov, weight_decay=args.weight_decay)
+if args.optimizer == 'adamw':
+    optimizer = torch.optim.AdamW(_trainable, lr=args.lr_max, weight_decay=args.weight_decay,
+                                  betas=tuple(float(b) for b in args.betas.split(',')))
+    _opt_keys = {'step', 'exp_avg', 'exp_avg_sq'}
+else:
+    optimizer = torch.optim.SGD(_trainable, lr=args.lr_max, momentum=args.momentum,
+                                nesterov=args.nesterov, weight_decay=args.weight_decay)
+    _opt_keys = {'momentum_buffer'}
 if _loaded_ckpt is not None and _loaded_ckpt.get('optimizer'):
     osd = optimizer.state_dict()
     ck = _loaded_ckpt['optimizer']
-    if [len(g['params']) for g in ck['param_groups']] == [len(g['params']) for g in osd['param_groups']]:
+    if any(set(v) != _opt_keys for v in ck['state'].values()):   # saved by the other optimizer
+        print(f'WARNING: optimizer state NOT restored: it is not {args.optimizer} state', flush=True)
+    elif [len(g['params']) for g in ck['param_groups']] == [len(g['params']) for g in osd['param_groups']]:
         osd['state'] = ck['state']
         optimizer.load_state_dict(osd)
         print(f'optimizer state restored ({len(osd["state"])} tensors)', flush=True)
