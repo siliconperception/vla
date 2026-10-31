@@ -446,6 +446,16 @@ parser.add_argument('--nesterov', default=False, action=argparse.BooleanOptional
 parser.add_argument('--optimizer', default='sgd', choices=['sgd', 'adamw'],
                     help='sgd (--momentum, --nesterov) or adamw (--betas); --weight_decay applies to both')
 parser.add_argument('--betas', default='0.9,0.999', help='adamw: beta1,beta2')
+parser.add_argument('--mom_schedule', default='const', choices=['const', 'cos', 'cycle'],
+                    help='sgd momentum schedule (the lr is unaffected): const = --momentum; cos = a half '
+                         'cosine from --mom_from to --mom_to over --mom_period steps, then held; cycle = '
+                         'from -> to -> from every --mom_period steps. Not const: dampening = momentum, so '
+                         'the buffer is an average and the effective step stays at the lr (no --nesterov)')
+parser.add_argument('--mom_from', default=0.0, type=float, help='--mom_schedule: starting momentum')
+parser.add_argument('--mom_to', default=0.9, type=float, help='--mom_schedule: momentum it moves to')
+parser.add_argument('--mom_period', default=20000, type=int, help='--mom_schedule: steps (see there)')
+parser.add_argument('--mom_start', default=None, type=int,
+                    help='--mom_schedule: global step where it starts (default: this run\'s first step)')
 parser.add_argument('--weight_decay', default=0.0, type=float, help='SGD weight decay')
 parser.add_argument('--run_steps',  default=None, type=int, help='stop after N steps of this run')
 parser.add_argument('--seed',       default=None, type=int)
@@ -6427,6 +6437,8 @@ else:
     optimizer = torch.optim.SGD(_trainable, lr=args.lr_max, momentum=args.momentum,
                                 nesterov=args.nesterov, weight_decay=args.weight_decay)
     _opt_keys = {'momentum_buffer'}
+if args.mom_schedule != 'const':
+    assert args.optimizer == 'sgd' and not args.nesterov, '--mom_schedule needs sgd without --nesterov'
 if _loaded_ckpt is not None and _loaded_ckpt.get('optimizer'):
     osd = optimizer.state_dict()
     ck = _loaded_ckpt['optimizer']
@@ -6509,6 +6521,26 @@ if _start_step:              # resume: fast-forward the schedule to the checkpoi
     for g, lr in zip(optimizer.param_groups, lrs):
         g['lr'] = lr
     scheduler._last_lr = lrs
+
+
+def _set_momentum(step):
+    """--mom_schedule: set the momentum (and dampening, the same) for a global step."""
+    if args.mom_schedule == 'const':
+        return
+    s = max(0, step - (_start_step if args.mom_start is None else args.mom_start))
+    if args.mom_schedule == 'cos':
+        f = (1.0 - math.cos(math.pi * min(s / max(1, args.mom_period), 1.0))) / 2.0
+    else:
+        f = (1.0 - math.cos(2.0 * math.pi * s / max(1, args.mom_period))) / 2.0
+    m = args.mom_from + (args.mom_to - args.mom_from) * f
+    for g in optimizer.param_groups:
+        g['momentum'] = g['dampening'] = m
+
+
+_set_momentum(_start_step)
+if args.mom_schedule != 'const':
+    print(f'--mom_schedule {args.mom_schedule}: momentum {args.mom_from} -> {args.mom_to} over '
+          f'{args.mom_period} steps, now {optimizer.param_groups[0]["momentum"]:.4f}', flush=True)
 
 # ── training loop ─────────────────────────────────────────────────────────────
 
@@ -7413,6 +7445,7 @@ try:
 
         _pt('stats')
         scheduler.step()
+        _set_momentum(i + 1)
         optimizer.zero_grad()
         i += 1
         if args.run_steps is not None and i - _start_step >= args.run_steps:
