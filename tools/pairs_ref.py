@@ -1,16 +1,20 @@
 """EVALM's minimal pairs (BLiMP / ComVE / Winogrande, as vla.py --eval_pairs builds them) scored
 by a reference HF causal LM, each sentence from a bare document start, for calibration.
-usage: python tools/pairs_ref.py MODEL [N] [--trust] (--trust: the model's own code from its repo)"""
+usage: python tools/pairs_ref.py MODEL [N] [--trust] [--rev REV] [--cpu]
+(--trust: the model's own code from its repo; --rev: a revision, e.g. a Pythia checkpoint step128)"""
 import sys, collections
 import numpy as np, torch
 from datasets import get_dataset_config_names, load_dataset
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 trust = '--trust' in sys.argv
-argv = [a for a in sys.argv if a != '--trust']
+dev = 'cpu' if '--cpu' in sys.argv else 'cuda'
+rev = sys.argv[sys.argv.index('--rev') + 1] if '--rev' in sys.argv else None
+argv = [a for i, a in enumerate(sys.argv) if a not in ('--trust', '--cpu', '--rev') and sys.argv[i - 1] != '--rev']
 name, N = argv[1], int(argv[2]) if len(argv) > 2 else 1000
 tok = AutoTokenizer.from_pretrained(name, trust_remote_code=trust)
-lm = AutoModelForCausalLM.from_pretrained(name, dtype=torch.float32, trust_remote_code=trust).cuda().eval()
+lm = AutoModelForCausalLM.from_pretrained(name, revision=rev, dtype=torch.float32,
+                                          trust_remote_code=trust).to(dev).eval()
 n_all = sum(p.numel() for p in lm.parameters())
 emb = {id(m.weight): m.weight.numel() for m in (lm.get_input_embeddings(), lm.get_output_embeddings()) if m is not None}
 params = f'params {n_all / 1e6:.1f}M, {(n_all - sum(emb.values())) / 1e6:.1f}M without token embedding/lm_head'
@@ -42,7 +46,7 @@ for ex in rows.select(range(min(N, len(rows)))):
 
 @torch.no_grad()
 def ce(q):
-    x = torch.tensor([q]).cuda()
+    x = torch.tensor([q]).to(dev)
     o = lm(x)
     lp = torch.log_softmax((o.logits if hasattr(o, 'logits') else o[0])[0, :-1].float(), -1)
     return (-lp.gather(1, x[0, 1:, None])[:, 0]).cpu().numpy()
@@ -60,4 +64,4 @@ for s, pairs in sets.items():
     if s == 'blimp':
         o += ' (' + ' '.join(f'{g} {100 * np.mean(v):.1f}' for g, v in sorted(grp.items())) + ')'
     out.append(o)
-print(f'REF {name} ({params}): ' + ' | '.join(out))
+print(f'REF {name}{"@" + rev if rev else ""} ({params}): ' + ' | '.join(out))

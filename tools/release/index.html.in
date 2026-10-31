@@ -1,0 +1,185 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Recurrent CNN VLA</title>
+<meta name="description" content="A recurrent CNN vision-language-action model with a fixed-size state, designed for a single battery-powered chip running at up to 500 Hz with low, deterministic latency. Open source (MIT) by Silicon Perception Inc.">
+<style>
+  :root {
+    --bg: #fbfaf7; --fg: #1d1d1f; --muted: #5f5f66; --rule: #e3e1db; --card: #ffffff;
+    --accent: #1f5fbf; --figbg: #ffffff;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #141416; --fg: #ececef; --muted: #a2a2ab; --rule: #2c2c31; --card: #1c1c20;
+      --accent: #7fb0ff; --figbg: #f4f4f2;
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #141416; --fg: #ececef; --muted: #a2a2ab; --rule: #2c2c31; --card: #1c1c20;
+    --accent: #7fb0ff; --figbg: #f4f4f2;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--fg);
+    font: 17px/1.6 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  }
+  main { max-width: 1040px; margin: 0 auto; padding: 48px 16px 64px; }
+  header p.kicker { color: var(--muted); margin: 0 0 6px; font-size: 14px; letter-spacing: .04em; text-transform: uppercase; }
+  h1 { font-size: clamp(30px, 5vw, 46px); line-height: 1.1; margin: 0 0 16px; letter-spacing: -.01em; }
+  h2 { font-size: 22px; margin: 48px 0 12px; }
+  p.lede { font-size: 19px; max-width: 760px; margin: 0 0 24px; }
+  nav.links { display: flex; flex-wrap: wrap; gap: 10px; margin: 0 0 32px; }
+  nav.links a {
+    display: inline-block; padding: 8px 14px; border: 1px solid var(--rule); border-radius: 8px;
+    color: var(--fg); text-decoration: none; background: var(--card); font-size: 15px;
+  }
+  nav.links a:hover { border-color: var(--accent); color: var(--accent); }
+  figure { margin: 0; }
+  figure a.fig { display: block; background: var(--figbg); border: 1px solid var(--rule); border-radius: 10px; padding: 12px; overflow: hidden; }
+  figure img { display: block; width: 100%; height: auto; }
+  figcaption { color: var(--muted); font-size: 14px; margin-top: 10px; }
+  .facts { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 12px; margin: 32px 0 0; }
+  .fact { background: var(--card); border: 1px solid var(--rule); border-radius: 10px; padding: 14px 16px; }
+  .fact b { display: block; font-size: 22px; }
+  .fact span { color: var(--muted); font-size: 14px; }
+  ol { padding-left: 22px; } li { margin: 6px 0; }
+  .tablewrap { overflow-x: auto; }
+  table { border-collapse: collapse; width: 100%; font-size: 15px; font-variant-numeric: tabular-nums; }
+  th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--rule); white-space: nowrap; }
+  td.n, th.n { text-align: right; }
+  tr.us td { font-weight: 600; }
+  blockquote {
+    margin: 12px 0; padding: 12px 16px; background: var(--card); border-left: 3px solid var(--accent);
+    border-radius: 0 8px 8px 0; font-size: 15px;
+  }
+  pre { background: var(--card); border: 1px solid var(--rule); border-radius: 8px; padding: 12px 14px; overflow-x: auto; font-size: 14px; }
+  code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+  .note { color: var(--muted); font-size: 14px; }
+  footer { border-top: 1px solid var(--rule); margin-top: 56px; padding-top: 20px; color: var(--muted); font-size: 14px; }
+  a { color: var(--accent); }
+  .placeholder { background: var(--card); border: 1px dashed var(--rule); border-radius: 10px; padding: 16px 18px; }
+  .placeholder h3 { margin: 0 0 6px; font-size: 17px; }
+  .placeholder ol { margin: 8px 0 0; }
+  .tag { display: inline-block; font-size: 12px; letter-spacing: .04em; text-transform: uppercase; color: var(--muted); border: 1px solid var(--rule); border-radius: 999px; padding: 2px 10px; margin-bottom: 8px; }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <p class="kicker">Silicon Perception Inc · open source</p>
+    <h1>A recurrent CNN vision-language-action model</h1>
+    <p class="lede">The applications this is for do not need superintelligence. They need conversational common
+    sense, grounded in and modulated by what the device perceives: sound, video, touch. But they need it fast:
+    frame rates up to 500&nbsp;Hz, with low and deterministic latency, so the model can sit inside an embedded control
+    loop, and on a power budget a battery can supply.</p>
+    <p class="lede">That rules out a large model streaming its weights from external DRAM. The goal is a
+    vision-language-action model on a single chip: a CNN is parameter-efficient enough that every weight fits in
+    on-chip SRAM, so there is no external memory, and the weights stay programmable. The same small kernels run at
+    every grid position and every tick, so about thirty million weights drive a state of 100,352 values.</p>
+    <p class="lede">The state also has a fixed size. Every tick does exactly the same work and finishes in the same
+    time, however long the model has been running.</p>
+    <nav class="links">
+      <a href="https://github.com/siliconperception/vla">Code on GitHub</a>
+      <a href="https://huggingface.co/siliconperception/vla">Model on Hugging Face</a>
+      <a href="https://github.com/siliconperception/vla/blob/main/docs/spec/README.md">Functional spec</a>
+      <a href="https://github.com/siliconperception/vla/tree/main/paper">Paper (in preparation)</a>
+    </nav>
+    <p class="note">Current release: <b>{{VERSION}}</b>, step {{STEP}} ({{TOKENS}} training tokens).</p>
+  </header>
+
+  <figure>
+    <a class="fig" href="figures/vla_v511.svg" title="Open the full-size figure">
+      <img src="figures/vla_v511.svg" alt="Block diagram of one clock tick, in two panes. Top: token and audio grids enter layer 1, whose output o1 feeds layer 2 and also bypasses it to an adder; the sum feeds three decoders that produce text, voice and image tokens, each fed back as the next input. Bottom: one layer zoomed in: its inputs and two registers are concatenated, mixed by a 1x1 convolution, transformed by eight 3x3 convolutions and projected; the result is written back into the registers as an average and a residual copy.">
+    </a>
+    <figcaption>One clock tick of the published model (v511): three token streams (text, voice, image) and two
+    recurrent layers in series, each with two registers (a slow average, over 16 ticks in layer 1 and 64 in layer
+    2, and a one-tick copy). The lower pane zooms into one layer. The image encoder is drawn as the design intends;
+    this model is trained on text. Select the figure to open it full size.</figcaption>
+  </figure>
+
+  <div class="facts">
+    <div class="fact"><b>500 Hz</b><span>target tick rate on one chip, with the same work every tick</span></div>
+    <div class="fact"><b>100,352</b><span>values of state, fixed in size: 2 layers × 2 registers of 512 × 7 × 7</span></div>
+    <div class="fact"><b>33.2 M</b><span>trained parameters, small enough to hold every weight in on-chip SRAM</span></div>
+    <div class="fact"><b>0</b><span>positional encodings; the state is reset only at the start of an example</span></div>
+  </div>
+
+  <h2>How a tick works</h2>
+  <ol>
+    <li>The current token's embedding is normalized and copied to every position of a 7 × 7 grid.</li>
+    <li>Layer 1: that grid, the sound grid and layer 1's two registers (each normalized per position) are
+    concatenated and mixed by a 1 × 1 convolution; eight 3 × 3 convolutions with BatchNorm and ReLU transform the
+    result, and a 3 × 3 convolution projects it to register width.</li>
+    <li>Layer 2 does the same with its own weights, reading only layer 1's output and its own two registers, and
+    adds its result to layer 1's output.</li>
+    <li>Each layer writes its output into its registers as a cascade: the first moves 1/16 (layer 1) or 1/64
+    (layer 2) of the way toward it, the second holds the remainder, so the two always sum to it.</li>
+    <li>A small tree of convolutions collapses the sum to one vector, and a frozen output layer gives the next token.</li>
+  </ol>
+
+  <h2>Results</h2>
+  <div class="placeholder">
+    <span class="tag">In preparation</span>
+    <h3>VLA against pythia-70m, at matched training tokens</h3>
+    <p>Pythia publishes checkpoints from the start of its training, so a small CNN with a fixed-size state can be
+    compared with a transformer at every point along the way, not only at the end. The plan:</p>
+    <ol>
+      <li><b>Same documents.</b> Score both models on the same held-out FineWeb documents, by the same rule
+      (nats per token, and per character, which does not depend on the tokenizer).</li>
+      <li><b>Loss against tokens seen.</b> One curve per model: the published VLA weights at each step pushed to
+      Hugging Face, and pythia-70m at its checkpoints from 2 M to 300 B tokens.</li>
+      <li><b>Use of context.</b> Loss by position in the document (tokens 0-63, 64-255, 256-1023): how much each
+      model gains from what it has already read.</li>
+      <li><b>Grammar and common sense.</b> BLiMP and ComVE minimal pairs at matched tokens.</li>
+      <li><b>Cost per token.</b> Weights, state and operations per token, next to the scores.</li>
+    </ol>
+    <p class="note">Pythia was trained on the Pile, not FineWeb; the comparison will show both models on both.
+    Interim scores for the current weights are on the <a href="https://huggingface.co/siliconperception/vla">model card</a>.</p>
+  </div>
+
+  <h2>Scores</h2>
+  <div class="tablewrap"><table>
+    <tr><th></th><th class="n">VLA {{VERSION}}</th><th class="n">pythia-70m</th><th class="n">pythia-70m</th><th class="n">pythia-70m</th></tr>
+    <tr><td>training tokens</td><td class="n">{{TOKENS}}</td><td class="n">268 M</td><td class="n">537 M</td><td class="n">300 B</td></tr>
+    <tr><td>FineWeb held-out, nats/token</td><td class="n">{{FW}}</td><td class="n">{{P128_FW}}</td><td class="n">{{P256_FW}}</td><td class="n">{{PMAIN_FW}}</td></tr>
+    <tr><td>BabyLM 2026 dev, nats/token</td><td class="n">{{BABY}}</td><td class="n">{{P128_BABY}}</td><td class="n">{{P256_BABY}}</td><td class="n">{{PMAIN_BABY}}</td></tr>
+    <tr><td>BLiMP, % of 1,005 pairs</td><td class="n">{{BLIMP}}</td><td class="n">{{P128_BLIMP}}</td><td class="n">{{P256_BLIMP}}</td><td class="n">{{PMAIN_BLIMP}}</td></tr>
+    <tr><td>ComVE, % of 999 pairs</td><td class="n">{{COMVE}}</td><td class="n">{{P128_COMVE}}</td><td class="n">{{P256_COMVE}}</td><td class="n">{{PMAIN_COMVE}}</td></tr>
+  </table></div>
+  <p class="note">pythia-70m (EleutherAI) is a transformer of similar total size with the same tokenizer, shown
+  at about this model's training tokens and fully trained; same documents, same pairs, same scoring rule (see the
+  <a href="https://huggingface.co/siliconperception/vla">model card</a>). Pythia was trained on the Pile, this
+  model on FineWeb. Matched tokens are not matched training: at 268 M and 537 M tokens pythia has made only 128
+  and 256 updates (of 2 M tokens each), this model {{STEP}} (of 250). Fully trained pythia-70m is the fair
+  reference.</p>
+
+  <h2>Samples</h2>
+  <p>From the prompt in bold, with the published weights ({{TOKENS}} tokens of training). Locally fluent, not yet
+  coherent:</p>
+  {{SAMPLES_HTML}}
+
+  <h2>Try it</h2>
+<pre><code>git clone https://github.com/siliconperception/vla && cd vla
+pip install -r requirements.txt
+for p in "The colors of the rainbow are" \
+         "The best way to learn a new language is" \
+         "My grandmother's recipe for apple pie starts with" \
+         "When you plant a vegetable garden, the first thing to do is" \
+         "The history of the bicycle began in"; do
+  python vla.py --pretrained --generate --n 120 --prompt "$p" --device cuda
+done
+
+# prompt tuning: fit the starting registers (weights frozen) until the model predicts the prompt,
+# then continue from them; prints the cold and the tuned continuation
+python vla.py --pretrained --generate --prompt_tune 200 --n 120 --prompt "The colors of the rainbow are" --device cuda</code></pre>
+
+  <footer>
+    © 2024-2026 Silicon Perception Inc. Code and weights under the
+    <a href="https://github.com/siliconperception/vla/blob/main/LICENSE">MIT License</a>; no patent rights are granted
+    (<a href="https://github.com/siliconperception/vla/blob/main/PATENTS">patent notice</a>).
+  </footer>
+</main>
+</body>
+</html>

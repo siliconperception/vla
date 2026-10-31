@@ -1,23 +1,25 @@
 """Draw docs/figures/vla_<model>.svg: one clock tick of a VLA model, 16:9 (1920 x 1080).
 
-usage: python tools/figure_vla.py [--model v498|v499|v502|v505] [--out OUT]
+usage: python tools/figure_vla.py [--model v498|v499|v502|v505|v511] [--out OUT]
 
 v498: recurrent CNN + two order-2 Legendre memories (4096, 64 ticks) + copy + recall attention, never
 reset. v499: no registers, the recall attention's ring is the whole state, reset at each example.
 v502: the residual cascade of an EMA (512 ticks) and the residual copy, read through per-sample RMSnorm,
 + recall attention, reset at each example. v505: two recurrent layers in series, each with that cascade, no
-recall attention; 1920 x 2160, two 16:9 panes: the whole tick on top, one layer zoomed in below."""
+recall attention; 1920 x 2160, two 16:9 panes: the whole tick on top, one layer zoomed in below. v511: v505
+with the layers' EMA windows 16 (layer 1) and 64 (layer 2) ticks."""
 import argparse
 
 ap = argparse.ArgumentParser()
-ap.add_argument('--model', default='v498', choices=('v498', 'v499', 'v502', 'v505'))
+ap.add_argument('--model', default='v498', choices=('v498', 'v499', 'v502', 'v505', 'v511'))
 ap.add_argument('--out', default=None)
 a = ap.parse_args()
 LMU = a.model == 'v498'                   # Legendre memories + copy
 CASC = a.model == 'v502'                  # EMA + residual copy, RMSnorm reads
 REGS = LMU or CASC                        # (v499: the ring alone)
 CAT = {'v498': ('3×256 + 2048 + 256 + 256 + 5×512', 5888), 'v499': ('3×256 + 2048 + 256 + 256', 3328),
-       'v502': ('3×256 + 2048 + 256 + 256 + 2×512', 4352), 'v505': ('', 0)}[a.model]
+       'v502': ('3×256 + 2048 + 256 + 256 + 2×512', 4352), 'v505': ('', 0), 'v511': ('', 0)}[a.model]
+EMA1, EMA2 = (16, 64) if a.model == 'v511' else (512, 512)    # two-layer models: each layer's EMA window
 
 W, H = 1920, 1080
 out = []
@@ -107,7 +109,7 @@ def legend(x, y, items, flop_note, w=460):
     text(x + 258, yy + 4, 'old state into the update', 12, anchor='start')
 
 
-def layer_block(x0, y0, name, cat, ins, cy):
+def layer_block(x0, y0, name, cat, ins, cy, ema):
     """Pane A: one recurrent layer as a 360 x 390 block at (x0, y0): concat, ctx_cat, 8 convs, linout and
     its two registers fed back (the cascade itself is drawn in pane B). ins: the y of each input entering
     the concat; cy: the main path. -> the output point."""
@@ -140,7 +142,7 @@ def layer_block(x0, y0, name, cat, ins, cy):
     line([(bx, ry - 10), (f1 + 82, ry - 10), (f1 + 82, ry + 23), (f1 + 66, ry + 23)])
     flop(f1, ry, 'DFF_1', size='')
     flop(f2, ry, 'DFF_2', size='')
-    text(f1 + 32, ry + 62, 'EMA 512', 10, fill=COL['soft'])
+    text(f1 + 32, ry + 62, f'EMA {ema}', 10, fill=COL['soft'])
     text(f2 + 32, ry + 62, 'copy', 10, fill=COL['soft'])
     line([(f1, ry + 16), (cx + 10, ry + 16), (cx + 10, y0 + 276)], dash=True, color='#757575')
     line([(f2, ry + 16), (f2 - 14, ry + 16), (f2 - 14, ry + 72), (cx + 20, ry + 72), (cx + 20, y0 + 276)],
@@ -157,10 +159,11 @@ def draw_v505():
     out.append(f'<rect width="{W5}" height="{H5}" fill="#ffffff"/>')
 
     # ── pane A: the whole tick ──────────────────────────────────────────────
-    text(30, 38, 'VLA v505 — one clock tick (40 ms): two recurrent CNN layers in series', 22, anchor='start',
+    text(30, 38, f'VLA {a.model} — one clock tick (40 ms): two recurrent CNN layers in series', 22, anchor='start',
          weight='bold')
     text(30, 62, 'A · the whole tick.  n_hidden 512 · c_context 384 · 7×7 grid · depth 8 per layer · 3 token '
-         'streams · 25 Hz · each layer: EMA 512 + copy, RMSnorm reads · reset at each example · 33.2M trainable · '
+         'streams · 25 Hz · each layer: EMA + copy (' + (f'EMA {EMA1}' if EMA1 == EMA2 else
+         f'EMA {EMA1} in layer 1, {EMA2} in layer 2') + '), RMSnorm reads · reset at each example · 33.2M trainable · '
          'state 4 × 512×7×7 = 100,352 values', 13, anchor='start', fill='#424242')
     ys = (300, 350, 400)
     for y, nm in zip(ys, ('text', 'voice', 'image')):
@@ -187,14 +190,14 @@ def draw_v505():
     line([(366, 500), (520, 500)], arrow=False)
 
     CY = 430
-    o1 = layer_block(520, 250, 'LAYER 1', '3×256 + 256 + 2×512 = 2048', list(ys) + [500], CY)
+    o1 = layer_block(520, 250, 'LAYER 1', '3×256 + 256 + 2×512 = 2048', list(ys) + [500], CY, EMA1)
     BX = o1[0] + 40                                       # the o_1 tap
     line([o1, (BX, CY)], arrow=False)
     dot(BX, CY)
     text(BX - 4, CY - 10, 'o₁', 13, anchor='end', weight='bold')
     L2 = 1000
     line([(BX, CY), (L2, CY)], arrow=False)
-    o2 = layer_block(L2, 250, 'LAYER 2', '512 + 2×512 = 1536', [CY], CY)
+    o2 = layer_block(L2, 250, 'LAYER 2', '512 + 2×512 = 1536', [CY], CY, EMA2)
     AX = o2[0] + 56                                       # the adder
     line([o2, (AX - 18, CY)])
     text(o2[0] + 22, CY - 10, 'd₂', 13, anchor='start', weight='bold')
@@ -248,8 +251,8 @@ def draw_v505():
            '(every layer\'s, reset to 0 at each example)', w=470)
     for i, s in enumerate(('Only layer 1 sees the inputs: text, voice and image tokens and sound reach layer 2',
                            'only through o₁. Layer 2 adds d₂ to o₁, and the decoders read the sum o.',
-                           'Layer 2 started as the identity (linout zero-initialized): v505 began exactly as',
-                           'the one-layer v504 at step 1,127,936.')):
+                           'Layer 2 started as the identity (linout zero-initialized): it was added at step',
+                           '1,127,936 to a trained one-layer model, which it began by computing exactly.')):
         text(560, 820 + 20 * i + (10 if i > 1 else 0), s, 12.5, anchor='start', fill='#424242')
 
     out.append('<line x1="0" y1="1080" x2="1920" y2="1080" stroke="#9e9e9e" stroke-width="2"/>')
@@ -258,7 +261,8 @@ def draw_v505():
     out.append('<g transform="translate(0,1080)">')
     text(30, 46, 'B · one recurrent layer (layers 1 and 2 have the same structure; only their inputs differ)', 22,
          anchor='start', weight='bold')
-    text(30, 70, 'its own weights · its own two registers (an EMA over 512 ticks, then the residual copy) · old '
+    text(30, 70, 'its own weights · its own two registers (an EMA over ' + (f'{EMA1} ticks' if EMA1 == EMA2 else
+         f'W = {EMA1} ticks in layer 1, {EMA2} in layer 2') + ', then the residual copy) · old '
          'register values read through per-sample RMSnorm · registers reset to 0 at each example', 13,
          anchor='start', fill='#424242')
     CYb, CXb = 400, 560
@@ -308,15 +312,19 @@ def draw_v505():
     out.append(f'<rect x="800" y="{y0}" width="660" height="270" rx="6" fill="#fffde7" stroke="#9e9e9e" '
                f'stroke-dasharray="6,4"/>')
     text(816, y0 + 22, 'residual cascade (Laplacian pyramid) · 2 × 512×7×7', 13, anchor='start', weight='bold')
-    text(816, y0 + 92, 'DFF_1: r ← r + (x − r)/512', 12, anchor='start')
-    text(816, y0 + 110, 'EMA, window 512 ticks (20.5 s)', 11, anchor='start', fill='#424242')
+    text(816, y0 + 92, 'DFF_1: r ← r + (x − r)/' + (f'{EMA1}' if EMA1 == EMA2 else 'W'), 12, anchor='start')
+    if EMA1 == EMA2:
+        text(816, y0 + 110, f'EMA, window {EMA1} ticks ({EMA1 / 25:g} s)', 11, anchor='start', fill='#424242')
+    else:
+        text(816, y0 + 110, f'EMA, W = {EMA1} ticks ({EMA1 / 25:g} s) in layer 1,', 11, anchor='start', fill='#424242')
+        text(816, y0 + 126, f'{EMA2} ticks ({EMA2 / 25:g} s) in layer 2', 11, anchor='start', fill='#424242')
     text(816, y0 + 218, 'DFF_2: r ← x − S_1', 12, anchor='start')
     text(816, y0 + 236, 'residual copy (window 1)', 11, anchor='start', fill='#424242')
     f1, f2 = y0 + 44, y0 + 172
     c1y, s2y = f1 + 23, f2 + 23
     out.append(f'<circle cx="{ex}" cy="{c1y}" r="26" fill="{COL["lmu"]}" stroke="{COL["ink"]}" stroke-width="1.2"/>')
     text(ex, c1y - 2, 'EMA', 11, weight='bold')
-    text(ex, c1y + 12, '/512', 10)
+    text(ex, c1y + 12, f'/{EMA1}' if EMA1 == EMA2 else '/W', 10)
     line([(BXb, CYb), (BXb, s2y)], arrow=False)
     dot(BXb, c1y)
     line([(BXb, c1y), (ex + 28, c1y)])
@@ -343,7 +351,8 @@ def draw_v505():
                      (COL['cat'], False, 'channel concatenation'),
                      (COL['lin'], False, 'conv 1×1 / 3×3 (linear)'),
                      (COL['cnn'], False, 'conv 3×3 + BatchNorm + ReLU'),
-                     (COL['lmu'], False, 'EMA r ← r + (x − r)/W, W = 512 ticks'),
+                     (COL['lmu'], False, f'EMA r ← r + (x − r)/W, W = {EMA1} ticks' if EMA1 == EMA2 else
+                      f'EMA r ← r + (x − r)/W, W = {EMA1} (layer 1) / {EMA2} (layer 2)'),
                      ('#ffffff', False, '(−) subtractor: x minus the EMA as just written')],
            '(reset to 0 at each example)', w=470)
     out.append('</g>')
@@ -351,7 +360,7 @@ def draw_v505():
     open(a.out or f'docs/figures/vla_{a.model}.svg', 'w').write('\n'.join(out))
 
 
-if a.model == 'v505':
+if a.model in ('v505', 'v511'):
     draw_v505()
     raise SystemExit(0)
 

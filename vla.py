@@ -768,13 +768,13 @@ parser.add_argument('--delay',      default=0.1,  type=float, help='--vis second
 parser.add_argument('--cmap',       default='viridis', help='--vis colormap')
 parser.add_argument('--push',       default=False, action='store_true',
                     help='push the --load checkpoint to the hub as --hub_repo, exit')
-parser.add_argument('--hub_repo',   default='siliconperception/vla_v502',
+parser.add_argument('--hub_repo',   default='siliconperception/vla',
                     help="--push target; '-' writes --push_dir only")
 parser.add_argument('--private',    default=False, action='store_true', help='--push: private repo')
 parser.add_argument('--push_dir',   default=None, help='--push: local folder written first (default ./<repo name>)')
 parser.add_argument('--card',       default=None, help='--push: model card (markdown) uploaded as README.md')
 parser.add_argument('--hub_tag',    default=None, help='--push: tag the pushed commit (e.g. the run name)')
-parser.add_argument('--pretrained', default=None, nargs='?', const='siliconperception/vla_v502',
+parser.add_argument('--pretrained', default=None, nargs='?', const='siliconperception/vla',
                     metavar='REPO', help='load weights + architecture from a hub repo')
 parser.add_argument('--revision',   default=None, help='--pretrained: branch, tag or commit')
 parser.add_argument('--verbose',    default=False, action='store_true',

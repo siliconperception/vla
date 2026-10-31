@@ -13,4 +13,4 @@ Earlier Silicon Perception projects, kept as they were when this repository was 
 | `README.md.devices` | the old repository README |
 
 The IE120R and CNN_LM weights were removed from Hugging Face on 2026-10-26; the current model is
-[siliconperception/vla_v502](https://huggingface.co/siliconperception/vla_v502).
+[siliconperception/vla](https://huggingface.co/siliconperception/vla).

@@ -1,0 +1,98 @@
+# VLA functional specification (model)
+
+This is what the model computes, tick by tick, for the published configuration (`siliconperception/vla`,
+run v511). It specifies the function, not an implementation. `vla.py` is the reference: where this text and the
+code disagree, the code is right and this text is a bug.
+
+## Dimensions
+
+| Symbol | Value | Meaning |
+|---|---|---|
+| S | 7 | grid side (positions S × S = 49) |
+| N | 512 | register channels, and the width of each layer's output |
+| C | 384 | working channels of a state update |
+| E | 256 | token embedding width (pythia-31m) |
+| V | 50,304 | vocabulary (pythia-31m BPE) |
+| L | 2 | recurrent layers, in series |
+| K | 2 | registers per layer |
+| W | layer 1: 16, 1 · layer 2: 64, 1 | register windows, in ticks (fixed) |
+| D | 8 | depth of each state update |
+| f | 25 Hz | tick rate in training (windows of 0.64 s and 2.56 s) |
+
+## State
+
+Each layer l has two registers R_l1, R_l2 (each N × S × S): 4 · N · S · S = 100,352 values in all. The state
+never grows. At the start of an example (the `<NUL>` input) every register is set to zero.
+
+## Inputs per tick
+
+- **Token grid T** (E × S × S): the current token's embedding t (frozen, from pythia-31m), scaled to unit RMS
+  over its E channels, copied to every grid position. A `<NUL>` or empty tick gives T = 0.
+- **Audio grid A** (256 × S × S): fixed log-mel features of the last ~2 s of sound (no weights). Zero for text.
+- **Voice and image token grids** (E × S × S each): the model's other two output streams fed back, built like T.
+  Zero for text.
+
+The multimodal design adds an image grid (a frozen ResNet-50 feature map); this configuration has none.
+
+## One tick
+
+The read of a register is the register scaled, per grid position, to unit RMS over its N channels:
+R̂ = R / √(mean_c R² + 1e-6). Each layer has its own weights; `Update` below is, for that layer,
+D times X ← ReLU( BN_d( Conv3×3_d(X) ) ), C → C, zero padding, where at inference BN_d normalizes each channel
+with its stored running mean and variance (no learned scale or shift).
+
+1. **Layer 1.**
+   - Mix: X = Conv1×1( concat(T, A, T_voice, T_image, R̂_11, R̂_12) ), 4·256 + 2·512 = 2,048 channels → C.
+   - Update X, then project: o₁ = Conv3×3(X), C → N, zero padding.
+2. **Layer 2.** It sees no input directly, only layer 1's output.
+   - Mix: X = Conv1×1( concat(ô₁, R̂_21, R̂_22) ), 3·512 = 1,536 channels → C, where ô₁ is o₁ scaled to unit
+     RMS per position like a register read.
+   - Update X, then project: d₂ = Conv3×3(X), C → N.
+   - The output is o = o₁ + d₂.
+3. **Write the registers.** Each layer writes its own output (o₁ for layer 1, d₂ for layer 2), x below, as a
+   Laplacian-pyramid cascade with that layer's window W_l1:
+   - R'_l1 = R_l1 + (x − R_l1) / W_l1
+   - R'_l2 = x − R'_l1 (window 1: a plain write)
+
+   so a layer's registers always sum to its output: R_l1 holds the slow part (a 16-tick average in layer 1, a
+   64-tick average in layer 2), R_l2 the rest.
+4. **Decode** (three independent decoders, one per stream: text, voice, image). Each reads o and is a linear tree
+   of unpadded convolutions, 3×3 (N → 256, 7 → 5), 3×3 (256 → 256, 5 → 3), 3×3 (256 → E, 3 → 1), then the frozen
+   pythia-31m output layer (E → V), plus one trained logit for `<NUL>` ("say nothing this tick").
+5. **Emit.** Each stream samples its next token or `<NUL>` by min-p sampling: only tokens with at least P times
+   the top token's probability are kept. P is stored with the weights; training keeps adjusting it so that the
+   model's own text from `<NUL>` scores a fluency of 100 (P = {{MINP}} at step {{STEP}}).
+
+## Training (for reference)
+
+Weights are trained with one token per row per step, 250 rows, plain SGD, cross-entropy normalized per word rather
+than per token, with truncated backpropagation through time over 16 steps. Text only (FineWeb sample-10BT).
+Frozen: the token embedding and the output layer. The configuration grew during training, each change resuming
+from the latest weights:
+
+| Steps | Change |
+|---|---|
+| 0 | from scratch: layer 1 only, register windows 512 and 1, plus a recall ring of 1,024 ticks read by attention; learning rate a half cosine from 4e-4 to 0.02 over 20,000 steps, then held |
+| 1,065,312 | recall ring and attention removed |
+| 1,127,936 | layer 2 added as the identity (its projection zero-initialized, its mix passing o₁ through) |
+| 1,321,120 | both layers' slow windows 512 → 64 |
+| 1,361,152 | both 64 → 16 |
+| 1,456,944 | layer 2's slow window 16 → 64 (the published configuration) |
+| 1,501,536 | learning rate a half cosine 0.02 → 0.01 over 20,000 steps, then held |
+| 1,581,808 | 0.01 → 0.005 |
+| 1,653,648 | 0.005 → 0.0025 |
+
+## Parameters
+
+| Part | Parameters | Trained |
+|---|---|---|
+| Layer 1: mix (1×1, 2,048 → 384) | 786,816 | yes |
+| Layer 1: update (8 × 3×3, with BN) | 10.62 M | yes |
+| Layer 1: project (3×3) | 1.77 M | yes |
+| Layer 2: mix (1×1, 1,536 → 384) | 590,208 | yes |
+| Layer 2: update (8 × 3×3, with BN) | 10.62 M | yes |
+| Layer 2: project (3×3) | 1.77 M | yes |
+| Decoders (3 trees + `<NUL>` heads) | 7.08 M | yes |
+| Token embedding | 12.88 M | frozen |
+| Output layer (shared by the 3 decoders) | 12.88 M | frozen |
+| **Total** | 58.99 M (33.24 M trained) | |

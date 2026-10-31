@@ -77,47 +77,46 @@
     <p class="lede">That rules out a large model streaming its weights from external DRAM. The goal is a
     vision-language-action model on a single chip: a CNN is parameter-efficient enough that every weight fits in
     on-chip SRAM, so there is no external memory, and the weights stay programmable. The same small kernels run at
-    every grid position and every tick, so about twenty million weights drive a state of 150,528 values.</p>
+    every grid position and every tick, so about thirty million weights drive a state of 100,352 values.</p>
     <p class="lede">The state also has a fixed size. Every tick does exactly the same work and finishes in the same
     time, however long the model has been running.</p>
     <nav class="links">
       <a href="https://github.com/siliconperception/vla">Code on GitHub</a>
-      <a href="https://huggingface.co/siliconperception/vla_v502">Model on Hugging Face</a>
+      <a href="https://huggingface.co/siliconperception/vla">Model on Hugging Face</a>
       <a href="https://github.com/siliconperception/vla/blob/main/docs/spec/README.md">Functional spec</a>
       <a href="https://github.com/siliconperception/vla/tree/main/paper">Paper (in preparation)</a>
     </nav>
+    <p class="note">Current release: <b>v511</b>, step 1,680,000 (420 M training tokens).</p>
   </header>
 
   <figure>
-    <a class="fig" href="figures/vla_v502.svg" title="Open the full-size figure">
-      <img src="figures/vla_v502.svg" alt="Block diagram of one clock tick: token and audio grids, a recall grid read by attention from a ring of the last 1,024 entries, and two registers are concatenated, mixed by a 1x1 convolution, transformed by eight 3x3 convolutions and projected; the result is written back into the registers as a cascade and appended to the ring; three decoders produce text, voice and image tokens.">
+    <a class="fig" href="figures/vla_v511.svg" title="Open the full-size figure">
+      <img src="figures/vla_v511.svg" alt="Block diagram of one clock tick, in two panes. Top: token and audio grids enter layer 1, whose output o1 feeds layer 2 and also bypasses it to an adder; the sum feeds three decoders that produce text, voice and image tokens, each fed back as the next input. Bottom: one layer zoomed in: its inputs and two registers are concatenated, mixed by a 1x1 convolution, transformed by eight 3x3 convolutions and projected; the result is written back into the registers as an average and a residual copy.">
     </a>
-    <figcaption>One clock tick of the published model (v502): three token streams (text, voice, image), two
-    registers (a 512-tick average and a one-tick copy), and a recall ring of the last 1,024 ticks read by one
-    attention step. The image encoder is drawn as the design intends; this model is trained on text. Select the
-    figure to open it full size.</figcaption>
+    <figcaption>One clock tick of the published model (v511): three token streams (text, voice, image) and two
+    recurrent layers in series, each with two registers (a slow average, over 16 ticks in layer 1 and 64 in layer
+    2, and a one-tick copy). The lower pane zooms into one layer. The image encoder is drawn as the design intends;
+    this model is trained on text. Select the figure to open it full size.</figcaption>
   </figure>
 
   <div class="facts">
     <div class="fact"><b>500 Hz</b><span>target tick rate on one chip, with the same work every tick</span></div>
-    <div class="fact"><b>150,528</b><span>values of state, fixed in size: 2 registers and a 1,024-entry ring</span></div>
-    <div class="fact"><b>20.7 M</b><span>trained parameters, small enough to hold every weight in on-chip SRAM</span></div>
+    <div class="fact"><b>100,352</b><span>values of state, fixed in size: 2 layers × 2 registers of 512 × 7 × 7</span></div>
+    <div class="fact"><b>33.2 M</b><span>trained parameters, small enough to hold every weight in on-chip SRAM</span></div>
     <div class="fact"><b>0</b><span>positional encodings; the state is reset only at the start of an example</span></div>
   </div>
 
   <h2>How a tick works</h2>
   <ol>
     <li>The current token's embedding is normalized and copied to every position of a 7 × 7 grid.</li>
-    <li>One attention read recalls from a ring holding a small entry for each of the last 1,024 ticks; the
-    result is normalized and copied to a grid like the token.</li>
-    <li>Those grids, the sound grid and the two registers (each normalized per position) are concatenated and mixed
-    by a 1 × 1 convolution.</li>
-    <li>Eight 3 × 3 convolutions with BatchNorm and ReLU transform the result, and a 3 × 3 convolution projects it to
-    register width.</li>
-    <li>The registers are written as a cascade: the first moves 1/512 of the way toward the new output, the second
-    holds the remainder, so the two always sum to it. A 1 × 1 convolution of the token and the output becomes the
-    ring's newest entry, and the oldest is dropped.</li>
-    <li>A small tree of convolutions collapses the grid to one vector, and a frozen output layer gives the next token.</li>
+    <li>Layer 1: that grid, the sound grid and layer 1's two registers (each normalized per position) are
+    concatenated and mixed by a 1 × 1 convolution; eight 3 × 3 convolutions with BatchNorm and ReLU transform the
+    result, and a 3 × 3 convolution projects it to register width.</li>
+    <li>Layer 2 does the same with its own weights, reading only layer 1's output and its own two registers, and
+    adds its result to layer 1's output.</li>
+    <li>Each layer writes its output into its registers as a cascade: the first moves 1/16 (layer 1) or 1/64
+    (layer 2) of the way toward it, the second holds the remainder, so the two always sum to it.</li>
+    <li>A small tree of convolutions collapses the sum to one vector, and a frozen output layer gives the next token.</li>
   </ol>
 
   <h2>Results</h2>
@@ -137,16 +136,30 @@
       <li><b>Cost per token.</b> Weights, state and operations per token, next to the scores.</li>
     </ol>
     <p class="note">Pythia was trained on the Pile, not FineWeb; the comparison will show both models on both.
-    Interim scores for the current weights are on the <a href="https://huggingface.co/siliconperception/vla_v502">model card</a>.</p>
+    Interim scores for the current weights are on the <a href="https://huggingface.co/siliconperception/vla">model card</a>.</p>
   </div>
 
+  <h2>Scores</h2>
+  <div class="tablewrap"><table>
+    <tr><th></th><th class="n">VLA v511</th><th class="n">pythia-70m</th><th class="n">pythia-70m</th><th class="n">pythia-70m</th></tr>
+    <tr><td>training tokens</td><td class="n">420 M</td><td class="n">268 M</td><td class="n">537 M</td><td class="n">300 B</td></tr>
+    <tr><td>FineWeb held-out, nats/token</td><td class="n">4.613</td><td class="n">7.420</td><td class="n">6.355</td><td class="n">3.731</td></tr>
+    <tr><td>BabyLM 2026 dev, nats/token</td><td class="n">4.608</td><td class="n">6.866</td><td class="n">5.718</td><td class="n">3.250</td></tr>
+    <tr><td>BLiMP, % of 1,005 pairs</td><td class="n">70.3</td><td class="n">51.8</td><td class="n">51.4</td><td class="n">75.7</td></tr>
+    <tr><td>ComVE, % of 999 pairs</td><td class="n">64.5</td><td class="n">56.5</td><td class="n">57.1</td><td class="n">69.7</td></tr>
+  </table></div>
+  <p class="note">pythia-70m (EleutherAI) is a transformer of similar total size with the same tokenizer, shown
+  at about this model's training tokens and fully trained; same documents, same pairs, same scoring rule (see the
+  <a href="https://huggingface.co/siliconperception/vla">model card</a>). Pythia was trained on the Pile, this
+  model on FineWeb. Matched tokens are not matched training: at 268 M and 537 M tokens pythia has made only 128
+  and 256 updates (of 2 M tokens each), this model 1,680,000 (of 250). Fully trained pythia-70m is the fair
+  reference.</p>
+
   <h2>Samples</h2>
-  <p>From the prompt in bold, with the published weights (250 M tokens of training). Locally fluent, not yet
+  <p>From the prompt in bold, with the published weights (420 M tokens of training). Locally fluent, not yet
   coherent:</p>
-  <blockquote><b>My grandmother's recipe for apple pie starts with</b> chocolate caramel and pumpkin pie! That is
-  one of the recipes you would like to put in the baking sheet, and let it be pretty cheesy.</blockquote>
-  <blockquote><b>When you plant a vegetable garden, the first thing to do is</b> focus on an assortment of
-  vegetables and veggie pasta (such as fruits) and a white vinegar cheese.</blockquote>
+  <blockquote><b>My grandmother&#x27;s recipe for apple pie starts with</b> almond and olive oil, green tea and apple, salt, garlic. I added a pair of the salsa cheese, and the balsamic vinegar in a pureed, salsa.</blockquote>
+  <blockquote><b>The colors of the rainbow are</b> beautiful and unique. It is a place of mystery, with light tones that lightens the sunlight in it and its speciality.</blockquote>
 
   <h2>Try it</h2>
 <pre><code>git clone https://github.com/siliconperception/vla && cd vla
