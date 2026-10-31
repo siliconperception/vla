@@ -437,6 +437,11 @@ parser.add_argument('--bptt', default=1, type=int, metavar='K',
                     help='truncated backpropagation through time: K steps run forward keeping the graph '
                          'through the register writes, then one backward of their mean loss and one '
                          'optimizer step (the gradient horizon grows from 1 token to up to K); 1 = off')
+parser.add_argument('--ckpt_ticks', action='store_true',
+                    help='--bptt: keep only each step\'s starting registers and inputs, and recompute the '
+                         'step (state update, decoders and loss) during the backward, so memory grows by '
+                         'the state alone per step (about 100 MB at batch 250) and --bptt 64 fits; one '
+                         'more forward per step')
 parser.add_argument('--lr_restart', action='store_true',
                     help='coswarm: rise over --lr_period steps from this run\'s first step '
                          '(a resumed run warms up again) instead of from global step 0')
@@ -940,6 +945,12 @@ if args.write_surprise:
     if _surprise is None:
         raise SystemExit(f'--write_surprise {args.write_surprise}: want rat,H[,MEAN] with H > 1, '
                          f'or LO,HI[,MEAN] with 0 < LO <= 1 <= HI')
+if args.ckpt_ticks and (args.bptt < 2 or args.learn_win or args.write_surprise
+                        or (not args.read_rmsnorm and args.ctx_read_norm > 0)):
+    # the backward recomputes each step: state kept outside the registers (the --learn_win
+    # traces, the surprise and read-norm running means) would be advanced twice
+    raise SystemExit('--ckpt_ticks needs --bptt > 1 and --read_rmsnorm (or --ctx_read_norm 0), '
+                     'without --learn_win or --write_surprise')
 args.align_min = 0.5 if args.align_min is None else float(args.align_min)
 if args.speech_align and not (args.fifo3 and args.clock_hz):
     raise SystemExit('--speech_align needs --fifo3 and --clock_hz')
@@ -7055,6 +7066,47 @@ _etr_start = None                # --learn_win: the sensitivity traces at that s
 _rows_t = {}                 # each corpus's training rows as a device index tensor
 
 
+def _train_loss(logits, y):
+    """One step's training loss of logits [B(, 3), V] against y -> (loss, ce [B(, 3)])."""
+    if model.streams == 3:       # <NUL> targets weigh --nul_weight; text on video rows: none
+        ce_all = F.cross_entropy(logits.reshape(-1, logits.shape[-1]), y.reshape(-1),
+                                 reduction='none').view(y.shape)
+        wt = torch.where(y == _NUL_ID, args.nul_weight, 1.0) * (y != -100)
+        return (ce_all * wt).sum() / _loss_den(wt, y), ce_all
+    ce_all = F.cross_entropy(logits, y, reduction='none')
+    if args.inner_voice:
+        return ce_all.sum() / (y != _SIL).sum().clamp(min=1), ce_all
+    if _NUL_ID is not None:      # --clock_hz: <NUL> targets weigh --nul_weight
+        wt = torch.where(y == _NUL_ID, args.nul_weight, 1.0)
+        return (ce_all * wt).sum() / _loss_den(wt, y), ce_all
+    return ce_all.mean(), ce_all
+
+
+def _ckpt_tick(dff, x, y, flag, img, aud):
+    """--ckpt_ticks: one training step from registers dff -> (loss, ce, logits, new registers),
+    run under torch.utils.checkpoint (only ce and logits leave detached)."""
+    model.dff = dff
+    logits, _ = model(x, flag=flag, img=img, aud=aud, keep=args.reset_scale, graph=True)
+    loss, ce_all = _train_loss(logits, y)
+    return loss, ce_all.detach(), logits.detach(), model.dff
+
+
+@contextlib.contextmanager
+def _bn_hold():
+    """--ckpt_ticks: the backward's recompute of a step leaves BatchNorm's running statistics
+    where the step's forward moved them (momentum 0 keeps them; the batch statistics, and so
+    the recomputed values, are the forward's), and their step counts where they were."""
+    saved = [(m.momentum, m.num_batches_tracked.clone()) for m in _bn_layers]
+    for m in _bn_layers:
+        m.momentum = 0.0
+    try:
+        yield
+    finally:
+        for m, (mo, n) in zip(_bn_layers, saved):
+            m.momentum = mo
+            m.num_batches_tracked.copy_(n)
+
+
 def _mmean(v, m):
     """Mean of v where m, nan where m is empty -- a GPU tensor, no host sync."""
     m = m.to(v.dtype)
@@ -7316,8 +7368,14 @@ try:
             _etr_start = model.etr
         model.etr_on = bool(model.learn)
         model.etr_inject = model.etr_on and len(_blk) == args.bptt - 1
-        logits, _ = model(x, flag=flag & ~_continuous_row, img=img, aud=aud, keep=args.reset_scale,
-                          graph=args.bptt > 1)
+        if args.ckpt_ticks:
+            loss, ce_all, logits, model.dff = torch.utils.checkpoint.checkpoint(
+                _ckpt_tick, model.dff, x, y, flag & ~_continuous_row, img, aud, use_reentrant=False,
+                context_fn=lambda: (contextlib.nullcontext(), _bn_hold()))
+        else:
+            logits, _ = model(x, flag=flag & ~_continuous_row, img=img, aud=aud, keep=args.reset_scale,
+                              graph=args.bptt > 1)
+            loss, ce_all = _train_loss(logits, y)
         model.etr_on = model.etr_inject = False
         if args.step_tokens:         # row 0's text-stream input and argmax prediction, kept on the GPU
             with torch.no_grad():
@@ -7325,26 +7383,13 @@ try:
                 pr = _truncate(F.softmax(lg / max(args.temperature, 1e-6), dim=-1))
                 _tok_buf.append(torch.stack([x[0, 0] if x.dim() > 1 else x[0],
                                              torch.multinomial(pr, 1, generator=_tok_gen)[0, 0]]))
-        if model.streams == 3:
-            ce_all = F.cross_entropy(logits.reshape(-1, logits.shape[-1]), y.reshape(-1),
-                                     reduction='none').view(y.shape)
-        else:
-            ce_all = F.cross_entropy(logits, y, reduction='none')
-        if model.streams == 3:       # <NUL> targets weigh --nul_weight; text on video rows: none
-            with torch.no_grad():    # (--fifo3: no sample is ever fed back; _own stays None)
-                if not args.fifo3:
+        if model.streams == 3:       # (--fifo3: no sample is ever fed back; _own stays None)
+            if not args.fifo3:
+                with torch.no_grad():
                     _own = torch.multinomial(_truncate(F.softmax(logits[:, 0].detach().float(), dim=-1)), 1)[:, 0]
-            wt = torch.where(y == _NUL_ID, args.nul_weight, 1.0) * (y != -100)
-            loss = (ce_all * wt).sum() / _loss_den(wt, y)
         elif args.inner_voice:
             with torch.no_grad():
                 _own = torch.multinomial(_truncate(F.softmax(logits.detach().float(), dim=-1)), 1)[:, 0]
-            loss = ce_all.sum() / (y != _SIL).sum().clamp(min=1)
-        elif _NUL_ID is not None:    # --clock_hz: <NUL> targets weigh --nul_weight
-            wt = torch.where(y == _NUL_ID, args.nul_weight, 1.0)
-            loss = (ce_all * wt).sum() / _loss_den(wt, y)
-        else:
-            loss = ce_all.mean()
         _pt('forward')
         if not torch.isfinite(loss):         # keep the last good checkpoint on disk
             print(f'\n*** HALT: non-finite loss at step {i}: {loss.item()} dff_max '
