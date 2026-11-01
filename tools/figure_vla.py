@@ -1,6 +1,6 @@
 """Draw docs/figures/vla_<model>.svg: one clock tick of a VLA model, 16:9 (1920 x 1080).
 
-usage: python tools/figure_vla.py [--model v498|v499|v502|v505|v511|v531|v533|v536] [--out OUT]
+usage: python tools/figure_vla.py [--model v498|v499|v502|v505|v511|v531|v533|v536|v538] [--out OUT]
 
 v498: recurrent CNN + two order-2 Legendre memories (4096, 64 ticks) + copy + recall attention, never
 reset. v499: no registers, the recall attention's ring is the whole state, reset at each example.
@@ -11,11 +11,13 @@ with the layers' EMA windows 16 (layer 1) and 64 (layer 2) ticks. v531: one laye
 written at a learned rate per channel and position (--write_gate), plus the residual copy. v533: v531's
 architecture, trained on with SGD lr 0.001 and Nesterov momentum 0.95. v536: --convdelta 6 --lm, a
 text-only model of 6 residual blocks of per-tick convs, each carrying a gated delta-rule matrix memory per grid
-position, trained a window at a time; 1920 x 2160, the whole model above and one block below."""
+position, trained a window at a time; 1920 x 2160, the whole model above and one block below. v538: v536
+with --grid_hist 8 (the input grid a learned map of the last 8 tokens, starting as concentric rings) and
+--reset_prob 0.5 (half the training documents start unreset: a stress test for perception discontinuities)."""
 import argparse
 
 ap = argparse.ArgumentParser()
-ap.add_argument('--model', default='v498', choices=('v498', 'v499', 'v502', 'v505', 'v511', 'v531', 'v533', 'v536'))
+ap.add_argument('--model', default='v498', choices=('v498', 'v499', 'v502', 'v505', 'v511', 'v531', 'v533', 'v536', 'v538'))
 ap.add_argument('--out', default=None)
 a = ap.parse_args()
 LMU = a.model == 'v498'                   # Legendre memories + copy
@@ -23,7 +25,7 @@ CASC = a.model == 'v502'                  # EMA + residual copy, RMSnorm reads
 REGS = LMU or CASC                        # (v499: the ring alone)
 CAT = {'v498': ('3×256 + 2048 + 256 + 256 + 5×512', 5888), 'v499': ('3×256 + 2048 + 256 + 256', 3328),
        'v502': ('3×256 + 2048 + 256 + 256 + 2×512', 4352), 'v505': ('', 0), 'v511': ('', 0),
-       'v531': ('', 0), 'v533': ('', 0), 'v536': ('', 0)}[a.model]
+       'v531': ('', 0), 'v533': ('', 0), 'v536': ('', 0), 'v538': ('', 0)}[a.model]
 EMA1, EMA2 = (16, 64) if a.model == 'v511' else (512, 512)    # two-layer models: each layer's EMA window
 
 W, H = 1920, 1080
@@ -536,24 +538,59 @@ def draw_v536():
     out.append(f'<rect width="{W5}" height="{H5}" fill="#ffffff"/>')
 
     # ── pane A: the whole model ─────────────────────────────────────────────
-    text(30, 38, 'VLA v536 — one clock tick (40 ms): a ConvDelta language model, 6 residual blocks of per-tick '
-         'convs, each with a gated delta-rule memory per grid position', 22, anchor='start', weight='bold')
+    V8 = a.model == 'v538'                # --grid_hist 8 (learned ring input) and --reset_prob 0.5
+    text(30, 38, f'VLA {a.model} — one clock tick (40 ms): a ConvDelta language model, 6 residual blocks of '
+         'per-tick convs, each with a gated delta-rule memory per grid position', 22, anchor='start', weight='bold')
     text(30, 62, 'A · the whole model.  --lm: text only · C 384 · 7×7 grid · 6 blocks · H 6 heads × d 32 per position '
-         '· 25 Hz · 21.97M trainable · fixed state 2,145,024 values · trained a 256-tick window at a time', 13,
+         '· 25 Hz · ' + ('22.01M trainable · fixed state 2,145,073 values · input: the last 8 tokens on a learned map '
+                         '· trained 256 ticks at a time, half the documents unreset' if V8 else
+                         '21.97M trainable · fixed state 2,145,024 values · trained a 256-tick window at a time'), 13,
          anchor='start', fill='#424242')
     CY = 400
     mux(40, CY)
-    line([(74, CY), (128, CY)])
-    text(100, CY - 6, 'text', 10, fill=COL['soft'])
-    box(130, CY - 75, 150, 150, COL['frozen'], ['tok_embed (frozen)', 'pythia-31m 50304×256'], hatch=True)
-    line([(280, CY), (318, CY)])
-    box(320, CY - 75, 40, 150, COL['rep'], ['RMS · replicate 1×1→7×7'], size=11, vertical=True)
-    text(385, CY + 18, '256×7×7', 10, fill=COL['soft'])
-    PX = 410
-    line([(360, CY), (PX, CY)])
-    box(PX, CY - 120, 40, 240, COL['lin'], ['ctx_cat 1×1 256 → 384'], size=11, vertical=True)
+    if V8:                                # the last 8 tokens, each embedded, mixed onto the grid by a[j, p]
+        line([(74, CY), (82, CY), (82, CY - 84), (92, CY - 84)])     # the new token enters at t
+        text(57, CY - 20, 'text', 10, fill=COL['soft'])
+        for j in range(8):
+            yy = CY - 96 + 24 * j
+            out.append(f'<rect x="92" y="{yy}" width="44" height="24" fill="#ffffff" stroke="{COL["ink"]}" '
+                       f'stroke-width="1.1"/>')
+            text(114, yy + 16, 't' if j == 0 else f't−{j}', 10.5)
+        text(114, CY - 104, 'last 8 tokens', 10, fill=COL['soft'])
+        text(114, CY + 112, 'shift down a slot', 9.5, fill=COL['soft'])
+        text(114, CY + 124, 'each tick (in the state)', 9.5, fill=COL['soft'])
+        line([(136, CY), (150, CY)])
+        box(150, CY - 75, 92, 150, COL['frozen'], ['tok_embed', '(frozen)', 'each token'], size=11, hatch=True)
+        line([(242, CY), (254, CY)])
+        box(254, CY - 60, 26, 120, COL['rep'], ['RMS'], size=10, vertical=True)
+        line([(280, CY), (292, CY)])
+        box(292, CY - 75, 34, 150, COL['lin'], ['ctx_cat 1×1 256→384'], size=10, vertical=True)
+        line([(326, CY), (344, CY)])
+        text(309, CY + 90, '8 × 384', 9.5, fill=COL['soft'])
+        cs, gx, gy = 14, 346, CY - 49                     # the map's starting rings, as a 7x7 icon
+        shade = ['#1a237e', '#3949ab', '#7986cb', '#c5cae9']
+        for r_ in range(7):
+            for c_ in range(7):
+                k = 3 - max(abs(r_ - 3), abs(c_ - 3))
+                out.append(f'<rect x="{gx + c_ * cs}" y="{gy + r_ * cs}" width="{cs}" height="{cs}" '
+                           f'fill="{shade[k]}" stroke="#ffffff" stroke-width="0.6"/>')
+        text(gx + 49, gy - 26, 'learned map a[j, p]', 11, weight='bold')
+        text(gx + 49, gy - 12, '8 × 7×7, mixes the tokens', 9.5, fill=COL['soft'])
+        text(gx + 49, gy + 114, 'start: rings, outer t', 9.5, fill=COL['soft'])
+        text(gx + 49, gy + 127, '… centre t−3', 9.5, fill=COL['soft'])
+        line([(gx + 98, CY), (480, CY)])
+    else:
+        line([(74, CY), (128, CY)])
+        text(100, CY - 6, 'text', 10, fill=COL['soft'])
+        box(130, CY - 75, 150, 150, COL['frozen'], ['tok_embed (frozen)', 'pythia-31m 50304×256'], hatch=True)
+        line([(280, CY), (318, CY)])
+        box(320, CY - 75, 40, 150, COL['rep'], ['RMS · replicate 1×1→7×7'], size=11, vertical=True)
+        text(385, CY + 18, '256×7×7', 10, fill=COL['soft'])
+        PX = 410
+        line([(360, CY), (PX, CY)])
+        box(PX, CY - 120, 40, 240, COL['lin'], ['ctx_cat 1×1 256 → 384'], size=11, vertical=True)
+        line([(PX + 40, CY), (480, CY)])
     box(480, CY - 120, 44, 240, COL['gate'], ['per position: × G + P'], size=11, vertical=True)
-    line([(PX + 40, CY), (480, CY)])
     x0 = 560
     line([(524, CY), (x0, CY)])
     BW, GAP = 100, 20
@@ -610,7 +647,8 @@ def draw_v536():
     text(1100, 132, 'the sampled token → the next tick\'s input (training: the dataset\'s)', 11, fill=COL['soft'])
 
     legend(30, 640, [(COL['frozen'], True, 'frozen: embedding / lmhead (pythia-31m)'),
-                     (COL['rep'], False, 'RMS norm · replicate 1×1 → 7×7'),
+                     (COL['rep'], False, 'RMS norm' if V8 else 'RMS norm · replicate 1×1 → 7×7')] +
+           ([('#3949ab', False, 'learned input map a[j, p]: tokens t … t−7 onto the grid')] if V8 else []) + [
                      (COL['lin'], False, 'conv 1×1 / 3×3 (linear): ctx_cat, linout'),
                      (COL['gate'], False, 'per-position gain G and bias P (learned)'),
                      (COL['tconv'], False, 'causal depthwise conv over the last 4 ticks'),
@@ -618,11 +656,26 @@ def draw_v536():
                      (COL['lmu'], False, 'Δ: gated delta-rule memory update and read'),
                      (COL['dec'], False, 'decoder convs 3×3, 7→5→3→1 (linear)'),
                      (COL['smp'], False, 'softmax + sample (+ <NUL> logit)')],
-           '(S: reset to 0 at each document start)', w=560)
+           '(training: reset at half the document starts)' if V8 else '(S: reset to 0 at each document start)',
+           w=560)
     nx = 650
     out.append(f'<rect x="{nx}" y="640" width="{1890 - nx}" height="380" rx="8" fill="#fafafa" stroke="#bdbdbd"/>')
-    text(nx + 18, 668, 'how it differs from v533', 14, anchor='start', weight='bold')
+    text(nx + 18, 668, 'how it differs from v536' if V8 else 'how it differs from v533', 14, anchor='start',
+         weight='bold')
     for i, s_ in enumerate((
+            'The input grid shows the last 8 tokens, not one token copied to every cell: cell p holds Σⱼ a[j, p] · ctx_cat(token t−j)',
+            'with a learned 8 × 7×7 map a, which starts as concentric rings (t on the outer ring, t−1, t−2 inward, t−3 at the',
+            'centre; t−4 … t−7 at 0, free to be recruited). Neighbouring cells now hold neighbouring moments, so the 3×3 convs',
+            'see tokens side by side and can form n-gram features in one layer. The 7 past token ids ride in the state.',
+            '',
+            'Stress test for perception discontinuities (--reset_prob 0.5): in training, half of the document starts reset',
+            'the state and half do not, so the previous, unrelated document\'s memories carry straight on, marked only by',
+            'the separator token, as when a robot\'s continuous perception jumps to a new scene, task or speaker. The model',
+            'must learn to let go of stale context itself (the decay α and write strength β see the input). Evals still',
+            'reset per document; EVALW measures the unreset case.',
+            '',
+            'Otherwise as v536: --lm, 6 ConvDelta blocks, AdamW (β 0.9, 0.95), lr warmed to 0.001, 32 × 256 tokens per update.',
+    ) if V8 else (
             'No conv reads the state. The convs see only this tick\'s input to their block, so in training they run on all',
             '256 ticks of a window at once ([32·256, 384, 7, 7], in bf16), and the memories S, the only state carried',
             'from tick to tick, are trained over the whole window by a chunked parallel scan (their update is linear in',
@@ -762,7 +815,7 @@ def draw_v536():
 if a.model in ('v531', 'v533'):
     draw_v531()
     raise SystemExit(0)
-if a.model == 'v536':
+if a.model in ('v536', 'v538'):
     draw_v536()
     raise SystemExit(0)
 
