@@ -265,6 +265,10 @@ parser.add_argument('--convdelta', default=0, type=int, metavar='N',
                     help='ConvDelta: N residual blocks (causal time conv, 2 x conv 3x3, a gated delta-rule '
                          'memory per grid position) between ctx_cat and linout instead of the ContextCNN '
                          'and registers; trained a whole --bptt window at once (parallel over ticks)')
+parser.add_argument('--grid_hist', default=0, type=int, metavar='K',
+                    help='--convdelta --lm: the input grid mixes the last K tokens, each cell p its own '
+                         'learned weights a[j, p] over tokens t-j (start: concentric rings, the current token '
+                         'on the outer ring and t-1, t-2, t-3 inward to the centre; older tokens at 0)')
 parser.add_argument('--cd_heads', default=6, type=int, help='--convdelta: memory heads per position')
 parser.add_argument('--cd_dim', default=32, type=int, help='--convdelta: key/value width per head')
 parser.add_argument('--cd_taps', default=4, type=int, help='--convdelta: causal time conv taps (this tick + taps-1)')
@@ -842,7 +846,7 @@ _ARCH_ARGS = ('context', 'n_hidden', 'c_context', 'depth', 'kernel', 'tokenizer'
               'ctx_read_norm', 'dec_tree_kernels', 'dec_width', 'bn_momentum', 'init',
               'image_encoder', 'audio_encoder', 'streams', 'linout_kernel', 'learn_win',
               'learn_regs', 'lmu', 'attn', 'attn_ch', 'attn_heads', 'attn_dim', 'attn_age', 'read_rmsnorm',
-              'layers', 'write_gate', 'convdelta', 'cd_heads', 'cd_dim', 'cd_taps', 'lm')
+              'layers', 'write_gate', 'convdelta', 'cd_heads', 'cd_dim', 'cd_taps', 'lm', 'grid_hist')
 
 
 def _parse_mix():
@@ -2183,7 +2187,7 @@ class VLAModel(nn.Module, _HubMixin):
                  text_nul=False, surprise=None, linout_kernel=1, learn_win=False,
                  learn_regs=(), lmu=False, attn=0, attn_ch=2, attn_heads=8, attn_dim=64, attn_age=True,
                  read_rmsnorm=False, layers=1, up_windows=None, write_gate=False,
-                 convdelta=0, cd_heads=6, cd_dim=32, cd_taps=4, cd_chunk=64):
+                 convdelta=0, cd_heads=6, cd_dim=32, cd_taps=4, cd_chunk=64, grid_hist=0):
         super().__init__()
         from transformers import AutoModelForCausalLM
         repo = _TOKENIZERS[tokenizer]
@@ -2347,6 +2351,25 @@ class VLAModel(nn.Module, _HubMixin):
             self.cd_G = nn.Parameter(torch.ones(c_context, S, S))
             self.cd_P = nn.Parameter(torch.zeros(c_context, S, S))
             self.ring_off = sum(b.state_ch for b in self.cd)
+        # --grid_hist K: cell p of the input grid is sum_j a[j, p] ctx_cat(token t-j); a starts as
+        # concentric rings (outer ring t, inward t-1, t-2, ..., the centre the oldest of them),
+        # the tokens beyond the rings at 0. The last K-1 token ids ride in the state's first
+        # channel (id + 1; 0 = none), so a document start clears them with everything else.
+        self.grid_hist = int(grid_hist or 0)
+        self.hist_ch = 0
+        if self.grid_hist:
+            if self.cd is None or self.streams != 1 or self.img_width or self.aud_width:
+                raise SystemExit('--grid_hist needs --convdelta and --lm (one text stream, no media)')
+            if not 2 <= self.grid_hist <= S * S + 1:
+                raise SystemExit(f'--grid_hist {self.grid_hist}: 2 .. {S * S + 1}')
+            r = torch.arange(S) - S // 2
+            ring = torch.maximum(r.abs()[:, None], r.abs()[None, :])          # 0 centre .. S//2 outer
+            a = torch.zeros(self.grid_hist, S, S)
+            for j in range(min(self.grid_hist, S // 2 + 1)):
+                a[j][ring == S // 2 - j] = 1.0
+            self.grid_a = nn.Parameter(a)
+            self.hist_ch = 1
+            self.ring_off += 1
         self.dff = None              # [B, K*n_hidden, S, S], detached; None until first step
         self._ablate = None          # --eval_info: registers read as their mean ...
         self._read_mean = None       # ... which is this [1, K*n_hidden, S, S] tensor
@@ -2587,8 +2610,26 @@ class VLAModel(nn.Module, _HubMixin):
         return torch.where(ok, g, torch.ones_like(g))
 
     def _cd_in(self, idx, img=None, aud=None):
-        """--convdelta: the input grid [M, C, S, S] for a batch of ticks."""
+        """--convdelta: the input grid [M, C, S, S] for a batch of ticks (--grid_hist: idx is
+        [M, K], the tokens t, t-1, ..., -1 where none)."""
+        if self.grid_hist:
+            M, K = idx.shape
+            e = self.tok_embed(idx.clamp(min=0))
+            e = (e * torch.rsqrt(e.pow(2).mean(-1, keepdim=True) + 1e-12)).masked_fill((idx < 0)[..., None], 0.0)
+            y = self.ctx_cat(e.reshape(M * K, -1, 1, 1)).view(M, K, -1)              # [M, K, C]
+            x = torch.einsum('mkc,kp->mcp', y, self.grid_a.view(K, -1)).view(M, -1, self.S, self.S)
+            return x * self.cd_G + self.cd_P
         return self.ctx_cat(torch.cat(self._inputs(idx, img, aud), 1)) * self.cd_G + self.cd_P
+
+    def _hist_get(self, dff):
+        """--grid_hist: the last K-1 token ids in a state [B, K-1], newest first (-1: none)."""
+        return dff[:, 0].flatten(1)[:, :self.grid_hist - 1].round().long() - 1
+
+    def _hist_put(self, ids):
+        """--grid_hist: ids [B, K-1] -> the state's history channel [B, 1, S, S]."""
+        h = ids.new_zeros(ids.shape[0], self.S * self.S, dtype=torch.float32)
+        h[:, :ids.shape[1]] = (ids + 1).clamp(min=0).float()
+        return h.view(-1, 1, self.S, self.S)
 
     @contextlib.contextmanager
     def _bn_hold(self):
@@ -2610,8 +2651,21 @@ class VLAModel(nn.Module, _HubMixin):
         entering that tick), dff [B, ring_off, S, S] entering tick 0 -> (o [B*T, n_hidden, S, S],
         the state after the last tick). Equal to T calls of step."""
         B, T = idx.shape[:2]
-        x = self._cd_in(idx.flatten(0, 1), img, aud).view(B, T, self.c_context, self.S, self.S)
-        sts, off = [], 0
+        sts, off = [], self.hist_ch
+        if self.grid_hist:           # each tick's last K tokens, none before a document start
+            K = self.grid_hist
+            ext = torch.cat([self._hist_get(dff).flip(1), idx], 1)                  # oldest first
+            doc = torch.cat([reset.new_zeros(B, K - 1, dtype=torch.long), torch.cumsum(reset.long(), 1)], 1)
+            ids = []
+            for j in range(K):
+                ok = doc[:, K - 1 - j:K - 1 - j + T] == doc[:, K - 1:]
+                ids.append(torch.where(ok, ext[:, K - 1 - j:K - 1 - j + T], -1))
+            x = self._cd_in(torch.stack(ids, 2).flatten(0, 1))
+            last = torch.where(doc[:, T:].flip(1) == doc[:, -1:], ext[:, T:].flip(1), -1)   # newest first
+            sts.append(self._hist_put(last))
+        else:
+            x = self._cd_in(idx.flatten(0, 1), img, aud)
+        x = x.view(B, T, self.c_context, self.S, self.S)
         for blk in self.cd:
             st = dff[:, off:off + blk.state_ch]
             off += blk.state_ch
@@ -2627,7 +2681,11 @@ class VLAModel(nn.Module, _HubMixin):
     def step(self, idx, dff, img=None, aud=None):
         """One token for every row: -> (new state, layer output). No detach."""
         if self.cd is not None:
-            x, sts, off = self._cd_in(idx, img, aud), [], 0
+            if self.grid_hist:
+                ids = torch.cat([idx[:, None], self._hist_get(dff)], 1)            # t, t-1, ...
+                x, sts, off = self._cd_in(ids), [self._hist_put(ids[:, :self.grid_hist - 1])], 1
+            else:
+                x, sts, off = self._cd_in(idx, img, aud), [], 0
             for blk in self.cd:
                 x, st = blk.step(x, dff[:, off:off + blk.state_ch])
                 off += blk.state_ch
@@ -3645,6 +3703,7 @@ model = VLAModel(S=args.context, n_hidden=args.n_hidden, c_context=args.c_contex
                  attn_dim=args.attn_dim, attn_age=args.attn_age, read_rmsnorm=args.read_rmsnorm,
                  layers=args.layers, write_gate=args.write_gate,
                  convdelta=args.convdelta, cd_heads=args.cd_heads, cd_dim=args.cd_dim, cd_taps=args.cd_taps,
+                 grid_hist=args.grid_hist,
                  cd_chunk=args.cd_chunk,
                  up_windows=[float(w) for w in str(args.up_ema).split(',') if w.strip()] if args.up_ema else None)
 if _loaded_ckpt is not None:
