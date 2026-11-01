@@ -1,31 +1,33 @@
 """Draw docs/figures/vla_<model>.svg: one clock tick of a VLA model, 16:9 (1920 x 1080).
 
-usage: python tools/figure_vla.py [--model v498|v499|v502|v505|v511] [--out OUT]
+usage: python tools/figure_vla.py [--model v498|v499|v502|v505|v511|v531] [--out OUT]
 
 v498: recurrent CNN + two order-2 Legendre memories (4096, 64 ticks) + copy + recall attention, never
 reset. v499: no registers, the recall attention's ring is the whole state, reset at each example.
 v502: the residual cascade of an EMA (512 ticks) and the residual copy, read through per-sample RMSnorm,
 + recall attention, reset at each example. v505: two recurrent layers in series, each with that cascade, no
 recall attention; 1920 x 2160, two 16:9 panes: the whole tick on top, one layer zoomed in below. v511: v505
-with the layers' EMA windows 16 (layer 1) and 64 (layer 2) ticks."""
+with the layers' EMA windows 16 (layer 1) and 64 (layer 2) ticks. v531: one layer, its EMA (16 ticks to start)
+written at a learned rate per channel and position (--write_gate), plus the residual copy."""
 import argparse
 
 ap = argparse.ArgumentParser()
-ap.add_argument('--model', default='v498', choices=('v498', 'v499', 'v502', 'v505', 'v511'))
+ap.add_argument('--model', default='v498', choices=('v498', 'v499', 'v502', 'v505', 'v511', 'v531'))
 ap.add_argument('--out', default=None)
 a = ap.parse_args()
 LMU = a.model == 'v498'                   # Legendre memories + copy
 CASC = a.model == 'v502'                  # EMA + residual copy, RMSnorm reads
 REGS = LMU or CASC                        # (v499: the ring alone)
 CAT = {'v498': ('3×256 + 2048 + 256 + 256 + 5×512', 5888), 'v499': ('3×256 + 2048 + 256 + 256', 3328),
-       'v502': ('3×256 + 2048 + 256 + 256 + 2×512', 4352), 'v505': ('', 0), 'v511': ('', 0)}[a.model]
+       'v502': ('3×256 + 2048 + 256 + 256 + 2×512', 4352), 'v505': ('', 0), 'v511': ('', 0),
+       'v531': ('', 0)}[a.model]
 EMA1, EMA2 = (16, 64) if a.model == 'v511' else (512, 512)    # two-layer models: each layer's EMA window
 
 W, H = 1920, 1080
 out = []
 COL = dict(frozen='#e0e0e0', rep='#ce93d8', cat='#90a4ae', lin='#64b5f6', cnn='#81c784', dec='#4dd0e1',
            media='#ffffff', smp='#f48fb1', lmu='#fff176', norm='#bcaaa4', attn='#ffb74d', mel='#fff9c4',
-           ink='#212121', soft='#616161')
+           ink='#212121', soft='#616161', gate='#ff8a65')
 
 
 def esc(s):
@@ -360,8 +362,168 @@ def draw_v505():
     open(a.out or f'docs/figures/vla_{a.model}.svg', 'w').write('\n'.join(out))
 
 
+def draw_v531():
+    """1920 x 1080: one recurrent layer, its EMA register written at a learned rate (the write gate)."""
+    out.append(f'<svg xmlns="http://www.w3.org/2000/svg" width="{W}" height="{H}" viewBox="0 0 {W} {H}" '
+               f'font-family="Helvetica, Arial, sans-serif">')
+    out.append(DEFS)
+    out.append(f'<rect width="{W}" height="{H}" fill="#ffffff"/>')
+    text(30, 38, 'VLA v531 — one clock tick (40 ms): one recurrent CNN layer, its EMA register written through a '
+         'learned gate', 22, anchor='start', weight='bold')
+    text(30, 62, 'n_hidden 512 · c_context 384 · 7×7 grid · depth 8 · 3 token streams · 25 Hz · EMA (16 ticks to '
+         'start) + copy, RMSnorm reads · reset at each example · 20.5M trainable · state 2 × 512×7×7 = 50,176 values',
+         13, anchor='start', fill='#424242')
+    CY = 330
+    ys = (215, 265, 315)                                  # inputs
+    for y, nm in zip(ys, ('text', 'voice', 'image')):
+        mux(40, y)
+        line([(74, y), (128, y)])
+        text(100, y - 6, nm, 10, fill=COL['soft'])
+    box(130, 190, 150, 150, COL['frozen'], ['tok_embed (frozen)', 'pythia-31m 50304×256', 'shared by 3 streams'],
+        hatch=True)
+    for y in ys:
+        line([(280, y), (318, y)])
+    box(320, 190, 40, 150, COL['rep'], ['RMS · replicate 1×1→7×7'], size=11, vertical=True)
+    text(430, ys[0] - 8, 'token grids 3 × 256×7×7', 10, fill=COL['soft'])
+    box(40, 400, 90, 44, COL['media'], ['audio', '16 kHz'])
+    line([(130, 422), (158, 422)])
+    box(160, 400, 150, 44, COL['mel'], ['log-mel (fixed)', '64 mels · 10 ms hop'])
+    line([(310, 422), (328, 422)])
+    box(330, 405, 36, 34, COL['norm'], ['RMS'], size=10)
+    text(430, 414, 'audio grid 256×7×7', 10, fill=COL['soft'])
+    box(40, 480, 90, 44, COL['media'], ['frame', '2 fps'], dash=True)
+    line([(130, 502), (158, 502)], dash=True, color='#9e9e9e')
+    box(160, 480, 150, 44, COL['frozen'], ['image encoder', '(future)'], hatch=True, dash=True)
+
+    CX, CW = 500, 48                                      # concat, ctx_cat, ContextCNN, linout
+    box(CX, 150, CW, 740, COL['cat'], ['concat  3×256 + 256 + 2×512 = 2048'], size=12, vertical=True)
+    for y in ys:
+        line([(360, y), (CX, y)])
+    line([(366, 422), (CX, 422)])
+    line([(CX + CW, CY), (578, CY)])
+    box(580, CY - 120, 40, 240, COL['lin'], ['ctx_cat 1×1 2048→384'], vertical=True)
+    x = 660
+    line([(620, CY), (x, CY)])
+    for k in range(8):
+        box(x, CY - 90, 36, 180, COL['cnn'])
+        if k < 7:
+            line([(x + 36, CY), (x + 58, CY)])
+        x += 58
+    text(660 + (58 * 8 - 22) / 2, CY - 104, 'ContextCNN: 8 × (conv 3×3 + BN + ReLU), 384→384', 13, weight='bold')
+    text(660 + (58 * 8 - 22) / 2, CY + 112, '384×7×7 throughout', 11, fill=COL['soft'])
+    HT = x + 4                                            # the working state h, tapped for the gate
+    LX = HT + 40
+    line([(x - 22, CY), (LX, CY)])
+    dot(HT, CY)
+    text(HT, CY - 10, 'h', 13, weight='bold')
+    box(LX, CY - 120, 40, 240, COL['lin'], ['linout 3×3 384→512'], vertical=True)
+    BX = LX + 110                                         # the output bus
+    line([(LX + 40, CY), (BX, CY)], arrow=False)
+    dot(BX, CY)
+    text(BX - 8, CY - 8, 'x = 512×7×7', 10, anchor='end', fill=COL['soft'])
+
+    DX = BX + 70                                          # decoders, lmhead, sampling
+    rows = ((200, 'text_dec', 'THINK'), (CY, 'voc_dec', 'HEAR'), (460, 'img_dec', 'SEE'))
+    line([(BX, rows[0][0]), (BX, rows[2][0])], arrow=False)
+    HX = DX + 220
+    for y, nm, kind in rows:
+        line([(BX, y), (DX, y)])
+        text(DX + 80, y - 42, nm, 12, weight='bold')
+        xx = DX
+        for lab in ('3×3 7→5', '3×3 5→3', '3×3 3→1'):
+            box(xx, y - 32, 34, 64, COL['dec'], [lab], size=10, vertical=True)
+            if xx < DX + 120:
+                line([(xx + 34, y), (xx + 60, y)])
+            xx += 60
+        line([(xx - 26, y), (HX, y)])
+    box(HX, 150, 44, 360, COL['frozen'], ['lmhead 256→50304 (frozen, shared)'], hatch=True, vertical=True)
+    SX = HX + 90
+    for y, nm, kind in rows:
+        line([(HX + 44, y), (SX, y)])
+        box(SX, y - 28, 104, 56, COL['smp'], ['softmax', f'sample · {kind}'])
+    for i, (y, nm, kind) in enumerate(rows):            # each stream's sample is its next input
+        top = 120 - 13 * i
+        xr = SX + 104 + 18 + 16 * i
+        xl = 34 - 7 * i
+        line([(SX + 104, y), (xr, y), (xr, top), (xl, top), (xl, ys[i]), (40, ys[i])])
+    text(SX - 300, 88, 'each stream\'s sample → its next input (training: the dataset\'s)', 11, fill=COL['soft'])
+
+    y0 = 620                                              # the register cascade, written through the gate
+    out.append(f'<rect x="640" y="{y0}" width="{BX + 40 - 640}" height="270" rx="6" fill="#fffde7" '
+               f'stroke="#9e9e9e" stroke-dasharray="6,4"/>')
+    text(656, y0 + 22, 'residual cascade (Laplacian pyramid) · 2 × 512×7×7', 13, anchor='start', weight='bold')
+    text(656, y0 + 92, 'DFF_1: r ← r + a ⊙ (x − r)', 12, anchor='start')
+    text(656, y0 + 110, 'an EMA at a learned rate a', 11, anchor='start', fill='#424242')
+    text(656, y0 + 126, 'per channel and position', 11, anchor='start', fill='#424242')
+    text(656, y0 + 218, 'DFF_2: r ← x − S_1', 12, anchor='start')
+    text(656, y0 + 236, 'residual copy (window 1)', 11, anchor='start', fill='#424242')
+    fx, ex = 900, HT
+    f1, f2 = y0 + 50, y0 + 172
+    c1y, s2y = f1 + 23, f2 + 23
+    gy = 470                                              # the write gate: a = sigmoid(wgate(h))
+    line([(HT, CY), (HT, gy)])
+    box(HT - 62, gy, 124, 58, COL['gate'], ['write gate', 'wgate 1×1 384→512', 'σ'], size=11)
+    line([(HT, gy + 58), (HT, c1y - 28)])
+    text(HT + 8, gy + 84, 'a = 512×7×7 rate', 10.5, anchor='start', fill=COL['soft'])
+    text(HT + 8, gy + 98, '(starts at 1/16)', 10.5, anchor='start', fill=COL['soft'])
+    out.append(f'<circle cx="{ex}" cy="{c1y}" r="26" fill="{COL["lmu"]}" stroke="{COL["ink"]}" stroke-width="1.2"/>')
+    text(ex, c1y - 2, 'EMA', 11, weight='bold')
+    text(ex, c1y + 12, '× a', 10)
+    line([(BX, CY), (BX, s2y)], arrow=False)
+    dot(BX, c1y)
+    line([(BX, c1y), (ex + 28, c1y)])
+    line([(ex - 26, c1y), (fx + 66, c1y)])
+    flop(fx, f1, 'DFF_1', size='')
+    line([(880, f1 + 16), (880, f1 + 76), (ex, f1 + 76), (ex, c1y + 28)], dash=True, color='#757575')
+    out.append(f'<circle cx="{ex}" cy="{s2y}" r="16" fill="#ffffff" stroke="{COL["ink"]}" stroke-width="1.2"/>')
+    text(ex, s2y + 6, '−', 18, weight='bold')
+    line([(BX, s2y), (ex + 18, s2y)])
+    sx = (fx + 66 + ex - 26) / 2
+    dot(sx, c1y)
+    line([(sx, c1y), (sx, s2y - 40), (ex, s2y - 40), (ex, s2y - 18)])
+    text(sx + 6, s2y - 46, 'S_1', 11, anchor='start', fill=COL['soft'])
+    line([(ex - 16, s2y), (fx + 66, s2y)])
+    flop(fx, f2, 'DFF_2', size='')
+    for qy, d in ((f1 + 16, 880), (f2 + 16, None)):      # Q -> RMS -> concat
+        line([(fx, qy), (628, qy)])
+        if d:
+            dot(d, qy)
+        box(590, qy - 13, 36, 26, COL['rep'], ['RMS'], size=9.5)
+        line([(590, qy), (CX + CW + 2, qy)])
+    text(780, f1 - 4, 'old registers (t−1)', 10.5, fill=COL['soft'])
+
+    nx, ny = BX + 70, 620                                 # notes
+    out.append(f'<rect x="{nx}" y="{ny}" width="{1890 - nx}" height="270" rx="8" fill="#fafafa" stroke="#bdbdbd"/>')
+    text(nx + 18, ny + 28, 'the write gate', 14, anchor='start', weight='bold')
+    for i, s in enumerate(('A 1×1 conv on the working state h sets DFF_1\'s write rate for each of',
+                           'its 512 channels at each of the 49 positions, every tick. It starts at',
+                           'the fixed rate 1/16 (weights 0, bias −log 15): the model it was added to.',
+                           'The copy register needs no rate; it holds whatever the EMA did not.',
+                           '',
+                           'Trained: SGD, lr 0.01, momentum 0.5 · BPTT 64 ticks · the gate at 100× lr.',
+                           'One layer: v522\'s second layer dropped (it never used its registers).')):
+        text(nx + 18, ny + 56 + 22 * i, s, 12, anchor='start', fill='#424242')
+
+    legend(30, 590, [(COL['frozen'], True, 'frozen: embedding / lmhead (pythia-31m)'),
+                     (COL['rep'], False, 'RMS norm (per sample, per position) · replicate'),
+                     (COL['cat'], False, 'channel concatenation'),
+                     (COL['lin'], False, 'conv 1×1 / 3×3 (linear): ctx_cat, linout'),
+                     (COL['cnn'], False, 'conv 3×3 + BatchNorm + ReLU'),
+                     (COL['gate'], False, 'write gate: conv 1×1 + sigmoid → rate a'),
+                     (COL['lmu'], False, 'EMA r ← r + a ⊙ (x − r)'),
+                     ('#ffffff', False, '(−) subtractor: x minus the EMA as just written'),
+                     (COL['dec'], False, 'decoder convs 3×3, 7→5→3→1 (linear)'),
+                     (COL['smp'], False, 'softmax + sample (+ <NUL> logit)')],
+           '(reset to 0 at each example)', w=440)
+    out.append('</svg>')
+    open(a.out or f'docs/figures/vla_{a.model}.svg', 'w').write('\n'.join(out))
+
+
 if a.model in ('v505', 'v511'):
     draw_v505()
+    raise SystemExit(0)
+if a.model == 'v531':
+    draw_v531()
     raise SystemExit(0)
 
 # ── canvas ────────────────────────────────────────────────────────────────────
