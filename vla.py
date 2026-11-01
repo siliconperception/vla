@@ -2646,6 +2646,33 @@ class VLAModel(nn.Module, _HubMixin):
                 m.momentum = mo
                 m.num_batches_tracked.copy_(n)
 
+    @contextlib.contextmanager
+    def replay(self, X, window=64):
+        """--convdelta eval: X [B, T] will be fed to forward() tick by tick from a zero state with
+        no resets; compute it a window at a time with seq_forward instead and serve each tick's
+        output from the window (self.dff then holds the state at the window's end)."""
+        if self.cd is None or self.streams != 1 or X.dim() != 2:
+            yield
+            return
+        self._replay = dict(X=X, t=0, t0=0, o=None, w=window)
+        try:
+            yield
+        finally:
+            self._replay = None
+
+    def _replay_tick(self, idx):
+        r = self._replay
+        t, X = r['t'], r['X']
+        if t >= X.shape[1] or not torch.equal(idx, X[:, t]):
+            raise RuntimeError('model.replay: forward() was not fed the replayed sequence in order')
+        if r['o'] is None or t >= r['t0'] + r['o'].shape[1]:
+            B, w = X.shape[0], min(r['w'], X.shape[1] - t)
+            dff = self.dff if self.dff is not None and self.dff.shape[0] == B else self.new_state(B, X.device)
+            o, self.dff = self.seq_forward(X[:, t:t + w], torch.zeros(B, w, dtype=torch.bool, device=X.device), dff)
+            r['o'], r['t0'] = o.view(B, w, *o.shape[1:]), t
+        r['t'] = t + 1
+        return r['o'][:, t - r['t0']]
+
     def seq_forward(self, idx, reset, dff, img=None, aud=None):
         """--convdelta: a whole sequence at once. idx [B, T(, 3)], reset [B, T] (state zero
         entering that tick), dff [B, ring_off, S, S] entering tick 0 -> (o [B*T, n_hidden, S, S],
@@ -2726,6 +2753,11 @@ class VLAModel(nn.Module, _HubMixin):
         img [B, 2048, S, S] image grid and aud [B, 512, S, S] audio grid, or None (zeros).
         Advances self.dff by one step; graph (--bptt): self.dff keeps its autograd graph."""
         B, dev = idx.shape[0], idx.device
+        if getattr(self, '_replay', None) is not None:      # --convdelta eval (replay)
+            assert img is None and aud is None and (flag is None or not flag.any())
+            o = self._replay_tick(idx)
+            logits = self.heads(o)
+            return logits, (F.cross_entropy(logits, targets.long()) if targets is not None else None)
         if self.dff is None or self.dff.shape[0] != B or self.dff.device != dev:
             self.dff = self.new_state(B, dev)
         if flag is not None and flag.any():
@@ -2747,6 +2779,26 @@ class VLAModel(nn.Module, _HubMixin):
         return logits, loss
 
     @torch.no_grad()
+    @torch.no_grad()
+    def generate_batch(self, prompts, n_tokens, temperature=1.0):
+        """Text only, as generate but every prompt at once: rows of equal-length prompt ids ->
+        each row's sampled continuation ([] for a row that hit NaN/Inf)."""
+        self.eval()
+        dev = next(self.parameters()).device
+        P = torch.tensor(prompts, device=dev)
+        dff, o = self.new_state(P.shape[0], dev), None
+        for t in range(P.shape[1]):
+            dff, o = self.step(P[:, t], dff)
+        outs, ok = [], torch.ones(P.shape[0], dtype=torch.bool, device=dev)
+        for _ in range(n_tokens):                 # one tick each
+            logits = self.text_dec(o).float()
+            ok &= logits.isfinite().all(-1) & dff.flatten(1).isfinite().all(-1)
+            prob = F.softmax(torch.nan_to_num(logits) / max(temperature, 1e-6), dim=-1)
+            b = torch.multinomial(_truncate(prob), 1)[:, 0]
+            outs.append(b)
+            dff, o = self.step(torch.where(b == _NUL_ID, _PAD, b) if _NUL_ID is not None else b, dff)
+        return [r if k else [] for r, k in zip(torch.stack(outs, 1).tolist(), ok.tolist())]
+
     def generate(self, prompt_ids, n_tokens, temperature=1.0, image=None, video=None,
                  stop_chars=None, h0=None):
         """Sample n_tokens after prompt_ids (opened with _NULL, see _prompt_ids) on a private
@@ -5150,90 +5202,92 @@ def _score(step, corpus, docs, imgs=None, tag=None, clips=None, bands=True, free
             if nb:
                 bsum = torch.zeros(B, nb, device=dev)
                 bcnt = torch.zeros(B, nb, device=dev)
-            for t in range(T):
-                img = model.image_grid(_views(*bank, gen)) if bank is not None else None
-                aud = None
-                if cb is not None:
-                    if see:
-                        fis = [v.fi[min(t, last[r])] for r, v in enumerate(cb)]
-                        ch = [r for r in range(B) if fis[r] != shown[r]]
-                        if ch:
-                            g = model.image_grid(_norm_u8(torch.stack(
-                                [cb[r].frames[fis[r]] for r in ch]).to(dev)))
-                            if grid is None:
-                                grid = g.new_zeros((B,) + tuple(g.shape[1:]))
-                            grid[ch] = g
-                            for r in ch:
-                                shown[r] = fis[r]
-                        img = grid
-                    if hear:
-                        ais = [v.ai[min(t, last[r])] for r, v in enumerate(cb)]
-                        if model.audio_encoder not in _WAV_ENCODERS:
-                            aud = model.audio_grid(lat, torch.tensor(ais, device=dev))
-                        else:
-                            ch = [r for r in range(B) if ais[r] != heard[r]]
+            with (model.replay(X) if bank is None and cb is None and not free and not args.inner_voice
+                  else contextlib.nullcontext()):
+                for t in range(T):
+                    img = model.image_grid(_views(*bank, gen)) if bank is not None else None
+                    aud = None
+                    if cb is not None:
+                        if see:
+                            fis = [v.fi[min(t, last[r])] for r, v in enumerate(cb)]
+                            ch = [r for r in range(B) if fis[r] != shown[r]]
                             if ch:
-                                if wbuf is None:
-                                    g = torch.cat([cb[r].aud_at(model, ais[r], dev) for r in ch])
-                                else:            # a grid per tick: every changed row at once
-                                    g = model.audio_grid(wbuf[ch], torch.tensor(
-                                        [float(ais[r]) for r in ch], device=dev))
-                                if agrid is None:
-                                    agrid = g.new_zeros((B,) + tuple(g.shape[1:]))
-                                agrid[ch] = g
+                                g = model.image_grid(_norm_u8(torch.stack(
+                                    [cb[r].frames[fis[r]] for r in ch]).to(dev)))
+                                if grid is None:
+                                    grid = g.new_zeros((B,) + tuple(g.shape[1:]))
+                                grid[ch] = g
                                 for r in ch:
-                                    heard[r] = ais[r]
-                            aud = agrid
-                xt = X[:, t]
-                if f3:
-                    ce, nw, cmax, own3 = _score3f_tick(
-                        X[:, t], Y[:, t], cb is not None, free, own3, img, aud, M3[:, t],
-                        Mn3[:, t], nul3, kce, kn, gen, (band_of, bsum, bcnt) if nb else None)
-                    rs += ce
-                    n3 += nw
-                    bad |= cmax > _EVAL_THRESH
-                    continue
-                if model.streams == 3:
-                    ce = _score3_tick(X[:, t], Y[:, t], Kd, t, cb is not None, free, own3,
-                                      img, aud, M[:, t], Mn[:, t], nul3, gen)
-                    own3 = ce[1]
-                    ce = ce[0]
-                elif free and own is not None:     # EVALF: every word is the model's own
-                    xt = torch.where((xt >= 0) | (xt == _PAD), own, xt)
-                    if _NUL_ID is not None:      # ... and after its own <NUL>, no word
-                        xt = torch.where(xt == _NUL_ID, _PAD, xt)
-                elif args.inner_voice and own is not None:   # after a silent tick: its own token
-                    fb = xt == _PAD
-                    if args.voice_drop:
-                        fb &= torch.rand(xt.shape, device=dev, generator=gen) >= args.voice_drop
-                    xt = torch.where(fb, own, xt)
-                if model.streams == 1:
-                    logits, _ = model(xt, img=img, aud=aud)
-                    if args.inner_voice or free:
-                        own = torch.multinomial(_truncate(F.softmax(logits.float(), dim=-1)), 1,
-                                                generator=gen)[:, 0]
-                    ce = F.cross_entropy(logits, Y[:, t], reduction='none')
-                # a diverged row is counted as runaway rather than poisoning the sums
-                ce = torch.where(torch.isfinite(ce), ce, torch.full_like(ce, 1e30))
-                if Mn is not None and model.streams == 1:
-                    pn = F.softmax(logits.float(), dim=-1)[:, _NUL_ID]
-                    nul['ce'] += float((ce.clamp(max=30) * Mn[:, t]).sum())
-                    nul['n'] += int(Mn[:, t].sum())
-                    nul['p_nul'] += float((pn * Mn[:, t]).sum())
-                    nul['p_tok'] += float((pn * M[:, t]).sum())
-                    nul['n_tok'] += int(M[:, t].sum())
-                if nb:
-                    oh = F.one_hot(band_of[Y[:, t].clamp(0, band_of.numel() - 1)],
-                                   nb).float() * M[:, t, None]
-                    bsum += oh * ce[:, None]
-                    bcnt += oh
-                rs += ce * M[:, t]
-                if Kd is not None:
-                    for kk in (1, 2):
-                        mk = M[:, t] & (Kd[:, t] == kk)
-                        kce[kk] += float((ce.clamp(max=30) * mk).sum())
-                        kn[kk] += int(mk.sum())
-                bad |= M[:, t] & (ce > _EVAL_THRESH)     # ANY token over: tools/score.py's rule
+                                    shown[r] = fis[r]
+                            img = grid
+                        if hear:
+                            ais = [v.ai[min(t, last[r])] for r, v in enumerate(cb)]
+                            if model.audio_encoder not in _WAV_ENCODERS:
+                                aud = model.audio_grid(lat, torch.tensor(ais, device=dev))
+                            else:
+                                ch = [r for r in range(B) if ais[r] != heard[r]]
+                                if ch:
+                                    if wbuf is None:
+                                        g = torch.cat([cb[r].aud_at(model, ais[r], dev) for r in ch])
+                                    else:            # a grid per tick: every changed row at once
+                                        g = model.audio_grid(wbuf[ch], torch.tensor(
+                                            [float(ais[r]) for r in ch], device=dev))
+                                    if agrid is None:
+                                        agrid = g.new_zeros((B,) + tuple(g.shape[1:]))
+                                    agrid[ch] = g
+                                    for r in ch:
+                                        heard[r] = ais[r]
+                                aud = agrid
+                    xt = X[:, t]
+                    if f3:
+                        ce, nw, cmax, own3 = _score3f_tick(
+                            X[:, t], Y[:, t], cb is not None, free, own3, img, aud, M3[:, t],
+                            Mn3[:, t], nul3, kce, kn, gen, (band_of, bsum, bcnt) if nb else None)
+                        rs += ce
+                        n3 += nw
+                        bad |= cmax > _EVAL_THRESH
+                        continue
+                    if model.streams == 3:
+                        ce = _score3_tick(X[:, t], Y[:, t], Kd, t, cb is not None, free, own3,
+                                          img, aud, M[:, t], Mn[:, t], nul3, gen)
+                        own3 = ce[1]
+                        ce = ce[0]
+                    elif free and own is not None:     # EVALF: every word is the model's own
+                        xt = torch.where((xt >= 0) | (xt == _PAD), own, xt)
+                        if _NUL_ID is not None:      # ... and after its own <NUL>, no word
+                            xt = torch.where(xt == _NUL_ID, _PAD, xt)
+                    elif args.inner_voice and own is not None:   # after a silent tick: its own token
+                        fb = xt == _PAD
+                        if args.voice_drop:
+                            fb &= torch.rand(xt.shape, device=dev, generator=gen) >= args.voice_drop
+                        xt = torch.where(fb, own, xt)
+                    if model.streams == 1:
+                        logits, _ = model(xt, img=img, aud=aud)
+                        if args.inner_voice or free:
+                            own = torch.multinomial(_truncate(F.softmax(logits.float(), dim=-1)), 1,
+                                                    generator=gen)[:, 0]
+                        ce = F.cross_entropy(logits, Y[:, t], reduction='none')
+                    # a diverged row is counted as runaway rather than poisoning the sums
+                    ce = torch.where(torch.isfinite(ce), ce, torch.full_like(ce, 1e30))
+                    if Mn is not None and model.streams == 1:
+                        pn = F.softmax(logits.float(), dim=-1)[:, _NUL_ID]
+                        nul['ce'] += float((ce.clamp(max=30) * Mn[:, t]).sum())
+                        nul['n'] += int(Mn[:, t].sum())
+                        nul['p_nul'] += float((pn * Mn[:, t]).sum())
+                        nul['p_tok'] += float((pn * M[:, t]).sum())
+                        nul['n_tok'] += int(M[:, t].sum())
+                    if nb:
+                        oh = F.one_hot(band_of[Y[:, t].clamp(0, band_of.numel() - 1)],
+                                       nb).float() * M[:, t, None]
+                        bsum += oh * ce[:, None]
+                        bcnt += oh
+                    rs += ce * M[:, t]
+                    if Kd is not None:
+                        for kk in (1, 2):
+                            mk = M[:, t] & (Kd[:, t] == kk)
+                            kce[kk] += float((ce.clamp(max=30) * mk).sum())
+                            kn[kk] += int(mk.sum())
+                    bad |= M[:, t] & (ce > _EVAL_THRESH)     # ANY token over: tools/score.py's rule
             per_doc.append((rs / (n3 if f3 else M.sum(dim=1)).clamp(min=1)).cpu().numpy())
             bad_doc.append(bad.cpu().numpy())
             if nb:
@@ -5577,8 +5631,9 @@ def _warm_eval(step, corpus, docs):
             pre = _doc_tokens(sel[(i + 1) % n]) if mode == 'warm' and n > 1 else []
             seq = pre + q
             rows.append((seq[:-1], seq[1:], len(pre)))
-        tot = torch.zeros(len(bands) + 1, dtype=torch.float64)
-        cnt = torch.zeros(len(bands) + 1, dtype=torch.float64)
+        dev = next(model.parameters()).device
+        tot = torch.zeros(len(bands) + 1, dtype=torch.float64, device=dev)    # on the device: no
+        cnt = torch.zeros(len(bands) + 1, dtype=torch.float64, device=dev)    # sync per tick
         with _EvalState(), torch.no_grad():
             for c in range(0, n, _EVAL_BATCH):
                 chunk = rows[c:c + _EVAL_BATCH]
@@ -5592,20 +5647,19 @@ def _warm_eval(step, corpus, docs):
                     P[r, k:len(xs)] = torch.arange(len(xs) - k)
                 X, Y, P = X.to(dev), Y.to(dev), P.to(dev)
                 model.dff = None
-                for t in range(T):
-                    logits, _ = model(X[:, t])
-                    m = P[:, t] >= 0
-                    if not m.any():
-                        continue
-                    ce = F.cross_entropy(logits.float(), Y[:, t].clamp(min=0), reduction='none')
-                    ce = torch.where(torch.isfinite(ce), ce, torch.full_like(ce, 30.0)).clamp(max=30.0)
-                    for b, (lo, hi) in enumerate(bands):
-                        mb = m & (P[:, t] >= lo) & (P[:, t] < hi)
-                        tot[b] += float(ce[mb].sum())
-                        cnt[b] += float(mb.sum())
-                    tot[-1] += float(ce[m].sum())
-                    cnt[-1] += float(m.sum())
-        res[mode] = (tot / cnt.clamp(min=1)).tolist()
+                with model.replay(X):
+                    for t in range(T):
+                        logits, _ = model(X[:, t])
+                        m = P[:, t] >= 0
+                        ce = F.cross_entropy(logits.float(), Y[:, t].clamp(min=0), reduction='none')
+                        ce = torch.where(torch.isfinite(ce), ce, torch.full_like(ce, 30.0)).clamp(max=30.0)
+                        for b, (lo, hi) in enumerate(bands):
+                            mb = m & (P[:, t] >= lo) & (P[:, t] < hi)
+                            tot[b] += (ce * mb).sum()
+                            cnt[b] += mb.sum()
+                        tot[-1] += (ce * m).sum()
+                        cnt[-1] += m.sum()
+        res[mode] = (tot / cnt.clamp(min=1)).cpu().tolist()
     c, w = res['cold'], res['warm']
     _eval_results[f'{corpus}~warm'] = dict(cold=c[-1], warm=w[-1])
     _emit(f'EVALW step {step:10} corpus {corpus:8} docs {n} | cold {c[-1]:.4f} warm {w[-1]:.4f} '
@@ -5628,8 +5682,12 @@ def _gen_eval(step, corpus, docs):
     g_n, r_n, s_n, gd, rd, reps, d2s = [], [], [], [], [], [], []
     dev = next(model.parameters()).device
     with _EvalState(), torch.random.fork_rng(devices=[dev] if dev.type == 'cuda' else []):
-        for prompt, ptxt, a, b, u, _ in _gen_prompts(corpus, docs):
-            out = model.generate(prompt, C, temperature=args.temperature)
+        items = list(_gen_prompts(corpus, docs))
+        # --convdelta: all prompts at once (every prompt has the same length)
+        outs = (model.generate_batch([it[0] for it in items], C, temperature=args.temperature)
+                if model.cd is not None else None)
+        for k, (prompt, ptxt, a, b, u, _) in enumerate(items):
+            out = outs[k] if outs is not None else model.generate(prompt, C, temperature=args.temperature)
             ctxt = _decode_plain(out)
             n = _judge.cond_nll(ptxt, ctxt) if ctxt.strip() else None
             n0 = _judge.cond_nll(_NO_PROMPT, ctxt.lstrip()) if n is not None else None
