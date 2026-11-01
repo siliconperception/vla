@@ -452,6 +452,10 @@ parser.add_argument('--lr_restart', action='store_true',
                     help='coswarm: rise over --lr_period steps from this run\'s first step '
                          '(a resumed run warms up again) instead of from global step 0')
 parser.add_argument('--momentum',   default=0.0,  type=float, help='SGD momentum')
+parser.add_argument('--gate_lr_mult', default=1.0, type=float, metavar='M',
+                    help='--write_gate: the gate\'s weights train at M times the lr (their own '
+                         'optimizer group, on the same schedule): through the sigmoid at 1/W and a '
+                         'rate that moves the register by only (o - R) per tick, they learn slowly')
 parser.add_argument('--nesterov', default=False, action=argparse.BooleanOptionalAction,
                     help='Nesterov momentum (needs --momentum > 0)')
 parser.add_argument('--optimizer', default='sgd', choices=['sgd', 'adamw'],
@@ -6472,12 +6476,16 @@ _win_opt = torch.optim.Adam([model.win_theta], lr=args.win_lr) if model.learn el
 if _win_opt is not None and _loaded_ckpt is not None and _loaded_ckpt.get('win_optimizer'):
     _win_opt.load_state_dict(_loaded_ckpt['win_optimizer'])
 _bn_layers = [m for m in model.modules() if isinstance(m, nn.BatchNorm2d)]
+_gate_ids = {id(p) for n, p in model.named_parameters() if n.startswith('wgate.')}
+_groups = ([{'params': [p for p in _trainable if id(p) not in _gate_ids]},     # --gate_lr_mult
+            {'params': [p for p in _trainable if id(p) in _gate_ids], 'lr': args.lr_max * args.gate_lr_mult}]
+           if _gate_ids and args.gate_lr_mult != 1 else _trainable)
 if args.optimizer == 'adamw':
-    optimizer = torch.optim.AdamW(_trainable, lr=args.lr_max, weight_decay=args.weight_decay,
+    optimizer = torch.optim.AdamW(_groups, lr=args.lr_max, weight_decay=args.weight_decay,
                                   betas=tuple(float(b) for b in args.betas.split(',')))
     _opt_keys = {'step', 'exp_avg', 'exp_avg_sq'}
 else:
-    optimizer = torch.optim.SGD(_trainable, lr=args.lr_max, momentum=args.momentum,
+    optimizer = torch.optim.SGD(_groups, lr=args.lr_max, momentum=args.momentum,
                                 nesterov=args.nesterov, weight_decay=args.weight_decay)
     _opt_keys = {'momentum_buffer'}
 if args.mom_schedule != 'const':
