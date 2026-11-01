@@ -793,7 +793,8 @@ parser.add_argument('--eval_dump',  default=None, metavar='FILE',
                          '(the targets, the opening _NULL dropped), to score other models on the same set')
 parser.add_argument('--vis',        default=False, action='store_true',
                     help='live generation view: layer output and registers (std across '
-                         'channels per grid cell) and P(next token); x exits')
+                         'channels per grid cell), --write_gate rates (mean across channels) and '
+                         'P(next token); x exits')
 parser.add_argument('--delay',      default=0.1,  type=float, help='--vis seconds per frame')
 parser.add_argument('--cmap',       default='viridis', help='--vis colormap')
 parser.add_argument('--push',       default=False, action='store_true',
@@ -4201,7 +4202,18 @@ if args.vis:
     plt.style.use('dark_background')
     plt.ion()
     nup = len(model.up)
-    rows = 1 + model.K * (1 + nup)
+    gated = list(model.gated) if model.wgate is not None else []
+    nr = 1 + model.K * (1 + nup)                    # output and register rows
+    rows = nr + len(gated)                           # --write_gate: a rate map per gated register
+    _gate_last = {}
+    if gated:
+        _gate_fn = model._gate
+
+        def _gate_keep(h):
+            out = _gate_fn(h)
+            _gate_last.update(out)
+            return out
+        model._gate = _gate_keep                     # the instance attribute shadows the method
     at = model.attn
     nb = 2 if at is not None else 0                  # --attn: ring and attention strips below
     fig = plt.figure(figsize=(max(7.5, _VIS_WIN * 7 * 0.602 / 72 * 1.05), 2.6 * rows + 1.8 * nb + 1.2))
@@ -4220,6 +4232,11 @@ if args.vis:
     else:
         ax_p = fig.add_subplot(gs[:rows, 1])
     for r, ax in enumerate(axes):
+        if r >= nr:
+            k = gated[r - nr]
+            ax.set_title(f'write gate: DFF {k + 1} rate (mean over channels; '
+                         f'fixed rate 1/{model.windows[k]:g} = {1 / model.windows[k]:.4f})', fontsize=9, pad=3)
+            continue
         L, k = divmod(r - 1, model.K) if r else (0, 0)
         w = (model.up_windows if L else model.windows)[k] if r else None
         ax.set_title('output' if r == 0 else
@@ -4240,7 +4257,8 @@ if args.vis:
         ax.set_xticks([])
         ax.set_yticks([])
     fig.text(0.03, 0.008, f'maps: std across the {model.n_hidden} channels at each of the '
-             f'{model.S}x{model.S} positions', fontsize=8, color='0.7', va='bottom')
+             f'{model.S}x{model.S} positions' + ('; gate maps: mean rate, running min-max scale' if gated else ''),
+             fontsize=8, color='0.7', va='bottom')
     header = fig.text(0.01, 0.99, '', family='monospace', fontsize=7, va='top', ha='left')
     PR = int(math.ceil(math.sqrt(model.vocab)))
     PC = int(math.ceil(model.vocab / PR))
@@ -4255,7 +4273,7 @@ if args.vis:
     cur = list(prompt)                               # ids so far (the ticker's tail)
     dff = model.new_state(1, dev)
     bank = _bank([_image], dev) if _image is not None else None
-    imgs, vmax, img_p, nstep = [None] * rows, [None] * rows, None, 0
+    imgs, vmax, vmin, img_p, nstep = [None] * rows, [None] * rows, [None] * rows, None, 0
     img_ring = img_att = None
     rmax = None
     while not _exit[0] and plt.fignum_exists(fig.number):
@@ -4271,15 +4289,20 @@ if args.vis:
             cur = (cur + [b])[-2 * _VIS_WIN:]
         regs = model.all_regs(dff)
         maps = [o] + (list(regs.chunk(model.K * (1 + nup), dim=1)) if model.K else [])
+        maps += [_gate_last[k] for k in gated]
         for r, t in enumerate(maps):
-            m = t[0].std(dim=0).float().cpu().numpy()
+            m = (t[0].mean(dim=0) if r >= nr else t[0].std(dim=0)).float().cpu().numpy()
             vmax[r] = float(m.max()) if vmax[r] is None else max(float(m.max()), 0.98 * vmax[r])
             if imgs[r] is None:
                 imgs[r] = axes[r].matshow(m, cmap=args.cmap)
                 axes[r].set_xticks([])
                 axes[r].set_yticks([])
             imgs[r].set_data(m)
-            imgs[r].set_clim(0.0, vmax[r] or 1e-9)
+            if r >= nr:                              # gate rates: a running min-max scale
+                vmin[r] = float(m.min()) if vmin[r] is None else min(float(m.min()), vmin[r] + 0.02 * (vmax[r] - vmin[r]))
+                imgs[r].set_clim(vmin[r], max(vmax[r], vmin[r] + 1e-6))
+            else:
+                imgs[r].set_clim(0.0, vmax[r] or 1e-9)
         pg = np.zeros(PR * PC, dtype=np.float32)
         pg[:model.vocab] = prob.cpu().numpy()
         pg = pg.reshape(PR, PC)
@@ -4307,6 +4330,9 @@ if args.vis:
             nfill = int((dff[0, model.ring_off:].reshape(at.W, at.E).abs().amax(-1) > 0).sum())
             extra = (f'  ring {nfill:4d}/{at.W}  sink {float(p[:, -1].mean()):5.3f}  '
                      f'slots read {eff:6.1f}')
+        if gated:
+            extra += '  gate ' + ' '.join(f'{float(_gate_last[k].mean()):.4f}/{float(_gate_last[k].std()):.4f}'
+                                          for k in gated)
         ticker = ''.join(DOT_TEXT if c in '$\\' else c for c in _render(cur))[-_VIS_WIN:]
         header.set_text(f'step {nstep:8d}  reg_std {float(regs.std()) if model.K else 0:6.4f}  reg_max '
                         f'{float(regs.abs().max()) if model.K else 0:7.3f}  p_max {float(prob.max()):5.3f}  '
