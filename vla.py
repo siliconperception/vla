@@ -254,6 +254,20 @@ parser.add_argument('--c_context',  default=384,  type=int,
                     help='ContextCNN width: ctx_cat reads the concat down to it and linout '
                          'projects it back up to --n_hidden')
 parser.add_argument('--depth',      default=8,    type=int, help='ContextCNN conv layers')
+parser.add_argument('--lm', default=None, action=argparse.BooleanOptionalAction,
+                    help='language model only: one text stream, no audio or image components (no '
+                         'encoders, no voice/image token grids or decoders; --streams 1, '
+                         '--audio_encoder none, --image_encoder none, no --fifo3). A media checkpoint '
+                         'loaded with --lm is narrowed: its voice/image decoders and the audio, image and '
+                         'voice/image token columns of ctx_cat are dropped')
+parser.add_argument('--convdelta', default=0, type=int, metavar='N',
+                    help='ConvDelta: N residual blocks (causal time conv, 2 x conv 3x3, a gated delta-rule '
+                         'memory per grid position) between ctx_cat and linout instead of the ContextCNN '
+                         'and registers; trained a whole --bptt window at once (parallel over ticks)')
+parser.add_argument('--cd_heads', default=6, type=int, help='--convdelta: memory heads per position')
+parser.add_argument('--cd_dim', default=32, type=int, help='--convdelta: key/value width per head')
+parser.add_argument('--cd_taps', default=4, type=int, help='--convdelta: causal time conv taps (this tick + taps-1)')
+parser.add_argument('--cd_chunk', default=64, type=int, help='--convdelta: scan chunk (ticks)')
 parser.add_argument('--write_gate', default=False, action=argparse.BooleanOptionalAction,
                     help='selective write: each windowed register of the first layer is written at a '
                          'rate a = sigmoid(Conv1x1(h) + b) per channel and position, h the state '
@@ -827,7 +841,7 @@ _ARCH_ARGS = ('context', 'n_hidden', 'c_context', 'depth', 'kernel', 'tokenizer'
               'ctx_read_norm', 'dec_tree_kernels', 'dec_width', 'bn_momentum', 'init',
               'image_encoder', 'audio_encoder', 'streams', 'linout_kernel', 'learn_win',
               'learn_regs', 'lmu', 'attn', 'attn_ch', 'attn_heads', 'attn_dim', 'attn_age', 'read_rmsnorm',
-              'layers', 'write_gate')
+              'layers', 'write_gate', 'convdelta', 'cd_heads', 'cd_dim', 'cd_taps', 'lm')
 
 
 def _parse_mix():
@@ -937,6 +951,18 @@ args.audio_hz = float(args.audio_hz or 0)
 args.streams = int(args.streams or 1)
 args.fifo3 = bool(args.fifo3)
 args.speech_align = bool(args.speech_align)
+_lm_from = None                 # --lm: the loaded checkpoint's media arch args, when it had any
+if args.lm:
+    if _loaded_ckpt is not None and (args.streams != 1 or (args.audio_encoder or 'none') != 'none'
+                                     or (args.image_encoder or 'none') != 'none'):
+        _lm_from = dict(streams=args.streams, audio_encoder=args.audio_encoder or 'none',
+                        image_encoder=args.image_encoder or 'none')
+    args.streams, args.audio_encoder, args.image_encoder = 1, 'none', 'none'
+    args.fifo3 = args.speech_align = args.inner_voice = False
+    args.voice_drop = args.caption_feed = args.text_feed = 0.0
+    _media = [n for n, _ in _MIX if n in _MEDIA_DATASETS]
+    if _media:
+        raise SystemExit(f'--lm: --mix has media corpora {_media}; give text corpora only')
 if args.eval_recent and args.doc_log_len < 1 + args.eval_gen_prompt + args.eval_gen_len:
     raise SystemExit(f'--eval_recent: --doc_log_len {args.doc_log_len} is shorter than a prompt '
                      f'and its continuation ({1 + args.eval_gen_prompt + args.eval_gen_len})')
@@ -956,7 +982,9 @@ if args.write_surprise:
     if _surprise is None:
         raise SystemExit(f'--write_surprise {args.write_surprise}: want rat,H[,MEAN] with H > 1, '
                          f'or LO,HI[,MEAN] with 0 < LO <= 1 <= HI')
-if args.ckpt_ticks and (args.bptt < 2 or args.learn_win or args.write_surprise
+if args.convdelta and args.bptt < 2 and not _ONESHOT:
+    raise SystemExit('--convdelta trains a --bptt window of ticks at once: give --bptt > 1')
+if args.ckpt_ticks and not args.convdelta and (args.bptt < 2 or args.learn_win or args.write_surprise
                         or (not args.read_rmsnorm and args.ctx_read_norm > 0)):
     # the backward recomputes each step: state kept outside the registers (the --learn_win
     # traces, the surprise and read-norm running means) would be advanced twice
@@ -1030,6 +1058,30 @@ def _widen_state_dict(sd, model):
     sd['ctx_cat.weight'] = torch.cat([w[:, :n_in], w[:, :c], w[:, :c], w[:, n_in:]], dim=1)
     print(f'--streams 3: widened a one-stream checkpoint (voice/image decoders copied from the '
           f'text decoder; ctx_cat {tuple(w.shape)} -> {tuple(sd["ctx_cat.weight"].shape)})',
+          flush=True)
+    return sd
+
+
+def _narrow_state_dict(sd, model, old):
+    """--lm: a media state_dict (old: its streams, audio_encoder, image_encoder) -> this
+    text-only model: the voice and image decoders and the frozen encoders go, and so do
+    ctx_cat's input columns for the image grid, the audio grid and the voice/image token
+    grids; the text token columns and everything after the inputs (registers) stay."""
+    sd = {k: v for k, v in sd.items()
+          if not k.startswith(('voc_dec.', 'img_dec.', 'aud_enc.', 'img_enc.'))}
+    widths = ([('text', model.c_text)] +
+              ([('image', 2048)] if old['image_encoder'] != 'none' else []) +
+              ([('audio', _AUD_DIMS[old['audio_encoder']])] if old['audio_encoder'] != 'none' else []) +
+              [('tok', model.c_text)] * (int(old['streams']) - 1))
+    w = sd['ctx_cat.weight']
+    keep, o = [], 0
+    for name, n in widths:
+        if name == 'text':
+            keep.append(w[:, o:o + n])
+        o += n
+    sd['ctx_cat.weight'] = torch.cat(keep + [w[:, o:]], dim=1)
+    print(f'--lm: narrowed a media checkpoint ({", ".join(n for n, _ in widths[1:])} inputs and the '
+          f'voice/image decoders dropped; ctx_cat {tuple(w.shape)} -> {tuple(sd["ctx_cat.weight"].shape)})',
           flush=True)
     return sd
 
@@ -1329,6 +1381,150 @@ class ContextCNN(nn.Module):
         for layer in self.layers:
             x = layer(x)
         return x
+
+
+def _delta_scan(q, k, v, beta, loga, reset, S0, chunk=64):
+    """--convdelta: the gated delta rule over a sequence, chunkwise in parallel.
+    q, k [N, T, dk] (L2-normalized), v [N, T, dv], beta, loga [N, T] (write strength, log decay),
+    reset [N, T] bool (the state entering that tick is zero), S0 [N, dv, dk]
+    -> (o [N, T, dv], S_T [N, dv, dk]), the same as stepping, per tick,
+       S <- a S (I - b k k^T) + b v k^T  (S = 0 first where reset),  o = S q.
+    Within a chunk the updates are u_r k_r^T with u_r = b_r (v_r - a_r S_{r-1} k_r), solved
+    for all r at once from a unit lower-triangular system (the WY form of the delta rule)."""
+    N, T, dk = k.shape
+    outs = []
+    S = S0
+    for c0 in range(0, T, chunk):
+        sl = slice(c0, min(T, c0 + chunk))
+        qc, kc, vc, bc, rc = q[:, sl], k[:, sl], v[:, sl], beta[:, sl], reset[:, sl]
+        C = kc.shape[1]
+        G = torch.cumsum(loga[:, sl], 1)                                   # log decay since chunk start
+        seg = torch.cumsum(rc.long(), 1)                                   # resets so far in the chunk
+        tri = torch.ones(C, C, dtype=torch.bool, device=k.device).tril()
+        live = tri & (seg[:, :, None] == seg[:, None, :])                  # [N, r, i]: i reaches r
+        Gam = torch.exp(torch.where(live, G[:, :, None] - G[:, None, :], float('-inf')))
+        g0 = torch.exp(G) * (seg == 0)                                     # S0 reaches r
+        A = (Gam * (kc @ kc.transpose(1, 2))).tril(-1)
+        L = torch.eye(C, device=k.device) + bc[:, :, None] * A
+        Ut = torch.linalg.solve_triangular(L, bc[:, :, None] * vc, upper=False, unitriangular=True)
+        Wk = torch.linalg.solve_triangular(L, (bc * g0)[:, :, None] * kc, upper=False, unitriangular=True)
+        U = Ut - Wk @ S.transpose(1, 2)                                    # [N, C, dv]
+        outs.append(g0[:, :, None] * (qc @ S.transpose(1, 2)) + (Gam * (qc @ kc.transpose(1, 2))) @ U)
+        gC = Gam[:, -1]                                                    # [N, C]: i reaches the end
+        S = g0[:, -1, None, None] * S + (U * gC[:, :, None]).transpose(1, 2) @ kc
+    return torch.cat(outs, 1), S
+
+
+class ConvDeltaBlock(nn.Module):
+    """--convdelta: one residual block. Per tick, on x [B, C, S, S]:
+         u = x + TimeConv(RMS(x))            causal depthwise conv over this and the last
+                                             taps-1 ticks' RMS(x) (a FIFO in the state)
+         u = u + ReLU(BN(conv3x3(ReLU(BN(conv3x3(u))))))
+         q, k, v, b, a = 1x1 convs of u     (H heads of d at each position; q, k L2-normalized;
+                                             b = sigmoid, a = exp(-exp(lam_h) * 2 sigmoid))
+         S = a S (I - b k k^T) + b v k^T    a d x d memory per head and grid position
+         x' = u + out(S q)                   out starts at zero
+    The convs never read the state, so a whole sequence runs at once (seq) and only the
+    memories S are carried tick to tick (_delta_scan); step does one tick."""
+
+    def __init__(self, C, H, d, taps, S, bn_momentum=0.1):
+        super().__init__()
+        self.C, self.H, self.d, self.taps, self.S = C, H, d, taps, S
+        self.tconv = nn.Parameter(torch.zeros(taps, C))                    # [lag, channel]
+        bn = dict(affine=False, momentum=bn_momentum or None)
+        self.mix = nn.Sequential(nn.Conv2d(C, C, 3, padding=1), nn.BatchNorm2d(C, **bn), nn.ReLU(),
+                                 nn.Conv2d(C, C, 3, padding=1), nn.BatchNorm2d(C, **bn), nn.ReLU())
+        self.qkv = nn.Conv2d(C, 3 * H * d, 1)
+        self.gates = nn.Conv2d(C, 2 * H, 1)                                # beta, alpha logits
+        with torch.no_grad():
+            self.gates.weight.zero_()
+            self.gates.bias.zero_()
+        # base decay windows log-spaced 4 .. 4096 ticks over the heads
+        w = torch.logspace(math.log10(4), math.log10(4096), H) if H > 1 else torch.tensor([64.0])
+        self.lam = nn.Parameter(-torch.log(w))
+        self.out = nn.Conv2d(H * d, C, 1)
+        with torch.no_grad():
+            self.out.weight.zero_()
+            self.out.bias.zero_()
+
+    @property
+    def state_ch(self):
+        """State channels per grid position: the memories, then the FIFO of past RMS(x)."""
+        return self.H * self.d * self.d + (self.taps - 1) * self.C
+
+    def _mixed(self, u):
+        """u + the spatial mixing branch; the convs in bf16 on the GPU."""
+        with torch.autocast(u.device.type, dtype=torch.bfloat16, enabled=u.is_cuda):
+            m = self.mix(u)
+        return u + m.to(u.dtype)
+
+    def _proj(self, u):
+        """u [M, C, S, S] -> q, k, v [M, P, H, d] (P = S*S positions), beta, loga [M, P, H]."""
+        M, P, H, d = u.shape[0], self.S * self.S, self.H, self.d
+        with torch.autocast(u.device.type, dtype=torch.bfloat16, enabled=u.is_cuda):
+            qkv = self.qkv(u)
+        q, k, v = qkv.to(u.dtype).view(M, 3, H, d, P).permute(1, 0, 4, 2, 3).unbind(0)
+        q, k = F.normalize(q, dim=-1), F.normalize(k, dim=-1)
+        gb, ga = self.gates(u).view(M, 2, H, P).permute(1, 0, 3, 2).unbind(0)
+        beta = torch.sigmoid(gb)
+        loga = -self.lam.exp() * 2 * torch.sigmoid(ga)
+        return q, k, v, beta, loga
+
+    def _read_out(self, o, M):
+        """o [M, P, H, d] -> the block's addend [M, C, S, S]."""
+        return self.out(o.permute(0, 2, 3, 1).reshape(M, self.H * self.d, self.S, self.S))
+
+    def step(self, x, st):
+        """One tick: x [B, C, S, S], st [B, state_ch, S, S] -> (x', st')."""
+        B, P, H, d, C = x.shape[0], self.S * self.S, self.H, self.d, self.C
+        nm = H * d * d
+        Sm = st[:, :nm].reshape(B, H, d, d, P).permute(0, 4, 1, 2, 3)      # [B, P, H, dv, dk]
+        fifo = st[:, nm:].reshape(B, self.taps - 1, C, self.S, self.S)     # newest first
+        r = _rms_pos(x)
+        hist = torch.cat([r[:, None], fifo], 1)                            # lags 0 .. taps-1
+        u = self._mixed(x + (hist * self.tconv[None, :, :, None, None]).sum(1))
+        q, k, v, beta, loga = self._proj(u)
+        a, b = loga.exp()[..., None, None], beta[..., None, None]
+        Sk = Sm @ k[..., None]                                             # [B, P, H, dv, 1]
+        Sm = a * Sm - (a * b) * Sk @ k[..., None, :] + b * v[..., None] @ k[..., None, :]
+        o = (Sm @ q[..., None])[..., 0]
+        x = u + self._read_out(o, B)
+        st = torch.cat([Sm.permute(0, 2, 3, 4, 1).reshape(B, nm, self.S, self.S),
+                        hist[:, :self.taps - 1].reshape(B, -1, self.S, self.S)], 1)
+        return x, st
+
+    def seq(self, x, st, reset, chunk=64):
+        """A sequence: x [B, T, C, S, S], st [B, state_ch, S, S] entering tick 0, reset [B, T]
+        (zero state entering that tick) -> (x' [B, T, C, S, S], st' after the last tick)."""
+        B, T, C = x.shape[:3]
+        P, H, d, n = self.S * self.S, self.H, self.d, self.taps - 1
+        nm = H * d * d
+        fifo = st[:, nm:].reshape(B, n, C, self.S, self.S)
+        r = _rms_pos(x.flatten(0, 1)).view(B, T, C, self.S, self.S)
+        ext = torch.cat([fifo.flip(1), r], 1)                              # [B, n + T]: oldest first
+        doc = torch.cat([reset.new_zeros(B, n, dtype=torch.long), torch.cumsum(reset.long(), 1)], 1)
+        y = 0
+        for j in range(self.taps):                                         # lag j
+            src = ext[:, n - j:n - j + T]
+            ok = (doc[:, n - j:n - j + T] == doc[:, n:]).to(x.dtype)
+            y = y + src * (self.tconv[j][None, None, :, None, None] * ok[:, :, None, None, None])
+        u = self._mixed((x + y).flatten(0, 1))
+        q, k, v, beta, loga = self._proj(u)                                # [B*T, P, H, ...]
+
+        def heads(t):                                                      # -> [B*P*H, T, ...]
+            t = t.view(B, T, P, H, *t.shape[3:])
+            return t.permute(0, 2, 3, 1, *range(4, t.dim())).reshape(B * P * H, T, *t.shape[4:])
+        S0 = st[:, :nm].reshape(B, H, d, d, P).permute(0, 4, 1, 2, 3).reshape(B * P * H, d, d)
+        rs = reset[:, None, None, :].expand(B, P, H, T).reshape(B * P * H, T)
+        o, ST = _delta_scan(heads(q), heads(k), heads(v), heads(beta), heads(loga), rs, S0, chunk)
+        o = o.view(B, P, H, T, d).permute(0, 3, 1, 2, 4).reshape(B * T, P, H, d)
+        x = (u + self._read_out(o, B * T)).view(B, T, C, self.S, self.S)
+        # the FIFO after the last tick: the last n RMS(x), zero where a reset came after them
+        last = ext[:, T:].flip(1)                                          # newest first
+        okl = (doc[:, T:].flip(1) == doc[:, -1:]).to(x.dtype)
+        ST = ST.view(B, P, H, d, d).permute(0, 2, 3, 4, 1).reshape(B, nm, self.S, self.S)
+        st = torch.cat([ST, (last * okl[:, :, None, None, None]).reshape(B, n * C, self.S, self.S)], 1)
+        return x, st
 
 
 def _linear_init(conv):
@@ -1985,7 +2181,8 @@ class VLAModel(nn.Module, _HubMixin):
                  image_encoder='none', audio_encoder='none', nul_head=False, streams=1,
                  text_nul=False, surprise=None, linout_kernel=1, learn_win=False,
                  learn_regs=(), lmu=False, attn=0, attn_ch=2, attn_heads=8, attn_dim=64, attn_age=True,
-                 read_rmsnorm=False, layers=1, up_windows=None, write_gate=False):
+                 read_rmsnorm=False, layers=1, up_windows=None, write_gate=False,
+                 convdelta=0, cd_heads=6, cd_dim=32, cd_taps=4, cd_chunk=64):
         super().__init__()
         from transformers import AutoModelForCausalLM
         repo = _TOKENIZERS[tokenizer]
@@ -1993,7 +2190,12 @@ class VLAModel(nn.Module, _HubMixin):
         self.S, self.n_hidden, self.c_context = S, n_hidden, c_context
         self._windows = [float(w) for w in windows]
         self.learn = []              # --learn_win: indices of the learned windows
-        if (not self._windows and not attn) or (self._windows and min(self._windows) < 1):
+        if convdelta:                # --convdelta: the blocks' memories are the whole state
+            self._windows = []
+            if attn or lmu or learn_win or surprise or write_gate or int(layers or 1) > 1:
+                raise SystemExit('--convdelta does not combine with --attn, --lmu, --learn_win, '
+                                 '--write_surprise, --write_gate or --layers')
+        if (not self._windows and not attn and not convdelta) or (self._windows and min(self._windows) < 1):
             raise SystemExit(f'--ctx_ema {windows}: windows must be >= 1 token (no registers: --attn only)')
         self.K = len(self.windows)
         self.read_norm = float(read_norm)
@@ -2003,7 +2205,7 @@ class VLAModel(nn.Module, _HubMixin):
         self.tok = HFTokenizer(repo, self.vocab)
 
         self.tok_embed = lm.get_input_embeddings()                      # frozen
-        self.context = ContextCNN(c_context, depth, kernel, bn_momentum)
+        self.context = None if convdelta else ContextCNN(c_context, depth, kernel, bn_momentum)
         self.streams = int(streams)
         self.nul_id = len(self.tok.tok) if (nul_head or self.streams == 3) and \
             len(self.tok.tok) < self.vocab else None
@@ -2132,6 +2334,18 @@ class VLAModel(nn.Module, _HubMixin):
         self.register_buffer('up_rate', torch.tensor([min(1.0, 1.0 / w) for w in self.up_windows]),
                              persistent=False)
         self.ring_off = n_hidden * self.K * layers   # the registers of every layer, then the ring
+        # --convdelta N: N ConvDeltaBlocks between ctx_cat and linout instead of the ContextCNN and
+        # registers, the input grid scaled and shifted per position (cd_G, cd_P) so the 49
+        # positions can differ; the state is every block's memories and FIFO in turn
+        self.cd = (nn.ModuleList(ConvDeltaBlock(c_context, int(cd_heads), int(cd_dim), int(cd_taps), S,
+                                                bn_momentum) for _ in range(int(convdelta)))
+                   if convdelta else None)
+        self.cd_chunk, self.cd_ckpt = int(cd_chunk), False   # cd_ckpt: checkpoint each block (seq)
+        if self.cd is not None:
+            torch.set_float32_matmul_precision('high')      # TF32 matmuls (the scan, projections)
+            self.cd_G = nn.Parameter(torch.ones(c_context, S, S))
+            self.cd_P = nn.Parameter(torch.zeros(c_context, S, S))
+            self.ring_off = sum(b.state_ch for b in self.cd)
         self.dff = None              # [B, K*n_hidden, S, S], detached; None until first step
         self._ablate = None          # --eval_info: registers read as their mean ...
         self._read_mean = None       # ... which is this [1, K*n_hidden, S, S] tensor
@@ -2371,8 +2585,53 @@ class VLAModel(nn.Module, _HubMixin):
             g = (s / m.clamp(min=1e-6)).clamp(*self.surprise[1:])
         return torch.where(ok, g, torch.ones_like(g))
 
+    def _cd_in(self, idx, img=None, aud=None):
+        """--convdelta: the input grid [M, C, S, S] for a batch of ticks."""
+        return self.ctx_cat(torch.cat(self._inputs(idx, img, aud), 1)) * self.cd_G + self.cd_P
+
+    @contextlib.contextmanager
+    def _bn_hold(self):
+        """A checkpointed block's recompute leaves BatchNorm's running statistics and step
+        counts where the forward left them."""
+        bns = [m for m in self.modules() if isinstance(m, nn.BatchNorm2d)]
+        saved = [(m.momentum, m.num_batches_tracked.clone()) for m in bns]
+        for m in bns:
+            m.momentum = 0.0
+        try:
+            yield
+        finally:
+            for m, (mo, n) in zip(bns, saved):
+                m.momentum = mo
+                m.num_batches_tracked.copy_(n)
+
+    def seq_forward(self, idx, reset, dff, img=None, aud=None):
+        """--convdelta: a whole sequence at once. idx [B, T(, 3)], reset [B, T] (state zero
+        entering that tick), dff [B, ring_off, S, S] entering tick 0 -> (o [B*T, n_hidden, S, S],
+        the state after the last tick). Equal to T calls of step."""
+        B, T = idx.shape[:2]
+        x = self._cd_in(idx.flatten(0, 1), img, aud).view(B, T, self.c_context, self.S, self.S)
+        sts, off = [], 0
+        for blk in self.cd:
+            st = dff[:, off:off + blk.state_ch]
+            off += blk.state_ch
+            if self.cd_ckpt and torch.is_grad_enabled():
+                x, st = torch.utils.checkpoint.checkpoint(
+                    blk.seq, x, st, reset, self.cd_chunk, use_reentrant=False,
+                    context_fn=lambda: (contextlib.nullcontext(), self._bn_hold()))
+            else:
+                x, st = blk.seq(x, st, reset, self.cd_chunk)
+            sts.append(st)
+        return self.linout(x.flatten(0, 1)), torch.cat(sts, 1)
+
     def step(self, idx, dff, img=None, aud=None):
         """One token for every row: -> (new state, layer output). No detach."""
+        if self.cd is not None:
+            x, sts, off = self._cd_in(idx, img, aud), [], 0
+            for blk in self.cd:
+                x, st = blk.step(x, dff[:, off:off + blk.state_ch])
+                off += blk.state_ch
+                sts.append(st)
+            return torch.cat(sts, 1), self.linout(x)
         ring = dff[:, self.ring_off:] if self.attn is not None else None
         nk = self.n_hidden * self.K
         ups = [dff[:, nk * (i + 1):nk * (i + 2)] for i in range(len(self.up))]
@@ -3384,6 +3643,8 @@ model = VLAModel(S=args.context, n_hidden=args.n_hidden, c_context=args.c_contex
                  lmu=args.lmu, attn=args.attn, attn_ch=args.attn_ch, attn_heads=args.attn_heads,
                  attn_dim=args.attn_dim, attn_age=args.attn_age, read_rmsnorm=args.read_rmsnorm,
                  layers=args.layers, write_gate=args.write_gate,
+                 convdelta=args.convdelta, cd_heads=args.cd_heads, cd_dim=args.cd_dim, cd_taps=args.cd_taps,
+                 cd_chunk=args.cd_chunk,
                  up_windows=[float(w) for w in str(args.up_ema).split(',') if w.strip()] if args.up_ema else None)
 if _loaded_ckpt is not None:
     _sd = _upgrade_state_dict(_loaded_ckpt['state_dict'])
@@ -3391,6 +3652,8 @@ if _loaded_ckpt is not None:
         _sd = _switch_audio_state_dict(_sd, model, *_aud_switch)
     if model.streams == 3 and 'voc_dec.proj.weight' not in _sd:
         _sd = _widen_state_dict(_sd, model)
+    if _lm_from is not None:
+        _sd = _narrow_state_dict(_sd, model, _lm_from)
     missing, unexpected = model.load_state_dict(_sd, strict=False)
     _new_up = sorted({k.split('.')[1] for k in missing if k.startswith('up.')})
     if _new_up and not any(k.startswith(f'up.{i}.') for k in _sd for i in _new_up):
@@ -6519,7 +6782,9 @@ if args.mom_schedule != 'const':
 if _loaded_ckpt is not None and _loaded_ckpt.get('optimizer'):
     osd = optimizer.state_dict()
     ck = _loaded_ckpt['optimizer']
-    if any(set(v) != _opt_keys for v in ck['state'].values()):   # saved by the other optimizer
+    if _lm_from is not None:     # --lm narrowed the model: the parameters are not the saved ones
+        print('--lm: optimizer state NOT restored (the model was narrowed)', flush=True)
+    elif any(set(v) != _opt_keys for v in ck['state'].values()):   # saved by the other optimizer
         print(f'WARNING: optimizer state NOT restored: it is not {args.optimizer} state', flush=True)
     elif [len(g['params']) for g in ck['param_groups']] == [len(g['params']) for g in osd['param_groups']]:
         osd['state'] = ck['state']
@@ -7128,6 +7393,20 @@ _imaginer = _Imaginer(_SYNTH_ROWS) if _SYNTH_ROWS else None
 
 larr, garr = [], []
 _blk, _blk_start = [], None      # --bptt: the current block's (loss, inputs) and its starting state
+_cdb = []                        # --convdelta: the current window's (x, y, reset) per tick
+_CD_SLICE = 16                   # --convdelta: ticks per checkpointed decoder + loss slice
+
+
+def _cd_losses(o, y):
+    """--convdelta: o [B, Ts, N, S, S], y [B, Ts(, 3)] -> per-tick losses [Ts] and ce [B, Ts(, 3)]
+    (detached)."""
+    ls, cs = [], []
+    for j in range(o.shape[1]):
+        loss, ce = _train_loss(model.heads(o[:, j]), y[:, j])
+        ls.append(loss)
+        cs.append(ce.detach())
+    return torch.stack(ls), torch.stack(cs, 1)
+
 _etr_start = None                # --learn_win: the sensitivity traces at that start
 _rows_t = {}                 # each corpus's training rows as a device index tensor
 
@@ -7428,109 +7707,163 @@ try:
                     fb |= (x >= 0) & _text_row & \
                         (torch.rand(x.shape, device=x.device) < args.text_feed)
                 x = torch.where(fb, _own, x)
-        if args.bptt > 1 and not _blk:            # --bptt: a block starts from a detached state
-            _blk_start, _etr_start = model.dff, model.etr
-        if args.bptt == 1:
-            _etr_start = model.etr
-        model.etr_on = bool(model.learn)
-        model.etr_inject = model.etr_on and len(_blk) == args.bptt - 1
-        if args.ckpt_ticks:
-            loss, ce_all, logits, model.dff = torch.utils.checkpoint.checkpoint(
-                _ckpt_tick, model.dff, x, y, flag & ~_continuous_row, img, aud, use_reentrant=False,
-                context_fn=lambda: (contextlib.nullcontext(), _bn_hold()))
-        else:
-            logits, _ = model(x, flag=flag & ~_continuous_row, img=img, aud=aud, keep=args.reset_scale,
-                              graph=args.bptt > 1)
-            loss, ce_all = _train_loss(logits, y)
-        model.etr_on = model.etr_inject = False
-        if args.step_tokens:         # row 0's text-stream input and argmax prediction, kept on the GPU
-            with torch.no_grad():
-                lg = (logits[0, 0] if logits.dim() > 2 else logits[0]).detach().float()[None]
-                pr = _truncate(F.softmax(lg / max(args.temperature, 1e-6), dim=-1))
-                _tok_buf.append(torch.stack([x[0, 0] if x.dim() > 1 else x[0],
-                                             torch.multinomial(pr, 1, generator=_tok_gen)[0, 0]]))
-        if model.streams == 3:       # (--fifo3: no sample is ever fed back; _own stays None)
-            if not args.fifo3:
-                with torch.no_grad():
-                    _own = torch.multinomial(_truncate(F.softmax(logits[:, 0].detach().float(), dim=-1)), 1)[:, 0]
-        elif args.inner_voice:
-            with torch.no_grad():
-                _own = torch.multinomial(_truncate(F.softmax(logits.detach().float(), dim=-1)), 1)[:, 0]
-        _pt('forward')
-        if not torch.isfinite(loss):         # keep the last good checkpoint on disk
-            print(f'\n*** HALT: non-finite loss at step {i}: {loss.item()} dff_max '
-                  f'{float(model.dff.abs().max())} logit_max {float(logits.detach().abs().max())}')
-            break
-        if args.bptt > 1:            # --bptt: hold the step until its block is complete
-            _blk.append((loss, x, flag & ~_continuous_row, img, aud))
-        if args.bptt == 1 or len(_blk) == args.bptt:
-            if args.bptt > 1:
-                loss_b = sum(t[0] for t in _blk) / len(_blk)
-                loss_b.backward()
-            else:
+        if model.cd is not None:     # --convdelta: hold the ticks; a full --bptt window runs at once
+            if not _cdb:
+                _blk_start = (model.dff if model.dff is not None and model.dff.shape[0] == len(x_list)
+                              else model.new_state(len(x_list), x.device)).detach()
+            _cdb.append((x, y, flag & ~_continuous_row))
+            if len(_cdb) == args.bptt:
+                Xb, Yb, Rb = (torch.stack([t[j] for t in _cdb], 1) for j in range(3))
+                model.cd_ckpt = bool(args.ckpt_ticks)
+                o, _ = model.seq_forward(Xb, Rb, _blk_start)
+                o = o.view(len(x_list), args.bptt, *o.shape[1:])
+                tl, tce = [], []
+                for s0 in range(0, args.bptt, _CD_SLICE):  # decoders + loss, recomputed in backward
+                    l_, c_ = torch.utils.checkpoint.checkpoint(_cd_losses, o[:, s0:s0 + _CD_SLICE],
+                                                               Yb[:, s0:s0 + _CD_SLICE], use_reentrant=False)
+                    tl.append(l_)
+                    tce.append(c_)
+                tl, tce = torch.cat(tl), torch.cat(tce, 1)
+                loss = tl.mean()
+                _pt('forward')
+                if not torch.isfinite(loss):
+                    print(f'\n*** HALT: non-finite loss at step {i}: {loss.item()}')
+                    break
                 loss.backward()
-            _pt('backward')
-            gnorm = _grad_norm()
-            garr.append(gnorm)
-            if not math.isfinite(gnorm):
-                print(f'\n*** HALT: non-finite grad at step {i}')
-                break
-            if args.clip and gnorm > args.clip:
-                for p in model.parameters():
-                    if p.grad is not None:
-                        p.grad.mul_(args.clip / gnorm)
-            _pt('grad_norm')
-            optimizer.step()
-            if _win_opt is not None:
-                _win_opt.step()
-                _win_opt.zero_grad()
-            _wema_step()
-            _pt('optimizer')
-            # recompute this step's (--bptt: the block's) states with the updated weights
-            # (eval-mode BatchNorm), so the state carried forward is the one the model would
-            # compute at inference
-            model.dff = _blk_start if args.bptt > 1 else dff_prev
-            model.etr = _etr_start
+                del o
+                _pt('backward')
+                gnorm = _grad_norm()
+                garr.append(gnorm)
+                if not math.isfinite(gnorm):
+                    print(f'\n*** HALT: non-finite grad at step {i}')
+                    break
+                if args.clip and gnorm > args.clip:
+                    for p in model.parameters():
+                        if p.grad is not None:
+                            p.grad.mul_(args.clip / gnorm)
+                optimizer.step()
+                _wema_step()
+                _pt('optimizer')
+                # the state carried on: the window again with the updated weights, eval-mode BN
+                model.eval()
+                with torch.no_grad():
+                    _, model.dff = model.seq_forward(Xb, Rb, _blk_start)
+                _pt('recompute')
+                larr.extend(tl.detach().unbind(0))
+                for j in range(args.bptt):
+                    ce = tce[:, j]
+                    for n, rows in _rows_of.items():
+                        if n not in carr:
+                            continue
+                        rt = _rows_t.get(n)
+                        if rt is None:
+                            rt = _rows_t[n] = torch.tensor(rows, device=ce.device)
+                        carr[n].append(ce[rt][:, 0].mean() if model.streams == 3 else ce[rt].mean())
+                _cdb = []
+        else:
+            if args.bptt > 1 and not _blk:            # --bptt: a block starts from a detached state
+                _blk_start, _etr_start = model.dff, model.etr
+            if args.bptt == 1:
+                _etr_start = model.etr
             model.etr_on = bool(model.learn)
-            model.eval()
-            with torch.no_grad():
-                for _, xb, fb, ib, ab in (_blk or [(None, x, flag & ~_continuous_row, img, aud)]):
-                    model(xb, flag=fb, img=ib, aud=ab, keep=args.reset_scale)
-            model.etr_on = False
-            _blk = []
-            _pt('recompute')
+            model.etr_inject = model.etr_on and len(_blk) == args.bptt - 1
+            if args.ckpt_ticks:
+                loss, ce_all, logits, model.dff = torch.utils.checkpoint.checkpoint(
+                    _ckpt_tick, model.dff, x, y, flag & ~_continuous_row, img, aud, use_reentrant=False,
+                    context_fn=lambda: (contextlib.nullcontext(), _bn_hold()))
+            else:
+                logits, _ = model(x, flag=flag & ~_continuous_row, img=img, aud=aud, keep=args.reset_scale,
+                                  graph=args.bptt > 1)
+                loss, ce_all = _train_loss(logits, y)
+            model.etr_on = model.etr_inject = False
+            if args.step_tokens:         # row 0's text-stream input and argmax prediction, kept on the GPU
+                with torch.no_grad():
+                    lg = (logits[0, 0] if logits.dim() > 2 else logits[0]).detach().float()[None]
+                    pr = _truncate(F.softmax(lg / max(args.temperature, 1e-6), dim=-1))
+                    _tok_buf.append(torch.stack([x[0, 0] if x.dim() > 1 else x[0],
+                                                 torch.multinomial(pr, 1, generator=_tok_gen)[0, 0]]))
+            if model.streams == 3:       # (--fifo3: no sample is ever fed back; _own stays None)
+                if not args.fifo3:
+                    with torch.no_grad():
+                        _own = torch.multinomial(_truncate(F.softmax(logits[:, 0].detach().float(), dim=-1)), 1)[:, 0]
+            elif args.inner_voice:
+                with torch.no_grad():
+                    _own = torch.multinomial(_truncate(F.softmax(logits.detach().float(), dim=-1)), 1)[:, 0]
+            _pt('forward')
+            if not torch.isfinite(loss):         # keep the last good checkpoint on disk
+                print(f'\n*** HALT: non-finite loss at step {i}: {loss.item()} dff_max '
+                      f'{float(model.dff.abs().max())} logit_max {float(logits.detach().abs().max())}')
+                break
+            if args.bptt > 1:            # --bptt: hold the step until its block is complete
+                _blk.append((loss, x, flag & ~_continuous_row, img, aud))
+            if args.bptt == 1 or len(_blk) == args.bptt:
+                if args.bptt > 1:
+                    loss_b = sum(t[0] for t in _blk) / len(_blk)
+                    loss_b.backward()
+                else:
+                    loss.backward()
+                _pt('backward')
+                gnorm = _grad_norm()
+                garr.append(gnorm)
+                if not math.isfinite(gnorm):
+                    print(f'\n*** HALT: non-finite grad at step {i}')
+                    break
+                if args.clip and gnorm > args.clip:
+                    for p in model.parameters():
+                        if p.grad is not None:
+                            p.grad.mul_(args.clip / gnorm)
+                _pt('grad_norm')
+                optimizer.step()
+                if _win_opt is not None:
+                    _win_opt.step()
+                    _win_opt.zero_grad()
+                _wema_step()
+                _pt('optimizer')
+                # recompute this step's (--bptt: the block's) states with the updated weights
+                # (eval-mode BatchNorm), so the state carried forward is the one the model would
+                # compute at inference
+                model.dff = _blk_start if args.bptt > 1 else dff_prev
+                model.etr = _etr_start
+                model.etr_on = bool(model.learn)
+                model.eval()
+                with torch.no_grad():
+                    for _, xb, fb, ib, ab in (_blk or [(None, x, flag & ~_continuous_row, img, aud)]):
+                        model(xb, flag=fb, img=ib, aud=ab, keep=args.reset_scale)
+                model.etr_on = False
+                _blk = []
+                _pt('recompute')
 
-        larr.append(loss.detach())   # 0-d GPU tensors, read once per --monitor (no sync per step)
-        if carr:
-            with torch.no_grad():
-                ce = ce_all.detach()
-                for n, rows in _rows_of.items():
-                    rt = _rows_t.get(n)
-                    if rt is None:
-                        rt = _rows_t[n] = torch.tensor(rows, device=ce.device)
-                    if model.streams == 3:
-                        yr, cr = y[rt], ce[rt]
-                        if n in _VIDEO_DATASETS:     # caption words (voice, image; --fifo3 text
-                            c0 = 0 if args.fifo3 else 1   # too); <NUL> apart
-                            isn = yr[:, c0:] == _NUL_ID
-                            carr[n].append(_mmean(cr[:, c0:], ~isn))
-                            carr[_nul_col[n]].append(_mmean(cr[:, c0:], isn))
-                        else:                        # the text stream
-                            carr[n].append(cr[:, 0].mean())
-                    elif _NUL_ID is not None and n in _VIDEO_DATASETS:
-                        # caption tokens only, as EVAL; the <NUL> targets get their own column
-                        isn = y[rt] == _NUL_ID
-                        carr[n].append(_mmean(ce[rt], ~isn))
-                        carr[_nul_col[n]].append(_mmean(ce[rt], isn))
-                    elif args.inner_voice and n in _VIDEO_DATASETS:   # caption ticks only
-                        carr[n].append(_mmean(ce[rt], y[rt] != _SIL))
-                    else:
-                        carr[n].append(ce[rt].mean())
+            larr.append(loss.detach())   # 0-d GPU tensors, read once per --monitor (no sync per step)
+            if carr:
+                with torch.no_grad():
+                    ce = ce_all.detach()
+                    for n, rows in _rows_of.items():
+                        rt = _rows_t.get(n)
+                        if rt is None:
+                            rt = _rows_t[n] = torch.tensor(rows, device=ce.device)
+                        if model.streams == 3:
+                            yr, cr = y[rt], ce[rt]
+                            if n in _VIDEO_DATASETS:     # caption words (voice, image; --fifo3 text
+                                c0 = 0 if args.fifo3 else 1   # too); <NUL> apart
+                                isn = yr[:, c0:] == _NUL_ID
+                                carr[n].append(_mmean(cr[:, c0:], ~isn))
+                                carr[_nul_col[n]].append(_mmean(cr[:, c0:], isn))
+                            else:                        # the text stream
+                                carr[n].append(cr[:, 0].mean())
+                        elif _NUL_ID is not None and n in _VIDEO_DATASETS:
+                            # caption tokens only, as EVAL; the <NUL> targets get their own column
+                            isn = y[rt] == _NUL_ID
+                            carr[n].append(_mmean(ce[rt], ~isn))
+                            carr[_nul_col[n]].append(_mmean(ce[rt], isn))
+                        elif args.inner_voice and n in _VIDEO_DATASETS:   # caption ticks only
+                            carr[n].append(_mmean(ce[rt], y[rt] != _SIL))
+                        else:
+                            carr[n].append(ce[rt].mean())
         if _T0 is not None:          # once, at the first step
             _emit(f'STARTUP step {i:10} wall to first step {time.time() - _T0:6.1f}s (of which datasets '
                   f'{_t_data:6.1f}s)')
             _T0 = None
-        if i % args.monitor == 0:
+        if i % args.monitor == 0 and larr:
             flat = (model.regs(model.dff) if model.K else model.dff).reshape(-1)
             _g0 = optimizer.param_groups[0]      # momentum now (adamw: beta1)
             line = ('STEP {:10} wall {} loss {:12.9f} grad {:12.6f} lr {:10.9f} mom {:6.4f} dff_mean {:12.5f} '
