@@ -360,6 +360,14 @@ parser.add_argument('--reset_scale', default=0.0, type=float, metavar='F',
                     help='at an example start (<NUL>) multiply a row\'s DFF registers by F instead of '
                          'resetting them to --init (0 = reset): the next example starts with a faint '
                          'trace of the last. Training only: eval rows and generation start from --init')
+parser.add_argument('--reset_prob', default=1.0, type=float, metavar='P',
+                    help='stress test for perception discontinuities: at each document start in '
+                         'training, reset the row\'s state only with probability P (1 = always, the '
+                         'default). Otherwise the state of the previous, unrelated document carries '
+                         'straight on, marked only by the document-separator token, as when a robot\'s '
+                         'continuous perception jumps (new scene, new task, new speaker) without a reset, '
+                         'so the model must learn to let go of stale context itself. Eval and generation '
+                         'still start each document from a reset state (EVALW measures the unreset case)')
 parser.add_argument('--continuous', default='', metavar='KINDS',
                     help='example kinds whose rows run CONTINUOUSLY: the DFF registers flow on into '
                          'the next example instead of resetting to --init at its first (<NUL>) '
@@ -956,6 +964,8 @@ args.audio_hz = float(args.audio_hz or 0)
 args.streams = int(args.streams or 1)
 args.fifo3 = bool(args.fifo3)
 args.speech_align = bool(args.speech_align)
+if not 0 <= args.reset_prob <= 1:
+    raise SystemExit(f'--reset_prob {args.reset_prob}: a probability, 0 .. 1')
 _lm_from = None                 # --lm: the loaded checkpoint's media arch args, when it had any
 if args.lm:
     if _loaded_ckpt is not None and (args.streams != 1 or (args.audio_encoder or 'none') != 'none'
@@ -7798,6 +7808,8 @@ try:
         x = torch.tensor(x_list, dtype=torch.long).to(args.device)
         y = torch.tensor(y_list, dtype=torch.long).to(args.device)
         flag = torch.tensor(flag_list, dtype=torch.bool).to(args.device)
+        if args.reset_prob < 1:      # --reset_prob: a document start without a reset (a discontinuity)
+            flag = flag & (torch.rand(flag.shape, device=flag.device) < args.reset_prob)
         img = aud = None
         if _BANK_ROWS or _VIDEO_ROWS:
             img = torch.zeros(len(x_list), model.img_width, model.S, model.S, device=args.device)
