@@ -1,6 +1,6 @@
 """Draw docs/figures/vla_<model>.svg: one clock tick of a VLA model, 16:9 (1920 x 1080).
 
-usage: python tools/figure_vla.py [--model v498|v499|v502|v505|v511|v531] [--out OUT]
+usage: python tools/figure_vla.py [--model v498|v499|v502|v505|v511|v531|convdelta] [--out OUT]
 
 v498: recurrent CNN + two order-2 Legendre memories (4096, 64 ticks) + copy + recall attention, never
 reset. v499: no registers, the recall attention's ring is the whole state, reset at each example.
@@ -8,11 +8,13 @@ v502: the residual cascade of an EMA (512 ticks) and the residual copy, read thr
 + recall attention, reset at each example. v505: two recurrent layers in series, each with that cascade, no
 recall attention; 1920 x 2160, two 16:9 panes: the whole tick on top, one layer zoomed in below. v511: v505
 with the layers' EMA windows 16 (layer 1) and 64 (layer 2) ticks. v531: one layer, its EMA (16 ticks to start)
-written at a learned rate per channel and position (--write_gate), plus the residual copy."""
+written at a learned rate per channel and position (--write_gate), plus the residual copy. convdelta: the
+proposed parallel-trainable model, 6 residual blocks of per-tick convs, each carrying a gated delta-rule matrix
+memory per grid position; 1920 x 2160, the whole model above and one block below."""
 import argparse
 
 ap = argparse.ArgumentParser()
-ap.add_argument('--model', default='v498', choices=('v498', 'v499', 'v502', 'v505', 'v511', 'v531'))
+ap.add_argument('--model', default='v498', choices=('v498', 'v499', 'v502', 'v505', 'v511', 'v531', 'convdelta'))
 ap.add_argument('--out', default=None)
 a = ap.parse_args()
 LMU = a.model == 'v498'                   # Legendre memories + copy
@@ -20,14 +22,14 @@ CASC = a.model == 'v502'                  # EMA + residual copy, RMSnorm reads
 REGS = LMU or CASC                        # (v499: the ring alone)
 CAT = {'v498': ('3×256 + 2048 + 256 + 256 + 5×512', 5888), 'v499': ('3×256 + 2048 + 256 + 256', 3328),
        'v502': ('3×256 + 2048 + 256 + 256 + 2×512', 4352), 'v505': ('', 0), 'v511': ('', 0),
-       'v531': ('', 0)}[a.model]
+       'v531': ('', 0), 'convdelta': ('', 0)}[a.model]
 EMA1, EMA2 = (16, 64) if a.model == 'v511' else (512, 512)    # two-layer models: each layer's EMA window
 
 W, H = 1920, 1080
 out = []
 COL = dict(frozen='#e0e0e0', rep='#ce93d8', cat='#90a4ae', lin='#64b5f6', cnn='#81c784', dec='#4dd0e1',
            media='#ffffff', smp='#f48fb1', lmu='#fff176', norm='#bcaaa4', attn='#ffb74d', mel='#fff9c4',
-           ink='#212121', soft='#616161', gate='#ff8a65')
+           ink='#212121', soft='#616161', gate='#ff8a65', tconv='#b39ddb')
 
 
 def esc(s):
@@ -522,8 +524,264 @@ def draw_v531():
 if a.model in ('v505', 'v511'):
     draw_v505()
     raise SystemExit(0)
+def draw_convdelta():
+    """1920 x 2160: pane A (top) the whole model, pane B (bottom) one block."""
+    W5, H5 = 1920, 2160
+    out.append(f'<svg xmlns="http://www.w3.org/2000/svg" width="{W5}" height="{H5}" viewBox="0 0 {W5} {H5}" '
+               f'font-family="Helvetica, Arial, sans-serif">')
+    out.append(DEFS)
+    out.append(f'<rect width="{W5}" height="{H5}" fill="#ffffff"/>')
+
+    # ── pane A: the whole model ─────────────────────────────────────────────
+    text(30, 38, 'ConvDelta (proposal) — one clock tick: 6 residual blocks of per-tick convs, each with a gated '
+         'delta-rule memory per grid position', 22, anchor='start', weight='bold')
+    text(30, 62, 'A · the whole model.  C 384 · 7×7 grid · 6 blocks · H 6 heads × d 32 per position · 3 token streams '
+         '· 25 Hz · about 27M trainable · fixed state about 2.1M values · trains in parallel over 2,048 ticks', 13,
+         anchor='start', fill='#424242')
+    CY = 400
+    ys = (250, 300, 350)
+    for y, nm in zip(ys, ('text', 'voice', 'image')):
+        mux(40, y)
+        line([(74, y), (128, y)])
+        text(100, y - 6, nm, 10, fill=COL['soft'])
+    box(130, 225, 150, 150, COL['frozen'], ['tok_embed (frozen)', 'pythia-31m 50304×256', 'shared by 3 streams'],
+        hatch=True)
+    for y in ys:
+        line([(280, y), (318, y)])
+    box(320, 225, 40, 150, COL['rep'], ['RMS · replicate 1×1→7×7'], size=11, vertical=True)
+    box(40, 430, 90, 44, COL['media'], ['audio', '16 kHz'])
+    line([(130, 452), (158, 452)])
+    box(160, 430, 150, 44, COL['mel'], ['log-mel (fixed)', '64 mels · 10 ms hop'])
+    line([(310, 452), (328, 452)])
+    box(330, 435, 36, 34, COL['norm'], ['RMS'], size=10)
+    box(40, 510, 90, 44, COL['media'], ['frame', '2 fps'], dash=True)
+    line([(130, 532), (158, 532)], dash=True, color='#9e9e9e')
+    box(160, 510, 150, 44, COL['frozen'], ['image encoder', '(future)'], hatch=True, dash=True)
+    text(440, ys[0] - 8, 'token grids 3 × 256×7×7', 10, fill=COL['soft'])
+    text(440, 444, 'audio grid 256×7×7', 10, fill=COL['soft'])
+    PX = 500
+    box(PX, 220, 40, 360, COL['lin'], ['concat 4×256 · 1×1 → 384'], size=11, vertical=True)
+    for y in ys:
+        line([(360, y), (PX, y)])
+    line([(366, 452), (PX, 452)])
+    box(565, 250, 44, 300, COL['gate'], ['per position: × G + P (384×7×7)'], size=11, vertical=True)
+    line([(PX + 40, CY), (565, CY)])
+    x0 = 650
+    line([(609, CY), (x0, CY)])
+    BW, GAP = 100, 20
+    for i in range(6):                                    # the six blocks
+        bx = x0 + i * (BW + GAP)
+        out.append(f'<rect x="{bx}" y="{CY - 140}" width="{BW}" height="280" rx="8" fill="#f5f9ff" '
+                   f'stroke="{COL["ink"]}" stroke-width="1.4"/>')
+        text(bx + BW / 2, CY - 150, f'block {i + 1}', 12, weight='bold')
+        line([(bx, CY), (bx + 8, CY)], arrow=False)
+        box(bx + 8, CY - 40, 14, 80, COL['tconv'], rx=2)
+        line([(bx + 22, CY), (bx + 30, CY)], arrow=False)
+        box(bx + 30, CY - 50, 12, 100, COL['cnn'], rx=2)
+        line([(bx + 42, CY), (bx + 46, CY)], arrow=False)
+        box(bx + 46, CY - 50, 12, 100, COL['cnn'], rx=2)
+        line([(bx + 58, CY), (bx + 64, CY)])
+        out.append(f'<circle cx="{bx + 78}" cy="{CY}" r="13" fill="{COL["lmu"]}" stroke="{COL["ink"]}" '
+                   f'stroke-width="1.2"/>')
+        text(bx + 78, CY + 4, 'Δ', 12, weight='bold')
+        line([(bx + 91, CY), (bx + BW + (GAP if i < 5 else 0), CY)], arrow=i < 5)
+        out.append(f'<rect x="{bx + 58}" y="{CY + 62}" width="40" height="30" fill="#ffffff" stroke="{COL["ink"]}" '
+                   f'stroke-width="1.2"/>')
+        text(bx + 78, CY + 82, 'S', 12, weight='bold')
+        line([(bx + 74, CY + 13), (bx + 74, CY + 62)])
+        line([(bx + 84, CY + 62), (bx + 84, CY + 15)], dash=True, color='#757575')
+        text(bx + BW / 2, CY + 118, '49×6×32×32', 9.5, fill=COL['soft'])
+    text(x0 + 3 * (BW + GAP) - GAP / 2, CY + 172, 'each block: causal time conv (4 ticks) → 2 × conv 3×3 → '
+         'delta-rule memory Δ with its state S', 12, fill='#424242')
+    zx = x0 + 2 * (BW + GAP) - 8                          # zoom marker on block 3
+    out.append(f'<rect x="{zx}" y="{CY - 172}" width="{BW + 16}" height="320" rx="12" fill="none" '
+               f'stroke="#e65100" stroke-width="2" stroke-dasharray="8,5"/>')
+    text(zx + 8, CY + 198, 'one block, zoomed in: pane B ▼', 12, anchor='start', fill='#e65100', weight='bold')
+    BX = x0 + 6 * (BW + GAP) - GAP + 30                    # the output bus
+    line([(x0 + 6 * (BW + GAP) - GAP, CY), (BX, CY)], arrow=False)
+    dot(BX, CY)
+    text(BX + 6, CY - 8, 'o', 13, anchor='start', weight='bold')
+    DX = BX + 40
+    rows = ((270, 'text_dec', 'THINK'), (CY, 'voc_dec', 'HEAR'), (530, 'img_dec', 'SEE'))
+    line([(BX, rows[0][0]), (BX, rows[2][0])], arrow=False)
+    HX = DX + 160
+    for y, nm, kind in rows:
+        line([(BX, y), (DX, y)])
+        text(DX + 62, y - 40, nm, 11, weight='bold')
+        xx = DX
+        for lab in ('7→5', '5→3', '3→1'):
+            box(xx, y - 30, 30, 60, COL['dec'], [lab], size=10, vertical=True)
+            if xx < DX + 90:
+                line([(xx + 30, y), (xx + 46, y)])
+            xx += 46
+        line([(xx - 16, y), (HX, y)])
+    box(HX, 220, 40, 360, COL['frozen'], ['lmhead 256→50304 (frozen, shared)'], hatch=True, vertical=True)
+    SX = HX + 60
+    for y, nm, kind in rows:
+        line([(HX + 40, y), (SX, y)])
+        box(SX, y - 28, 92, 56, COL['smp'], ['softmax', f'sample · {kind}'], size=11)
+    for i, (y, nm, kind) in enumerate(rows):
+        top = 160 - 16 * i
+        xr = SX + 92 + 10 + 12 * i
+        xl = 30 - 8 * i
+        line([(SX + 92, y), (xr, y), (xr, top), (xl, top), (xl, ys[i]), (40, ys[i])])
+    text(1200, 104, 'each stream\'s sample → its next input (training: the dataset\'s)', 11, fill=COL['soft'])
+
+    legend(30, 640, [(COL['frozen'], True, 'frozen: embedding / lmhead (pythia-31m)'),
+                     (COL['rep'], False, 'RMS norm · replicate 1×1 → 7×7'),
+                     (COL['lin'], False, 'conv 1×1 (linear): input projection'),
+                     (COL['gate'], False, 'per-position gain G and bias P (learned)'),
+                     (COL['tconv'], False, 'causal depthwise conv over the last 4 ticks'),
+                     (COL['cnn'], False, 'conv 3×3 + BatchNorm (+ ReLU)'),
+                     (COL['lmu'], False, 'Δ: gated delta-rule memory update and read'),
+                     (COL['dec'], False, 'decoder convs 3×3, 7→5→3→1 (linear)'),
+                     (COL['smp'], False, 'softmax + sample (+ <NUL> logit)')],
+           '(S: reset to 0 at each document start)', w=560)
+    nx = 650
+    out.append(f'<rect x="{nx}" y="640" width="{1890 - nx}" height="380" rx="8" fill="#fafafa" stroke="#bdbdbd"/>')
+    text(nx + 18, 668, 'how it differs from v531', 14, anchor='start', weight='bold')
+    for i, s_ in enumerate((
+            'No conv reads the state. The convs see only this tick\'s input to their block, so in training they run on',
+            'every tick of a 2,048-token sequence at once ([B·T, 384, 7, 7]). Only the memories S carry anything',
+            'from tick to tick, and their update is linear in S, so a chunked parallel scan trains them over the whole',
+            'sequence: no truncated BPTT. On the chip it runs one tick at a time, as now.',
+            '',
+            'The state is an associative memory, not an average: each of the 49 positions holds 6 heads of 32×32',
+            'key→value matrices per block, written by the delta rule and read by a query. Heads start at decay',
+            'windows log-spaced from 4 to 4,096 ticks. The short time conv carries the last 4 ticks (the copy',
+            'register\'s job). The per-position G and P let the 49 columns differ, since every position gets the',
+            'same token. A document start sets the decay α to 0: a clean reset, so no warm penalty.',
+            '',
+            'State: 6 × (49·6·32·32 memory + 3·384·49 time conv) ≈ 2.1M values, fixed for any context length.')):
+        text(nx + 18, 696 + 22 * i, s_, 12.5, anchor='start', fill='#424242')
+
+    out.append('<line x1="0" y1="1080" x2="1920" y2="1080" stroke="#9e9e9e" stroke-width="2"/>')
+
+    # ── pane B: one block ──────────────────────────────────────────────────
+    out.append('<g transform="translate(0,1080)">')
+    text(30, 46, 'B · one block (all 6 have this structure, each with its own weights and memory)', 22,
+         anchor='start', weight='bold')
+    text(30, 70, 'x: 384×7×7 per tick · H = 6 heads of d = 32 at each of the 49 positions · every operation is per '
+         'position except the 3×3 convs', 13, anchor='start', fill='#424242')
+    CYb = 330
+    text(40, CYb - 10, 'x', 14, anchor='start', weight='bold')
+    text(40, CYb + 20, 'from below', 10, anchor='start', fill=COL['soft'])
+    line([(60, CYb), (110, CYb)], arrow=False)
+    dot(110, CYb)
+    line([(110, CYb), (140, CYb)])
+    box(140, CYb - 17, 36, 34, COL['rep'], ['RMS'], size=10)
+    line([(176, CYb), (230, CYb)])
+    for j, fx in enumerate((350, 250, 150)):             # the time conv's FIFO of past inputs (in at the right)
+        flop(fx, 130, f't−{j + 1}', size='')
+    line([(196, CYb), (196, 190), (450, 190), (450, 153), (416, 153)])
+    line([(350, 146), (330, 146), (330, 160), (316, 160)])
+    line([(250, 146), (230, 146), (230, 160), (216, 160)])
+    text(282, 118, 'last 3 ticks\' inputs (384×7×7 each)', 10.5, fill=COL['soft'])
+    box(230, CYb - 50, 130, 100, COL['tconv'], ['causal time conv', 'depthwise, 4 taps', 'this tick + last 3'],
+        size=11)
+    for qx in (182, 282, 382):
+        line([(qx - 32 + 32, 176), (qx - 32 + 32, CYb - 52)], dash=True, color='#757575')
+    line([(360, CYb), (393, CYb)])
+    out.append(f'<circle cx="410" cy="{CYb}" r="16" fill="#ffffff" stroke="{COL["ink"]}" stroke-width="1.3"/>')
+    text(410, CYb + 7, '+', 20, weight='bold')
+    line([(110, CYb), (110, CYb + 90), (410, CYb + 90), (410, CYb + 18)])
+    line([(426, CYb), (470, CYb)], arrow=False)
+    dot(470, CYb)
+    line([(470, CYb), (500, CYb)])
+    box(500, CYb - 80, 44, 160, COL['cnn'], ['conv 3×3 · BN · ReLU'], size=11, vertical=True)
+    line([(544, CYb), (580, CYb)])
+    box(580, CYb - 80, 44, 160, COL['cnn'], ['conv 3×3 · BN'], size=11, vertical=True)
+    line([(624, CYb), (663, CYb)])
+    out.append(f'<circle cx="680" cy="{CYb}" r="16" fill="#ffffff" stroke="{COL["ink"]}" stroke-width="1.3"/>')
+    text(680, CYb + 7, '+', 20, weight='bold')
+    line([(470, CYb), (470, CYb + 110), (680, CYb + 110), (680, CYb + 18)])
+    text(562, CYb + 128, 'spatial mixing, per tick', 10.5, fill=COL['soft'])
+    UX = 740
+    line([(696, CYb), (UX, CYb)], arrow=False)
+    dot(UX, CYb)
+    text(UX, CYb - 12, 'u', 14, weight='bold')
+    AX = 1720                                             # the residual add after the read
+    line([(UX, CYb), (AX - 18, CYb)])
+    out.append(f'<circle cx="{AX}" cy="{CYb}" r="16" fill="#ffffff" stroke="{COL["ink"]}" stroke-width="1.3"/>')
+    text(AX, CYb + 7, '+', 20, weight='bold')
+    line([(AX + 16, CYb), (1880, CYb)])
+    text(1880, CYb - 12, 'x′ to the next block', 12, anchor='end', weight='bold')
+
+    pr = (('q', 'query', 490, True), ('k', 'key', 550, True), ('v', 'value', 610, False),
+          ('β', 'write strength σ(·)', 670, False), ('α', 'decay exp(−softplus(λ)·σ(·))', 730, False))
+    line([(UX, CYb), (UX, 730)], arrow=False)
+    for nm, desc, y, l2 in pr:
+        line([(UX, y), (800, y)])
+        box(800, y - 18, 190, 36, COL['lin'] if nm in 'qkv' else COL['gate'], [f'1×1 conv → {nm}', desc], size=11)
+        if l2:
+            line([(990, y), (1010, y)])
+            box(1010, y - 13, 40, 26, COL['norm'], ['L2'], size=10)
+    text(895, 452, 'per position: 6 heads × 32', 10.5, fill=COL['soft'])
+    DX0, DY0, DW, DH = 1110, 520, 300, 240               # the delta-rule update
+    box(DX0, DY0, DW, DH, COL['lmu'], [], rx=8)
+    text(DX0 + DW / 2, DY0 + 30, 'gated delta rule', 14, weight='bold')
+    text(DX0 + DW / 2, DY0 + 64, 'S ← α · S (I − β k kᵀ) + β v kᵀ', 14)
+    text(DX0 + DW / 2, DY0 + 96, 'erase what k pointed at, write v there,', 11, fill='#424242')
+    text(DX0 + DW / 2, DY0 + 114, 'decay the rest by α', 11, fill='#424242')
+    text(DX0 + DW / 2, DY0 + 146, 'per position, per head: d×d = 32×32', 11, fill='#424242')
+    text(DX0 + DW / 2, DY0 + 164, 'about 3d² MACs each per tick', 11, fill='#424242')
+    text(DX0 + DW / 2, DY0 + 198, 'no weights of its own: S is state (fast weights),', 11, weight='bold')
+    text(DX0 + DW / 2, DY0 + 216, 'learned only through the 1×1 convs feeding it', 11, weight='bold')
+    for nm, desc, y, l2 in pr[1:]:
+        line([(1050 if l2 else 990, y), (DX0, y)])
+    MX, MY = 1180, 820                                    # the memory register
+    flop(MX, MY, 'S', size='49 × 6 × 32×32 = 301,056')
+    line([(DX0 + DW - 60, DY0 + DH), (DX0 + DW - 60, MY + 23), (MX + 66, MY + 23)])
+    line([(MX, MY + 16), (DX0 + 30, MY + 16), (DX0 + 30, DY0 + DH + 2)], dash=True, color='#757575')
+    text(DX0 + 34, MY + 40, 'S (t−1)', 10.5, anchor='start', fill=COL['soft'])
+    RX = 1440                                             # the read
+    box(RX, 470, 110, 40, COL['lmu'], ['read  S q'], size=12)
+    line([(1050, 490), (1080, 490), (1080, 440), (RX + 55, 440), (RX + 55, 468)])
+    line([(DX0 + DW, 640), (RX + 55, 640), (RX + 55, 512)])
+    text(DX0 + DW + 8, 632, 'S (t)', 10.5, anchor='start', fill=COL['soft'])
+    box(RX + 140, 470, 80, 40, COL['lin'], ['1×1 out'], size=11)
+    line([(RX + 110, 490), (RX + 140, 490)])
+    line([(RX + 220, 490), (AX, 490), (AX, CYb + 18)])
+    text(AX + 6, 420, 'y', 13, anchor='start', weight='bold')
+    box(800, 790, 190, 50, '#ffffff', ['document start', 'α = 0: S reset'], size=11, dash=True)
+    line([(895, 790), (895, 750)], dash=True, color='#757575')
+
+    out.append(f'<rect x="1530" y="600" width="360" height="420" rx="8" fill="#fafafa" stroke="#bdbdbd"/>')
+    text(1548, 628, 'training vs the chip', 14, anchor='start', weight='bold')
+    for i, s_ in enumerate((
+            'Training: everything before Δ runs on all',
+            'T = 2,048 ticks at once. q, k, v, β, α for',
+            'the whole sequence go to a chunked scan',
+            '(the WY form of the delta rule, Yang et',
+            'al. 2024), giving every S q exactly. No',
+            'BPTT window: the gradient reaches back',
+            'to the start of the sequence.',
+            '',
+            'Chip: one tick at a time. Per block it',
+            'holds S and the 3-tick FIFO, and does',
+            'the convs, five 1×1 projections and',
+            '49 × 6 small 32×32 updates and reads.',
+            'Same results as training, by construction.')):
+        text(1548, 656 + 25 * i, s_, 12, anchor='start', fill='#424242')
+
+    legend(30, 560, [(COL['rep'], False, 'RMS norm (per position) / L2 norm (per head)'),
+                     (COL['tconv'], False, 'causal depthwise conv over time, 4 taps'),
+                     (COL['cnn'], False, 'conv 3×3 + BatchNorm (+ ReLU)'),
+                     (COL['lin'], False, 'conv 1×1 (linear): q, k, v, out'),
+                     (COL['gate'], False, 'gates: β = σ(·), α = exp(−softplus(λ)·σ(·))'),
+                     (COL['lmu'], False, 'delta-rule update / read (linear in S)'),
+                     ('#ffffff', False, '(+) residual add')],
+           '(S, and the FIFO: reset at each document start)', w=640)
+    out.append('</g>')
+    out.append('</svg>')
+    open(a.out or f'docs/figures/vla_{a.model}.svg', 'w').write('\n'.join(out))
+
+
 if a.model == 'v531':
     draw_v531()
+    raise SystemExit(0)
+if a.model == 'convdelta':
+    draw_convdelta()
     raise SystemExit(0)
 
 # ── canvas ────────────────────────────────────────────────────────────────────

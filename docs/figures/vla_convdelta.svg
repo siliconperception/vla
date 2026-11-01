@@ -1,0 +1,437 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1920" height="2160" viewBox="0 0 1920 2160" font-family="Helvetica, Arial, sans-serif">
+<defs><marker id="arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0,0 L 10,5 L 0,10 z" fill="#212121"/></marker><pattern id="hatch" width="6" height="6" patternUnits="userSpaceOnUse" patternTransform="rotate(45)"><line x1="0" y1="0" x2="0" y2="6" stroke="#757575" stroke-width="1.2"/></pattern></defs>
+<rect width="1920" height="2160" fill="#ffffff"/>
+<text x="30" y="38" font-size="22" text-anchor="start" font-weight="bold" fill="#212121">ConvDelta (proposal) — one clock tick: 6 residual blocks of per-tick convs, each with a gated delta-rule memory per grid position</text>
+<text x="30" y="62" font-size="13" text-anchor="start" font-weight="normal" fill="#424242">A · the whole model.  C 384 · 7×7 grid · 6 blocks · H 6 heads × d 32 per position · 3 token streams · 25 Hz · about 27M trainable · fixed state about 2.1M values · trains in parallel over 2,048 ticks</text>
+<path d="M 40,235 L 74,241 L 74,259 L 40,265 z" fill="#e0e0e0" stroke="#212121" stroke-width="1.2"/>
+<path d="M 74,250 L 128,250" fill="none" stroke="#212121" stroke-width="1.4" marker-end="url(#arr)"/>
+<text x="100" y="244" font-size="10" text-anchor="middle" font-weight="normal" fill="#616161">text</text>
+<path d="M 40,285 L 74,291 L 74,309 L 40,315 z" fill="#e0e0e0" stroke="#212121" stroke-width="1.2"/>
+<path d="M 74,300 L 128,300" fill="none" stroke="#212121" stroke-width="1.4" marker-end="url(#arr)"/>
+<text x="100" y="294" font-size="10" text-anchor="middle" font-weight="normal" fill="#616161">voice</text>
+<path d="M 40,335 L 74,341 L 74,359 L 40,365 z" fill="#e0e0e0" stroke="#212121" stroke-width="1.2"/>
+<path d="M 74,350 L 128,350" fill="none" stroke="#212121" stroke-width="1.4" marker-end="url(#arr)"/>
+<text x="100" y="344" font-size="10" text-anchor="middle" font-weight="normal" fill="#616161">image</text>
+<rect x="130" y="225" width="150" height="150" rx="3" fill="#e0e0e0" stroke="#212121" stroke-width="1.2"/>
+<rect x="130" y="225" width="150" height="150" rx="3" fill="url(#hatch)" opacity="0.5"/>
+<text x="205.0" y="290.0" font-size="11" text-anchor="middle" font-weight="bold" fill="#212121">tok_embed (frozen)</text>
+<text x="205.0" y="304.0" font-size="9.5" text-anchor="middle" font-weight="normal" fill="#424242">pythia-31m 50304×256</text>
+<text x="205.0" y="318.0" font-size="9.5" text-anchor="middle" font-weight="normal" fill="#424242">shared by 3 streams</text>
+<path d="M 280,250 L 318,250" fill="none" stroke="#212121" stroke-width="1.4" marker-end="url(#arr)"/>
+<path d="M 280,300 L 318,300" fill="none" stroke="#212121" stroke-width="1.4" marker-end="url(#arr)"/>
+<path d="M 280,350 L 318,350" fill="none" stroke="#212121" stroke-width="1.4" marker-end="url(#arr)"/>
+<rect x="320" y="225" width="40" height="150" rx="3" fill="#ce93d8" stroke="#212121" stroke-width="1.2"/>
+<text x="344.0" y="300.0" font-size="11" text-anchor="middle" font-weight="bold" fill="#212121" transform="rotate(-90 344.0 300.0)">RMS · replicate 1×1→7×7</text>
+<rect x="40" y="430" width="90" height="44" rx="3" fill="#ffffff" stroke="#212121" stroke-width="1.2"/>
+<text x="85.0" y="449.0" font-size="11" text-anchor="middle" font-weight="bold" fill="#212121">audio</text>
+<text x="85.0" y="463.0" font-size="9.5" text-anchor="middle" font-weight="normal" fill="#424242">16 kHz</text>
+<path d="M 130,452 L 158,452" fill="none" stroke="#212121" stroke-width="1.4" marker-end="url(#arr)"/>
+<rect x="160" y="430" width="150" height="44" rx="3" fill="#fff9c4" stroke="#212121" stroke-width="1.2"/>
+<text x="235.0" y="449.0" font-size="11" text-anchor="middle" font-weight="bold" fill="#212121">log-mel (fixed)</text>
+<text x="235.0" y="463.0" font-size="9.5" text-anchor="middle" font-weight="normal" fill="#424242">64 mels · 10 ms hop</text>
+<path d="M 310,452 L 328,452" fill="none" stroke="#212121" stroke-width="1.4" marker-end="url(#arr)"/>
+<rect x="330" y="435" width="36" height="34" rx="3" fill="#bcaaa4" stroke="#212121" stroke-width="1.2"/>
+<text x="348.0" y="456.0" font-size="10" text-anchor="middle" font-weight="bold" fill="#212121">RMS</text>
+<rect x="40" y="510" width="90" height="44" rx="3" fill="#ffffff" stroke="#212121" stroke-width="1.2" stroke-dasharray="5,3"/>
+<text x="85.0" y="529.0" font-size="11" text-anchor="middle" font-weight="bold" fill="#212121">frame</text>
+<text x="85.0" y="543.0" font-size="9.5" text-anchor="middle" font-weight="normal" fill="#424242">2 fps</text>
+<path d="M 130,532 L 158,532" fill="none" stroke="#9e9e9e" stroke-width="1.4" stroke-dasharray="5,3" marker-end="url(#arr)"/>
+<rect x="160" y="510" width="150" height="44" rx="3" fill="#e0e0e0" stroke="#212121" stroke-width="1.2" stroke-dasharray="5,3"/>
+<rect x="160" y="510" width="150" height="44" rx="3" fill="url(#hatch)" opacity="0.5"/>
+<text x="235.0" y="529.0" font-size="11" text-anchor="middle" font-weight="bold" fill="#212121">image encoder</text>
+<text x="235.0" y="543.0" font-size="9.5" text-anchor="middle" font-weight="normal" fill="#424242">(future)</text>
+<text x="440" y="242" font-size="10" text-anchor="middle" font-weight="normal" fill="#616161">token grids 3 × 256×7×7</text>
+<text x="440" y="444" font-size="10" text-anchor="middle" font-weight="normal" fill="#616161">audio grid 256×7×7</text>
+<rect x="500" y="220" width="40" height="360" rx="3" fill="#64b5f6" stroke="#212121" stroke-width="1.2"/>
+<text x="524.0" y="400.0" font-size="11" text-anchor="middle" font-weight="bold" fill="#212121" transform="rotate(-90 524.0 400.0)">concat 4×256 · 1×1 → 384</text>
+<path d="M 360,250 L 500,250" fill="none" stroke="#212121" stroke-width="1.4" marker-end="url(#arr)"/>
+<path d="M 360,300 L 500,300" fill="none" stroke="#212121" stroke-width="1.4" marker-end="url(#arr)"/>
+<path d="M 360,350 L 500,350" fill="none" stroke="#212121" stroke-width="1.4" marker-end="url(#arr)"/>
+<path d="M 366,452 L 500,452" fill="none" stroke="#212121" stroke-width="1.4" marker-end="url(#arr)"/>
+<rect x="565" y="250" width="44" height="300" rx="3" fill="#ff8a65" stroke="#212121" stroke-width="1.2"/>
+<text x="591.0" y="400.0" font-size="11" text-anchor="middle" font-weight="bold" fill="#212121" transform="rotate(-90 591.0 400.0)">per position: × G + P (384×7×7)</text>
+<path d="M 540,400 L 565,400" fill="none" stroke="#212121" stroke-width="1.4" marker-end="url(#arr)"/>
+<path d="M 609,400 L 650,400" fill="none" stroke="#212121" stroke-width="1.4" marker-end="url(#arr)"/>
+<rect x="650" y="260" width="100" height="280" rx="8" fill="#f5f9ff" stroke="#212121" stroke-width="1.4"/>
+<text x="700.0" y="250" font-size="12" text-anchor="middle" font-weight="bold" fill="#212121">block 1</text>
+<path d="M 650,400 L 658,400" fill="none" stroke="#212121" stroke-width="1.4"/>
+<rect x="658" y="360" width="14" height="80" rx="2" fill="#b39ddb" stroke="#212121" stroke-width="1.2"/>
+<path d="M 672,400 L 680,400" fill="none" stroke="#212121" stroke-width="1.4"/>
+<rect x="680" y="350" width="12" height="100" rx="2" fill="#81c784" stroke="#212121" stroke-width="1.2"/>
+<path d="M 692,400 L 696,400" fill="none" stroke="#212121" stroke-width="1.4"/>
+<rect x="696" y="350" width="12" height="100" rx="2" fill="#81c784" stroke="#212121" stroke-width="1.2"/>
+<path d="M 708,400 L 714,400" fill="none" stroke="#212121" stroke-width="1.4" marker-end="url(#arr)"/>
+<circle cx="728" cy="400" r="13" fill="#fff176" stroke="#212121" stroke-width="1.2"/>
+<text x="728" y="404" font-size="12" text-anchor="middle" font-weight="bold" fill="#212121">Δ</text>
+<path d="M 741,400 L 770,400" fill="none" stroke="#212121" stroke-width="1.4" marker-end="url(#arr)"/>
+<rect x="708" y="462" width="40" height="30" fill="#ffffff" stroke="#212121" stroke-width="1.2"/>
+<text x="728" y="482" font-size="12" text-anchor="middle" font-weight="bold" fill="#212121">S</text>
+<path d="M 724,413 L 724,462" fill="none" stroke="#212121" stroke-width="1.4" marker-end="url(#arr)"/>
+<path d="M 734,462 L 734,415" fill="none" stroke="#757575" stroke-width="1.4" stroke-dasharray="5,3" marker-end="url(#arr)"/>
+<text x="700.0" y="518" font-size="9.5" text-anchor="middle" font-weight="normal" fill="#616161">49×6×32×32</text>
+<rect x="770" y="260" width="100" height="280" rx="8" fill="#f5f9ff" stroke="#212121" stroke-width="1.4"/>
+<text x="820.0" y="250" font-size="12" text-anchor="middle" font-weight="bold" fill="#212121">block 2</text>
+<path d="M 770,400 L 778,400" fill="none" stroke="#212121" stroke-width="1.4"/>
+<rect x="778" y="360" width="14" height="80" rx="2" fill="#b39ddb" stroke="#212121" stroke-width="1.2"/>
+<path d="M 792,400 L 800,400" fill="none" stroke="#212121" stroke-width="1.4"/>
+<rect x="800" y="350" width="12" height="100" rx="2" fill="#81c784" stroke="#212121" stroke-width="1.2"/>
+<path d="M 812,400 L 816,400" fill="none" stroke="#212121" stroke-width="1.4"/>
+<rect x="816" y="350" width="12" height="100" rx="2" fill="#81c784" stroke="#212121" stroke-width="1.2"/>
+<path d="M 828,400 L 834,400" fill="none" stroke="#212121" stroke-width="1.4" marker-end="url(#arr)"/>
+<circle cx="848" cy="400" r="13" fill="#fff176" stroke="#212121" stroke-width="1.2"/>
+<text x="848" y="404" font-size="12" text-anchor="middle" font-weight="bold" fill="#212121">Δ</text>
+<path d="M 861,400 L 890,400" fill="none" stroke="#212121" stroke-width="1.4" marker-end="url(#arr)"/>
+<rect x="828" y="462" width="40" height="30" fill="#ffffff" stroke="#212121" stroke-width="1.2"/>
+<text x="848" y="482" font-size="12" text-anchor="middle" font-weight="bold" fill="#212121">S</text>
+<path d="M 844,413 L 844,462" fill="none" stroke="#212121" stroke-width="1.4" marker-end="url(#arr)"/>
+<path d="M 854,462 L 854,415" fill="none" stroke="#757575" stroke-width="1.4" stroke-dasharray="5,3" marker-end="url(#arr)"/>
+<text x="820.0" y="518" font-size="9.5" text-anchor="middle" font-weight="normal" fill="#616161">49×6×32×32</text>
+<rect x="890" y="260" width="100" height="280" rx="8" fill="#f5f9ff" stroke="#212121" stroke-width="1.4"/>
+<text x="940.0" y="250" font-size="12" text-anchor="middle" font-weight="bold" fill="#212121">block 3</text>
+<path d="M 890,400 L 898,400" fill="none" stroke="#212121" stroke-width="1.4"/>
+<rect x="898" y="360" width="14" height="80" rx="2" fill="#b39ddb" stroke="#212121" stroke-width="1.2"/>
+<path d="M 912,400 L 920,400" fill="none" stroke="#212121" stroke-width="1.4"/>
+<rect x="920" y="350" width="12" height="100" rx="2" fill="#81c784" stroke="#212121" stroke-width="1.2"/>
+<path d="M 932,400 L 936,400" fill="none" stroke="#212121" stroke-width="1.4"/>
+<rect x="936" y="350" width="12" height="100" rx="2" fill="#81c784" stroke="#212121" stroke-width="1.2"/>
+<path d="M 948,400 L 954,400" fill="none" stroke="#212121" stroke-width="1.4" marker-end="url(#arr)"/>
+<circle cx="968" cy="400" r="13" fill="#fff176" stroke="#212121" stroke-width="1.2"/>
+<text x="968" y="404" font-size="12" text-anchor="middle" font-weight="bold" fill="#212121">Δ</text>
+<path d="M 981,400 L 1010,400" fill="none" stroke="#212121" stroke-width="1.4" marker-end="url(#arr)"/>
+<rect x="948" y="462" width="40" height="30" fill="#ffffff" stroke="#212121" stroke-width="1.2"/>
+<text x="968" y="482" font-size="12" text-anchor="middle" font-weight="bold" fill="#212121">S</text>
+<path d="M 964,413 L 964,462" fill="none" stroke="#212121" stroke-width="1.4" marker-end="url(#arr)"/>
+<path d="M 974,462 L 974,415" fill="none" stroke="#757575" stroke-width="1.4" stroke-dasharray="5,3" marker-end="url(#arr)"/>
+<text x="940.0" y="518" font-size="9.5" text-anchor="middle" font-weight="normal" fill="#616161">49×6×32×32</text>
+<rect x="1010" y="260" width="100" height="280" rx="8" fill="#f5f9ff" stroke="#212121" stroke-width="1.4"/>
+<text x="1060.0" y="250" font-size="12" text-anchor="middle" font-weight="bold" fill="#212121">block 4</text>
+<path d="M 1010,400 L 1018,400" fill="none" stroke="#212121" stroke-width="1.4"/>
+<rect x="1018" y="360" width="14" height="80" rx="2" fill="#b39ddb" stroke="#212121" stroke-width="1.2"/>
+<path d="M 1032,400 L 1040,400" fill="none" stroke="#212121" stroke-width="1.4"/>
+<rect x="1040" y="350" width="12" height="100" rx="2" fill="#81c784" stroke="#212121" stroke-width="1.2"/>
+<path d="M 1052,400 L 1056,400" fill="none" stroke="#212121" stroke-width="1.4"/>
+<rect x="1056" y="350" width="12" height="100" rx="2" fill="#81c784" stroke="#212121" stroke-width="1.2"/>
+<path d="M 1068,400 L 1074,400" fill="none" stroke="#212121" stroke-width="1.4" marker-end="url(#arr)"/>
+<circle cx="1088" cy="400" r="13" fill="#fff176" stroke="#212121" stroke-width="1.2"/>
+<text x="1088" y="404" font-size="12" text-anchor="middle" font-weight="bold" fill="#212121">Δ</text>
+<path d="M 1101,400 L 1130,400" fill="none" stroke="#212121" stroke-width="1.4" marker-end="url(#arr)"/>
+<rect x="1068" y="462" width="40" height="30" fill="#ffffff" stroke="#212121" stroke-width="1.2"/>
+<text x="1088" y="482" font-size="12" text-anchor="middle" font-weight="bold" fill="#212121">S</text>
+<path d="M 1084,413 L 1084,462" fill="none" stroke="#212121" stroke-width="1.4" marker-end="url(#arr)"/>
+<path d="M 1094,462 L 1094,415" fill="none" stroke="#757575" stroke-width="1.4" stroke-dasharray="5,3" marker-end="url(#arr)"/>
+<text x="1060.0" y="518" font-size="9.5" text-anchor="middle" font-weight="normal" fill="#616161">49×6×32×32</text>
+<rect x="1130" y="260" width="100" height="280" rx="8" fill="#f5f9ff" stroke="#212121" stroke-width="1.4"/>
+<text x="1180.0" y="250" font-size="12" text-anchor="middle" font-weight="bold" fill="#212121">block 5</text>
+<path d="M 1130,400 L 1138,400" fill="none" stroke="#212121" stroke-width="1.4"/>
+<rect x="1138" y="360" width="14" height="80" rx="2" fill="#b39ddb" stroke="#212121" stroke-width="1.2"/>
+<path d="M 1152,400 L 1160,400" fill="none" stroke="#212121" stroke-width="1.4"/>
+<rect x="1160" y="350" width="12" height="100" rx="2" fill="#81c784" stroke="#212121" stroke-width="1.2"/>
+<path d="M 1172,400 L 1176,400" fill="none" stroke="#212121" stroke-width="1.4"/>
+<rect x="1176" y="350" width="12" height="100" rx="2" fill="#81c784" stroke="#212121" stroke-width="1.2"/>
+<path d="M 1188,400 L 1194,400" fill="none" stroke="#212121" stroke-width="1.4" marker-end="url(#arr)"/>
+<circle cx="1208" cy="400" r="13" fill="#fff176" stroke="#212121" stroke-width="1.2"/>
+<text x="1208" y="404" font-size="12" text-anchor="middle" font-weight="bold" fill="#212121">Δ</text>
+<path d="M 1221,400 L 1250,400" fill="none" stroke="#212121" stroke-width="1.4" marker-end="url(#arr)"/>
+<rect x="1188" y="462" width="40" height="30" fill="#ffffff" stroke="#212121" stroke-width="1.2"/>
+<text x="1208" y="482" font-size="12" text-anchor="middle" font-weight="bold" fill="#212121">S</text>
+<path d="M 1204,413 L 1204,462" fill="none" stroke="#212121" stroke-width="1.4" marker-end="url(#arr)"/>
+<path d="M 1214,462 L 1214,415" fill="none" stroke="#757575" stroke-width="1.4" stroke-dasharray="5,3" marker-end="url(#arr)"/>
+<text x="1180.0" y="518" font-size="9.5" text-anchor="middle" font-weight="normal" fill="#616161">49×6×32×32</text>
+<rect x="1250" y="260" width="100" height="280" rx="8" fill="#f5f9ff" stroke="#212121" stroke-width="1.4"/>
+<text x="1300.0" y="250" font-size="12" text-anchor="middle" font-weight="bold" fill="#212121">block 6</text>
+<path d="M 1250,400 L 1258,400" fill="none" stroke="#212121" stroke-width="1.4"/>
+<rect x="1258" y="360" width="14" height="80" rx="2" fill="#b39ddb" stroke="#212121" stroke-width="1.2"/>
+<path d="M 1272,400 L 1280,400" fill="none" stroke="#212121" stroke-width="1.4"/>
+<rect x="1280" y="350" width="12" height="100" rx="2" fill="#81c784" stroke="#212121" stroke-width="1.2"/>
+<path d="M 1292,400 L 1296,400" fill="none" stroke="#212121" stroke-width="1.4"/>
+<rect x="1296" y="350" width="12" height="100" rx="2" fill="#81c784" stroke="#212121" stroke-width="1.2"/>
+<path d="M 1308,400 L 1314,400" fill="none" stroke="#212121" stroke-width="1.4" marker-end="url(#arr)"/>
+<circle cx="1328" cy="400" r="13" fill="#fff176" stroke="#212121" stroke-width="1.2"/>
+<text x="1328" y="404" font-size="12" text-anchor="middle" font-weight="bold" fill="#212121">Δ</text>
+<path d="M 1341,400 L 1350,400" fill="none" stroke="#212121" stroke-width="1.4"/>
+<rect x="1308" y="462" width="40" height="30" fill="#ffffff" stroke="#212121" stroke-width="1.2"/>
+<text x="1328" y="482" font-size="12" text-anchor="middle" font-weight="bold" fill="#212121">S</text>
+<path d="M 1324,413 L 1324,462" fill="none" stroke="#212121" stroke-width="1.4" marker-end="url(#arr)"/>
+<path d="M 1334,462 L 1334,415" fill="none" stroke="#757575" stroke-width="1.4" stroke-dasharray="5,3" marker-end="url(#arr)"/>
+<text x="1300.0" y="518" font-size="9.5" text-anchor="middle" font-weight="normal" fill="#616161">49×6×32×32</text>
+<text x="1000.0" y="572" font-size="12" text-anchor="middle" font-weight="normal" fill="#424242">each block: causal time conv (4 ticks) → 2 × conv 3×3 → delta-rule memory Δ with its state S</text>
+<rect x="882" y="228" width="116" height="320" rx="12" fill="none" stroke="#e65100" stroke-width="2" stroke-dasharray="8,5"/>
+<text x="890" y="598" font-size="12" text-anchor="start" font-weight="bold" fill="#e65100">one block, zoomed in: pane B ▼</text>
+<path d="M 1350,400 L 1380,400" fill="none" stroke="#212121" stroke-width="1.4"/>
+<circle cx="1380" cy="400" r="3.2" fill="#212121"/>
+<text x="1386" y="392" font-size="13" text-anchor="start" font-weight="bold" fill="#212121">o</text>
+<path d="M 1380,270 L 1380,530" fill="none" stroke="#212121" stroke-width="1.4"/>
+<path d="M 1380,270 L 1420,270" fill="none" stroke="#212121" stroke-width="1.4" marker-end="url(#arr)"/>
+<text x="1482" y="230" font-size="11" text-anchor="middle" font-weight="bold" fill="#212121">text_dec</text>
+<rect x="1420" y="240" width="30" height="60" rx="3" fill="#4dd0e1" stroke="#212121" stroke-width="1.2"/>
+<text x="1439.0" y="270.0" font-size="10" text-anchor="middle" font-weight="bold" fill="#212121" transform="rotate(-90 1439.0 270.0)">7→5</text>
+<path d="M 1450,270 L 1466,270" fill="none" stroke="#212121" stroke-width="1.4" marker-end="url(#arr)"/>
+<rect x="1466" y="240" width="30" height="60" rx="3" fill="#4dd0e1" stroke="#212121" stroke-width="1.2"/>
+<text x="1485.0" y="270.0" font-size="10" text-anchor="middle" font-weight="bold" fill="#212121" transform="rotate(-90 1485.0 270.0)">5→3</text>
+<path d="M 1496,270 L 1512,270" fill="none" stroke="#212121" stroke-width="1.4" marker-end="url(#arr)"/>
+<rect x="1512" y="240" width="30" height="60" rx="3" fill="#4dd0e1" stroke="#212121" stroke-width="1.2"/>
+<text x="1531.0" y="270.0" font-size="10" text-anchor="middle" font-weight="bold" fill="#212121" transform="rotate(-90 1531.0 270.0)">3→1</text>
+<path d="M 1542,270 L 1580,270" fill="none" stroke="#212121" stroke-width="1.4" marker-end="url(#arr)"/>
+<path d="M 1380,400 L 1420,400" fill="none" stroke="#212121" stroke-width="1.4" marker-end="url(#arr)"/>
+<text x="1482" y="360" font-size="11" text-anchor="middle" font-weight="bold" fill="#212121">voc_dec</text>
+<rect x="1420" y="370" width="30" height="60" rx="3" fill="#4dd0e1" stroke="#212121" stroke-width="1.2"/>
+<text x="1439.0" y="400.0" font-size="10" text-anchor="middle" font-weight="bold" fill="#212121" transform="rotate(-90 1439.0 400.0)">7→5</text>
+<path d="M 1450,400 L 1466,400" fill="none" stroke="#212121" stroke-width="1.4" marker-end="url(#arr)"/>
+<rect x="1466" y="370" width="30" height="60" rx="3" fill="#4dd0e1" stroke="#212121" stroke-width="1.2"/>
+<text x="1485.0" y="400.0" font-size="10" text-anchor="middle" font-weight="bold" fill="#212121" transform="rotate(-90 1485.0 400.0)">5→3</text>
+<path d="M 1496,400 L 1512,400" fill="none" stroke="#212121" stroke-width="1.4" marker-end="url(#arr)"/>
+<rect x="1512" y="370" width="30" height="60" rx="3" fill="#4dd0e1" stroke="#212121" stroke-width="1.2"/>
+<text x="1531.0" y="400.0" font-size="10" text-anchor="middle" font-weight="bold" fill="#212121" transform="rotate(-90 1531.0 400.0)">3→1</text>
+<path d="M 1542,400 L 1580,400" fill="none" stroke="#212121" stroke-width="1.4" marker-end="url(#arr)"/>
+<path d="M 1380,530 L 1420,530" fill="none" stroke="#212121" stroke-width="1.4" marker-end="url(#arr)"/>
+<text x="1482" y="490" font-size="11" text-anchor="middle" font-weight="bold" fill="#212121">img_dec</text>
+<rect x="1420" y="500" width="30" height="60" rx="3" fill="#4dd0e1" stroke="#212121" stroke-width="1.2"/>
+<text x="1439.0" y="530.0" font-size="10" text-anchor="middle" font-weight="bold" fill="#212121" transform="rotate(-90 1439.0 530.0)">7→5</text>
+<path d="M 1450,530 L 1466,530" fill="none" stroke="#212121" stroke-width="1.4" marker-end="url(#arr)"/>
+<rect x="1466" y="500" width="30" height="60" rx="3" fill="#4dd0e1" stroke="#212121" stroke-width="1.2"/>
+<text x="1485.0" y="530.0" font-size="10" text-anchor="middle" font-weight="bold" fill="#212121" transform="rotate(-90 1485.0 530.0)">5→3</text>
+<path d="M 1496,530 L 1512,530" fill="none" stroke="#212121" stroke-width="1.4" marker-end="url(#arr)"/>
+<rect x="1512" y="500" width="30" height="60" rx="3" fill="#4dd0e1" stroke="#212121" stroke-width="1.2"/>
+<text x="1531.0" y="530.0" font-size="10" text-anchor="middle" font-weight="bold" fill="#212121" transform="rotate(-90 1531.0 530.0)">3→1</text>
+<path d="M 1542,530 L 1580,530" fill="none" stroke="#212121" stroke-width="1.4" marker-end="url(#arr)"/>
+<rect x="1580" y="220" width="40" height="360" rx="3" fill="#e0e0e0" stroke="#212121" stroke-width="1.2"/>
+<rect x="1580" y="220" width="40" height="360" rx="3" fill="url(#hatch)" opacity="0.5"/>
+<text x="1604.0" y="400.0" font-size="11" text-anchor="middle" font-weight="bold" fill="#212121" transform="rotate(-90 1604.0 400.0)">lmhead 256→50304 (frozen, shared)</text>
+<path d="M 1620,270 L 1640,270" fill="none" stroke="#212121" stroke-width="1.4" marker-end="url(#arr)"/>
+<rect x="1640" y="242" width="92" height="56" rx="3" fill="#f48fb1" stroke="#212121" stroke-width="1.2"/>
+<text x="1686.0" y="267.0" font-size="11" text-anchor="middle" font-weight="bold" fill="#212121">softmax</text>
+<text x="1686.0" y="281.0" font-size="9.5" text-anchor="middle" font-weight="normal" fill="#424242">sample · THINK</text>
+<path d="M 1620,400 L 1640,400" fill="none" stroke="#212121" stroke-width="1.4" marker-end="url(#arr)"/>
+<rect x="1640" y="372" width="92" height="56" rx="3" fill="#f48fb1" stroke="#212121" stroke-width="1.2"/>
+<text x="1686.0" y="397.0" font-size="11" text-anchor="middle" font-weight="bold" fill="#212121">softmax</text>
+<text x="1686.0" y="411.0" font-size="9.5" text-anchor="middle" font-weight="normal" fill="#424242">sample · HEAR</text>
+<path d="M 1620,530 L 1640,530" fill="none" stroke="#212121" stroke-width="1.4" marker-end="url(#arr)"/>
+<rect x="1640" y="502" width="92" height="56" rx="3" fill="#f48fb1" stroke="#212121" stroke-width="1.2"/>
+<text x="1686.0" y="527.0" font-size="11" text-anchor="middle" font-weight="bold" fill="#212121">softmax</text>
+<text x="1686.0" y="541.0" font-size="9.5" text-anchor="middle" font-weight="normal" fill="#424242">sample · SEE</text>
+<path d="M 1732,270 L 1742,270 L 1742,160 L 30,160 L 30,250 L 40,250" fill="none" stroke="#212121" stroke-width="1.4" marker-end="url(#arr)"/>
+<path d="M 1732,400 L 1754,400 L 1754,144 L 22,144 L 22,300 L 40,300" fill="none" stroke="#212121" stroke-width="1.4" marker-end="url(#arr)"/>
+<path d="M 1732,530 L 1766,530 L 1766,128 L 14,128 L 14,350 L 40,350" fill="none" stroke="#212121" stroke-width="1.4" marker-end="url(#arr)"/>
+<text x="1200" y="104" font-size="11" text-anchor="middle" font-weight="normal" fill="#616161">each stream's sample → its next input (training: the dataset's)</text>
+<rect x="30" y="640" width="560" height="388" rx="8" fill="#fafafa" stroke="#bdbdbd"/>
+<text x="48" y="666" font-size="14" text-anchor="start" font-weight="bold" fill="#212121">Legend</text>
+<rect x="48" y="688" width="26" height="18" rx="2" fill="#e0e0e0" stroke="#212121" stroke-width="1.2"/>
+<rect x="48" y="688" width="26" height="18" rx="2" fill="url(#hatch)" opacity="0.5"/>
+<text x="86" y="701" font-size="12" text-anchor="start" font-weight="normal" fill="#212121">frozen: embedding / lmhead (pythia-31m)</text>
+<rect x="48" y="716" width="26" height="18" rx="2" fill="#ce93d8" stroke="#212121" stroke-width="1.2"/>
+<text x="86" y="729" font-size="12" text-anchor="start" font-weight="normal" fill="#212121">RMS norm · replicate 1×1 → 7×7</text>
+<rect x="48" y="744" width="26" height="18" rx="2" fill="#64b5f6" stroke="#212121" stroke-width="1.2"/>
+<text x="86" y="757" font-size="12" text-anchor="start" font-weight="normal" fill="#212121">conv 1×1 (linear): input projection</text>
+<rect x="48" y="772" width="26" height="18" rx="2" fill="#ff8a65" stroke="#212121" stroke-width="1.2"/>
+<text x="86" y="785" font-size="12" text-anchor="start" font-weight="normal" fill="#212121">per-position gain G and bias P (learned)</text>
+<rect x="48" y="800" width="26" height="18" rx="2" fill="#b39ddb" stroke="#212121" stroke-width="1.2"/>
+<text x="86" y="813" font-size="12" text-anchor="start" font-weight="normal" fill="#212121">causal depthwise conv over the last 4 ticks</text>
+<rect x="48" y="828" width="26" height="18" rx="2" fill="#81c784" stroke="#212121" stroke-width="1.2"/>
+<text x="86" y="841" font-size="12" text-anchor="start" font-weight="normal" fill="#212121">conv 3×3 + BatchNorm (+ ReLU)</text>
+<rect x="48" y="856" width="26" height="18" rx="2" fill="#fff176" stroke="#212121" stroke-width="1.2"/>
+<text x="86" y="869" font-size="12" text-anchor="start" font-weight="normal" fill="#212121">Δ: gated delta-rule memory update and read</text>
+<rect x="48" y="884" width="26" height="18" rx="2" fill="#4dd0e1" stroke="#212121" stroke-width="1.2"/>
+<text x="86" y="897" font-size="12" text-anchor="start" font-weight="normal" fill="#212121">decoder convs 3×3, 7→5→3→1 (linear)</text>
+<rect x="48" y="912" width="26" height="18" rx="2" fill="#f48fb1" stroke="#212121" stroke-width="1.2"/>
+<text x="86" y="925" font-size="12" text-anchor="start" font-weight="normal" fill="#212121">softmax + sample (+ &lt;NUL&gt; logit)</text>
+<rect x="48" y="942" width="64" height="46" fill="#ffffff" stroke="#212121" stroke-width="1.3"/>
+<path d="M 74,988 L 80,981 L 86,988" fill="none" stroke="#212121" stroke-width="1.1"/>
+<text x="57" y="955" font-size="10" text-anchor="start" font-weight="normal" fill="#212121">Q</text>
+<text x="103" y="955" font-size="10" text-anchor="end" font-weight="normal" fill="#212121">D</text>
+<text x="80" y="972" font-size="12" text-anchor="middle" font-weight="bold" fill="#212121"></text>
+<text x="80" y="937" font-size="9.5" text-anchor="middle" font-weight="normal" fill="#616161"></text>
+<text x="124" y="962" font-size="12" text-anchor="start" font-weight="normal" fill="#212121">D flip-flop register, clocked every tick</text>
+<text x="124" y="978" font-size="11" text-anchor="start" font-weight="normal" fill="#616161">(S: reset to 0 at each document start)</text>
+<path d="M 48,1010 L 80,1010" fill="none" stroke="#212121" stroke-width="1.4" marker-end="url(#arr)"/>
+<text x="86" y="1014" font-size="12" text-anchor="start" font-weight="normal" fill="#212121">data / state path</text>
+<path d="M 250,1010 L 282,1010" fill="none" stroke="#757575" stroke-width="1.4" stroke-dasharray="5,3" marker-end="url(#arr)"/>
+<text x="288" y="1014" font-size="12" text-anchor="start" font-weight="normal" fill="#212121">old state into the update</text>
+<rect x="650" y="640" width="1240" height="380" rx="8" fill="#fafafa" stroke="#bdbdbd"/>
+<text x="668" y="668" font-size="14" text-anchor="start" font-weight="bold" fill="#212121">how it differs from v531</text>
+<text x="668" y="696" font-size="12.5" text-anchor="start" font-weight="normal" fill="#424242">No conv reads the state. The convs see only this tick's input to their block, so in training they run on</text>
+<text x="668" y="718" font-size="12.5" text-anchor="start" font-weight="normal" fill="#424242">every tick of a 2,048-token sequence at once ([B·T, 384, 7, 7]). Only the memories S carry anything</text>
+<text x="668" y="740" font-size="12.5" text-anchor="start" font-weight="normal" fill="#424242">from tick to tick, and their update is linear in S, so a chunked parallel scan trains them over the whole</text>
+<text x="668" y="762" font-size="12.5" text-anchor="start" font-weight="normal" fill="#424242">sequence: no truncated BPTT. On the chip it runs one tick at a time, as now.</text>
+<text x="668" y="784" font-size="12.5" text-anchor="start" font-weight="normal" fill="#424242"></text>
+<text x="668" y="806" font-size="12.5" text-anchor="start" font-weight="normal" fill="#424242">The state is an associative memory, not an average: each of the 49 positions holds 6 heads of 32×32</text>
+<text x="668" y="828" font-size="12.5" text-anchor="start" font-weight="normal" fill="#424242">key→value matrices per block, written by the delta rule and read by a query. Heads start at decay</text>
+<text x="668" y="850" font-size="12.5" text-anchor="start" font-weight="normal" fill="#424242">windows log-spaced from 4 to 4,096 ticks. The short time conv carries the last 4 ticks (the copy</text>
+<text x="668" y="872" font-size="12.5" text-anchor="start" font-weight="normal" fill="#424242">register's job). The per-position G and P let the 49 columns differ, since every position gets the</text>
+<text x="668" y="894" font-size="12.5" text-anchor="start" font-weight="normal" fill="#424242">same token. A document start sets the decay α to 0: a clean reset, so no warm penalty.</text>
+<text x="668" y="916" font-size="12.5" text-anchor="start" font-weight="normal" fill="#424242"></text>
+<text x="668" y="938" font-size="12.5" text-anchor="start" font-weight="normal" fill="#424242">State: 6 × (49·6·32·32 memory + 3·384·49 time conv) ≈ 2.1M values, fixed for any context length.</text>
+<line x1="0" y1="1080" x2="1920" y2="1080" stroke="#9e9e9e" stroke-width="2"/>
+<g transform="translate(0,1080)">
+<text x="30" y="46" font-size="22" text-anchor="start" font-weight="bold" fill="#212121">B · one block (all 6 have this structure, each with its own weights and memory)</text>
+<text x="30" y="70" font-size="13" text-anchor="start" font-weight="normal" fill="#424242">x: 384×7×7 per tick · H = 6 heads of d = 32 at each of the 49 positions · every operation is per position except the 3×3 convs</text>
+<text x="40" y="320" font-size="14" text-anchor="start" font-weight="bold" fill="#212121">x</text>
+<text x="40" y="350" font-size="10" text-anchor="start" font-weight="normal" fill="#616161">from below</text>
+<path d="M 60,330 L 110,330" fill="none" stroke="#212121" stroke-width="1.4"/>
+<circle cx="110" cy="330" r="3.2" fill="#212121"/>
+<path d="M 110,330 L 140,330" fill="none" stroke="#212121" stroke-width="1.4" marker-end="url(#arr)"/>
+<rect x="140" y="313" width="36" height="34" rx="3" fill="#ce93d8" stroke="#212121" stroke-width="1.2"/>
+<text x="158.0" y="334.0" font-size="10" text-anchor="middle" font-weight="bold" fill="#212121">RMS</text>
+<path d="M 176,330 L 230,330" fill="none" stroke="#212121" stroke-width="1.4" marker-end="url(#arr)"/>
+<rect x="350" y="130" width="64" height="46" fill="#ffffff" stroke="#212121" stroke-width="1.3"/>
+<path d="M 376,176 L 382,169 L 388,176" fill="none" stroke="#212121" stroke-width="1.1"/>
+<text x="359" y="143" font-size="10" text-anchor="start" font-weight="normal" fill="#212121">Q</text>
+<text x="405" y="143" font-size="10" text-anchor="end" font-weight="normal" fill="#212121">D</text>
+<text x="382" y="160" font-size="12" text-anchor="middle" font-weight="bold" fill="#212121">t−1</text>
+<text x="382" y="125" font-size="9.5" text-anchor="middle" font-weight="normal" fill="#616161"></text>
+<rect x="250" y="130" width="64" height="46" fill="#ffffff" stroke="#212121" stroke-width="1.3"/>
+<path d="M 276,176 L 282,169 L 288,176" fill="none" stroke="#212121" stroke-width="1.1"/>
+<text x="259" y="143" font-size="10" text-anchor="start" font-weight="normal" fill="#212121">Q</text>
+<text x="305" y="143" font-size="10" text-anchor="end" font-weight="normal" fill="#212121">D</text>
+<text x="282" y="160" font-size="12" text-anchor="middle" font-weight="bold" fill="#212121">t−2</text>
+<text x="282" y="125" font-size="9.5" text-anchor="middle" font-weight="normal" fill="#616161"></text>
+<rect x="150" y="130" width="64" height="46" fill="#ffffff" stroke="#212121" stroke-width="1.3"/>
+<path d="M 176,176 L 182,169 L 188,176" fill="none" stroke="#212121" stroke-width="1.1"/>
+<text x="159" y="143" font-size="10" text-anchor="start" font-weight="normal" fill="#212121">Q</text>
+<text x="205" y="143" font-size="10" text-anchor="end" font-weight="normal" fill="#212121">D</text>
+<text x="182" y="160" font-size="12" text-anchor="middle" font-weight="bold" fill="#212121">t−3</text>
+<text x="182" y="125" font-size="9.5" text-anchor="middle" font-weight="normal" fill="#616161"></text>
+<path d="M 196,330 L 196,190 L 450,190 L 450,153 L 416,153" fill="none" stroke="#212121" stroke-width="1.4" marker-end="url(#arr)"/>
+<path d="M 350,146 L 330,146 L 330,160 L 316,160" fill="none" stroke="#212121" stroke-width="1.4" marker-end="url(#arr)"/>
+<path d="M 250,146 L 230,146 L 230,160 L 216,160" fill="none" stroke="#212121" stroke-width="1.4" marker-end="url(#arr)"/>
+<text x="282" y="118" font-size="10.5" text-anchor="middle" font-weight="normal" fill="#616161">last 3 ticks' inputs (384×7×7 each)</text>
+<rect x="230" y="280" width="130" height="100" rx="3" fill="#b39ddb" stroke="#212121" stroke-width="1.2"/>
+<text x="295.0" y="320.0" font-size="11" text-anchor="middle" font-weight="bold" fill="#212121">causal time conv</text>
+<text x="295.0" y="334.0" font-size="9.5" text-anchor="middle" font-weight="normal" fill="#424242">depthwise, 4 taps</text>
+<text x="295.0" y="348.0" font-size="9.5" text-anchor="middle" font-weight="normal" fill="#424242">this tick + last 3</text>
+<path d="M 182,176 L 182,278" fill="none" stroke="#757575" stroke-width="1.4" stroke-dasharray="5,3" marker-end="url(#arr)"/>
+<path d="M 282,176 L 282,278" fill="none" stroke="#757575" stroke-width="1.4" stroke-dasharray="5,3" marker-end="url(#arr)"/>
+<path d="M 382,176 L 382,278" fill="none" stroke="#757575" stroke-width="1.4" stroke-dasharray="5,3" marker-end="url(#arr)"/>
+<path d="M 360,330 L 393,330" fill="none" stroke="#212121" stroke-width="1.4" marker-end="url(#arr)"/>
+<circle cx="410" cy="330" r="16" fill="#ffffff" stroke="#212121" stroke-width="1.3"/>
+<text x="410" y="337" font-size="20" text-anchor="middle" font-weight="bold" fill="#212121">+</text>
+<path d="M 110,330 L 110,420 L 410,420 L 410,348" fill="none" stroke="#212121" stroke-width="1.4" marker-end="url(#arr)"/>
+<path d="M 426,330 L 470,330" fill="none" stroke="#212121" stroke-width="1.4"/>
+<circle cx="470" cy="330" r="3.2" fill="#212121"/>
+<path d="M 470,330 L 500,330" fill="none" stroke="#212121" stroke-width="1.4" marker-end="url(#arr)"/>
+<rect x="500" y="250" width="44" height="160" rx="3" fill="#81c784" stroke="#212121" stroke-width="1.2"/>
+<text x="526.0" y="330.0" font-size="11" text-anchor="middle" font-weight="bold" fill="#212121" transform="rotate(-90 526.0 330.0)">conv 3×3 · BN · ReLU</text>
+<path d="M 544,330 L 580,330" fill="none" stroke="#212121" stroke-width="1.4" marker-end="url(#arr)"/>
+<rect x="580" y="250" width="44" height="160" rx="3" fill="#81c784" stroke="#212121" stroke-width="1.2"/>
+<text x="606.0" y="330.0" font-size="11" text-anchor="middle" font-weight="bold" fill="#212121" transform="rotate(-90 606.0 330.0)">conv 3×3 · BN</text>
+<path d="M 624,330 L 663,330" fill="none" stroke="#212121" stroke-width="1.4" marker-end="url(#arr)"/>
+<circle cx="680" cy="330" r="16" fill="#ffffff" stroke="#212121" stroke-width="1.3"/>
+<text x="680" y="337" font-size="20" text-anchor="middle" font-weight="bold" fill="#212121">+</text>
+<path d="M 470,330 L 470,440 L 680,440 L 680,348" fill="none" stroke="#212121" stroke-width="1.4" marker-end="url(#arr)"/>
+<text x="562" y="458" font-size="10.5" text-anchor="middle" font-weight="normal" fill="#616161">spatial mixing, per tick</text>
+<path d="M 696,330 L 740,330" fill="none" stroke="#212121" stroke-width="1.4"/>
+<circle cx="740" cy="330" r="3.2" fill="#212121"/>
+<text x="740" y="318" font-size="14" text-anchor="middle" font-weight="bold" fill="#212121">u</text>
+<path d="M 740,330 L 1702,330" fill="none" stroke="#212121" stroke-width="1.4" marker-end="url(#arr)"/>
+<circle cx="1720" cy="330" r="16" fill="#ffffff" stroke="#212121" stroke-width="1.3"/>
+<text x="1720" y="337" font-size="20" text-anchor="middle" font-weight="bold" fill="#212121">+</text>
+<path d="M 1736,330 L 1880,330" fill="none" stroke="#212121" stroke-width="1.4" marker-end="url(#arr)"/>
+<text x="1880" y="318" font-size="12" text-anchor="end" font-weight="bold" fill="#212121">x′ to the next block</text>
+<path d="M 740,330 L 740,730" fill="none" stroke="#212121" stroke-width="1.4"/>
+<path d="M 740,490 L 800,490" fill="none" stroke="#212121" stroke-width="1.4" marker-end="url(#arr)"/>
+<rect x="800" y="472" width="190" height="36" rx="3" fill="#64b5f6" stroke="#212121" stroke-width="1.2"/>
+<text x="895.0" y="487.0" font-size="11" text-anchor="middle" font-weight="bold" fill="#212121">1×1 conv → q</text>
+<text x="895.0" y="501.0" font-size="9.5" text-anchor="middle" font-weight="normal" fill="#424242">query</text>
+<path d="M 990,490 L 1010,490" fill="none" stroke="#212121" stroke-width="1.4" marker-end="url(#arr)"/>
+<rect x="1010" y="477" width="40" height="26" rx="3" fill="#bcaaa4" stroke="#212121" stroke-width="1.2"/>
+<text x="1030.0" y="494.0" font-size="10" text-anchor="middle" font-weight="bold" fill="#212121">L2</text>
+<path d="M 740,550 L 800,550" fill="none" stroke="#212121" stroke-width="1.4" marker-end="url(#arr)"/>
+<rect x="800" y="532" width="190" height="36" rx="3" fill="#64b5f6" stroke="#212121" stroke-width="1.2"/>
+<text x="895.0" y="547.0" font-size="11" text-anchor="middle" font-weight="bold" fill="#212121">1×1 conv → k</text>
+<text x="895.0" y="561.0" font-size="9.5" text-anchor="middle" font-weight="normal" fill="#424242">key</text>
+<path d="M 990,550 L 1010,550" fill="none" stroke="#212121" stroke-width="1.4" marker-end="url(#arr)"/>
+<rect x="1010" y="537" width="40" height="26" rx="3" fill="#bcaaa4" stroke="#212121" stroke-width="1.2"/>
+<text x="1030.0" y="554.0" font-size="10" text-anchor="middle" font-weight="bold" fill="#212121">L2</text>
+<path d="M 740,610 L 800,610" fill="none" stroke="#212121" stroke-width="1.4" marker-end="url(#arr)"/>
+<rect x="800" y="592" width="190" height="36" rx="3" fill="#64b5f6" stroke="#212121" stroke-width="1.2"/>
+<text x="895.0" y="607.0" font-size="11" text-anchor="middle" font-weight="bold" fill="#212121">1×1 conv → v</text>
+<text x="895.0" y="621.0" font-size="9.5" text-anchor="middle" font-weight="normal" fill="#424242">value</text>
+<path d="M 740,670 L 800,670" fill="none" stroke="#212121" stroke-width="1.4" marker-end="url(#arr)"/>
+<rect x="800" y="652" width="190" height="36" rx="3" fill="#ff8a65" stroke="#212121" stroke-width="1.2"/>
+<text x="895.0" y="667.0" font-size="11" text-anchor="middle" font-weight="bold" fill="#212121">1×1 conv → β</text>
+<text x="895.0" y="681.0" font-size="9.5" text-anchor="middle" font-weight="normal" fill="#424242">write strength σ(·)</text>
+<path d="M 740,730 L 800,730" fill="none" stroke="#212121" stroke-width="1.4" marker-end="url(#arr)"/>
+<rect x="800" y="712" width="190" height="36" rx="3" fill="#ff8a65" stroke="#212121" stroke-width="1.2"/>
+<text x="895.0" y="727.0" font-size="11" text-anchor="middle" font-weight="bold" fill="#212121">1×1 conv → α</text>
+<text x="895.0" y="741.0" font-size="9.5" text-anchor="middle" font-weight="normal" fill="#424242">decay exp(−softplus(λ)·σ(·))</text>
+<text x="895" y="452" font-size="10.5" text-anchor="middle" font-weight="normal" fill="#616161">per position: 6 heads × 32</text>
+<rect x="1110" y="520" width="300" height="240" rx="8" fill="#fff176" stroke="#212121" stroke-width="1.2"/>
+<text x="1260.0" y="550" font-size="14" text-anchor="middle" font-weight="bold" fill="#212121">gated delta rule</text>
+<text x="1260.0" y="584" font-size="14" text-anchor="middle" font-weight="normal" fill="#212121">S ← α · S (I − β k kᵀ) + β v kᵀ</text>
+<text x="1260.0" y="616" font-size="11" text-anchor="middle" font-weight="normal" fill="#424242">erase what k pointed at, write v there,</text>
+<text x="1260.0" y="634" font-size="11" text-anchor="middle" font-weight="normal" fill="#424242">decay the rest by α</text>
+<text x="1260.0" y="666" font-size="11" text-anchor="middle" font-weight="normal" fill="#424242">per position, per head: d×d = 32×32</text>
+<text x="1260.0" y="684" font-size="11" text-anchor="middle" font-weight="normal" fill="#424242">about 3d² MACs each per tick</text>
+<text x="1260.0" y="718" font-size="11" text-anchor="middle" font-weight="bold" fill="#212121">no weights of its own: S is state (fast weights),</text>
+<text x="1260.0" y="736" font-size="11" text-anchor="middle" font-weight="bold" fill="#212121">learned only through the 1×1 convs feeding it</text>
+<path d="M 1050,550 L 1110,550" fill="none" stroke="#212121" stroke-width="1.4" marker-end="url(#arr)"/>
+<path d="M 990,610 L 1110,610" fill="none" stroke="#212121" stroke-width="1.4" marker-end="url(#arr)"/>
+<path d="M 990,670 L 1110,670" fill="none" stroke="#212121" stroke-width="1.4" marker-end="url(#arr)"/>
+<path d="M 990,730 L 1110,730" fill="none" stroke="#212121" stroke-width="1.4" marker-end="url(#arr)"/>
+<rect x="1180" y="820" width="64" height="46" fill="#ffffff" stroke="#212121" stroke-width="1.3"/>
+<path d="M 1206,866 L 1212,859 L 1218,866" fill="none" stroke="#212121" stroke-width="1.1"/>
+<text x="1189" y="833" font-size="10" text-anchor="start" font-weight="normal" fill="#212121">Q</text>
+<text x="1235" y="833" font-size="10" text-anchor="end" font-weight="normal" fill="#212121">D</text>
+<text x="1212" y="850" font-size="12" text-anchor="middle" font-weight="bold" fill="#212121">S</text>
+<text x="1212" y="815" font-size="9.5" text-anchor="middle" font-weight="normal" fill="#616161">49 × 6 × 32×32 = 301,056</text>
+<path d="M 1350,760 L 1350,843 L 1246,843" fill="none" stroke="#212121" stroke-width="1.4" marker-end="url(#arr)"/>
+<path d="M 1180,836 L 1140,836 L 1140,762" fill="none" stroke="#757575" stroke-width="1.4" stroke-dasharray="5,3" marker-end="url(#arr)"/>
+<text x="1144" y="860" font-size="10.5" text-anchor="start" font-weight="normal" fill="#616161">S (t−1)</text>
+<rect x="1440" y="470" width="110" height="40" rx="3" fill="#fff176" stroke="#212121" stroke-width="1.2"/>
+<text x="1495.0" y="494.0" font-size="12" text-anchor="middle" font-weight="bold" fill="#212121">read  S q</text>
+<path d="M 1050,490 L 1080,490 L 1080,440 L 1495,440 L 1495,468" fill="none" stroke="#212121" stroke-width="1.4" marker-end="url(#arr)"/>
+<path d="M 1410,640 L 1495,640 L 1495,512" fill="none" stroke="#212121" stroke-width="1.4" marker-end="url(#arr)"/>
+<text x="1418" y="632" font-size="10.5" text-anchor="start" font-weight="normal" fill="#616161">S (t)</text>
+<rect x="1580" y="470" width="80" height="40" rx="3" fill="#64b5f6" stroke="#212121" stroke-width="1.2"/>
+<text x="1620.0" y="494.0" font-size="11" text-anchor="middle" font-weight="bold" fill="#212121">1×1 out</text>
+<path d="M 1550,490 L 1580,490" fill="none" stroke="#212121" stroke-width="1.4" marker-end="url(#arr)"/>
+<path d="M 1660,490 L 1720,490 L 1720,348" fill="none" stroke="#212121" stroke-width="1.4" marker-end="url(#arr)"/>
+<text x="1726" y="420" font-size="13" text-anchor="start" font-weight="bold" fill="#212121">y</text>
+<rect x="800" y="790" width="190" height="50" rx="3" fill="#ffffff" stroke="#212121" stroke-width="1.2" stroke-dasharray="5,3"/>
+<text x="895.0" y="812.0" font-size="11" text-anchor="middle" font-weight="bold" fill="#212121">document start</text>
+<text x="895.0" y="826.0" font-size="9.5" text-anchor="middle" font-weight="normal" fill="#424242">α = 0: S reset</text>
+<path d="M 895,790 L 895,750" fill="none" stroke="#757575" stroke-width="1.4" stroke-dasharray="5,3" marker-end="url(#arr)"/>
+<rect x="1530" y="600" width="360" height="420" rx="8" fill="#fafafa" stroke="#bdbdbd"/>
+<text x="1548" y="628" font-size="14" text-anchor="start" font-weight="bold" fill="#212121">training vs the chip</text>
+<text x="1548" y="656" font-size="12" text-anchor="start" font-weight="normal" fill="#424242">Training: everything before Δ runs on all</text>
+<text x="1548" y="681" font-size="12" text-anchor="start" font-weight="normal" fill="#424242">T = 2,048 ticks at once. q, k, v, β, α for</text>
+<text x="1548" y="706" font-size="12" text-anchor="start" font-weight="normal" fill="#424242">the whole sequence go to a chunked scan</text>
+<text x="1548" y="731" font-size="12" text-anchor="start" font-weight="normal" fill="#424242">(the WY form of the delta rule, Yang et</text>
+<text x="1548" y="756" font-size="12" text-anchor="start" font-weight="normal" fill="#424242">al. 2024), giving every S q exactly. No</text>
+<text x="1548" y="781" font-size="12" text-anchor="start" font-weight="normal" fill="#424242">BPTT window: the gradient reaches back</text>
+<text x="1548" y="806" font-size="12" text-anchor="start" font-weight="normal" fill="#424242">to the start of the sequence.</text>
+<text x="1548" y="831" font-size="12" text-anchor="start" font-weight="normal" fill="#424242"></text>
+<text x="1548" y="856" font-size="12" text-anchor="start" font-weight="normal" fill="#424242">Chip: one tick at a time. Per block it</text>
+<text x="1548" y="881" font-size="12" text-anchor="start" font-weight="normal" fill="#424242">holds S and the 3-tick FIFO, and does</text>
+<text x="1548" y="906" font-size="12" text-anchor="start" font-weight="normal" fill="#424242">the convs, five 1×1 projections and</text>
+<text x="1548" y="931" font-size="12" text-anchor="start" font-weight="normal" fill="#424242">49 × 6 small 32×32 updates and reads.</text>
+<text x="1548" y="956" font-size="12" text-anchor="start" font-weight="normal" fill="#424242">Same results as training, by construction.</text>
+<rect x="30" y="560" width="640" height="332" rx="8" fill="#fafafa" stroke="#bdbdbd"/>
+<text x="48" y="586" font-size="14" text-anchor="start" font-weight="bold" fill="#212121">Legend</text>
+<rect x="48" y="608" width="26" height="18" rx="2" fill="#ce93d8" stroke="#212121" stroke-width="1.2"/>
+<text x="86" y="621" font-size="12" text-anchor="start" font-weight="normal" fill="#212121">RMS norm (per position) / L2 norm (per head)</text>
+<rect x="48" y="636" width="26" height="18" rx="2" fill="#b39ddb" stroke="#212121" stroke-width="1.2"/>
+<text x="86" y="649" font-size="12" text-anchor="start" font-weight="normal" fill="#212121">causal depthwise conv over time, 4 taps</text>
+<rect x="48" y="664" width="26" height="18" rx="2" fill="#81c784" stroke="#212121" stroke-width="1.2"/>
+<text x="86" y="677" font-size="12" text-anchor="start" font-weight="normal" fill="#212121">conv 3×3 + BatchNorm (+ ReLU)</text>
+<rect x="48" y="692" width="26" height="18" rx="2" fill="#64b5f6" stroke="#212121" stroke-width="1.2"/>
+<text x="86" y="705" font-size="12" text-anchor="start" font-weight="normal" fill="#212121">conv 1×1 (linear): q, k, v, out</text>
+<rect x="48" y="720" width="26" height="18" rx="2" fill="#ff8a65" stroke="#212121" stroke-width="1.2"/>
+<text x="86" y="733" font-size="12" text-anchor="start" font-weight="normal" fill="#212121">gates: β = σ(·), α = exp(−softplus(λ)·σ(·))</text>
+<rect x="48" y="748" width="26" height="18" rx="2" fill="#fff176" stroke="#212121" stroke-width="1.2"/>
+<text x="86" y="761" font-size="12" text-anchor="start" font-weight="normal" fill="#212121">delta-rule update / read (linear in S)</text>
+<rect x="48" y="776" width="26" height="18" rx="2" fill="#ffffff" stroke="#212121" stroke-width="1.2"/>
+<text x="86" y="789" font-size="12" text-anchor="start" font-weight="normal" fill="#212121">(+) residual add</text>
+<rect x="48" y="806" width="64" height="46" fill="#ffffff" stroke="#212121" stroke-width="1.3"/>
+<path d="M 74,852 L 80,845 L 86,852" fill="none" stroke="#212121" stroke-width="1.1"/>
+<text x="57" y="819" font-size="10" text-anchor="start" font-weight="normal" fill="#212121">Q</text>
+<text x="103" y="819" font-size="10" text-anchor="end" font-weight="normal" fill="#212121">D</text>
+<text x="80" y="836" font-size="12" text-anchor="middle" font-weight="bold" fill="#212121"></text>
+<text x="80" y="801" font-size="9.5" text-anchor="middle" font-weight="normal" fill="#616161"></text>
+<text x="124" y="826" font-size="12" text-anchor="start" font-weight="normal" fill="#212121">D flip-flop register, clocked every tick</text>
+<text x="124" y="842" font-size="11" text-anchor="start" font-weight="normal" fill="#616161">(S, and the FIFO: reset at each document start)</text>
+<path d="M 48,874 L 80,874" fill="none" stroke="#212121" stroke-width="1.4" marker-end="url(#arr)"/>
+<text x="86" y="878" font-size="12" text-anchor="start" font-weight="normal" fill="#212121">data / state path</text>
+<path d="M 250,874 L 282,874" fill="none" stroke="#757575" stroke-width="1.4" stroke-dasharray="5,3" marker-end="url(#arr)"/>
+<text x="288" y="878" font-size="12" text-anchor="start" font-weight="normal" fill="#212121">old state into the update</text>
+</g>
+</svg>
