@@ -254,6 +254,12 @@ parser.add_argument('--c_context',  default=384,  type=int,
                     help='ContextCNN width: ctx_cat reads the concat down to it and linout '
                          'projects it back up to --n_hidden')
 parser.add_argument('--depth',      default=8,    type=int, help='ContextCNN conv layers')
+parser.add_argument('--write_gate', default=False, action=argparse.BooleanOptionalAction,
+                    help='selective write: each windowed register of the first layer is written at a '
+                         'rate a = sigmoid(Conv1x1(h) + b) per channel and position, h the state '
+                         'update\'s working channels, instead of the fixed 1/W (the plain copy stays '
+                         'a copy). Starts at exactly 1/W (weights zero), so it can be added to a '
+                         'trained model; saved and restored')
 parser.add_argument('--kernel',     default=3,    type=int, help='ContextCNN kernel (odd)')
 parser.add_argument('--learn_win', default=False, action=argparse.BooleanOptionalAction,
                     help='learn the register windows (all but plain copies, window 1): W = 1 + '
@@ -816,7 +822,7 @@ _ARCH_ARGS = ('context', 'n_hidden', 'c_context', 'depth', 'kernel', 'tokenizer'
               'ctx_read_norm', 'dec_tree_kernels', 'dec_width', 'bn_momentum', 'init',
               'image_encoder', 'audio_encoder', 'streams', 'linout_kernel', 'learn_win',
               'learn_regs', 'lmu', 'attn', 'attn_ch', 'attn_heads', 'attn_dim', 'attn_age', 'read_rmsnorm',
-              'layers')
+              'layers', 'write_gate')
 
 
 def _parse_mix():
@@ -1974,7 +1980,7 @@ class VLAModel(nn.Module, _HubMixin):
                  image_encoder='none', audio_encoder='none', nul_head=False, streams=1,
                  text_nul=False, surprise=None, linout_kernel=1, learn_win=False,
                  learn_regs=(), lmu=False, attn=0, attn_ch=2, attn_heads=8, attn_dim=64, attn_age=True,
-                 read_rmsnorm=False, layers=1, up_windows=None):
+                 read_rmsnorm=False, layers=1, up_windows=None, write_gate=False):
         super().__init__()
         from transformers import AutoModelForCausalLM
         repo = _TOKENIZERS[tokenizer]
@@ -2058,6 +2064,18 @@ class VLAModel(nn.Module, _HubMixin):
         self.register_buffer('ctx_read_rms', torch.zeros(self.K))       # 0 = not measured yet
         self.register_buffer('rate', torch.tensor([min(1.0, 1.0 / w) for w in self.windows]),
                              persistent=False)
+        # --write_gate: the windowed registers' write rates from the working state h, one 1x1 conv
+        # (c_context -> n_hidden per gated register) and a sigmoid, its bias at logit(1/W)
+        self.gated = [k for k, w in enumerate(self._windows) if w > 1] if write_gate else []
+        if self.gated and (lmu or learn_win or surprise):
+            raise SystemExit('--write_gate does not combine with --lmu, --learn_win or --write_surprise')
+        self.wgate = nn.Conv2d(c_context, n_hidden * len(self.gated), 1) if self.gated else None
+        if self.wgate is not None:
+            with torch.no_grad():
+                self.wgate.weight.zero_()
+                self.wgate.bias.copy_(torch.cat([torch.full((n_hidden,), -math.log(self._windows[k] - 1))
+                                                 for k in self.gated]))
+        self.gate_stats = None       # --write_gate: the last tick's rates, mean and std ([2] tensor)
         # --lmu: the registers with a window over 1 are Legendre memories, one per distinct window
         # (lmu_A<g> [D, D], lmu_B<g> [D] for the g-th, over the registers lmu[g]); the window-1
         # registers are plain copies of o
@@ -2262,7 +2280,15 @@ class VLAModel(nn.Module, _HubMixin):
             new.append(p + self.up_rate[k] * (inp - p))
         return torch.cat(new, dim=1)
 
-    def _write(self, o, dff, gain=None):
+    def _gate(self, h):
+        """--write_gate: {k: [B, N, S, S] write rate} for the windowed registers, else None."""
+        if self.wgate is None:
+            return None
+        a = torch.sigmoid(self.wgate(h))
+        self.gate_stats = torch.stack(torch.std_mean(a.detach()))[[1, 0]]
+        return dict(zip(self.gated, a.chunk(len(self.gated), dim=1)))
+
+    def _write(self, o, dff, gain=None, gate=None):
         """Laplacian-pyramid cascade: register k blends toward o minus registers 1..k-1 as
         just written. gain [B] (--write_surprise) scales the rate of every register but the
         plain copy, capped at 1. --lmu: the Legendre memory instead, the copies holding o."""
@@ -2283,7 +2309,9 @@ class VLAModel(nn.Module, _HubMixin):
         for k, p in enumerate(dff.chunk(self.K, dim=1)):
             inp = o - sum(new) if k else o
             r = rates[k]
-            if gain is not None and self.windows[k] > 1:
+            if gate is not None and k in gate:         # --write_gate: per channel and position
+                r = gate[k]
+            elif gain is not None and self.windows[k] > 1:
                 r = (r * gain).clamp(max=1.0).view(-1, 1, 1, 1)
             new.append(p + r * (inp - p))
         if self.learn and self.etr_on:
@@ -2357,8 +2385,9 @@ class VLAModel(nn.Module, _HubMixin):
             a = self.attn.read(ins[0][:, :, 0, 0], ring)
             ins = ins + [a[:, :, None, None].expand(-1, -1, self.S, self.S)]
         x = self.ctx_cat(torch.cat(ins + self._read(dff, inj), dim=1))
-        o = self.linout(self.context(x))
-        new = self._write(o, dff, gain)
+        h = self.context(x)
+        o = self.linout(h)
+        new = self._write(o, dff, gain, self._gate(h))
         o1 = o
         for u, h in zip(self.up, ups):                 # --layers: in series, each adding to o
             d = u(o, h)
@@ -3349,7 +3378,7 @@ model = VLAModel(S=args.context, n_hidden=args.n_hidden, c_context=args.c_contex
                  learn_regs=[int(k) for k in str(args.learn_regs or '').split(',') if k.strip()],
                  lmu=args.lmu, attn=args.attn, attn_ch=args.attn_ch, attn_heads=args.attn_heads,
                  attn_dim=args.attn_dim, attn_age=args.attn_age, read_rmsnorm=args.read_rmsnorm,
-                 layers=args.layers,
+                 layers=args.layers, write_gate=args.write_gate,
                  up_windows=[float(w) for w in str(args.up_ema).split(',') if w.strip()] if args.up_ema else None)
 if _loaded_ckpt is not None:
     _sd = _upgrade_state_dict(_loaded_ckpt['state_dict'])
@@ -3363,6 +3392,9 @@ if _loaded_ckpt is not None:
         print(f'--layers {args.layers}: layer(s) {", ".join(str(int(i) + 2) for i in _new_up)} new, '
               f'starting as the identity (linout zero)', flush=True)
         missing = [k for k in missing if not k.startswith('up.')]
+    if 'wgate.weight' in missing and 'wgate.weight' not in _sd:
+        print('--write_gate: the gate is new, writing at the fixed rates 1/W to start', flush=True)
+        missing = [k for k in missing if not k.startswith('wgate.')]
     if 'win_theta' in missing:
         print(f'--learn_win: windows start at {model.windows}', flush=True)
     bad = [k for k in missing if not re.match(r'(text|voc|img)_dec\.nul\.|surp_mean$|gain_mean$|win_theta$', k)] + \
@@ -7476,6 +7508,8 @@ try:
             line += _ex_ep()
             if model.learn:
                 line += ' win ' + '/'.join(f'{w:.1f}' for w in model.windows)
+            if model.gate_stats is not None:
+                line += ' gate {:.4f}/{:.4f}'.format(*model.gate_stats.tolist())
             if _imaginer is not None:
                 line += _imaginer.stats()
             for n, a in carr.items():
