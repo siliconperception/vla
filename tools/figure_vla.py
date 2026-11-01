@@ -799,13 +799,15 @@ def draw_v536():
             'Same results as training, by construction.')):
         text(1548, 656 + 25 * i, s_, 12, anchor='start', fill='#424242')
 
-    legend(30, 560, [(COL['rep'], False, 'RMS norm (per position) / L2 norm (per head)'),
+    legend(30, 560, [(COL['rep'], False, 'RMS norm (per position, over channels)'),
+                     (COL['norm'], False, 'L2: q, k scaled to unit length per head (keeps S bounded)'),
                      (COL['tconv'], False, 'causal depthwise conv over time, 4 taps'),
                      (COL['cnn'], False, 'conv 3×3 + BatchNorm + ReLU'),
                      (COL['lin'], False, 'conv 1×1 (linear): q, k, v, out'),
                      (COL['gate'], False, 'gates: β = σ(·), α = exp(−2 exp(λ) σ(·)), λ per head'),
                      (COL['lmu'], False, 'delta-rule update / read (linear in S)'),
                      ('#ffffff', False, '(+) residual add')],
+           '(S and the FIFO; training: reset at half the document starts)' if V8 else
            '(S, and the FIFO: reset at each document start)', w=640)
     out.append('</g>')
     out.append('</svg>')
