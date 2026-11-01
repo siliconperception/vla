@@ -3968,6 +3968,10 @@ def _param_summary(model):
                 tr, fr = (tr + p.numel(), fr) if p.requires_grad else (tr, fr + p.numel())
         if tr or fr:
             rows.append((name, tr, fr))
+    for name, p in model.named_parameters(recurse=False):    # the model's own (--convdelta's G, P, ...)
+        if id(p) not in seen:
+            seen.add(id(p))
+            rows.append((name, p.numel(), 0) if p.requires_grad else (name, 0, p.numel()))
     w = max(len(r[0]) for r in rows)
     out = [f'PARAMS  {"module":<{w}}  {"trainable":>13}  {"frozen":>13}  {"total":>13}']
     out += [f'PARAMS  {n:<{w}}  {tr:>13,}  {fr:>13,}  {tr + fr:>13,}' for n, tr, fr in rows]
@@ -4580,6 +4584,28 @@ if args.vis:
     gated = list(model.gated) if model.wgate is not None else []
     nr = 1 + model.K * (1 + nup)                    # output and register rows
     rows = nr + len(gated)                           # --write_gate: a rate map per gated register
+    cdv = model.cd is not None                       # --convdelta: input grid, memories, (input map)
+    ci = rows                                        # its first row
+    rows += (2 + bool(model.grid_hist)) if cdv else 0
+    _cd_last = {}
+    if cdv:
+        _cd_fn = model._cd_in
+
+        def _cd_keep(*a, **k):
+            x = _cd_fn(*a, **k)
+            _cd_last['x'] = x
+            return x
+        model._cd_in = _cd_keep                      # the instance attribute shadows the method
+
+    def _mosaic(ms, ncol):
+        """Equal [S, S] maps -> one array, ncol per row, NaN gaps between them."""
+        S_ = ms[0].shape[0]
+        nrow = -(-len(ms) // ncol)
+        out = np.full((nrow * (S_ + 1) - 1, ncol * (S_ + 1) - 1), np.nan, dtype=np.float32)
+        for j, m in enumerate(ms):
+            r_, c_ = divmod(j, ncol)
+            out[r_ * (S_ + 1):r_ * (S_ + 1) + S_, c_ * (S_ + 1):c_ * (S_ + 1) + S_] = m
+        return out
     _gate_last = {}
     if gated:
         _gate_fn = model._gate
@@ -4607,6 +4633,12 @@ if args.vis:
     else:
         ax_p = fig.add_subplot(gs[:rows, 1])
     for r, ax in enumerate(axes):
+        if cdv and r >= ci:
+            ax.set_title(['input grid (std over channels)',
+                          f'memories: |S| per cell, blocks 1-{len(model.cd)} (3 per row)',
+                          f'learned input map a[j, p]: tokens t .. t-{model.grid_hist - 1} '
+                          f'(4 per row; red +, blue -)'][r - ci], fontsize=9, pad=3)
+            continue
         if r >= nr:
             k = gated[r - nr]
             ax.set_title(f'write gate: DFF {k + 1} rate (mean over channels; '
@@ -4678,6 +4710,27 @@ if args.vis:
                 imgs[r].set_clim(vmin[r], max(vmax[r], vmin[r] + 1e-6))
             else:
                 imgs[r].set_clim(0.0, vmax[r] or 1e-9)
+        if cdv:                                      # --convdelta rows
+            mos, off = [_cd_last['x'][0].std(dim=0).float().cpu().numpy()], model.hist_ch
+            mem = []
+            for blk in model.cd:
+                nm = blk.H * blk.d * blk.d
+                mem.append(dff[0, off:off + nm].float().pow(2).sum(0).sqrt().cpu().numpy())
+                off += blk.state_ch
+            mos.append(_mosaic(mem, 3))
+            if model.grid_hist:
+                mos.append(_mosaic(list(model.grid_a.detach().float().cpu().numpy()), 4))
+            for j, m in enumerate(mos):
+                r = ci + j
+                sym = j == 2
+                hi = float(np.nanmax(np.abs(m))) if sym else float(np.nanmax(m))
+                vmax[r] = hi if vmax[r] is None or sym else max(hi, 0.98 * vmax[r])
+                if imgs[r] is None:
+                    imgs[r] = axes[r].matshow(m, cmap='RdBu_r' if sym else args.cmap)
+                    axes[r].set_xticks([])
+                    axes[r].set_yticks([])
+                imgs[r].set_data(m)
+                imgs[r].set_clim(-vmax[r] if sym else 0.0, vmax[r] or 1e-9)
         pg = np.zeros(PR * PC, dtype=np.float32)
         pg[:model.vocab] = prob.cpu().numpy()
         pg = pg.reshape(PR, PC)
@@ -4709,8 +4762,8 @@ if args.vis:
             extra += '  gate ' + ' '.join(f'{float(_gate_last[k].mean()):.4f}/{float(_gate_last[k].std()):.4f}'
                                           for k in gated)
         ticker = ''.join(DOT_TEXT if c in '$\\' else c for c in _render(cur))[-_VIS_WIN:]
-        header.set_text(f'step {nstep:8d}  reg_std {float(regs.std()) if model.K else 0:6.4f}  reg_max '
-                        f'{float(regs.abs().max()) if model.K else 0:7.3f}  p_max {float(prob.max()):5.3f}  '
+        header.set_text(f'step {nstep:8d}  reg_std {float(regs.std()) if model.K or cdv else 0:6.4f}  reg_max '
+                        f'{float(regs.abs().max()) if model.K or cdv else 0:7.3f}  p_max {float(prob.max()):5.3f}  '
                         f'min_p {args.min_p:.4f}  T {args.temperature:.2f}{extra}\ngen: {ticker}')
         fig.canvas.draw()
         fig.canvas.flush_events()
