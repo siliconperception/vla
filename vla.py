@@ -33,6 +33,7 @@ import io
 import itertools
 import shutil
 import textwrap
+import traceback
 import json
 import math
 import os
@@ -5449,9 +5450,18 @@ class _Judge:
             p.requires_grad_(False)
         print(f'--eval_gen: judge {repo} loaded on {self.dev} ({dt})', flush=True)
 
+    def park(self):
+        """Between uses on the GPU: the judge's weights wait on the CPU (cond_nll brings them
+        back), so training gets its memory."""
+        if self.dev.type == 'cuda' and next(self.lm.parameters()).device.type == 'cuda':
+            self.lm.to('cpu')
+            torch.cuda.empty_cache()
+
     @torch.no_grad()
     def cond_nll(self, prompt, cont):
         """Mean nats/token of cont after prompt (prompt tokens not scored)."""
+        if next(self.lm.parameters()).device != self.dev:
+            self.lm.to(self.dev)
         p = self.tok(prompt).input_ids
         full = self.tok(prompt + cont, truncation=True, max_length=1024).input_ids
         if len(full) - len(p) < 2:
@@ -7580,6 +7590,8 @@ try:
         if args.eval_interval and i > 0 and ((i % args.eval_interval == 0 and i > _start_step) or
                                              (i == _start_step and args.eval_at_start)):
             _heldout_eval(i)
+            if _judge is not None:
+                _judge.park()
             _wema_eval(i)
 
         if i % args.checkpoint == 0:
@@ -7594,6 +7606,8 @@ try:
 
         if args.gen_interval and i % args.gen_interval == 0:
             _emit('\n' + '\n'.join(_gen_lines(i)) + '\n')
+            if _judge is not None:
+                _judge.park()
             if _gen_inbox is not None and args.sample_vis and _VIDEO_ROWS:
                 _vid_rec = True                                     # record the next example
             elif _gen_inbox is not None and args.sample_vis and _IMAGE_ROWS:
@@ -7904,7 +7918,11 @@ except KeyboardInterrupt:
     pass
 except BaseException:
     stop.set()      # else the non-daemon worker keeps a crashed run alive and longrun waits forever
-    raise
+    # ... and a worker blocked on a full queue never sees stop: exit hard (longrun restarts)
+    traceback.print_exc()
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(1)
 
 print('\nSTOPPING THREADS')
 stop.set()
