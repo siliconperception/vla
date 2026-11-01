@@ -1,7 +1,7 @@
 # VLA functional specification (model)
 
 This is what the model computes, tick by tick, for the published configuration (`siliconperception/vla`,
-run v511). It specifies the function, not an implementation. `vla.py` is the reference: where this text and the
+run v533). It specifies the function, not an implementation. `vla.py` is the reference: where this text and the
 code disagree, the code is right and this text is a bug.
 
 ## Dimensions
@@ -9,20 +9,20 @@ code disagree, the code is right and this text is a bug.
 | Symbol | Value | Meaning |
 |---|---|---|
 | S | 7 | grid side (positions S × S = 49) |
-| N | 512 | register channels, and the width of each layer's output |
-| C | 384 | working channels of a state update |
+| N | 512 | register channels, and the width of the layer's output |
+| C | 384 | working channels of the state update |
 | E | 256 | token embedding width (pythia-31m) |
 | V | 50,304 | vocabulary (pythia-31m BPE) |
-| L | 2 | recurrent layers, in series |
-| K | 2 | registers per layer |
-| W | layer 1: 16, 1 · layer 2: 64, 1 | register windows, in ticks (fixed) |
-| D | 8 | depth of each state update |
-| f | 25 Hz | tick rate in training (windows of 0.64 s and 2.56 s) |
+| L | 1 | recurrent layers |
+| K | 2 | registers |
+| W | 16, 1 | register windows, in ticks: the first is the starting point of its learned write rate (1/16), the second is fixed |
+| D | 8 | depth of the state update |
+| f | 25 Hz | tick rate in training (a 16-tick window is 0.64 s) |
 
 ## State
 
-Each layer l has two registers R_l1, R_l2 (each N × S × S): 4 · N · S · S = 100,352 values in all. The state
-never grows. At the start of an example (the `<NUL>` input) every register is set to zero.
+Two registers R₁, R₂ (each N × S × S): 2 · N · S · S = 50,176 values in all. The state never grows. At the start
+of an example (the `<NUL>` input) both registers are set to zero.
 
 ## Inputs per tick
 
@@ -37,62 +37,68 @@ The multimodal design adds an image grid (a frozen ResNet-50 feature map); this 
 ## One tick
 
 The read of a register is the register scaled, per grid position, to unit RMS over its N channels:
-R̂ = R / √(mean_c R² + 1e-6). Each layer has its own weights; `Update` below is, for that layer,
-D times X ← ReLU( BN_d( Conv3×3_d(X) ) ), C → C, zero padding, where at inference BN_d normalizes each channel
-with its stored running mean and variance (no learned scale or shift).
+R̂ = R / √(mean_c R² + 1e-6). `Update` below is D times X ← ReLU( BN_d( Conv3×3_d(X) ) ), C → C, zero padding,
+where at inference BN_d normalizes each channel with its stored running mean and variance (no learned scale or
+shift).
 
-1. **Layer 1.**
-   - Mix: X = Conv1×1( concat(T, A, T_voice, T_image, R̂_11, R̂_12) ), 4·256 + 2·512 = 2,048 channels → C.
-   - Update X, then project: o₁ = Conv3×3(X), C → N, zero padding.
-2. **Layer 2.** It sees no input directly, only layer 1's output.
-   - Mix: X = Conv1×1( concat(ô₁, R̂_21, R̂_22) ), 3·512 = 1,536 channels → C, where ô₁ is o₁ scaled to unit
-     RMS per position like a register read.
-   - Update X, then project: d₂ = Conv3×3(X), C → N.
-   - The output is o = o₁ + d₂.
-3. **Write the registers.** Each layer writes its own output (o₁ for layer 1, d₂ for layer 2), x below, as a
-   Laplacian-pyramid cascade with that layer's window W_l1:
-   - R'_l1 = R_l1 + (x − R_l1) / W_l1
-   - R'_l2 = x − R'_l1 (window 1: a plain write)
+1. **Mix:** X = Conv1×1( concat(T, A, T_voice, T_image, R̂₁, R̂₂) ), 4·256 + 2·512 = 2,048 channels → C.
+2. **Update** X, giving the working state h (C × S × S), then **project:** o = Conv3×3(h), C → N, zero padding.
+3. **Write gate:** a = σ( Conv1×1_gate(h) ), C → N: one write rate in (0, 1) for every channel and grid position
+   of R₁, recomputed every tick. Its weights were initialized to zero and its bias to logit(1/16) = −ln 15, so it
+   started as the fixed rate 1/16 (a 16-tick average).
+4. **Write the registers** as a Laplacian-pyramid cascade (⊙: elementwise):
+   - R'₁ = R₁ + a ⊙ (o − R₁)
+   - R'₂ = o − R'₁ (window 1: a plain write)
 
-   so a layer's registers always sum to its output: R_l1 holds the slow part (a 16-tick average in layer 1, a
-   64-tick average in layer 2), R_l2 the rest.
-4. **Decode** (three independent decoders, one per stream: text, voice, image). Each reads o and is a linear tree
+   so the registers always sum to the output: R₁ holds the slow part, an average whose window the model sets
+   per channel and position, R₂ the rest.
+5. **Decode** (three independent decoders, one per stream: text, voice, image). Each reads o and is a linear tree
    of unpadded convolutions, 3×3 (N → 256, 7 → 5), 3×3 (256 → 256, 5 → 3), 3×3 (256 → E, 3 → 1), then the frozen
    pythia-31m output layer (E → V), plus one trained logit for `<NUL>` ("say nothing this tick").
-5. **Emit.** Each stream samples its next token or `<NUL>` by min-p sampling: only tokens with at least P times
+6. **Emit.** Each stream samples its next token or `<NUL>` by min-p sampling: only tokens with at least P times
    the top token's probability are kept. P is stored with the weights; training keeps adjusting it so that the
-   model's own text from `<NUL>` scores a fluency of 100 (P = 0.0089 at step 1,680,000).
+   model's own text from `<NUL>` scores a fluency of 100 (P = 0.0088 at step 3,043,841).
 
 ## Training (for reference)
 
-Weights are trained with one token per row per step, 250 rows, plain SGD, cross-entropy normalized per word rather
-than per token, with truncated backpropagation through time over 16 steps. Text only (FineWeb sample-10BT).
-Frozen: the token embedding and the output layer. The configuration grew during training, each change resuming
-from the latest weights:
+Weights are trained with one token per row per step, 250 rows, SGD (at the published step: Nesterov momentum 0.95,
+learning rate 0.001, the write gate's weights at 100 × that), cross-entropy normalized per word rather than per
+token, with truncated backpropagation through time over 64 steps (activations recomputed per tick in the backward
+pass). Text only (FineWeb sample-10BT). Frozen: the token embedding and the output layer. The configuration
+changed during training, each change resuming from the latest weights; "a → b" for the learning rate is a half
+cosine over the given steps, then held:
 
 | Steps | Change |
 |---|---|
-| 0 | from scratch: layer 1 only, register windows 512 and 1, plus a recall ring of 1,024 ticks read by attention; learning rate a half cosine from 4e-4 to 0.02 over 20,000 steps, then held |
+| 0 | from scratch: one layer, register windows 512 and 1, plus a recall ring of 1,024 ticks read by attention; plain SGD, truncated backpropagation over 16 steps; learning rate 4e-4 → 0.02 over 20,000 steps |
 | 1,065,312 | recall ring and attention removed |
-| 1,127,936 | layer 2 added as the identity (its projection zero-initialized, its mix passing o₁ through) |
+| 1,127,936 | a second layer added in series as the identity (its projection zero-initialized, its mix passing the first layer's output through); its output added to the first layer's |
 | 1,321,120 | both layers' slow windows 512 → 64 |
 | 1,361,152 | both 64 → 16 |
-| 1,456,944 | layer 2's slow window 16 → 64 (the published configuration) |
-| 1,501,536 | learning rate a half cosine 0.02 → 0.01 over 20,000 steps, then held |
+| 1,456,944 | layer 2's slow window 16 → 64 |
+| 1,501,536 | learning rate 0.02 → 0.01 over 20,000 steps |
 | 1,581,808 | 0.01 → 0.005 |
-| 1,653,648 | 0.005 → 0.0025 |
+| 1,653,648 | 0.005 → 0.0025 (the previous release, v511, is this configuration at step 1,680,000) |
+| 2,219,568 | 0.0025 → 0.00125; momentum 0.1 |
+| 2,263,328 | 0.00125 → 0.001; momentum 0.2 |
+| 2,269,536 | Nesterov momentum 0.2 |
+| 2,372,644 | momentum (not Nesterov) cycled from 0 to 0.9 every 40,000 steps |
+| 2,538,191 | layer 2's slow window 64 → 256; momentum 0 |
+| 2,566,001 | layer 2 removed (it never used its registers); the write gate added on the 16-tick register, starting at the fixed rate 1/16; truncated backpropagation 16 → 64 steps; learning rate 0.001 → 0.01 over 2,000 steps |
+| 2,607,025 | the write gate's weights at 100 × the learning rate |
+| 2,960,001 | momentum 0.5 |
+| 2,987,329 | Nesterov momentum 0.95 |
+| 2,994,305 | learning rate 0.001 (the published configuration) |
 
 ## Parameters
 
 | Part | Parameters | Trained |
 |---|---|---|
-| Layer 1: mix (1×1, 2,048 → 384) | 786,816 | yes |
-| Layer 1: update (8 × 3×3, with BN) | 10.62 M | yes |
-| Layer 1: project (3×3) | 1.77 M | yes |
-| Layer 2: mix (1×1, 1,536 → 384) | 590,208 | yes |
-| Layer 2: update (8 × 3×3, with BN) | 10.62 M | yes |
-| Layer 2: project (3×3) | 1.77 M | yes |
+| Mix (1×1, 2,048 → 384) | 786,816 | yes |
+| Update (8 × 3×3, with BN) | 10.62 M | yes |
+| Project (3×3, 384 → 512) | 1.77 M | yes |
+| Write gate (1×1, 384 → 512) | 197,120 | yes |
 | Decoders (3 trees + `<NUL>` heads) | 7.08 M | yes |
 | Token embedding | 12.88 M | frozen |
 | Output layer (shared by the 3 decoders) | 12.88 M | frozen |
-| **Total** | 58.99 M (33.24 M trained) | |
+| **Total** | 46.21 M (20.45 M trained) | |

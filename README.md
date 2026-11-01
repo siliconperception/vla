@@ -1,10 +1,10 @@
 # VLA: a recurrent CNN vision-language-action model
 
-`vla.py` is a language model with a fixed-size state and no positional encoding. It is two recurrent
-convolutional layers in series, each with its own memory: two 2-D register grids of 512 × 7 × 7, a slow average
-and a copy of the rest. Every clock tick, layer 1 reads the current token (and, in multimodal runs, the current
-image and sound) and its registers; layer 2 reads layer 1's output and its own registers; each writes its
-registers back, and the sum of the two layers' outputs is decoded into the next token.
+`vla.py` is a language model with a fixed-size state and no positional encoding. It is one recurrent
+convolutional layer whose memory is two 2-D register grids of 512 × 7 × 7: a slow average, written at a rate a
+learned gate sets for every channel and grid position, and a copy of the rest. Every clock tick, the layer reads
+the current token (and, in multimodal runs, the current image and sound) and its registers, writes the registers
+back, and its output is decoded into the next token.
 
 Most commercial applications for autonomous, agile robots do not require superintelligence. They need
 conversational common sense, grounded in and modulated by what the device perceives: sound, video, touch. To
@@ -17,16 +17,16 @@ on-chip SRAM, so there is no external memory, and the weights stay programmable.
 saves power: there are no DRAM chips to keep refreshed and no high-speed interface driving signals between chips,
 and reading a weight from on-chip SRAM takes on the order of a hundred times less energy than fetching it from
 off-chip DRAM. One set of small convolution
-kernels is reused at every grid position and every tick, so about thirty million weights drive a state of
-100,352 values. And the state never grows, so every tick does the same work in the same time, however long the
+kernels is reused at every grid position and every tick, so about twenty million weights drive a state of
+50,176 values. And the state never grows, so every tick does the same work in the same time, however long the
 model has been running.
 
-![One clock tick of the VLA](docs/figures/vla_v511.svg)
+![One clock tick of the VLA](docs/figures/vla_v533.svg)
 
-*One clock tick of the published model, v511: three token streams (text, voice, image) and two recurrent layers
-in series, each with two registers (a slow average, over 16 ticks in layer 1 and 64 in layer 2, and a one-tick
-copy). The lower pane zooms into one layer. The image encoder is drawn as the design intends; v511 is trained on
-text.*
+*One clock tick of the published model, v533: three token streams (text, voice, image) and one recurrent layer
+with two registers, a slow average whose write rate a learned gate sets per channel and position (starting at
+1/16, a 16-tick average), and a one-tick copy of the rest. The image encoder is drawn as the design intends; v533
+is trained on text.*
 
 - **Model:** [huggingface.co/siliconperception/vla](https://huggingface.co/siliconperception/vla)
 - **Page:** [siliconperception.github.io/vla](https://siliconperception.github.io/vla/)
@@ -39,7 +39,7 @@ text.*
 git clone https://github.com/siliconperception/vla && cd vla
 pip install -r requirements.txt
 
-# generate from the published weights (downloads ~340 MB once)
+# generate from the published weights (downloads ~290 MB once)
 for p in "The colors of the rainbow are" \
          "The best way to learn a new language is" \
          "My grandmother's recipe for apple pie starts with" \
@@ -63,32 +63,34 @@ python vla.py --pretrained --eval --eval_corpora fineweb --eval_docs 100 --devic
 Each tick (see [docs/spec](docs/spec/README.md) for the exact computation):
 
 1. The current token's embedding is RMS-normalized and broadcast over the 7 × 7 grid.
-2. Layer 1: that grid, the sound grid (zeros for text) and layer 1's two registers, each RMS-normalized per
-   position, are concatenated and mixed by a 1 × 1 convolution. Eight 3 × 3 convolutions with BatchNorm and ReLU
-   transform the result, and a 3 × 3 convolution projects it to register width: the output o₁.
-3. Layer 2 does the same with its own weights, reading only o₁ and its own two registers. Its output d₂ is added
-   to o₁.
-4. Each layer writes its output into its registers as a cascade: the first moves 1/W of the way toward it (W = 16
-   ticks in layer 1, 64 in layer 2), the second holds the remainder, so the two always sum to it.
-5. A small tree of convolutions collapses o₁ + d₂ to one vector, and a frozen output layer gives the next-token
+2. That grid, the sound grid (zeros for text) and the two registers, each RMS-normalized per position, are
+   concatenated and mixed by a 1 × 1 convolution. Eight 3 × 3 convolutions with BatchNorm and ReLU transform the
+   result into the working state h, and a 3 × 3 convolution projects it to register width: the output o.
+3. The write gate, a 1 × 1 convolution of h and a sigmoid, gives a rate a for every channel and position.
+4. The output is written into the registers as a cascade: the first moves the fraction a of the way toward it
+   (a started at 1/16 everywhere, a 16-tick average), the second holds the remainder, so the two always sum to it.
+5. A small tree of convolutions collapses o to one vector, and a frozen output layer gives the next-token
    probabilities.
 
-Training feeds one token per step to each of 250 rows and backpropagates through the last 16 steps (truncated
-backpropagation through time, `--bptt 16`). Every document starts from a zero state.
+Training feeds one token per step to each of 250 rows and backpropagates through the last 64 steps (truncated
+backpropagation through time, `--bptt 64`, with `--ckpt_ticks` recomputing each tick's activations in the backward
+pass to save memory). Every document starts from a zero state.
 
 ## Training your own
 
 ```bash
-# text from FineWeb (sample-10BT), 250 rows, from scratch, with v511's architecture: two layers, a 16-tick
-# average in layer 1 and a 64-tick average in layer 2, each with a one-tick copy and RMS-normalized reads
-python vla.py --dataset fineweb --batch 250 --context 7 --layers 2 --ctx_ema 16,1 --up_ema 64,1 \
-    --no-learn_win --read_rmsnorm --attn 0 --linout_kernel 3 --bptt 16 --lr_max 0.02 --lr_min 4e-4 \
-    --loss_norm words --save checkpoint/my_run.pt --log log/exp.my_run
+# text from FineWeb (sample-10BT), 250 rows, from scratch, with v533's architecture: one layer, a gated
+# average (starting at 16 ticks) and a one-tick copy, RMS-normalized reads, the gate at 100x the learning rate
+python vla.py --dataset fineweb --batch 250 --context 7 --layers 1 --ctx_ema 16,1 --write_gate \
+    --gate_lr_mult 100 --no-learn_win --read_rmsnorm --attn 0 --linout_kernel 3 --bptt 64 --ckpt_ticks \
+    --lr_max 0.02 --lr_min 4e-4 --loss_norm words --save checkpoint/my_run.pt --log log/exp.my_run
 ```
 
-The published weights were not trained in one run like this: the configuration grew during training, each change
-resuming from the latest weights ([docs/spec](docs/spec/README.md) lists the steps). Adding a layer to a trained
-model starts it as the identity, so `--layers 2` on a one-layer checkpoint keeps its function.
+The published weights were not trained in one run like this: the configuration changed during training, each
+change resuming from the latest weights ([docs/spec](docs/spec/README.md) lists the steps). Adding a layer to a
+trained model starts it as the identity, so `--layers 2` on a one-layer checkpoint keeps its function;
+`tools/drop_layers.py` removes the upper layers of one, and `--write_gate` on a checkpoint without a gate starts
+it at the fixed rates 1/W.
 
 `tools/run.sh` is the launcher used for every published run: it records the full command line and keeps the log
 and checkpoint names in step. Local corpora (BabyLM, image and video features) are built by the `tools/*_prep.py`

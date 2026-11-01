@@ -1,25 +1,25 @@
 {
- "version": "v511",
- "step": 1680000,
+ "version": "v533",
+ "step": 3043841,
  "rows": 250,
- "fineweb": 4.612759,
- "babylm": 4.608267,
- "blimp": 70.3,
- "comve": 64.5,
- "runaway": 2,
- "min_p": 0.008927496623800608,
+ "fineweb": 4.579951,
+ "babylm": 4.564411,
+ "blimp": 70.2,
+ "comve": 65.0,
+ "runaway": 4,
+ "min_p": 0.008785064762800927,
  "pythia70m": {
-  "128": {
-   "fw": 7.4203,
-   "baby": 6.8661,
-   "blimp": 51.8,
-   "comve": 56.5
-  },
   "256": {
    "fw": 6.3546,
    "baby": 5.718,
    "blimp": 51.4,
    "comve": 57.1
+  },
+  "512": {
+   "fw": 5.4674,
+   "baby": 4.9845,
+   "blimp": 54.7,
+   "comve": 59.7
   },
   "main": {
    "fw": 3.7312,
@@ -31,11 +31,11 @@
  "samples": [
   {
    "prompt": "My grandmother's recipe for apple pie starts with",
-   "text": "almond and olive oil, green tea and apple, salt, garlic. I added a pair of the salsa cheese, and the balsamic vinegar in a pureed, salsa."
+   "text": "a creamy teta sauce with cheese in its usual small butter and egg yolks, although they have been a tadota taste! You will love it too!"
   },
   {
    "prompt": "The colors of the rainbow are",
-   "text": "beautiful and unique. It is a place of mystery, with light tones that lightens the sunlight in it and its speciality."
+   "text": "the few parts of the image. The flower has a sparkling blue colour which I’ve written in my mind."
   }
  ]
 }

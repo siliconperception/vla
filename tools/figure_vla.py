@@ -1,6 +1,6 @@
 """Draw docs/figures/vla_<model>.svg: one clock tick of a VLA model, 16:9 (1920 x 1080).
 
-usage: python tools/figure_vla.py [--model v498|v499|v502|v505|v511|v531|convdelta] [--out OUT]
+usage: python tools/figure_vla.py [--model v498|v499|v502|v505|v511|v531|v533|convdelta] [--out OUT]
 
 v498: recurrent CNN + two order-2 Legendre memories (4096, 64 ticks) + copy + recall attention, never
 reset. v499: no registers, the recall attention's ring is the whole state, reset at each example.
@@ -8,13 +8,14 @@ v502: the residual cascade of an EMA (512 ticks) and the residual copy, read thr
 + recall attention, reset at each example. v505: two recurrent layers in series, each with that cascade, no
 recall attention; 1920 x 2160, two 16:9 panes: the whole tick on top, one layer zoomed in below. v511: v505
 with the layers' EMA windows 16 (layer 1) and 64 (layer 2) ticks. v531: one layer, its EMA (16 ticks to start)
-written at a learned rate per channel and position (--write_gate), plus the residual copy. convdelta: the
+written at a learned rate per channel and position (--write_gate), plus the residual copy. v533: v531's
+architecture, trained on with SGD lr 0.001 and Nesterov momentum 0.95. convdelta: the
 proposed parallel-trainable model, 6 residual blocks of per-tick convs, each carrying a gated delta-rule matrix
 memory per grid position; 1920 x 2160, the whole model above and one block below."""
 import argparse
 
 ap = argparse.ArgumentParser()
-ap.add_argument('--model', default='v498', choices=('v498', 'v499', 'v502', 'v505', 'v511', 'v531', 'convdelta'))
+ap.add_argument('--model', default='v498', choices=('v498', 'v499', 'v502', 'v505', 'v511', 'v531', 'v533', 'convdelta'))
 ap.add_argument('--out', default=None)
 a = ap.parse_args()
 LMU = a.model == 'v498'                   # Legendre memories + copy
@@ -22,7 +23,7 @@ CASC = a.model == 'v502'                  # EMA + residual copy, RMSnorm reads
 REGS = LMU or CASC                        # (v499: the ring alone)
 CAT = {'v498': ('3×256 + 2048 + 256 + 256 + 5×512', 5888), 'v499': ('3×256 + 2048 + 256 + 256', 3328),
        'v502': ('3×256 + 2048 + 256 + 256 + 2×512', 4352), 'v505': ('', 0), 'v511': ('', 0),
-       'v531': ('', 0), 'convdelta': ('', 0)}[a.model]
+       'v531': ('', 0), 'v533': ('', 0), 'convdelta': ('', 0)}[a.model]
 EMA1, EMA2 = (16, 64) if a.model == 'v511' else (512, 512)    # two-layer models: each layer's EMA window
 
 W, H = 1920, 1080
@@ -370,7 +371,7 @@ def draw_v531():
                f'font-family="Helvetica, Arial, sans-serif">')
     out.append(DEFS)
     out.append(f'<rect width="{W}" height="{H}" fill="#ffffff"/>')
-    text(30, 38, 'VLA v531 — one clock tick (40 ms): one recurrent CNN layer, its EMA register written through a '
+    text(30, 38, f'VLA {a.model} — one clock tick (40 ms): one recurrent CNN layer, its EMA register written through a '
          'learned gate', 22, anchor='start', weight='bold')
     text(30, 62, 'n_hidden 512 · c_context 384 · 7×7 grid · depth 8 · 3 token streams · 25 Hz · EMA (16 ticks to '
          'start) + copy, RMSnorm reads · reset at each example · 20.5M trainable · state 2 × 512×7×7 = 50,176 values',
@@ -502,7 +503,9 @@ def draw_v531():
                            'the fixed rate 1/16 (weights 0, bias −log 15): the model it was added to.',
                            'The copy register needs no rate; it holds whatever the EMA did not.',
                            '',
-                           'Trained: SGD, lr 0.01, momentum 0.5 · BPTT 64 ticks · the gate at 100× lr.',
+                           {'v531': 'Trained: SGD, lr 0.01, momentum 0.5 · BPTT 64 ticks · the gate at 100× lr.',
+                            'v533': 'Trained: SGD, lr 0.001, Nesterov momentum 0.95 · BPTT 64 ticks · gate at 100× lr.'
+                            }[a.model],
                            'One layer: v522\'s second layer dropped (it never used its registers).')):
         text(nx + 18, ny + 56 + 22 * i, s, 12, anchor='start', fill='#424242')
 
@@ -777,7 +780,7 @@ def draw_convdelta():
     open(a.out or f'docs/figures/vla_{a.model}.svg', 'w').write('\n'.join(out))
 
 
-if a.model == 'v531':
+if a.model in ('v531', 'v533'):
     draw_v531()
     raise SystemExit(0)
 if a.model == 'convdelta':

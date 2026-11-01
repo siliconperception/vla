@@ -14,13 +14,13 @@ datasets:
 
 # VLA (recurrent CNN)
 
-**Release v511, step 1,680,000** (420 M training tokens).
+**Release v533, step 3,043,841** (761 M training tokens).
 
-A language model with a fixed-size state and no positional encoding. It is two recurrent convolutional layers
-in series, each with two 2-D registers of 512 × 7 × 7: a slow one (a 16-tick average in layer 1, a 64-tick
-average in layer 2) and a copy of the rest. Every tick, layer 1 reads the current token and its registers,
-layer 2 reads layer 1's output and its own registers, each writes its registers back, and the sum of the two
-outputs is decoded into the next token.
+A language model with a fixed-size state and no positional encoding. It is one recurrent convolutional layer
+with two 2-D registers of 512 × 7 × 7: a slow one, an average written through a learned gate (its rate, set
+every tick for each channel and grid position, starts at 1/16, a 16-tick average), and a copy of the rest.
+Every tick the layer reads the current token and its registers, writes the registers back, and its output is
+decoded into the next token.
 
 It is the text-trained core of a vision-language-action design. Most commercial applications for autonomous,
 agile robots do not require superintelligence; they need conversational common sense, grounded in and modulated by
@@ -34,7 +34,7 @@ one fetched from off-chip DRAM.
 
 Code, functional spec and figures: [github.com/siliconperception/vla](https://github.com/siliconperception/vla)
 
-![One clock tick](https://raw.githubusercontent.com/siliconperception/vla/main/docs/figures/vla_v511.svg)
+![One clock tick](https://raw.githubusercontent.com/siliconperception/vla/main/docs/figures/vla_v533.svg)
 
 ## Use
 
@@ -62,47 +62,52 @@ kept.
 
 | | |
 |---|---|
-| Parameters | 59.0 M: 33.2 M trained, 25.8 M frozen (token embedding and output layer from pythia-31m) |
-| State | 2 layers × 2 registers × 512 × 7 × 7: 100,352 values, fixed in size |
-| Register windows | layer 1: 16 / 1 ticks; layer 2: 64 / 1 ticks (0.64 s and 2.56 s at 25 Hz), fixed |
-| Layer 1 | 1×1 mix (2,048 → 384) of the token, sound and its two registers (RMS-normalized reads), 8 × (3×3 conv, BatchNorm, ReLU) at 384, 3×3 project (384 → 512), cascade write |
-| Layer 2 | the same, reading only layer 1's output and its own registers (1,536 → 384); its output is added to layer 1's |
+| Parameters | 46.2 M: 20.5 M trained, 25.8 M frozen (token embedding and output layer from pythia-31m) |
+| State | 2 registers × 512 × 7 × 7: 50,176 values, fixed in size |
+| Registers | a gated average (rate learned per channel and position, starting at 1/16: 16 ticks, 0.64 s at 25 Hz) and a one-tick copy of the rest |
+| Layer | 1×1 mix (2,048 → 384) of the token, sound and the two registers (RMS-normalized reads), 8 × (3×3 conv, BatchNorm, ReLU) at 384, 3×3 project (384 → 512), cascade write |
+| Write gate | 1×1 conv (384 → 512) of the working channels and a sigmoid: the slow register's write rate |
 | Readout | 3 decoders (text, voice, image), each a tree of three 3×3 convs and the frozen pythia-31m output layer |
 | Tokenizer | pythia-31m BPE (50,304) plus a `<NUL>` token ("say nothing this tick") |
 
 ## Training
 
-- 1,680,000 steps × 250 rows, one token per row per step (420 M tokens), plain SGD. Truncated backpropagation
-  through time over 16 steps; the loss is normalized per word rather than per token.
+- 3,043,841 steps × 250 rows, one token per row per step (761 M tokens), SGD (at the end with Nesterov
+  momentum 0.95, learning rate 0.001, the write gate at 100 × that). Truncated backpropagation through time over
+  64 steps (16 before step 2,566,001); the loss is normalized per word rather than per token.
 - Data: FineWeb sample-10BT, text only. Every document starts from a zero state.
-- The configuration grew during training, always resuming from the latest weights: one layer with a 512-tick
+- The configuration changed during training, always resuming from the latest weights: one layer with a 512-tick
   average and a 1,024-tick recall ring from scratch; the ring removed at step 1,065,312; the second layer added
-  as the identity at 1,127,936; the slow windows shortened to 16 / 64 ticks by 1,456,944; then the learning
-  rate stepped down by half cosines, 0.02 → 0.01 → 0.005 → 0.0025, from 1,501,536. The
+  as the identity at 1,127,936; the slow windows shortened to 16 / 64 ticks by 1,456,944; the learning rate
+  stepped down by half cosines, 0.02 → 0.01 → 0.005 → 0.0025 → 0.00125 → 0.001, from 1,501,536 to 2,263,328, with
+  trials of momentum; layer 2's window 64 → 256 at 2,538,191. At 2,566,001 the second layer was removed (it
+  never used its registers), the write gate added (starting at the fixed rate 1/16, the rate it replaced) and
+  backpropagation lengthened to 64 steps, at learning rate 0.01; then momentum 0.5 from 2,960,001, Nesterov
+  momentum 0.95 from 2,987,329 and learning rate 0.001 from 2,994,305. The
   [spec](https://github.com/siliconperception/vla/blob/main/docs/spec/README.md) lists every step.
 
-## Evaluation (at the published step, 1,680,000)
+## Evaluation (at the published step, 3,043,841)
 
 The reference is EleutherAI's [pythia-70m](https://huggingface.co/EleutherAI/pythia-70m): a transformer of a
 similar total size (70 M parameters, 19 M of them outside the token embedding and output layer) with the same
 tokenizer, so losses per token compare directly. Pythia publishes checkpoints from early in training, so it is
-shown at about this model's training tokens (steps 128 and 256 bracket it) as well as fully trained. Every model
+shown at about this model's training tokens (steps 256 and 512 bracket it) as well as fully trained. Every model
 is scored on the same documents and pairs, by the same rule.
 
 | | **this model** | pythia-70m | pythia-70m | pythia-70m |
 |---|---|---|---|---|
-| training tokens | **420 M** | 268 M (step 128) | 537 M (step 256) | 300 B (final) |
-| FineWeb held-out (100 documents, nats/token) | **4.613** | 7.420 | 6.355 | 3.731 |
-| BabyLM 2026 dev (100 pieces, nats/token) | **4.608** | 6.866 | 5.718 | 3.250 |
-| BLiMP (1,005 pairs from all 67 paradigms), % | **70.3** | 51.8 | 51.4 | 75.7 |
-| ComVE (999 pairs, common sense), % | **64.5** | 56.5 | 57.1 | 69.7 |
+| training tokens | **761 M** | 537 M (step 256) | 1,074 M (step 512) | 300 B (final) |
+| FineWeb held-out (100 documents, nats/token) | **4.580** | 6.355 | 5.467 | 3.731 |
+| BabyLM 2026 dev (100 pieces, nats/token) | **4.564** | 5.718 | 4.984 | 3.250 |
+| BLiMP (1,005 pairs from all 67 paradigms), % | **70.2** | 51.4 | 54.7 | 75.7 |
+| ComVE (999 pairs, common sense), % | **65.0** | 57.1 | 59.7 | 69.7 |
 
 Losses are the mean over documents of each document's mean loss per token, from a zero state (this model) or a
 bare document start (pythia); a document with any token over 20 nats is counted as a runaway and left out
-(2 % of the FineWeb documents for this model). Pythia was trained on the Pile, this model on FineWeb, so the FineWeb row is
-in-domain for this model only. Matched tokens are not matched training: pythia's 268 M and 537 M tokens are only
-128 and 256 optimizer updates of 2 M tokens each, still inside its learning-rate warm-up, while this model's are
-1,680,000 updates of 250 tokens. Fully trained pythia-70m is the fair reference, and this model is still well
+(4 % of the FineWeb documents for this model). Pythia was trained on the Pile, this model on FineWeb, so the FineWeb row is
+in-domain for this model only. Matched tokens are not matched training: pythia's 537 M and 1,074 M tokens are only
+256 and 512 optimizer updates of 2 M tokens each, still inside its learning-rate warm-up, while this model's are
+3,043,841 updates of 250 tokens. Fully trained pythia-70m is the fair reference, and this model is still well
 short of it. A pair is right when the model gives the correct sentence the lower total loss,
 each sentence read without context. For scale on the pairs: babyllama-10m-2024 (trained on 10 M words) scores
 70.0 / 63.7 and SmolLM2-135M 80.9 / 79.3.
@@ -111,9 +116,9 @@ each sentence read without context. For scale on the pairs: babyllama-10m-2024 (
 
 From the prompt in bold, with these weights. Locally fluent, not yet coherent:
 
-> **My grandmother's recipe for apple pie starts with** almond and olive oil, green tea and apple, salt, garlic. I added a pair of the salsa cheese, and the balsamic vinegar in a pureed, salsa.
+> **My grandmother's recipe for apple pie starts with** a creamy teta sauce with cheese in its usual small butter and egg yolks, although they have been a tadota taste! You will love it too!
 
-> **The colors of the rainbow are** beautiful and unique. It is a place of mystery, with light tones that lightens the sunlight in it and its speciality.
+> **The colors of the rainbow are** the few parts of the image. The flower has a sparkling blue colour which I’ve written in my mind.
 
 ## Limits
 

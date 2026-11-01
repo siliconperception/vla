@@ -21,7 +21,7 @@ v = {'VERSION': r['version'], 'STEP': f'{r["step"]:,}', 'TOKENS': f'{r["step"] *
      'COMVE': f'{r["comve"]:.1f}', 'MINP': f'{r["min_p"]:.4f}', 'RUNAWAY': f'{r["runaway"]:g} %',
      **{f'P{k.upper()}_{f.upper()}': (f'{r["pythia70m"][k][f]:.3f}' if f in ('fw', 'baby') else
                                        f'{r["pythia70m"][k][f]:.1f}')
-        for k in ('128', '256', 'main') for f in ('fw', 'baby', 'blimp', 'comve')},
+        for k in r['pythia70m'] for f in ('fw', 'baby', 'blimp', 'comve')},
      'SAMPLES_MD': '\n\n'.join(f'> **{s["prompt"]}** {s["text"]}' for s in r['samples']),
      'SAMPLES_HTML': '\n  '.join(f'<blockquote><b>{html.escape(s["prompt"])}</b> {html.escape(s["text"])}'
                                  '</blockquote>' for s in r['samples'])}
