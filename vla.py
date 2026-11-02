@@ -2920,6 +2920,7 @@ class VLAModel(nn.Module, _HubMixin):
             dff, o = self.step(torch.where(b == _NUL_ID, _PAD, b) if _NUL_ID is not None else b, dff)
         return [r if k else [] for r, k in zip(torch.stack(outs, 1).tolist(), ok.tolist())]
 
+    @torch.no_grad()        # sampling: no graph (it held every tick's activations until the end)
     def generate(self, prompt_ids, n_tokens, temperature=1.0, image=None, video=None,
                  stop_chars=None, h0=None):
         """Sample n_tokens after prompt_ids (opened with _NULL, see _prompt_ids) on a private
