@@ -1435,7 +1435,8 @@ class ContextCNN(nn.Module):
 def _ema_scan(y, c, reset, h0, chunk=16):
     """--cd_gamma: one stage of the ladder over a sequence, chunkwise in parallel.
     s(t+1) = c s(t) + (1 - c) y(t) per channel, s(t) zero entering a reset tick; y [B, T, C, P],
-    c [C], reset [B, T] bool, h0 [B, C, P] = s(0) -> (s(t) for t < T [B, T, C, P], s(T))."""
+    c [C], reset [B, T] bool, h0 [B, C, P] = s(0) -> (s(t) for t < T [B, T, C, P], s(T)).
+    Each chunk is one einsum on y's own storage, so only the result is new memory."""
     B, T, C, P = y.shape
     L = min(chunk, T)
     pw = [torch.ones_like(c)]
@@ -1443,19 +1444,18 @@ def _ema_scan(y, c, reset, h0, chunk=16):
         pw.append(pw[-1] * c)
     pw = torch.stack(pw, 1)                                                # [C, L + 1]
     ar = torch.arange(L, device=y.device)
-    yb = y * (1 - c)[None, None, :, None]
     s, outs = h0, []
     for t0 in range(0, T, L):
         n = min(L, T - t0)
-        rc = reset[:, t0:t0 + n]
+        yc, rc = y[:, t0:t0 + n], reset[:, t0:t0 + n]
         seg = torch.cumsum(rc.long(), 1)                                   # resets so far in the chunk
-        diff = ar[:n, None] - ar[None, :n]                                 # t - j
-        D = pw[:, diff.clamp(min=0)] * (diff >= 0)                         # [C, n, n]: c^(t-j), j <= t
+        diff = ar[:n, None] - ar[None, :n] - 1                             # t - 1 - j
+        D = (1 - c)[:, None, None] * pw[:, diff.clamp(min=0)] * (diff >= 0)   # [C, n, n]: j < t
         W = D[None] * (seg[:, :, None] == seg[:, None, :])[:, None]        # [B, C, n, n]
-        o = torch.einsum('bctj,bjcp->btcp', W, yb[:, t0:t0 + n])          # s(t+1), t in the chunk
-        o = o + (pw[:, 1:n + 1].T[None, :, :, None] * (seg == 0)[:, :, None, None]) * s[:, None]
-        outs.append(torch.cat([s[:, None], o[:, :-1]], 1) * (~rc)[:, :, None, None])
-        s = o[:, -1]
+        rd = torch.einsum('bctj,bjcp->btcp', W, yc)                        # s(t) from this chunk's y
+        rd = rd.add_((pw[:, :n].T[None] * (seg == 0)[:, :, None])[..., None] * s[:, None])   # ... and s(t0)
+        outs.append(rd)
+        s = c[None, :, None] * rd[:, -1] + (1 - c)[None, :, None] * yc[:, -1]
     return torch.cat(outs, 1), s
 
 
