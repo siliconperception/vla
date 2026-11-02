@@ -1432,31 +1432,82 @@ class ContextCNN(nn.Module):
         return x
 
 
-def _ema_scan(y, c, reset, h0, chunk=16):
-    """--cd_gamma: one stage of the ladder over a sequence, chunkwise in parallel.
-    s(t+1) = c s(t) + (1 - c) y(t) per channel, s(t) zero entering a reset tick; y [B, T, C, P],
-    c [C], reset [B, T] bool, h0 [B, C, P] = s(0) -> (s(t) for t < T [B, T, C, P], s(T)).
-    Each chunk is one einsum on y's own storage, so only the result is new memory."""
-    B, T, C, P = y.shape
-    L = min(chunk, T)
+def _ema_powers(c, L):
+    """c^0 .. c^L per channel [C, L + 1], by products."""
     pw = [torch.ones_like(c)]
-    for _ in range(L):           # c^0 .. c^L by products (pow's gradient is NaN at c = 0)
+    for _ in range(L):
         pw.append(pw[-1] * c)
-    pw = torch.stack(pw, 1)                                                # [C, L + 1]
-    ar = torch.arange(L, device=y.device)
-    s, outs = h0, []
-    for t0 in range(0, T, L):
-        n = min(L, T - t0)
-        yc, rc = y[:, t0:t0 + n], reset[:, t0:t0 + n]
-        seg = torch.cumsum(rc.long(), 1)                                   # resets so far in the chunk
-        diff = ar[:n, None] - ar[None, :n] - 1                             # t - 1 - j
-        D = (1 - c)[:, None, None] * pw[:, diff.clamp(min=0)] * (diff >= 0)   # [C, n, n]: j < t
-        W = D[None] * (seg[:, :, None] == seg[:, None, :])[:, None]        # [B, C, n, n]
-        rd = torch.einsum('bctj,bjcp->btcp', W, yc)                        # s(t) from this chunk's y
-        rd = rd.add_((pw[:, :n].T[None] * (seg == 0)[:, :, None])[..., None] * s[:, None])   # ... and s(t0)
-        outs.append(rd)
-        s = c[None, :, None] * rd[:, -1] + (1 - c)[None, :, None] * yc[:, -1]
-    return torch.cat(outs, 1), s
+    return torch.stack(pw, 1)
+
+
+class _EmaScan(torch.autograd.Function):
+    """--cd_gamma: one stage of the ladder over a sequence, chunkwise in parallel.
+    s'(t) = s(t), or 0 entering a reset tick;  s(t+1) = c s'(t) + (1 - c) y(t);  s(0) = h0.
+    y [B, T, C, P], c [C], reset [B, T] bool, h0 [B, C, P] -> (s'(t) for t < T [B, T, C, P], s(T)).
+    Its backward is the same recurrence backwards in time (l(t) = dLoss/ds(t)):
+       l(T) = dLoss/ds(T),  l(t) = keep(t) (g(t) + c l(t+1)),  g(t) = dLoss/ds'(t);
+       dLoss/dy(t) = (1 - c) l(t+1),  dLoss/dc = sum l(t+1) (s'(t) - y(t)),  dLoss/dh0 = l(0);
+    both directions write straight into their results, so autograd keeps only y and s'."""
+
+    @staticmethod
+    def forward(ctx, y, c, reset, h0, chunk):
+        B, T, C, P = y.shape
+        L = min(chunk, T)
+        pw = _ema_powers(c, L)
+        ar = torch.arange(L, device=y.device)
+        s, out = h0, y.new_empty(B, T, C, P)
+        for t0 in range(0, T, L):
+            n = min(L, T - t0)
+            yc, rc = y[:, t0:t0 + n], reset[:, t0:t0 + n]
+            seg = torch.cumsum(rc.long(), 1)                               # resets so far in the chunk
+            diff = ar[:n, None] - ar[None, :n] - 1                         # t - 1 - j
+            D = (1 - c)[:, None, None] * pw[:, diff.clamp(min=0)] * (diff >= 0)   # [C, n, n]: j < t
+            W = D[None] * (seg[:, :, None] == seg[:, None, :])[:, None]    # [B, C, n, n]
+            rd = torch.einsum('bctj,bjcp->btcp', W, yc)                    # s'(t) from this chunk's y
+            rd.add_((pw[:, :n].T[None] * (seg == 0)[:, :, None])[..., None] * s[:, None])   # ... and s(t0)
+            out[:, t0:t0 + n] = rd
+            s = c[None, :, None] * rd[:, -1] + (1 - c)[None, :, None] * yc[:, -1]
+        ctx.save_for_backward(y, c, reset, out)
+        ctx.chunk = chunk
+        return out, s
+
+    @staticmethod
+    def backward(ctx, g, gT):
+        y, c, reset, out = ctx.saved_tensors
+        B, T, C, P = y.shape
+        L = min(ctx.chunk, T)
+        g = torch.zeros_like(y) if g is None else g
+        lam = torch.zeros_like(y[:, 0]) if gT is None else gT              # l(t1), entering from the right
+        pw = _ema_powers(c, L)
+        ar = torch.arange(L, device=y.device)
+        keep = ~reset
+        dy, dc = torch.empty_like(y), torch.zeros_like(c)
+        dy[:, -1] = (1 - c)[None, :, None] * lam
+        dc += (lam * (out[:, -1] - y[:, -1])).sum((0, 2))
+        for t1 in range(T, 0, -L):
+            t0 = max(0, t1 - L)
+            n = t1 - t0
+            kc = keep[:, t0:t1]
+            bc = torch.cumsum((~kc).long(), 1)                             # breaks in [t0, t]
+            diff = ar[None, :n] - ar[:n, None]                             # j - t
+            D = pw[:, diff.clamp(min=0)] * (diff >= 0)                     # [C, n, n]: c^(j-t), j >= t
+            W = D[None] * ((bc[:, :, None] == bc[:, None, :]) & kc[:, :, None])[:, None]
+            lc = torch.einsum('bctj,bjcp->btcp', W, g[:, t0:t1])          # l(t), t in the chunk
+            lc.add_((pw[:, n - ar[:n]].T[None] * ((bc == bc[:, -1:]) & kc)[:, :, None])[..., None]
+                    * lam[:, None])
+            if t0 > 0:               # l(t) feeds dy(t-1) and dc
+                dy[:, t0 - 1:t1 - 1] = (1 - c)[None, None, :, None] * lc
+                dc += (lc * (out[:, t0 - 1:t1 - 1] - y[:, t0 - 1:t1 - 1])).sum((0, 1, 3))
+            else:
+                dy[:, :t1 - 1] = (1 - c)[None, None, :, None] * lc[:, 1:]
+                dc += (lc[:, 1:] * (out[:, :t1 - 1] - y[:, :t1 - 1])).sum((0, 1, 3))
+            lam = lc[:, 0]
+        return dy, dc, None, lam, None
+
+
+def _ema_scan(y, c, reset, h0, chunk=16):
+    """--cd_gamma: one stage of the ladder (see _EmaScan) -> (s'(t) [B, T, C, P], s(T))."""
+    return _EmaScan.apply(y, c, reset, h0, chunk)
 
 
 def _delta_scan(q, k, v, beta, loga, reset, S0, chunk=64):
@@ -1708,7 +1759,7 @@ class ConvDeltaBlock(nn.Module):
         stage, y, ends = r.reshape(B, T, C, P_), r * self.tconv[0][None, None, :, None, None], []
         for j in range(1, self.taps):
             stage, sT = _ema_scan(stage, c, reset, fifo[:, j - 1].reshape(B, C, P_))
-            y = y + stage.view(B, T, C, self.S, self.S) * self.tconv[j][None, None, :, None, None]
+            y = y.addcmul_(stage.view(B, T, C, self.S, self.S), self.tconv[j][None, None, :, None, None])
             ends.append(sT.view(B, C, self.S, self.S))
         return y, torch.stack(ends, 1)
 
