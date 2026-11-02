@@ -4024,6 +4024,8 @@ def _model_graph(model):
             b = cd[int(mb.group(1))]
             mem = (f'{b.H} heads of {b.d}x{b.d} per position: S = a S (I - b k k^T) + b v k^T, '
                    f'read S q (S[t-1] from the state)')
+            if b.neg is not None:
+                mem += '; b in (0, 2) (--cd_neg)'
             if b.fw:
                 mem += f'; {b.fw} conv fast-weight heads of {b.d}x{b.fw_D}'
             out.append(dict(name=f'cd.{mb.group(1)} (delta memory)', op=mem,
