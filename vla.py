@@ -3947,6 +3947,8 @@ if args.use_ema:
     model.load_state_dict(_e, strict=False)
     print(f'--use_ema: weights replaced by the T={args.use_ema} running average', flush=True)
 model = model.to(args.device)
+if args.prompt_tune and model.cd is not None:
+    raise SystemExit('--prompt_tune tunes the registers of a register model; a --convdelta model has none')
 _tokenizer = model.tok
 _NUL_ID = model.nul_id
 _SIL = _NUL_ID if _NUL_ID is not None else -100
