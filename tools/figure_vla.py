@@ -1,6 +1,6 @@
 """Draw docs/figures/vla_<model>.svg: one clock tick of a VLA model, 16:9 (1920 x 1080).
 
-usage: python tools/figure_vla.py [--model v498|v499|v502|v505|v511|v531|v533|v536|v538] [--out OUT]
+usage: python tools/figure_vla.py [--model v498|v499|v502|v505|v511|v531|v533|v536|v538|v540] [--out OUT]
 
 v498: recurrent CNN + two order-2 Legendre memories (4096, 64 ticks) + copy + recall attention, never
 reset. v499: no registers, the recall attention's ring is the whole state, reset at each example.
@@ -13,11 +13,12 @@ architecture, trained on with SGD lr 0.001 and Nesterov momentum 0.95. v536: --c
 text-only model of 6 residual blocks of per-tick convs, each carrying a gated delta-rule matrix memory per grid
 position, trained a window at a time; 1920 x 2160, the whole model above and one block below. v538: v536
 with --grid_hist 8 (the input grid a learned map of the last 8 tokens, starting as concentric rings) and
---reset_prob 0.5 (half the training documents start unreset: a stress test for perception discontinuities)."""
+--reset_prob 0.5 (half the training documents start unreset: a stress test for perception discontinuities).
+v540: v538 with a third conv 3x3 + BN + ReLU in every block (--cd_convs 3)."""
 import argparse
 
 ap = argparse.ArgumentParser()
-ap.add_argument('--model', default='v498', choices=('v498', 'v499', 'v502', 'v505', 'v511', 'v531', 'v533', 'v536', 'v538'))
+ap.add_argument('--model', default='v498', choices=('v498', 'v499', 'v502', 'v505', 'v511', 'v531', 'v533', 'v536', 'v538', 'v540'))
 ap.add_argument('--out', default=None)
 a = ap.parse_args()
 LMU = a.model == 'v498'                   # Legendre memories + copy
@@ -25,7 +26,7 @@ CASC = a.model == 'v502'                  # EMA + residual copy, RMSnorm reads
 REGS = LMU or CASC                        # (v499: the ring alone)
 CAT = {'v498': ('3×256 + 2048 + 256 + 256 + 5×512', 5888), 'v499': ('3×256 + 2048 + 256 + 256', 3328),
        'v502': ('3×256 + 2048 + 256 + 256 + 2×512', 4352), 'v505': ('', 0), 'v511': ('', 0),
-       'v531': ('', 0), 'v533': ('', 0), 'v536': ('', 0), 'v538': ('', 0)}[a.model]
+       'v531': ('', 0), 'v533': ('', 0), 'v536': ('', 0), 'v538': ('', 0), 'v540': ('', 0)}[a.model]
 EMA1, EMA2 = (16, 64) if a.model == 'v511' else (512, 512)    # two-layer models: each layer's EMA window
 
 W, H = 1920, 1080
@@ -538,11 +539,12 @@ def draw_v536():
     out.append(f'<rect width="{W5}" height="{H5}" fill="#ffffff"/>')
 
     # ── pane A: the whole model ─────────────────────────────────────────────
-    V8 = a.model == 'v538'                # --grid_hist 8 (learned ring input) and --reset_prob 0.5
+    V8 = a.model in ('v538', 'v540')      # --grid_hist 8 (learned ring input) and --reset_prob 0.5
+    NC = 3 if a.model == 'v540' else 2    # --cd_convs: conv 3x3 + BN + ReLU layers per block
     text(30, 38, f'VLA {a.model} — one clock tick (40 ms): a ConvDelta language model, 6 residual blocks of '
          'per-tick convs, each with a gated delta-rule memory per grid position', 22, anchor='start', weight='bold')
     text(30, 62, 'A · the whole model.  --lm: text only · C 384 · 7×7 grid · 6 blocks · H 6 heads × d 32 per position '
-         '· 25 Hz · ' + ('22.01M trainable · fixed state 2,145,073 values · input: the last 8 tokens on a learned map '
+         '· 25 Hz · ' + (('29.97M' if NC == 3 else '22.01M') + ' trainable · fixed state 2,145,073 values · input: the last 8 tokens on a learned map '
                          '· trained 256 ticks at a time, half the documents unreset' if V8 else
                          '21.97M trainable · fixed state 2,145,024 values · trained a 256-tick window at a time'), 13,
          anchor='start', fill='#424242')
@@ -602,9 +604,12 @@ def draw_v536():
         line([(bx, CY), (bx + 8, CY)], arrow=False)
         box(bx + 8, CY - 40, 14, 80, COL['tconv'], rx=2)
         line([(bx + 22, CY), (bx + 30, CY)], arrow=False)
-        box(bx + 30, CY - 50, 12, 100, COL['cnn'], rx=2)
-        line([(bx + 42, CY), (bx + 46, CY)], arrow=False)
-        box(bx + 46, CY - 50, 12, 100, COL['cnn'], rx=2)
+        cw = 12 if NC == 2 else 8                         # the convs, side by side in x 30 .. 58
+        for j in range(NC):
+            cx_ = bx + 30 + j * (28 - cw) // (NC - 1) if NC > 1 else bx + 30
+            if j:
+                line([(cx_ - (28 - cw) // (NC - 1) + cw, CY), (cx_, CY)], arrow=False)
+            box(cx_, CY - 50, cw, 100, COL['cnn'], rx=2)
         line([(bx + 58, CY), (bx + 64, CY)])
         out.append(f'<circle cx="{bx + 78}" cy="{CY}" r="13" fill="{COL["lmu"]}" stroke="{COL["ink"]}" '
                    f'stroke-width="1.2"/>')
@@ -616,7 +621,7 @@ def draw_v536():
         line([(bx + 74, CY + 13), (bx + 74, CY + 62)])
         line([(bx + 84, CY + 62), (bx + 84, CY + 15)], dash=True, color='#757575')
         text(bx + BW / 2, CY + 118, '49×6×32×32', 9.5, fill=COL['soft'])
-    text(x0 + 3 * (BW + GAP) - GAP / 2, CY + 172, 'each block: causal time conv (4 ticks) → 2 × (conv 3×3 + BN + '
+    text(x0 + 3 * (BW + GAP) - GAP / 2, CY + 172, f'each block: causal time conv (4 ticks) → {NC} × (conv 3×3 + BN + '
          'ReLU) → delta-rule memory Δ with its state S', 12, fill='#424242')
     zx = x0 + 2 * (BW + GAP) - 8                          # zoom marker on block 3
     out.append(f'<rect x="{zx}" y="{CY - 172}" width="{BW + 16}" height="320" rx="12" fill="none" '
@@ -660,9 +665,21 @@ def draw_v536():
            w=560)
     nx = 650
     out.append(f'<rect x="{nx}" y="640" width="{1890 - nx}" height="380" rx="8" fill="#fafafa" stroke="#bdbdbd"/>')
-    text(nx + 18, 668, 'how it differs from v536' if V8 else 'how it differs from v533', 14, anchor='start',
-         weight='bold')
+    text(nx + 18, 668, 'how it differs from v538' if NC == 3 else 'how it differs from v536' if V8 else
+         'how it differs from v533', 14, anchor='start', weight='bold')
     for i, s_ in enumerate((
+            'A third conv 3×3 + BatchNorm + ReLU in every block (--cd_convs 3), before the memory\'s projections: 18 spatial',
+            'convs in all instead of 12. Each adds 1.33M weights (29.97M trainable, from 22.01M) and about 9% more time per',
+            'tick in training. It reads no state, so the state is unchanged (2,145,073 values) and the windows still train in',
+            'parallel. The question it answers: is the per-tick spatial mixing, between the input and the memories, the',
+            'bottleneck? Same rows, window, lr and data as v538, so the two compare step for step.',
+            '',
+            'As v538: the input grid is a learned map of the last 8 tokens (starting as concentric rings: t outermost,',
+            't−3 at the centre), and in training half the document starts do not reset the state, a stress test for',
+            'perception discontinuities: the model must let go of the previous document\'s memories itself.',
+            '',
+            'Otherwise as v536: --lm, 6 ConvDelta blocks, AdamW (β 0.9, 0.95), lr warmed to 0.001, 32 × 256 tokens per update.',
+    ) if NC == 3 else (
             'The input grid shows the last 8 tokens, not one token copied to every cell: cell p holds Σⱼ a[j, p] · ctx_cat(token t−j)',
             'with a learned 8 × 7×7 map a, which starts as concentric rings (t on the outer ring, t−1, t−2 inward, t−3 at the',
             'centre; t−4 … t−7 at 0, free to be recruited). Neighbouring cells now hold neighbouring moments, so the 3×3 convs',
@@ -722,11 +739,12 @@ def draw_v536():
     line([(110, CYb), (110, CYb + 90), (410, CYb + 90), (410, CYb + 18)])
     line([(426, CYb), (470, CYb)], arrow=False)
     dot(470, CYb)
-    line([(470, CYb), (500, CYb)])
-    box(500, CYb - 80, 44, 160, COL['cnn'], ['conv 3×3 · BN · ReLU'], size=11, vertical=True)
-    line([(544, CYb), (580, CYb)])
-    box(580, CYb - 80, 44, 160, COL['cnn'], ['conv 3×3 · BN · ReLU'], size=11, vertical=True)
-    line([(624, CYb), (663, CYb)])
+    cx_ = 500 if NC == 2 else 484                         # the convs: 2 at 500, 580; 3 at 484, 544, 604
+    for j in range(NC):
+        line([(470 if not j else cx_ - (80 if NC == 2 else 60) + (44 if NC == 2 else 40), CYb), (cx_, CYb)])
+        box(cx_, CYb - 80, 44 if NC == 2 else 40, 160, COL['cnn'], ['conv 3×3 · BN · ReLU'], size=11, vertical=True)
+        cx_ += 80 if NC == 2 else 60
+    line([(cx_ - (80 if NC == 2 else 60) + (44 if NC == 2 else 40), CYb), (663, CYb)])
     out.append(f'<circle cx="680" cy="{CYb}" r="16" fill="#ffffff" stroke="{COL["ink"]}" stroke-width="1.3"/>')
     text(680, CYb + 7, '+', 20, weight='bold')
     line([(470, CYb), (470, CYb + 110), (680, CYb + 110), (680, CYb + 18)])
@@ -817,7 +835,7 @@ def draw_v536():
 if a.model in ('v531', 'v533'):
     draw_v531()
     raise SystemExit(0)
-if a.model in ('v536', 'v538'):
+if a.model in ('v536', 'v538', 'v540'):
     draw_v536()
     raise SystemExit(0)
 
