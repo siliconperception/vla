@@ -271,6 +271,11 @@ parser.add_argument('--grid_hist', default=0, type=int, metavar='K',
                          'on the outer ring and t-1, t-2, t-3 inward to the centre; older tokens at 0)')
 parser.add_argument('--cd_heads', default=6, type=int, help='--convdelta: memory heads per position')
 parser.add_argument('--cd_convs', default=2, type=int, help='--convdelta: 3x3 conv + BN + ReLU layers per block')
+parser.add_argument('--cd_neg', default=False, action=argparse.BooleanOptionalAction,
+                    help='--convdelta: write strength beta in (0, 2), not (0, 1): beta = sigmoid(g) (1 + tanh(n)), n a '
+                         '1x1 conv starting at zero, so it can be added to a trained model. Beyond 1 the delta rule '
+                         'reflects along k (eigenvalue 1 - beta < 0), which lets a linear recurrence track state '
+                         '(Grazzi et al. 2024, arXiv 2411.12537). Restored by --load')
 parser.add_argument('--cd_fw_kernel', default=0, type=int, metavar='K',
                     help='--cd_fw: 0 = the memory is a 3x3 kernel, its keys/queries the 3x3 patches of a 1x1 '
                          'projection (d x 9d per head); K >= 1 = a 1x1 kernel, each position\'s own key/query '
@@ -868,7 +873,7 @@ _ARCH_ARGS = ('context', 'n_hidden', 'c_context', 'depth', 'kernel', 'tokenizer'
               'image_encoder', 'audio_encoder', 'streams', 'linout_kernel', 'learn_win',
               'learn_regs', 'lmu', 'attn', 'attn_ch', 'attn_heads', 'attn_dim', 'attn_age', 'read_rmsnorm',
               'layers', 'write_gate', 'convdelta', 'cd_heads', 'cd_dim', 'cd_taps', 'lm', 'grid_hist',
-              'cd_convs', 'cd_fw', 'cd_fw_kernel', 'cd_fw_dk')
+              'cd_convs', 'cd_fw', 'cd_fw_kernel', 'cd_fw_dk', 'cd_neg')
 
 
 def _parse_mix():
@@ -1501,7 +1506,8 @@ class ConvDeltaBlock(nn.Module):
     The convs never read the state, so a whole sequence runs at once (seq) and only the
     memories S are carried tick to tick (_delta_scan); step does one tick."""
 
-    def __init__(self, C, H, d, taps, S, bn_momentum=0.1, n_convs=2, fw=0, fw_chunk=2, fw_kernel=0, fw_dk=64):
+    def __init__(self, C, H, d, taps, S, bn_momentum=0.1, n_convs=2, fw=0, fw_chunk=2, fw_kernel=0, fw_dk=64,
+                 neg=False):
         super().__init__()
         self.C, self.H, self.d, self.taps, self.S = C, H, d, taps, S
         self.fw, self.fw_chunk = int(fw), int(fw_chunk)
@@ -1533,6 +1539,12 @@ class ConvDeltaBlock(nn.Module):
         with torch.no_grad():
             self.gates.weight.zero_()
             self.gates.bias.zero_()
+        # --cd_neg: beta = sigmoid(g) (1 + tanh(n)) in (0, 2); n starts at zero (beta unchanged)
+        self.neg = nn.Conv2d(C, H, 1) if neg else None
+        if neg:
+            with torch.no_grad():
+                self.neg.weight.zero_()
+                self.neg.bias.zero_()
         # base decay windows log-spaced 4 .. 4096 ticks over the heads
         w = torch.logspace(math.log10(4), math.log10(4096), H) if H > 1 else torch.tensor([64.0])
         self.lam = nn.Parameter(-torch.log(w))
@@ -1595,6 +1607,8 @@ class ConvDeltaBlock(nn.Module):
         q, k = F.normalize(q, dim=-1), F.normalize(k, dim=-1)
         gb, ga = self.gates(u).view(M, 2, H, P).permute(1, 0, 3, 2).unbind(0)
         beta = torch.sigmoid(gb)
+        if self.neg is not None:
+            beta = beta * (1 + torch.tanh(self.neg(u).view(M, H, P).transpose(1, 2)))
         loga = -self.lam.exp() * 2 * torch.sigmoid(ga)
         return q, k, v, beta, loga
 
@@ -2332,7 +2346,7 @@ class VLAModel(nn.Module, _HubMixin):
                  learn_regs=(), lmu=False, attn=0, attn_ch=2, attn_heads=8, attn_dim=64, attn_age=True,
                  read_rmsnorm=False, layers=1, up_windows=None, write_gate=False,
                  convdelta=0, cd_heads=6, cd_dim=32, cd_taps=4, cd_chunk=64, grid_hist=0,
-                 cd_convs=2, cd_fw=0, cd_fw_chunk=2, cd_fw_kernel=0, cd_fw_dk=64):
+                 cd_convs=2, cd_fw=0, cd_fw_chunk=2, cd_fw_kernel=0, cd_fw_dk=64, cd_neg=False):
         super().__init__()
         from transformers import AutoModelForCausalLM
         repo = _TOKENIZERS[tokenizer]
@@ -2489,7 +2503,7 @@ class VLAModel(nn.Module, _HubMixin):
         # positions can differ; the state is every block's memories and FIFO in turn
         self.cd = (nn.ModuleList(ConvDeltaBlock(c_context, int(cd_heads), int(cd_dim), int(cd_taps), S,
                                                 bn_momentum, int(cd_convs or 2), int(cd_fw or 0), int(cd_fw_chunk),
-                                                int(cd_fw_kernel or 0), int(cd_fw_dk or 64))
+                                                int(cd_fw_kernel or 0), int(cd_fw_dk or 64), bool(cd_neg))
                                  for _ in range(int(convdelta)))
                    if convdelta else None)
         self.cd_chunk, self.cd_ckpt = int(cd_chunk), False   # cd_ckpt: checkpoint each block (seq)
@@ -3906,7 +3920,7 @@ model = VLAModel(S=args.context, n_hidden=args.n_hidden, c_context=args.c_contex
                  layers=args.layers, write_gate=args.write_gate,
                  convdelta=args.convdelta, cd_heads=args.cd_heads, cd_dim=args.cd_dim, cd_taps=args.cd_taps,
                  grid_hist=args.grid_hist, cd_convs=args.cd_convs, cd_fw=args.cd_fw, cd_fw_chunk=args.cd_fw_chunk,
-                 cd_fw_kernel=args.cd_fw_kernel, cd_fw_dk=args.cd_fw_dk,
+                 cd_fw_kernel=args.cd_fw_kernel, cd_fw_dk=args.cd_fw_dk, cd_neg=args.cd_neg,
                  cd_chunk=args.cd_chunk,
                  up_windows=[float(w) for w in str(args.up_ema).split(',') if w.strip()] if args.up_ema else None)
 if _loaded_ckpt is not None:
@@ -3928,6 +3942,9 @@ if _loaded_ckpt is not None:
         missing = [k for k in missing if not k.startswith('wgate.')]
     if 'win_theta' in missing:
         print(f'--learn_win: windows start at {model.windows}', flush=True)
+    if any(re.match(r'cd\.\d+\.neg\.', k) for k in missing) and not any('.neg.' in k for k in _sd):
+        print('--cd_neg: the beta extension is new, starting at zero (beta unchanged)', flush=True)
+        missing = [k for k in missing if not re.match(r'cd\.\d+\.neg\.', k)]
     bad = [k for k in missing if not re.match(r'(text|voc|img)_dec\.nul\.|surp_mean$|gain_mean$|win_theta$', k)] + \
           [k for k in unexpected if not ((args.inner_voice or model.streams == 3)
                                          and k.startswith('text_dec.nul.'))]
