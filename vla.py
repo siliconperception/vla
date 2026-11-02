@@ -1444,36 +1444,48 @@ def _delta_scan(q, k, v, beta, loga, reset, S0, chunk=64):
     return torch.cat(outs, 1), S
 
 
+def _convfw_chunk(q, k, v, b, loga, reset, S_):
+    """_convfw_scan's work on one chunk of ticks: -> (o [N, C, P, dv], S at its end)."""
+    N, C, P, D = k.shape
+    G = torch.cumsum(loga, 1)
+    seg = torch.cumsum(reset.long(), 1)
+    live = torch.ones(C, C, dtype=torch.bool, device=k.device).tril() & (seg[:, :, None] == seg[:, None, :])
+    Gam = torch.exp(torch.where(live, G[:, :, None] - G[:, None, :], float('-inf')))
+    g0 = torch.exp(G) * (seg == 0)
+    kc, qc = k.reshape(N, C * P, D), q.reshape(N, C * P, D)
+    vc, bc = v.reshape(N, C * P, -1), b.reshape(N, C * P)
+    tick = torch.arange(C, device=k.device).repeat_interleave(P)
+    GI = Gam[:, tick][:, :, tick]
+    A = GI * (tick[:, None] > tick[None, :]) * (kc @ kc.transpose(1, 2))
+    L = torch.eye(C * P, dtype=k.dtype, device=k.device) + bc[:, :, None] * A
+    g0i = g0[:, tick]
+    Ut = torch.linalg.solve_triangular(L, bc[:, :, None] * vc, upper=False, unitriangular=True)
+    Wk = torch.linalg.solve_triangular(L, (bc * g0i)[:, :, None] * kc, upper=False, unitriangular=True)
+    U = Ut - Wk @ S_.transpose(1, 2)
+    o = (g0i[:, :, None] * (qc @ S_.transpose(1, 2)) +
+         (GI * (tick[:, None] >= tick[None, :]) * (qc @ kc.transpose(1, 2))) @ U).view(N, C, P, -1)
+    return o, g0[:, -1, None, None] * S_ + (U * Gam[:, -1][:, tick][:, :, None]).transpose(1, 2) @ kc
+
+
 def _convfw_scan(q, k, v, b, loga, reset, S0, chunk=8):
     """--cd_fw: the conv fast-weight delta rule over a sequence, chunkwise in parallel.
-    q, k [N, T, P, D] (unit 3x3 patches, D = 9 dk), v [N, T, P, dv], b [N, T, P] (beta / P),
-    loga [N, T], reset [N, T] (zero state entering that tick), S0 [N, dv, D] -> (o [N, T, P, dv], S_T),
-    the same as stepping S <- a S (I - sum_p b_p k_p k_p^T) + sum_p b_p v_p k_p^T, o_p = S q_p. Each tick's
-    P writes all read S_{t-1}: within a chunk the items (tick, position) solve a unit block-lower-
-    triangular system (items of one tick do not see each other), as in _delta_scan."""
-    N, T, P, D = k.shape
+    q, k [N, T, P, D] (unit keys / queries: 3x3 patches, or per position), v [N, T, P, dv],
+    b [N, T, P] (beta / P), loga [N, T], reset [N, T] (zero state entering that tick), S0 [N, dv, D]
+    -> (o [N, T, P, dv], S_T), the same as stepping S <- a S (I - sum_p b_p k_p k_p^T) + sum_p b_p
+    v_p k_p^T, o_p = S q_p. Each tick's P writes all read S_{t-1}: within a chunk the items (tick,
+    position) solve a unit block-lower-triangular system (items of one tick do not see each other),
+    as in _delta_scan. Under autograd each chunk is checkpointed: its (C P)^2 matrices are rebuilt in
+    the backward instead of kept for every chunk of the window."""
+    T = k.shape[1]
     outs, S_ = [], S0
     for c0 in range(0, T, chunk):
         sl = slice(c0, min(T, c0 + chunk))
-        C = k[:, sl].shape[1]
-        G = torch.cumsum(loga[:, sl], 1)
-        seg = torch.cumsum(reset[:, sl].long(), 1)
-        live = torch.ones(C, C, dtype=torch.bool, device=k.device).tril() & (seg[:, :, None] == seg[:, None, :])
-        Gam = torch.exp(torch.where(live, G[:, :, None] - G[:, None, :], float('-inf')))
-        g0 = torch.exp(G) * (seg == 0)
-        kc, qc = k[:, sl].reshape(N, C * P, D), q[:, sl].reshape(N, C * P, D)
-        vc, bc = v[:, sl].reshape(N, C * P, -1), b[:, sl].reshape(N, C * P)
-        tick = torch.arange(C, device=k.device).repeat_interleave(P)
-        GI = Gam[:, tick][:, :, tick]
-        A = GI * (tick[:, None] > tick[None, :]) * (kc @ kc.transpose(1, 2))
-        L = torch.eye(C * P, dtype=k.dtype, device=k.device) + bc[:, :, None] * A
-        g0i = g0[:, tick]
-        Ut = torch.linalg.solve_triangular(L, bc[:, :, None] * vc, upper=False, unitriangular=True)
-        Wk = torch.linalg.solve_triangular(L, (bc * g0i)[:, :, None] * kc, upper=False, unitriangular=True)
-        U = Ut - Wk @ S_.transpose(1, 2)
-        outs.append((g0i[:, :, None] * (qc @ S_.transpose(1, 2)) +
-                     (GI * (tick[:, None] >= tick[None, :]) * (qc @ kc.transpose(1, 2))) @ U).view(N, C, P, -1))
-        S_ = g0[:, -1, None, None] * S_ + (U * Gam[:, -1][:, tick][:, :, None]).transpose(1, 2) @ kc
+        args_ = (q[:, sl], k[:, sl], v[:, sl], b[:, sl], loga[:, sl], reset[:, sl], S_)
+        if torch.is_grad_enabled():
+            o, S_ = torch.utils.checkpoint.checkpoint(_convfw_chunk, *args_, use_reentrant=False)
+        else:
+            o, S_ = _convfw_chunk(*args_)
+        outs.append(o)
     return torch.cat(outs, 1), S_
 
 
