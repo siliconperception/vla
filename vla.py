@@ -276,6 +276,15 @@ parser.add_argument('--cd_neg', default=False, action=argparse.BooleanOptionalAc
                          '1x1 conv starting at zero, so it can be added to a trained model. Beyond 1 the delta rule '
                          'reflects along k (eigenvalue 1 - beta < 0), which lets a linear recurrence track state '
                          '(Grazzi et al. 2024, arXiv 2411.12537). Restored by --load')
+parser.add_argument('--cd_band', default=0.0, type=float, metavar='F',
+                    help='--convdelta: confine each head\'s decay window to [w/F, w F] around its base window w, '
+                         'and fix w: log a = -(1/w) F^tanh(g) (0 = off: log a = -(1/w) 2 sigmoid(g), the window '
+                         'free to grow without bound, and w learned). A bank of fixed, log-spaced timescales: '
+                         'forgetting as a power law, not drift to "never forget". Restored by --load')
+parser.add_argument('--cd_windows', default=None, metavar='LO:HI,...',
+                    help='--convdelta: base windows per block, log-spaced from LO to HI over its heads; one '
+                         'LO:HI for every block, or one per block (default 4:4096). Given with --load, it '
+                         'replaces the loaded base windows')
 parser.add_argument('--cd_fw_kernel', default=0, type=int, metavar='K',
                     help='--cd_fw: 0 = the memory is a 3x3 kernel, its keys/queries the 3x3 patches of a 1x1 '
                          'projection (d x 9d per head); K >= 1 = a 1x1 kernel, each position\'s own key/query '
@@ -873,7 +882,7 @@ _ARCH_ARGS = ('context', 'n_hidden', 'c_context', 'depth', 'kernel', 'tokenizer'
               'image_encoder', 'audio_encoder', 'streams', 'linout_kernel', 'learn_win',
               'learn_regs', 'lmu', 'attn', 'attn_ch', 'attn_heads', 'attn_dim', 'attn_age', 'read_rmsnorm',
               'layers', 'write_gate', 'convdelta', 'cd_heads', 'cd_dim', 'cd_taps', 'lm', 'grid_hist',
-              'cd_convs', 'cd_fw', 'cd_fw_kernel', 'cd_fw_dk', 'cd_neg')
+              'cd_convs', 'cd_fw', 'cd_fw_kernel', 'cd_fw_dk', 'cd_neg', 'cd_band')
 
 
 def _parse_mix():
@@ -1507,7 +1516,7 @@ class ConvDeltaBlock(nn.Module):
     memories S are carried tick to tick (_delta_scan); step does one tick."""
 
     def __init__(self, C, H, d, taps, S, bn_momentum=0.1, n_convs=2, fw=0, fw_chunk=2, fw_kernel=0, fw_dk=64,
-                 neg=False):
+                 neg=False, band=0.0):
         super().__init__()
         self.C, self.H, self.d, self.taps, self.S = C, H, d, taps, S
         self.fw, self.fw_chunk = int(fw), int(fw_chunk)
@@ -1548,6 +1557,10 @@ class ConvDeltaBlock(nn.Module):
         # base decay windows log-spaced 4 .. 4096 ticks over the heads
         w = torch.logspace(math.log10(4), math.log10(4096), H) if H > 1 else torch.tensor([64.0])
         self.lam = nn.Parameter(-torch.log(w))
+        # --cd_band F: the window stays within [w/F, w F] and w is fixed
+        self.band = float(band or 0)
+        if self.band:
+            self.lam.requires_grad_(False)
         self.out = nn.Conv2d((H + self.fw) * d, C, 1)
         with torch.no_grad():
             self.out.weight.zero_()
@@ -1609,7 +1622,10 @@ class ConvDeltaBlock(nn.Module):
         beta = torch.sigmoid(gb)
         if self.neg is not None:
             beta = beta * (1 + torch.tanh(self.neg(u).view(M, H, P).transpose(1, 2)))
-        loga = -self.lam.exp() * 2 * torch.sigmoid(ga)
+        if self.band:
+            loga = -self.lam.exp() * self.band ** torch.tanh(ga)
+        else:
+            loga = -self.lam.exp() * 2 * torch.sigmoid(ga)
         return q, k, v, beta, loga
 
     def _read_out(self, o, M):
@@ -2346,7 +2362,7 @@ class VLAModel(nn.Module, _HubMixin):
                  learn_regs=(), lmu=False, attn=0, attn_ch=2, attn_heads=8, attn_dim=64, attn_age=True,
                  read_rmsnorm=False, layers=1, up_windows=None, write_gate=False,
                  convdelta=0, cd_heads=6, cd_dim=32, cd_taps=4, cd_chunk=64, grid_hist=0,
-                 cd_convs=2, cd_fw=0, cd_fw_chunk=2, cd_fw_kernel=0, cd_fw_dk=64, cd_neg=False):
+                 cd_convs=2, cd_fw=0, cd_fw_chunk=2, cd_fw_kernel=0, cd_fw_dk=64, cd_neg=False, cd_band=0.0):
         super().__init__()
         from transformers import AutoModelForCausalLM
         repo = _TOKENIZERS[tokenizer]
@@ -2503,7 +2519,8 @@ class VLAModel(nn.Module, _HubMixin):
         # positions can differ; the state is every block's memories and FIFO in turn
         self.cd = (nn.ModuleList(ConvDeltaBlock(c_context, int(cd_heads), int(cd_dim), int(cd_taps), S,
                                                 bn_momentum, int(cd_convs or 2), int(cd_fw or 0), int(cd_fw_chunk),
-                                                int(cd_fw_kernel or 0), int(cd_fw_dk or 64), bool(cd_neg))
+                                                int(cd_fw_kernel or 0), int(cd_fw_dk or 64), bool(cd_neg),
+                                                float(cd_band or 0))
                                  for _ in range(int(convdelta)))
                    if convdelta else None)
         self.cd_chunk, self.cd_ckpt = int(cd_chunk), False   # cd_ckpt: checkpoint each block (seq)
@@ -3920,7 +3937,7 @@ model = VLAModel(S=args.context, n_hidden=args.n_hidden, c_context=args.c_contex
                  layers=args.layers, write_gate=args.write_gate,
                  convdelta=args.convdelta, cd_heads=args.cd_heads, cd_dim=args.cd_dim, cd_taps=args.cd_taps,
                  grid_hist=args.grid_hist, cd_convs=args.cd_convs, cd_fw=args.cd_fw, cd_fw_chunk=args.cd_fw_chunk,
-                 cd_fw_kernel=args.cd_fw_kernel, cd_fw_dk=args.cd_fw_dk, cd_neg=args.cd_neg,
+                 cd_fw_kernel=args.cd_fw_kernel, cd_fw_dk=args.cd_fw_dk, cd_neg=args.cd_neg, cd_band=args.cd_band,
                  cd_chunk=args.cd_chunk,
                  up_windows=[float(w) for w in str(args.up_ema).split(',') if w.strip()] if args.up_ema else None)
 if _loaded_ckpt is not None:
@@ -3963,6 +3980,16 @@ if args.use_ema:
                          f'(it has {sorted((_loaded_ckpt or {}).get("weight_ema", {}))})')
     model.load_state_dict(_e, strict=False)
     print(f'--use_ema: weights replaced by the T={args.use_ema} running average', flush=True)
+if args.cd_windows and model.cd is not None:     # --cd_windows: the base windows, block by block
+    _cw = [tuple(float(x) for x in b.split(':')) for b in args.cd_windows.split(',')]
+    if len(_cw) not in (1, len(model.cd)) or any(len(b) != 2 for b in _cw):
+        raise SystemExit(f'--cd_windows {args.cd_windows}: one LO:HI, or one per block ({len(model.cd)})')
+    with torch.no_grad():
+        for _b, (_lo, _hi) in zip(model.cd, _cw * len(model.cd) if len(_cw) == 1 else _cw):
+            _w = torch.logspace(math.log10(_lo), math.log10(_hi), _b.H) if _b.H > 1 else torch.tensor([_lo])
+            _b.lam.copy_(-torch.log(_w))
+    print('--cd_windows: base windows ' + ' | '.join(
+        ' '.join(f'{w:g}' for w in (1 / _b.lam.exp()).round().tolist()) for _b in model.cd), flush=True)
 model = model.to(args.device)
 if args.prompt_tune and model.cd is not None:
     raise SystemExit('--prompt_tune tunes the registers of a register model; a --convdelta model has none')
@@ -4026,6 +4053,8 @@ def _model_graph(model):
                    f'read S q (S[t-1] from the state)')
             if b.neg is not None:
                 mem += '; b in (0, 2) (--cd_neg)'
+            if b.band:
+                mem += f'; windows within x{b.band:g} of fixed bases (--cd_band)'
             if b.fw:
                 mem += f'; {b.fw} conv fast-weight heads of {b.d}x{b.fw_D}'
             out.append(dict(name=f'cd.{mb.group(1)} (delta memory)', op=mem,
