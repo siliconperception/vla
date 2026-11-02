@@ -663,49 +663,38 @@ def draw_v536():
                      (COL['smp'], False, 'softmax + sample (+ <NUL> logit)')],
            '(training: reset at half the document starts)' if V8 else '(S: reset to 0 at each document start)',
            w=560)
-    nx = 650
-    out.append(f'<rect x="{nx}" y="640" width="{1890 - nx}" height="380" rx="8" fill="#fafafa" stroke="#bdbdbd"/>')
-    text(nx + 18, 668, 'how it differs from v538' if NC == 3 else 'how it differs from v536' if V8 else
-         'how it differs from v533', 14, anchor='start', weight='bold')
-    for i, s_ in enumerate((
-            'A third conv 3×3 + BatchNorm + ReLU in every block (--cd_convs 3), before the memory\'s projections: 18 spatial',
-            'convs in all instead of 12. Each adds 1.33M weights (29.97M trainable, from 22.01M) and about 9% more time per',
-            'tick in training. It reads no state, so the state is unchanged (2,145,073 values) and the windows still train in',
-            'parallel. The question it answers: is the per-tick spatial mixing, between the input and the memories, the',
-            'bottleneck? Same rows, window, lr and data as v538, so the two compare step for step.',
-            '',
-            'As v538: the input grid is a learned map of the last 8 tokens (starting as concentric rings: t outermost,',
-            't−3 at the centre), and in training half the document starts do not reset the state, a stress test for',
-            'perception discontinuities: the model must let go of the previous document\'s memories itself.',
-            '',
-            'Otherwise as v536: --lm, 6 ConvDelta blocks, AdamW (β 0.9, 0.95), lr warmed to 0.001, 32 × 256 tokens per update.',
-    ) if NC == 3 else (
-            'The input grid shows the last 8 tokens, not one token copied to every cell: cell p holds Σⱼ a[j, p] · ctx_cat(token t−j)',
-            'with a learned 8 × 7×7 map a, which starts as concentric rings (t on the outer ring, t−1, t−2 inward, t−3 at the',
-            'centre; t−4 … t−7 at 0, free to be recruited). Neighbouring cells now hold neighbouring moments, so the 3×3 convs',
-            'see tokens side by side and can form n-gram features in one layer. The 7 past token ids ride in the state.',
-            '',
-            'Stress test for perception discontinuities (--reset_prob 0.5): in training, half of the document starts reset',
-            'the state and half do not, so the previous, unrelated document\'s memories carry straight on, marked only by',
-            'the separator token, as when a robot\'s continuous perception jumps to a new scene, task or speaker. The model',
-            'must learn to let go of stale context itself (the decay α and write strength β see the input). Evals still',
-            'reset per document; EVALW measures the unreset case.',
-            '',
-            'Otherwise as v536: --lm, 6 ConvDelta blocks, AdamW (β 0.9, 0.95), lr warmed to 0.001, 32 × 256 tokens per update.',
-    ) if V8 else (
-            'No conv reads the state. The convs see only this tick\'s input to their block, so in training they run on all',
-            '256 ticks of a window at once ([32·256, 384, 7, 7], in bf16), and the memories S, the only state carried',
-            'from tick to tick, are trained over the whole window by a chunked parallel scan (their update is linear in',
-            'S). The state carries on between windows. On the chip it runs one tick at a time, as v533 does.',
-            '',
-            'The state is an associative memory, not an average: each of the 49 positions holds 6 heads of 32×32',
-            'key→value matrices per block, written by the delta rule and read by a query. The heads\' base decay windows',
-            'start log-spaced from 4 to 4,096 ticks. The time conv carries the last 4 ticks (the copy register\'s job).',
-            'G and P let the 49 columns differ, since every position gets the same token. A document start zeroes S.',
-            '',
-            '--lm: text only (no audio, image, voice or image streams; one decoder). AdamW (β 0.9, 0.95, no weight decay),',
-            'lr warmed up to 0.001 over 1,000 updates of 32 × 256 tokens. State: 2,145,024 values, fixed for any context.')):
-        text(nx + 18, 696 + 24 * i, s_, 12.5, anchor='start', fill='#424242')
+    if NC == 2:                           # (v540: no revision notes)
+        nx = 650
+        out.append(f'<rect x="{nx}" y="640" width="{1890 - nx}" height="380" rx="8" fill="#fafafa" stroke="#bdbdbd"/>')
+        text(nx + 18, 668, 'how it differs from v536' if V8 else
+             'how it differs from v533', 14, anchor='start', weight='bold')
+        for i, s_ in enumerate((
+                'The input grid shows the last 8 tokens, not one token copied to every cell: cell p holds Σⱼ a[j, p] · ctx_cat(token t−j)',
+                'with a learned 8 × 7×7 map a, which starts as concentric rings (t on the outer ring, t−1, t−2 inward, t−3 at the',
+                'centre; t−4 … t−7 at 0, free to be recruited). Neighbouring cells now hold neighbouring moments, so the 3×3 convs',
+                'see tokens side by side and can form n-gram features in one layer. The 7 past token ids ride in the state.',
+                '',
+                'Stress test for perception discontinuities (--reset_prob 0.5): in training, half of the document starts reset',
+                'the state and half do not, so the previous, unrelated document\'s memories carry straight on, marked only by',
+                'the separator token, as when a robot\'s continuous perception jumps to a new scene, task or speaker. The model',
+                'must learn to let go of stale context itself (the decay α and write strength β see the input). Evals still',
+                'reset per document; EVALW measures the unreset case.',
+                '',
+                'Otherwise as v536: --lm, 6 ConvDelta blocks, AdamW (β 0.9, 0.95), lr warmed to 0.001, 32 × 256 tokens per update.',
+        ) if V8 else (
+                'No conv reads the state. The convs see only this tick\'s input to their block, so in training they run on all',
+                '256 ticks of a window at once ([32·256, 384, 7, 7], in bf16), and the memories S, the only state carried',
+                'from tick to tick, are trained over the whole window by a chunked parallel scan (their update is linear in',
+                'S). The state carries on between windows. On the chip it runs one tick at a time, as v533 does.',
+                '',
+                'The state is an associative memory, not an average: each of the 49 positions holds 6 heads of 32×32',
+                'key→value matrices per block, written by the delta rule and read by a query. The heads\' base decay windows',
+                'start log-spaced from 4 to 4,096 ticks. The time conv carries the last 4 ticks (the copy register\'s job).',
+                'G and P let the 49 columns differ, since every position gets the same token. A document start zeroes S.',
+                '',
+                '--lm: text only (no audio, image, voice or image streams; one decoder). AdamW (β 0.9, 0.95, no weight decay),',
+                'lr warmed up to 0.001 over 1,000 updates of 32 × 256 tokens. State: 2,145,024 values, fixed for any context.')):
+            text(nx + 18, 696 + 24 * i, s_, 12.5, anchor='start', fill='#424242')
 
     out.append('<line x1="0" y1="1080" x2="1920" y2="1080" stroke="#9e9e9e" stroke-width="2"/>')
 
