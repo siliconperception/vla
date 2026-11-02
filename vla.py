@@ -3993,7 +3993,37 @@ def _model_graph(model):
     S, H = model.S, f'{model.n_hidden}x{model.S}x{model.S}'
     regs = [f'DFF_{k + 1}' for k in range(model.K)]
     out = []
+    cd, G = model.cd, getattr(model, 'grid_hist', 0)
     for r in rows:
+        mb = re.match(r'cd\.(\d+)\.(mix\.0|out)$', r['name']) if cd is not None else None
+        if mb and mb.group(2) == 'mix.0':        # --convdelta: the block's time conv, then its convs
+            b = cd[int(mb.group(1))]
+            out.append(dict(name=f'cd.{mb.group(1)}.tconv <- RMS(x), FIFO[t-1]',
+                            op=f'causal depthwise time conv over {b.taps} ticks, residual add',
+                            inp=r['inp'], out=r['inp'], tr=b.tconv.numel(), fr=0))
+        if mb and mb.group(2) == 'out':          # ... and its memories, read before out
+            b = cd[int(mb.group(1))]
+            mem = (f'{b.H} heads of {b.d}x{b.d} per position: S = a S (I - b k k^T) + b v k^T, '
+                   f'read S q (S[t-1] from the state)')
+            if b.fw:
+                mem += f'; {b.fw} conv fast-weight heads of {b.d}x{b.fw_D}'
+            out.append(dict(name=f'cd.{mb.group(1)} (delta memory)', op=mem,
+                            inp=f'{3 * (b.H + b.fw)}x{b.d}x{model.S}x{model.S}', out=r['inp'],
+                            tr=sum(p.numel() for n, p in b.named_parameters(recurse=False) if n != 'tconv'), fr=0))
+        if r['name'] == 'ctx_cat' and cd is not None and G:   # --grid_hist: per history token, then the map
+            C = r['out'].split('x')[0]
+            out.append(dict(r, op=r['op'] + ', per token', inp=f'{G}x{r["inp"].split("x")[0]}',
+                            out=f'{G}x{C}'))
+            out.append(dict(name='grid_a, cd_G, cd_P', op=f'learned map of the {G} tokens onto '
+                            f'{model.S}x{model.S}, then scale + shift per position',
+                            inp=f'{G}x{C}', out=f'{C}x{model.S}x{model.S}',
+                            tr=model.grid_a.numel() + model.cd_G.numel() + model.cd_P.numel(), fr=0))
+            continue
+        if r['name'] == 'tok_embed' and cd is not None and G:
+            out.append(dict(r, name=f'tok_embed <- tokens t .. t-{G - 1} (HIST[t-1])'))
+            out.append(dict(name='(token history)', op='RMSnorm per token', inp=r['out'], out=r['out'],
+                            tr=0, fr=0))
+            continue
         if r['name'] == 'ctx_cat':
             srcs = ['(token grid)'] + [f'{g}[t-1]' for g in regs]
             if model.img_enc is not None:
@@ -4027,10 +4057,11 @@ def _model_graph(model):
                 srcs[len(srcs) - model.K:len(srcs) - model.K] = ['(voice token grid)', '(image token grid)']
             if model.attn is not None:
                 srcs[len(srcs) - model.K:len(srcs) - model.K] = ['(recall grid)']
-            out.append(dict(name=', '.join(srcs), op='Concat (channels)',
-                            inp=f'{"+".join(map(str, model.in_widths + ([model.att_width] if model.attn else [])))}'
-                                f'+{model.K}x{model.n_hidden} x{S}x{S}',
-                            out=r['inp'], tr=0, fr=0))
+            if len(srcs) > 1:              # (one source: nothing to concatenate)
+                out.append(dict(name=', '.join(srcs), op='Concat (channels)',
+                                inp=f'{"+".join(map(str, model.in_widths + ([model.att_width] if model.attn else [])))}'
+                                    + (f'+{model.K}x{model.n_hidden}' if model.K else '') + f' x{S}x{S}',
+                                out=r['inp'], tr=0, fr=0))
         m = re.match(r'up\.(\d+)\.ctx_cat$', r['name'])
         if m:
             L = int(m.group(1)) + 2
@@ -4057,6 +4088,9 @@ def _model_graph(model):
                                    'attn.entry': ' of (token grid), linout',
                                    }.get(r['name'], ''))
         out.append(r)
+        if r['name'] == 'ctx_cat' and cd is not None:
+            out.append(dict(name='cd_G, cd_P', op='scale + shift per position', inp=r['out'],
+                            out=r['out'], tr=model.cd_G.numel() + model.cd_P.numel(), fr=0))
         if r['name'] == 'attn.out':
             out.append(dict(name='(recall grid)', op=f'RMSnorm, replicate 1x1 -> {S}x{S}', inp=r['out'],
                             out=f'{r["out"]}x{S}x{S}', tr=0, fr=0))
