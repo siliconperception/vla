@@ -1,10 +1,10 @@
 # VLA functional specification (model)
 
 This is what the model computes, tick by tick, for the published configuration (`siliconperception/vla`,
-run v540, a ConvDelta model). It specifies the function, not an implementation. `vla.py` is the reference:
+run v541, a ConvDelta model). It specifies the function, not an implementation. `vla.py` is the reference:
 where this text and the code disagree, the code is right and this text is a bug.
 
-![One clock tick of v540](../figures/vla_v540.svg)
+![One clock tick of the model](../figures/vla_v541.svg)
 
 ## Dimensions
 
@@ -103,7 +103,7 @@ the projections feeding it.
    `<NUL>`. Embedding rows the tokenizer never uses are masked off.
 3. **Emit.** Softmax, then min-p sampling: only tokens with at least p_min times the top token's probability
    are kept. p_min is stored with the weights; in training it is adjusted so that the model's own text,
-   generated from `<NUL>`, scores a fluency of 100 (p_min = 0.0344 at step 400,000).
+   generated from `<NUL>`, scores a fluency of 100 (p_min = 0.0078 at step 2,560,000).
 4. The sampled token is the next tick's input (in training, the dataset's next token is).
 
 ### Cost per tick
@@ -132,7 +132,7 @@ every tick does exactly the same work.
 
 ## The figure
 
-[`docs/figures/vla_v540.svg`](../figures/vla_v540.svg) draws one clock tick (40 ms at 25 Hz) in two panes,
+[`docs/figures/vla_v541.svg`](../figures/vla_v541.svg) draws one clock tick (40 ms at 25 Hz) in two panes,
 1920 × 2160. Colours encode the kind of operation, the same in both panes: grey hatched = frozen (embedding,
 output layer); violet = RMS norm; dark blue = the learned input map; blue = linear convs (1×1 or 3×3);
 orange = per-position gain and bias, and the β, α gates; lavender = the causal time conv; green = conv 3×3 +
@@ -214,8 +214,8 @@ bounded), the gate formulas β = σ(·), α = exp(−2 exp(λ) σ(·)) with λ p
 
 ## Training (for reference)
 
-- From scratch, in one configuration, to step 400,000. A step is one tick (one token) for each of 32 rows,
-  so 12.8 M tokens.
+- From scratch, in one configuration, to step 2,560,000. A step is one tick (one token) for each of 32 rows,
+  so 81.9 M tokens.
 - Data: FineWeb sample-10BT, text only.
 - Each row trains on windows of 256 consecutive ticks. Within a window the convs run on all ticks at once, and
   the memories are trained over the whole window by an exact chunked parallel scan. The state carries on from
@@ -226,7 +226,7 @@ bounded), the gate formulas β = σ(·), α = exp(−2 exp(λ) σ(·)) with λ p
   a robot's perception jumps to a new scene, task or speaker. The model has to learn to let go of stale context
   itself, through α and β, which see the input. Evaluations reset at every document.
 - Optimizer: AdamW, β (0.9, 0.95), no weight decay, no gradient clipping. The learning rate rises from 1e-5 to
-  0.001 over the first 256,000 steps (a half cosine, 1,000 updates) and is then held. Cross-entropy is
+  1e-4 over the first 256,000 steps (a half cosine, 1,000 updates) and is then held. Cross-entropy is
   normalized per word, not per token.
 - Frozen: the token embedding and the output layer (pythia-31m).
 - Numerics: the convs run in bf16 on the GPU and the scan in TF32. In float64, the parallel scan equals one-tick

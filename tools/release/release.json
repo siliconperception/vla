@@ -1,25 +1,25 @@
 {
- "version": "v540",
- "step": 400000,
+ "version": "v541",
+ "step": 2560000,
  "rows": 32,
- "fineweb": 5.186256,
- "babylm": 4.987792,
- "blimp": 64.0,
- "comve": 65.0,
- "runaway": 1,
- "min_p": 0.03435659916414424,
+ "fineweb": 4.679966,
+ "babylm": 4.383574,
+ "blimp": 68.6,
+ "comve": 65.7,
+ "runaway": 2,
+ "min_p": 0.0078,
  "pythia70m": {
-  "step4": {
-   "fw": 11.0253,
-   "baby": 11.0332,
-   "blimp": 53.3,
-   "comve": 53.5
-  },
-  "step8": {
-   "fw": 10.8942,
-   "baby": 10.8478,
-   "blimp": 52.7,
+  "step32": {
+   "fw": 9.8234,
+   "baby": 9.4483,
+   "blimp": 52.0,
    "comve": 54.0
+  },
+  "step64": {
+   "fw": 9.0023,
+   "baby": 8.6347,
+   "blimp": 52.7,
+   "comve": 56.3
   },
   "main": {
    "fw": 3.7312,
@@ -30,12 +30,12 @@
  },
  "samples": [
   {
-   "prompt": "The colors of the rainbow are",
-   "text": "also unique, but not the most recognizable images of the color. The colour images are dark and decorating with pink colors."
+   "prompt": "The best way to learn a new language is",
+   "text": "to get comfortable with its touch. It is as if they don't want to be in the way of a book."
   },
   {
-   "prompt": "My grandmother's recipe for apple pie starts with",
-   "text": "2/1 cup cream: 1 cup. Sweet syrup, chocolate syrup (food & wine) to cook with tasty desserts, plus 6 cups, sugar syrup, baking and baking, cook cooking and cook."
+   "prompt": "The history of the bicycle began in",
+   "text": "2005. From the very first time, I’m doing this by myself or our big body to climb with my bike."
   }
  ]
 }

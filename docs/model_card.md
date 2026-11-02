@@ -16,7 +16,7 @@ datasets:
 
 # VLA (ConvDelta)
 
-**Release v540, step 400,000** (12.8 M training tokens).
+**Release v541, step 2,560,000** (81.9 M training tokens).
 
 A language model with a fixed-size state and no positional encoding, built from convolutions on a 7 × 7 grid. Its
 input is the last 8 tokens, placed on the grid by a learned map. Six residual ConvDelta blocks follow. Each one
@@ -37,7 +37,7 @@ one fetched from off-chip DRAM.
 
 Code, functional spec and figures: [github.com/siliconperception/vla](https://github.com/siliconperception/vla)
 
-![One clock tick](https://raw.githubusercontent.com/siliconperception/vla/main/docs/figures/vla_v540.svg)
+![One clock tick](https://raw.githubusercontent.com/siliconperception/vla/main/docs/figures/vla_v541.svg)
 
 ## Use
 
@@ -72,38 +72,38 @@ kept.
 
 ## Training
 
-- From scratch, in one configuration: 400,000 steps × 32 rows, one token per row per step (12.8 M tokens).
+- From scratch, in one configuration: 2,560,000 steps × 32 rows, one token per row per step (81.9 M tokens).
   Each row trains on 256-tick windows, all ticks of a window at once (the memories through an exact chunked
   parallel scan); the state carries on between windows and the gradient stops at a window's start.
-- AdamW (β 0.9, 0.95, no weight decay), learning rate warmed from 1e-5 to 0.001 over the first 256,000 steps,
+- AdamW (β 0.9, 0.95, no weight decay), learning rate warmed from 1e-5 to 1e-4 over the first 256,000 steps,
   then held. The loss is normalized per word rather than per token.
 - Data: FineWeb sample-10BT, text only. In training, a document start resets the state only half the time; in
   the other half the previous document's memories carry on, and the model must learn to drop them itself
   (a stress test for discontinuities in a robot's continuous perception). Evaluation resets at every document.
 - The [spec](https://github.com/siliconperception/vla/blob/main/docs/spec/README.md) gives the exact computation.
 
-## Evaluation (at the published step, 400,000)
+## Evaluation (at the published step, 2,560,000)
 
 The reference is EleutherAI's [pythia-70m](https://huggingface.co/EleutherAI/pythia-70m): a transformer of a
 similar total size (70 M parameters, 19 M of them outside the token embedding and output layer) with the same
 tokenizer, so losses per token compare directly. Pythia publishes checkpoints from early in training, so it is
-shown at about this model's training tokens (steps 4 and 8 bracket it) as well as fully trained. Every model is
+shown at about this model's training tokens (steps 32 and 64 bracket it) as well as fully trained. Every model is
 scored on the same documents and pairs, by the same rule.
 
 | | **this model** | pythia-70m | pythia-70m | pythia-70m |
 |---|---|---|---|---|
-| training tokens | **12.8 M** | 8.4 M (step 4) | 16.8 M (step 8) | 300 B (final) |
-| FineWeb held-out (100 documents, nats/token) | **5.186** | 11.025 | 10.894 | 3.731 |
-| BabyLM 2026 dev (100 pieces, nats/token) | **4.988** | 11.033 | 10.848 | 3.250 |
-| BLiMP (1,005 pairs from all 67 paradigms), % | **64.0** | 53.3 | 52.7 | 75.7 |
-| ComVE (999 pairs, common sense), % | **65.0** | 53.5 | 54.0 | 69.7 |
+| training tokens | **81.9 M** | 67.1 M (step 32) | 134.2 M (step 64) | 300 B (final) |
+| FineWeb held-out (100 documents, nats/token) | **4.680** | 9.823 | 9.002 | 3.731 |
+| BabyLM 2026 dev (100 pieces, nats/token) | **4.384** | 9.448 | 8.635 | 3.250 |
+| BLiMP (1,005 pairs from all 67 paradigms), % | **68.6** | 52.0 | 52.7 | 75.7 |
+| ComVE (999 pairs, common sense), % | **65.7** | 54.0 | 56.3 | 69.7 |
 
 Losses are the mean over documents of each document's mean loss per token, from a zero state (this model) or a
 bare document start (pythia); a document with any token over 20 nats is counted as a runaway and left out
-(1 % of the FineWeb documents for this model). Pythia was trained on the Pile, this model on FineWeb, so
-the FineWeb row is in-domain for this model only. Matched tokens are not matched training: pythia's 8.4 M and
-16.8 M tokens are only 4 and 8 optimizer updates of 2 M tokens each, at the very start of its learning-rate
-warm-up, while this model's are 400,000 steps of 32 tokens (1,562 updates). Fully trained pythia-70m is the fair
+(2 % of the FineWeb documents for this model). Pythia was trained on the Pile, this model on FineWeb, so
+the FineWeb row is in-domain for this model only. Matched tokens are not matched training: pythia's 67.1 M and
+134.2 M tokens are only 32 and 64 optimizer updates of 2 M tokens each, early in its learning-rate
+warm-up, while this model's are 2,560,000 steps of 32 tokens (10,000 updates). Fully trained pythia-70m is the fair
 reference, and this model is far short of it. A pair is right when the model gives the correct sentence the lower
 total loss, each sentence read without context; chance is 50 %. For scale on the pairs: babyllama-10m-2024
 (trained on 10 M words) scores 70.0 / 63.7 and SmolLM2-135M 80.9 / 79.3.
@@ -112,9 +112,9 @@ total loss, each sentence read without context; chance is 50 %. For scale on the
 
 From the prompt in bold, with these weights. Locally fluent in places, repetitive, not yet coherent:
 
-> **The colors of the rainbow are** also unique, but not the most recognizable images of the color. The colour images are dark and decorating with pink colors.
+> **The best way to learn a new language is** to get comfortable with its touch. It is as if they don't want to be in the way of a book.
 
-> **My grandmother's recipe for apple pie starts with** 2/1 cup cream: 1 cup. Sweet syrup, chocolate syrup (food & wine) to cook with tasty desserts, plus 6 cups, sugar syrup, baking and baking, cook cooking and cook.
+> **The history of the bicycle began in** 2005. From the very first time, I’m doing this by myself or our big body to climb with my bike.
 
 ## Limits
 

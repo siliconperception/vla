@@ -91,14 +91,14 @@
       <a href="https://github.com/siliconperception/vla/blob/main/docs/spec/README.md">Functional spec</a>
       <a href="https://github.com/siliconperception/vla/tree/main/paper">Paper (in preparation)</a>
     </nav>
-    <p class="note">Current release: <b>v540</b>, step 400,000 (12.8 M training tokens).</p>
+    <p class="note">Current release: <b>v541</b>, step 2,560,000 (81.9 M training tokens).</p>
   </header>
 
   <figure>
-    <a class="fig" href="figures/vla_v540.svg" title="Open the full-size figure">
-      <img src="figures/vla_v540.svg" alt="Block diagram of one clock tick, in two panes. Top: the last 8 tokens are embedded, normalized, mixed by a 1x1 convolution and placed on a 7x7 grid by a learned map, scaled and shifted per position, and passed through six ConvDelta blocks, each a causal time conv, three 3x3 conv-BatchNorm-ReLU layers and a delta-rule memory with its state S; a 3x3 projection, a decoder tree of three 3x3 convolutions and the frozen output layer give the next token, which is fed back as the next input. Bottom: one block in detail: RMS norm and a 3-tick FIFO feeding the time conv, the three convs with a residual, five 1x1 projections to q, k, v, beta and alpha, the gated delta rule S = alpha S (I - beta k k^T) + beta v k^T on a 32x32 memory per position and head, the read S q, and a 1x1 output added back.">
+    <a class="fig" href="figures/vla_v541.svg" title="Open the full-size figure">
+      <img src="figures/vla_v541.svg" alt="Block diagram of one clock tick, in two panes. Top: the last 8 tokens are embedded, normalized, mixed by a 1x1 convolution and placed on a 7x7 grid by a learned map, scaled and shifted per position, and passed through six ConvDelta blocks, each a causal time conv, three 3x3 conv-BatchNorm-ReLU layers and a delta-rule memory with its state S; a 3x3 projection, a decoder tree of three 3x3 convolutions and the frozen output layer give the next token, which is fed back as the next input. Bottom: one block in detail: RMS norm and a 3-tick FIFO feeding the time conv, the three convs with a residual, five 1x1 projections to q, k, v, beta and alpha, the gated delta rule S = alpha S (I - beta k k^T) + beta v k^T on a 32x32 memory per position and head, the read S q, and a 1x1 output added back.">
     </a>
-    <figcaption>One clock tick of the published model (v540). Top: the whole model, text only: the last 8
+    <figcaption>One clock tick of the published model (v541). Top: the whole model, text only: the last 8
     tokens on a learned 7 × 7 map, six ConvDelta blocks, and the decoder. Bottom: one block, a causal time conv,
     three 3 × 3 convs, and a gated delta-rule memory at every grid position (6 heads of 32 × 32). The
     <a href="https://github.com/siliconperception/vla/blob/main/docs/spec/README.md">functional spec</a> walks
@@ -152,25 +152,25 @@
 
   <h2>Scores</h2>
   <div class="tablewrap"><table>
-    <tr><th></th><th class="n">VLA v540</th><th class="n">pythia-70m</th><th class="n">pythia-70m</th><th class="n">pythia-70m</th></tr>
-    <tr><td>training tokens</td><td class="n">12.8 M</td><td class="n">8.4 M</td><td class="n">16.8 M</td><td class="n">300 B</td></tr>
-    <tr><td>FineWeb held-out, nats/token</td><td class="n">5.186</td><td class="n">11.025</td><td class="n">10.894</td><td class="n">3.731</td></tr>
-    <tr><td>BabyLM 2026 dev, nats/token</td><td class="n">4.988</td><td class="n">11.033</td><td class="n">10.848</td><td class="n">3.250</td></tr>
-    <tr><td>BLiMP, % of 1,005 pairs</td><td class="n">64.0</td><td class="n">53.3</td><td class="n">52.7</td><td class="n">75.7</td></tr>
-    <tr><td>ComVE, % of 999 pairs</td><td class="n">65.0</td><td class="n">53.5</td><td class="n">54.0</td><td class="n">69.7</td></tr>
+    <tr><th></th><th class="n">VLA v541</th><th class="n">pythia-70m</th><th class="n">pythia-70m</th><th class="n">pythia-70m</th></tr>
+    <tr><td>training tokens</td><td class="n">81.9 M</td><td class="n">67.1 M</td><td class="n">134.2 M</td><td class="n">300 B</td></tr>
+    <tr><td>FineWeb held-out, nats/token</td><td class="n">4.680</td><td class="n">9.823</td><td class="n">9.002</td><td class="n">3.731</td></tr>
+    <tr><td>BabyLM 2026 dev, nats/token</td><td class="n">4.384</td><td class="n">9.448</td><td class="n">8.635</td><td class="n">3.250</td></tr>
+    <tr><td>BLiMP, % of 1,005 pairs</td><td class="n">68.6</td><td class="n">52.0</td><td class="n">52.7</td><td class="n">75.7</td></tr>
+    <tr><td>ComVE, % of 999 pairs</td><td class="n">65.7</td><td class="n">54.0</td><td class="n">56.3</td><td class="n">69.7</td></tr>
   </table></div>
   <p class="note">pythia-70m (EleutherAI) is a transformer of similar total size with the same tokenizer, shown
   at about this model's training tokens and fully trained; same documents, same pairs, same scoring rule (see the
   <a href="https://huggingface.co/siliconperception/vla">model card</a>). Pythia was trained on the Pile, this
-  model on FineWeb. Matched tokens are not matched training: at 8.4 M and 16.8 M tokens pythia has made only 4
-  and 8 updates (of 2 M tokens each), at the very start of its warm-up; this model has made 1,562 (of 8,192
+  model on FineWeb. Matched tokens are not matched training: at 67.1 M and 134.2 M tokens pythia has made only 32
+  and 64 updates (of 2 M tokens each), early in its warm-up; this model has made 10,000 (of 8,192
   tokens). Fully trained pythia-70m is the fair reference.</p>
 
   <h2>Samples</h2>
-  <p>From the prompt in bold, with the published weights (12.8 M tokens of training). Locally fluent in places,
+  <p>From the prompt in bold, with the published weights (81.9 M tokens of training). Locally fluent in places,
   repetitive, not yet coherent:</p>
-  <blockquote><b>The colors of the rainbow are</b> also unique, but not the most recognizable images of the color. The colour images are dark and decorating with pink colors.</blockquote>
-  <blockquote><b>My grandmother&#x27;s recipe for apple pie starts with</b> 2/1 cup cream: 1 cup. Sweet syrup, chocolate syrup (food &amp; wine) to cook with tasty desserts, plus 6 cups, sugar syrup, baking and baking, cook cooking and cook.</blockquote>
+  <blockquote><b>The best way to learn a new language is</b> to get comfortable with its touch. It is as if they don&#x27;t want to be in the way of a book.</blockquote>
+  <blockquote><b>The history of the bicycle began in</b> 2005. From the very first time, I’m doing this by myself or our big body to climb with my bike.</blockquote>
 
   <h2>Try it</h2>
 <pre><code>git clone https://github.com/siliconperception/vla && cd vla

@@ -1,7 +1,7 @@
 # VLA: a recurrent CNN vision-language-action model
 
 `vla.py` is a language model with a fixed-size state and no positional encoding, built from convolutions on a
-7 × 7 grid. The published model, v540, is a ConvDelta model. Its input is the last 8 tokens, placed on the grid
+7 × 7 grid. The published model, v541, is a ConvDelta model. Its input is the last 8 tokens, placed on the grid
 by a learned map. Six residual blocks follow, each a causal time conv, three 3 × 3 convolutions, and an
 associative memory at every grid position (6 heads of 32 × 32) written by the gated delta rule. Every clock tick
 the model reads one token, updates its memories, and decodes the next token.
@@ -20,9 +20,9 @@ off-chip DRAM. One set of small convolution kernels is reused at every grid posi
 thirty million weights drive a state of 2.1 million values. And the state never grows, so every tick does the
 same work in the same time, however long the model has been running.
 
-![One clock tick of the VLA](docs/figures/vla_v540.svg)
+![One clock tick of the VLA](docs/figures/vla_v541.svg)
 
-*One clock tick of the published model, v540. Top: the whole model, text only: the last 8 tokens on a learned
+*One clock tick of the published model, v541. Top: the whole model, text only: the last 8 tokens on a learned
 7 × 7 map, six ConvDelta blocks, and the decoder. Bottom: one block, a causal time conv, three 3 × 3 convs, and a
 gated delta-rule memory at every grid position. The [functional spec](docs/spec/README.md) walks through the
 figure part by part.*
@@ -86,13 +86,13 @@ discontinuities of a robot's continuous perception.
 ## Training your own
 
 ```bash
-# v540's configuration from scratch: text from FineWeb (sample-10BT), 32 rows x 256-tick windows, AdamW with
-# the learning rate warmed from 1e-5 to 0.001 over 256,000 steps
+# v541's configuration from scratch: text from FineWeb (sample-10BT), 32 rows x 256-tick windows, AdamW with
+# the learning rate warmed from 1e-5 to 1e-4 over 256,000 steps
 python vla.py --mix fineweb:1 --shards 14 --shard_offset 1 --lm --context 7 --c_context 384 --linout_kernel 3 --attn 0 \
     --convdelta 6 --cd_heads 6 --cd_dim 32 --cd_taps 4 --cd_convs 3 --cd_chunk 32 --grid_hist 8 \
     --batch 32 --bptt 256 --ckpt_ticks --reset_prob 0.5 --clock_hz 25 --nul_weight 1 --loss_norm words \
     --optimizer adamw --betas 0.9,0.95 --weight_decay 0 \
-    --schedule decay --lr_max 1e-5 --lr_final 0.001 --decay_steps 256000 --decay_start 0 \
+    --schedule decay --lr_max 1e-5 --lr_final 0.0001 --decay_steps 256000 --decay_start 0 \
     --save checkpoint/my_run.pt --log log/exp.my_run
 ```
 

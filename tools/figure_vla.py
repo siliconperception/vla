@@ -1,6 +1,6 @@
 """Draw docs/figures/vla_<model>.svg: one clock tick of a VLA model, 16:9 (1920 x 1080).
 
-usage: python tools/figure_vla.py [--model v498|v499|v502|v505|v511|v531|v533|v536|v538|v540] [--out OUT]
+usage: python tools/figure_vla.py [--model v498|v499|v502|v505|v511|v531|v533|v536|v538|v540|v541] [--out OUT]
 
 v498: recurrent CNN + two order-2 Legendre memories (4096, 64 ticks) + copy + recall attention, never
 reset. v499: no registers, the recall attention's ring is the whole state, reset at each example.
@@ -14,13 +14,17 @@ text-only model of 6 residual blocks of per-tick convs, each carrying a gated de
 position, trained a window at a time; 1920 x 2160, the whole model above and one block below. v538: v536
 with --grid_hist 8 (the input grid a learned map of the last 8 tokens, starting as concentric rings) and
 --reset_prob 0.5 (half the training documents start unreset: a stress test for perception discontinuities).
-v540: v538 with a third conv 3x3 + BN + ReLU in every block (--cd_convs 3)."""
+v540: v538 with a third conv 3x3 + BN + ReLU in every block (--cd_convs 3).
+v541: v540's model, trained at a 10x lower learning rate (--lr_final 0.0001); drawn as v540."""
 import argparse
 
 ap = argparse.ArgumentParser()
-ap.add_argument('--model', default='v498', choices=('v498', 'v499', 'v502', 'v505', 'v511', 'v531', 'v533', 'v536', 'v538', 'v540'))
+ap.add_argument('--model', default='v498', choices=('v498', 'v499', 'v502', 'v505', 'v511', 'v531', 'v533', 'v536', 'v538', 'v540', 'v541'))
 ap.add_argument('--out', default=None)
 a = ap.parse_args()
+NAME = a.model                            # the title and file name
+if a.model == 'v541':
+    a.model = 'v540'                      # same model as v540
 LMU = a.model == 'v498'                   # Legendre memories + copy
 CASC = a.model == 'v502'                  # EMA + residual copy, RMSnorm reads
 REGS = LMU or CASC                        # (v499: the ring alone)
@@ -365,7 +369,7 @@ def draw_v505():
            '(reset to 0 at each example)', w=470)
     out.append('</g>')
     out.append('</svg>')
-    open(a.out or f'docs/figures/vla_{a.model}.svg', 'w').write('\n'.join(out))
+    open(a.out or f'docs/figures/vla_{NAME}.svg', 'w').write('\n'.join(out))
 
 
 def draw_v531():
@@ -524,7 +528,7 @@ def draw_v531():
                      (COL['smp'], False, 'softmax + sample (+ <NUL> logit)')],
            '(reset to 0 at each example)', w=440)
     out.append('</svg>')
-    open(a.out or f'docs/figures/vla_{a.model}.svg', 'w').write('\n'.join(out))
+    open(a.out or f'docs/figures/vla_{NAME}.svg', 'w').write('\n'.join(out))
 
 
 if a.model in ('v505', 'v511'):
@@ -541,7 +545,7 @@ def draw_v536():
     # ── pane A: the whole model ─────────────────────────────────────────────
     V8 = a.model in ('v538', 'v540')      # --grid_hist 8 (learned ring input) and --reset_prob 0.5
     NC = 3 if a.model == 'v540' else 2    # --cd_convs: conv 3x3 + BN + ReLU layers per block
-    text(30, 38, f'VLA {a.model} — one clock tick (40 ms): a ConvDelta language model, 6 residual blocks of '
+    text(30, 38, f'VLA {NAME} — one clock tick (40 ms): a ConvDelta language model, 6 residual blocks of '
          'per-tick convs, each with a gated delta-rule memory per grid position', 22, anchor='start', weight='bold')
     text(30, 62, 'A · the whole model.  --lm: text only · C 384 · 7×7 grid · 6 blocks · H 6 heads × d 32 per position '
          '· 25 Hz · ' + (('29.97M' if NC == 3 else '22.01M') + ' trainable · fixed state 2,145,073 values · input: the last 8 tokens on a learned map '
@@ -818,7 +822,7 @@ def draw_v536():
            '(S, and the FIFO: reset at each document start)', w=640)
     out.append('</g>')
     out.append('</svg>')
-    open(a.out or f'docs/figures/vla_{a.model}.svg', 'w').write('\n'.join(out))
+    open(a.out or f'docs/figures/vla_{NAME}.svg', 'w').write('\n'.join(out))
 
 
 if a.model in ('v531', 'v533'):
@@ -1082,4 +1086,4 @@ if REGS:
     text(288, y + 4, 'old state into the update', 12, anchor='start')
 
 out.append('</svg>')
-open(a.out or f'docs/figures/vla_{a.model}.svg', 'w').write('\n'.join(out))
+open(a.out or f'docs/figures/vla_{NAME}.svg', 'w').write('\n'.join(out))
