@@ -4193,10 +4193,11 @@ def _model_graph(model):
         mb = re.match(r'cd\.(\d+)\.(mix\.0|out)$', r['name']) if cd is not None else None
         if mb and mb.group(2) == 'mix.0':        # --convdelta: the block's time conv, then its convs
             b = cd[int(mb.group(1))]
-            out.append(dict(name=f'cd.{mb.group(1)}.tconv <- RMS(x), FIFO[t-1]',
+            out.append(dict(name=f'cd.{mb.group(1)}.tconv <- RMS(x)' + (', FIFO[t-1]' if b.taps > 1 else ''),
                             op=(f'depthwise conv over RMS(x) and a {b.taps - 1}-stage gamma ladder, residual add'
                                 if b.gz is not None else
-                                f'causal depthwise time conv over {b.taps} ticks, residual add'),
+                                f'causal depthwise time conv over {b.taps} ticks, residual add' if b.taps > 1 else
+                                'per-channel scale of RMS(x), residual add (no FIFO)'),
                             inp=r['inp'], out=r['inp'],
                             tr=b.tconv.numel() + (b.gz.numel() if b.gz is not None else 0), fr=0))
         if mb and mb.group(2) == 'out':          # ... and its memories, read before out
