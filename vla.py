@@ -285,6 +285,12 @@ parser.add_argument('--cd_windows', default=None, metavar='LO:HI,...',
                     help='--convdelta: base windows per block, log-spaced from LO to HI over its heads; one '
                          'LO:HI for every block, or one per block (default 4:4096). Given with --load, it '
                          'replaces the loaded base windows')
+parser.add_argument('--cd_gamma', default=False, action=argparse.BooleanOptionalAction,
+                    help='--convdelta: the time conv\'s FIFO becomes a gamma ladder (de Vries & Principe 1992): '
+                         'stage k(t+1) = c stage k(t) + (1 - c) stage k-1(t), stage 0 = RMS(x), c = 0.99 tanh(z) '
+                         'learned per block and channel. z starts at zero, where the ladder is exactly the FIFO '
+                         '(plain copies of the last ticks); c > 0 trades time resolution for reach (stage k '
+                         'peaks about k/(1 - c) ticks back). Same state. Restored by --load')
 parser.add_argument('--cd_fw_kernel', default=0, type=int, metavar='K',
                     help='--cd_fw: 0 = the memory is a 3x3 kernel, its keys/queries the 3x3 patches of a 1x1 '
                          'projection (d x 9d per head); K >= 1 = a 1x1 kernel, each position\'s own key/query '
@@ -882,7 +888,7 @@ _ARCH_ARGS = ('context', 'n_hidden', 'c_context', 'depth', 'kernel', 'tokenizer'
               'image_encoder', 'audio_encoder', 'streams', 'linout_kernel', 'learn_win',
               'learn_regs', 'lmu', 'attn', 'attn_ch', 'attn_heads', 'attn_dim', 'attn_age', 'read_rmsnorm',
               'layers', 'write_gate', 'convdelta', 'cd_heads', 'cd_dim', 'cd_taps', 'lm', 'grid_hist',
-              'cd_convs', 'cd_fw', 'cd_fw_kernel', 'cd_fw_dk', 'cd_neg', 'cd_band')
+              'cd_convs', 'cd_fw', 'cd_fw_kernel', 'cd_fw_dk', 'cd_neg', 'cd_band', 'cd_gamma')
 
 
 def _parse_mix():
@@ -1426,6 +1432,33 @@ class ContextCNN(nn.Module):
         return x
 
 
+def _ema_scan(y, c, reset, h0, chunk=16):
+    """--cd_gamma: one stage of the ladder over a sequence, chunkwise in parallel.
+    s(t+1) = c s(t) + (1 - c) y(t) per channel, s(t) zero entering a reset tick; y [B, T, C, P],
+    c [C], reset [B, T] bool, h0 [B, C, P] = s(0) -> (s(t) for t < T [B, T, C, P], s(T))."""
+    B, T, C, P = y.shape
+    L = min(chunk, T)
+    pw = [torch.ones_like(c)]
+    for _ in range(L):           # c^0 .. c^L by products (pow's gradient is NaN at c = 0)
+        pw.append(pw[-1] * c)
+    pw = torch.stack(pw, 1)                                                # [C, L + 1]
+    ar = torch.arange(L, device=y.device)
+    yb = y * (1 - c)[None, None, :, None]
+    s, outs = h0, []
+    for t0 in range(0, T, L):
+        n = min(L, T - t0)
+        rc = reset[:, t0:t0 + n]
+        seg = torch.cumsum(rc.long(), 1)                                   # resets so far in the chunk
+        diff = ar[:n, None] - ar[None, :n]                                 # t - j
+        D = pw[:, diff.clamp(min=0)] * (diff >= 0)                         # [C, n, n]: c^(t-j), j <= t
+        W = D[None] * (seg[:, :, None] == seg[:, None, :])[:, None]        # [B, C, n, n]
+        o = torch.einsum('bctj,bjcp->btcp', W, yb[:, t0:t0 + n])          # s(t+1), t in the chunk
+        o = o + (pw[:, 1:n + 1].T[None, :, :, None] * (seg == 0)[:, :, None, None]) * s[:, None]
+        outs.append(torch.cat([s[:, None], o[:, :-1]], 1) * (~rc)[:, :, None, None])
+        s = o[:, -1]
+    return torch.cat(outs, 1), s
+
+
 def _delta_scan(q, k, v, beta, loga, reset, S0, chunk=64):
     """--convdelta: the gated delta rule over a sequence, chunkwise in parallel.
     q, k [N, T, dk] (L2-normalized), v [N, T, dv], beta, loga [N, T] (write strength, log decay),
@@ -1516,7 +1549,7 @@ class ConvDeltaBlock(nn.Module):
     memories S are carried tick to tick (_delta_scan); step does one tick."""
 
     def __init__(self, C, H, d, taps, S, bn_momentum=0.1, n_convs=2, fw=0, fw_chunk=2, fw_kernel=0, fw_dk=64,
-                 neg=False, band=0.0):
+                 neg=False, band=0.0, gamma=False):
         super().__init__()
         self.C, self.H, self.d, self.taps, self.S = C, H, d, taps, S
         self.fw, self.fw_chunk = int(fw), int(fw_chunk)
@@ -1526,6 +1559,8 @@ class ConvDeltaBlock(nn.Module):
         self.fw_k = int(fw_kernel or 0)
         self.fw_D = int(fw_dk) if self.fw_k else 9 * d
         self.tconv = nn.Parameter(torch.zeros(taps, C))                    # [lag, channel]
+        # --cd_gamma: the FIFO is a gamma ladder, c = 0.99 tanh(gz) per channel (0: the FIFO)
+        self.gz = nn.Parameter(torch.zeros(C)) if gamma else None
         bn = dict(affine=False, momentum=bn_momentum or None)
         self.mix = nn.Sequential(*[m for _ in range(int(n_convs)) for m in
                                    (nn.Conv2d(C, C, 3, padding=1), nn.BatchNorm2d(C, **bn), nn.ReLU())])
@@ -1646,8 +1681,12 @@ class ConvDeltaBlock(nn.Module):
         Sk = Sm @ k[..., None]                                             # [B, P, H, dv, 1]
         Sm = a * Sm - (a * b) * Sk @ k[..., None, :] + b * v[..., None] @ k[..., None, :]
         o = (Sm @ q[..., None])[..., 0]
+        nxt = hist[:, :self.taps - 1]                                      # the FIFO shifted by a tick
+        if self.gz is not None:      # the gamma ladder: each stage leaks toward the one below
+            c = 0.99 * torch.tanh(self.gz)[None, None, :, None, None]
+            nxt = c * fifo + (1 - c) * nxt
         parts = [Sm.permute(0, 2, 3, 4, 1).reshape(B, nm, self.S, self.S),
-                 hist[:, :self.taps - 1].reshape(B, -1, self.S, self.S)]
+                 nxt.reshape(B, -1, self.S, self.S)]
         if self.fw:                  # the conv memories: one rank-P write per head
             fq, fk, fv, fb, fa = self._fw_proj(u)
             Sf = self._fw_get(st)
@@ -1668,13 +1707,21 @@ class ConvDeltaBlock(nn.Module):
         nm = H * d * d
         fifo = st[:, nm:nm + n * C].reshape(B, n, C, self.S, self.S)
         r = _rms_pos(x.flatten(0, 1)).view(B, T, C, self.S, self.S)
-        ext = torch.cat([fifo.flip(1), r], 1)                              # [B, n + T]: oldest first
-        doc = torch.cat([reset.new_zeros(B, n, dtype=torch.long), torch.cumsum(reset.long(), 1)], 1)
-        y = 0
-        for j in range(self.taps):                                         # lag j
-            src = ext[:, n - j:n - j + T]
-            ok = (doc[:, n - j:n - j + T] == doc[:, n:]).to(x.dtype)
-            y = y + src * (self.tconv[j][None, None, :, None, None] * ok[:, :, None, None, None])
+        if self.gz is not None:      # --cd_gamma: the ladder's stages over the window, one scan each
+            c, P_ = 0.99 * torch.tanh(self.gz), self.S * self.S
+            stage, y, ends = r.reshape(B, T, C, P_), r * self.tconv[0][None, None, :, None, None], []
+            for j in range(1, self.taps):
+                stage, sT = _ema_scan(stage, c, reset, fifo[:, j - 1].reshape(B, C, P_))
+                y = y + stage.view(B, T, C, self.S, self.S) * self.tconv[j][None, None, :, None, None]
+                ends.append(sT.view(B, C, self.S, self.S))
+        else:
+            ext = torch.cat([fifo.flip(1), r], 1)                          # [B, n + T]: oldest first
+            doc = torch.cat([reset.new_zeros(B, n, dtype=torch.long), torch.cumsum(reset.long(), 1)], 1)
+            y = 0
+            for j in range(self.taps):                                     # lag j
+                src = ext[:, n - j:n - j + T]
+                ok = (doc[:, n - j:n - j + T] == doc[:, n:]).to(x.dtype)
+                y = y + src * (self.tconv[j][None, None, :, None, None] * ok[:, :, None, None, None])
         u = self._mixed((x + y).flatten(0, 1))
         q, k, v, beta, loga = self._proj(u)                                # [B*T, P, H, ...]
 
@@ -1696,11 +1743,13 @@ class ConvDeltaBlock(nn.Module):
             of = of.view(B, self.fw, T, P, d).permute(0, 2, 3, 1, 4).reshape(B * T, P, self.fw, d)
             o = torch.cat([o, of], 2)
         x = (u + self._read_out(o, B * T)).view(B, T, C, self.S, self.S)
-        # the FIFO after the last tick: the last n RMS(x), zero where a reset came after them
-        last = ext[:, T:].flip(1)                                          # newest first
-        okl = (doc[:, T:].flip(1) == doc[:, -1:]).to(x.dtype)
         ST = ST.view(B, P, H, d, d).permute(0, 2, 3, 4, 1).reshape(B, nm, self.S, self.S)
-        parts = [ST, (last * okl[:, :, None, None, None]).reshape(B, n * C, self.S, self.S)]
+        if self.gz is not None:      # the ladder after the last tick
+            parts = [ST, torch.stack(ends, 1).reshape(B, n * C, self.S, self.S)]
+        else:                        # the FIFO after the last tick: the last n RMS(x), zero where a reset came after them
+            last = ext[:, T:].flip(1)                                      # newest first
+            okl = (doc[:, T:].flip(1) == doc[:, -1:]).to(x.dtype)
+            parts = [ST, (last * okl[:, :, None, None, None]).reshape(B, n * C, self.S, self.S)]
         if self.fw:
             parts.append(self._fw_put(SfT, B))
         return x, torch.cat(parts, 1)
@@ -2362,7 +2411,7 @@ class VLAModel(nn.Module, _HubMixin):
                  learn_regs=(), lmu=False, attn=0, attn_ch=2, attn_heads=8, attn_dim=64, attn_age=True,
                  read_rmsnorm=False, layers=1, up_windows=None, write_gate=False,
                  convdelta=0, cd_heads=6, cd_dim=32, cd_taps=4, cd_chunk=64, grid_hist=0,
-                 cd_convs=2, cd_fw=0, cd_fw_chunk=2, cd_fw_kernel=0, cd_fw_dk=64, cd_neg=False, cd_band=0.0):
+                 cd_convs=2, cd_fw=0, cd_fw_chunk=2, cd_fw_kernel=0, cd_fw_dk=64, cd_neg=False, cd_band=0.0, cd_gamma=False):
         super().__init__()
         from transformers import AutoModelForCausalLM
         repo = _TOKENIZERS[tokenizer]
@@ -2520,7 +2569,7 @@ class VLAModel(nn.Module, _HubMixin):
         self.cd = (nn.ModuleList(ConvDeltaBlock(c_context, int(cd_heads), int(cd_dim), int(cd_taps), S,
                                                 bn_momentum, int(cd_convs or 2), int(cd_fw or 0), int(cd_fw_chunk),
                                                 int(cd_fw_kernel or 0), int(cd_fw_dk or 64), bool(cd_neg),
-                                                float(cd_band or 0))
+                                                float(cd_band or 0), bool(cd_gamma))
                                  for _ in range(int(convdelta)))
                    if convdelta else None)
         self.cd_chunk, self.cd_ckpt = int(cd_chunk), False   # cd_ckpt: checkpoint each block (seq)
@@ -3937,7 +3986,7 @@ model = VLAModel(S=args.context, n_hidden=args.n_hidden, c_context=args.c_contex
                  layers=args.layers, write_gate=args.write_gate,
                  convdelta=args.convdelta, cd_heads=args.cd_heads, cd_dim=args.cd_dim, cd_taps=args.cd_taps,
                  grid_hist=args.grid_hist, cd_convs=args.cd_convs, cd_fw=args.cd_fw, cd_fw_chunk=args.cd_fw_chunk,
-                 cd_fw_kernel=args.cd_fw_kernel, cd_fw_dk=args.cd_fw_dk, cd_neg=args.cd_neg, cd_band=args.cd_band,
+                 cd_fw_kernel=args.cd_fw_kernel, cd_fw_dk=args.cd_fw_dk, cd_neg=args.cd_neg, cd_band=args.cd_band, cd_gamma=args.cd_gamma,
                  cd_chunk=args.cd_chunk,
                  up_windows=[float(w) for w in str(args.up_ema).split(',') if w.strip()] if args.up_ema else None)
 if _loaded_ckpt is not None:
@@ -3962,6 +4011,9 @@ if _loaded_ckpt is not None:
     if any(re.match(r'cd\.\d+\.neg\.', k) for k in missing) and not any('.neg.' in k for k in _sd):
         print('--cd_neg: the beta extension is new, starting at zero (beta unchanged)', flush=True)
         missing = [k for k in missing if not re.match(r'cd\.\d+\.neg\.', k)]
+    if any(re.match(r'cd\.\d+\.gz$', k) for k in missing) and not any(k.endswith('.gz') for k in _sd):
+        print('--cd_gamma: the ladder is new, starting as the FIFO (c = 0)', flush=True)
+        missing = [k for k in missing if not re.match(r'cd\.\d+\.gz$', k)]
     bad = [k for k in missing if not re.match(r'(text|voc|img)_dec\.nul\.|surp_mean$|gain_mean$|win_theta$', k)] + \
           [k for k in unexpected if not ((args.inner_voice or model.streams == 3)
                                          and k.startswith('text_dec.nul.'))]
@@ -4045,8 +4097,11 @@ def _model_graph(model):
         if mb and mb.group(2) == 'mix.0':        # --convdelta: the block's time conv, then its convs
             b = cd[int(mb.group(1))]
             out.append(dict(name=f'cd.{mb.group(1)}.tconv <- RMS(x), FIFO[t-1]',
-                            op=f'causal depthwise time conv over {b.taps} ticks, residual add',
-                            inp=r['inp'], out=r['inp'], tr=b.tconv.numel(), fr=0))
+                            op=(f'depthwise conv over RMS(x) and a {b.taps - 1}-stage gamma ladder, residual add'
+                                if b.gz is not None else
+                                f'causal depthwise time conv over {b.taps} ticks, residual add'),
+                            inp=r['inp'], out=r['inp'],
+                            tr=b.tconv.numel() + (b.gz.numel() if b.gz is not None else 0), fr=0))
         if mb and mb.group(2) == 'out':          # ... and its memories, read before out
             b = cd[int(mb.group(1))]
             mem = (f'{b.H} heads of {b.d}x{b.d} per position: S = a S (I - b k k^T) + b v k^T, '
@@ -4059,7 +4114,9 @@ def _model_graph(model):
                 mem += f'; {b.fw} conv fast-weight heads of {b.d}x{b.fw_D}'
             out.append(dict(name=f'cd.{mb.group(1)} (delta memory)', op=mem,
                             inp=f'{3 * (b.H + b.fw)}x{b.d}x{model.S}x{model.S}', out=r['inp'],
-                            tr=sum(p.numel() for n, p in b.named_parameters(recurse=False) if n != 'tconv'), fr=0))
+                            tr=sum(p.numel() for n, p in b.named_parameters(recurse=False)
+                                   if n not in ('tconv', 'gz') and p.requires_grad),
+                            fr=sum(p.numel() for n, p in b.named_parameters(recurse=False) if not p.requires_grad)))
         if r['name'] == 'ctx_cat' and cd is not None and G:   # --grid_hist: per history token, then the map
             C = r['out'].split('x')[0]
             out.append(dict(r, op=r['op'] + ', per token', inp=f'{G}x{r["inp"].split("x")[0]}',
