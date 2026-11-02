@@ -270,6 +270,14 @@ parser.add_argument('--grid_hist', default=0, type=int, metavar='K',
                          'learned weights a[j, p] over tokens t-j (start: concentric rings, the current token '
                          'on the outer ring and t-1, t-2, t-3 inward to the centre; older tokens at 0)')
 parser.add_argument('--cd_heads', default=6, type=int, help='--convdelta: memory heads per position')
+parser.add_argument('--cd_convs', default=2, type=int, help='--convdelta: 3x3 conv + BN + ReLU layers per block')
+parser.add_argument('--cd_fw_chunk', default=2, type=int,
+                    help='--cd_fw: scan chunk (ticks); its backward keeps ~T x chunk x P^2 values per head')
+parser.add_argument('--cd_fw', default=0, type=int, metavar='F',
+                    help='--convdelta: F conv fast-weight heads per block, besides the per-position heads: '
+                         'each a single memory [d, 9d] shared by all positions, a 3x3 kernel written by the '
+                         'delta rule from every position\'s key patch and read by convolving it over the '
+                         'query grid (translation-invariant; its size does not grow with the grid)')
 parser.add_argument('--cd_dim', default=32, type=int, help='--convdelta: key/value width per head')
 parser.add_argument('--cd_taps', default=4, type=int, help='--convdelta: causal time conv taps (this tick + taps-1)')
 parser.add_argument('--cd_chunk', default=64, type=int, help='--convdelta: scan chunk (ticks)')
@@ -854,7 +862,8 @@ _ARCH_ARGS = ('context', 'n_hidden', 'c_context', 'depth', 'kernel', 'tokenizer'
               'ctx_read_norm', 'dec_tree_kernels', 'dec_width', 'bn_momentum', 'init',
               'image_encoder', 'audio_encoder', 'streams', 'linout_kernel', 'learn_win',
               'learn_regs', 'lmu', 'attn', 'attn_ch', 'attn_heads', 'attn_dim', 'attn_age', 'read_rmsnorm',
-              'layers', 'write_gate', 'convdelta', 'cd_heads', 'cd_dim', 'cd_taps', 'lm', 'grid_hist')
+              'layers', 'write_gate', 'convdelta', 'cd_heads', 'cd_dim', 'cd_taps', 'lm', 'grid_hist',
+              'cd_convs', 'cd_fw')
 
 
 def _parse_mix():
@@ -1430,6 +1439,39 @@ def _delta_scan(q, k, v, beta, loga, reset, S0, chunk=64):
     return torch.cat(outs, 1), S
 
 
+def _convfw_scan(q, k, v, b, loga, reset, S0, chunk=8):
+    """--cd_fw: the conv fast-weight delta rule over a sequence, chunkwise in parallel.
+    q, k [N, T, P, D] (unit 3x3 patches, D = 9 dk), v [N, T, P, dv], b [N, T, P] (beta / P),
+    loga [N, T], reset [N, T] (zero state entering that tick), S0 [N, dv, D] -> (o [N, T, P, dv], S_T),
+    the same as stepping S <- a S (I - sum_p b_p k_p k_p^T) + sum_p b_p v_p k_p^T, o_p = S q_p. Each tick's
+    P writes all read S_{t-1}: within a chunk the items (tick, position) solve a unit block-lower-
+    triangular system (items of one tick do not see each other), as in _delta_scan."""
+    N, T, P, D = k.shape
+    outs, S_ = [], S0
+    for c0 in range(0, T, chunk):
+        sl = slice(c0, min(T, c0 + chunk))
+        C = k[:, sl].shape[1]
+        G = torch.cumsum(loga[:, sl], 1)
+        seg = torch.cumsum(reset[:, sl].long(), 1)
+        live = torch.ones(C, C, dtype=torch.bool, device=k.device).tril() & (seg[:, :, None] == seg[:, None, :])
+        Gam = torch.exp(torch.where(live, G[:, :, None] - G[:, None, :], float('-inf')))
+        g0 = torch.exp(G) * (seg == 0)
+        kc, qc = k[:, sl].reshape(N, C * P, D), q[:, sl].reshape(N, C * P, D)
+        vc, bc = v[:, sl].reshape(N, C * P, -1), b[:, sl].reshape(N, C * P)
+        tick = torch.arange(C, device=k.device).repeat_interleave(P)
+        GI = Gam[:, tick][:, :, tick]
+        A = GI * (tick[:, None] > tick[None, :]) * (kc @ kc.transpose(1, 2))
+        L = torch.eye(C * P, dtype=k.dtype, device=k.device) + bc[:, :, None] * A
+        g0i = g0[:, tick]
+        Ut = torch.linalg.solve_triangular(L, bc[:, :, None] * vc, upper=False, unitriangular=True)
+        Wk = torch.linalg.solve_triangular(L, (bc * g0i)[:, :, None] * kc, upper=False, unitriangular=True)
+        U = Ut - Wk @ S_.transpose(1, 2)
+        outs.append((g0i[:, :, None] * (qc @ S_.transpose(1, 2)) +
+                     (GI * (tick[:, None] >= tick[None, :]) * (qc @ kc.transpose(1, 2))) @ U).view(N, C, P, -1))
+        S_ = g0[:, -1, None, None] * S_ + (U * Gam[:, -1][:, tick][:, :, None]).transpose(1, 2) @ kc
+    return torch.cat(outs, 1), S_
+
+
 class ConvDeltaBlock(nn.Module):
     """--convdelta: one residual block. Per tick, on x [B, C, S, S]:
          u = x + TimeConv(RMS(x))            causal depthwise conv over this and the last
@@ -1442,13 +1484,27 @@ class ConvDeltaBlock(nn.Module):
     The convs never read the state, so a whole sequence runs at once (seq) and only the
     memories S are carried tick to tick (_delta_scan); step does one tick."""
 
-    def __init__(self, C, H, d, taps, S, bn_momentum=0.1):
+    def __init__(self, C, H, d, taps, S, bn_momentum=0.1, n_convs=2, fw=0, fw_chunk=2):
         super().__init__()
         self.C, self.H, self.d, self.taps, self.S = C, H, d, taps, S
+        self.fw, self.fw_chunk = int(fw), int(fw_chunk)
         self.tconv = nn.Parameter(torch.zeros(taps, C))                    # [lag, channel]
         bn = dict(affine=False, momentum=bn_momentum or None)
-        self.mix = nn.Sequential(nn.Conv2d(C, C, 3, padding=1), nn.BatchNorm2d(C, **bn), nn.ReLU(),
-                                 nn.Conv2d(C, C, 3, padding=1), nn.BatchNorm2d(C, **bn), nn.ReLU())
+        self.mix = nn.Sequential(*[m for _ in range(int(n_convs)) for m in
+                                   (nn.Conv2d(C, C, 3, padding=1), nn.BatchNorm2d(C, **bn), nn.ReLU())])
+        # --cd_fw F: F conv fast-weight heads, each one memory [d, 9 d] shared by every position
+        # (a 3x3 kernel over the key grid): written from every position's 3x3 key patch at once,
+        # read by convolving it over the query grid (see _convfw_scan)
+        if self.fw:
+            self.fw_qkv = nn.Conv2d(C, 3 * self.fw * d, 1)
+            self.fw_beta = nn.Conv2d(C, self.fw, 1)                        # per position
+            self.fw_alpha = nn.Conv2d(C, self.fw, 1)                       # on the grid mean: per head
+            with torch.no_grad():
+                for m in (self.fw_beta, self.fw_alpha):
+                    m.weight.zero_()
+                    m.bias.zero_()
+            wf = torch.logspace(math.log10(16), math.log10(1024), self.fw) if self.fw > 1 else torch.tensor([64.0])
+            self.fw_lam = nn.Parameter(-torch.log(wf))
         self.qkv = nn.Conv2d(C, 3 * H * d, 1)
         self.gates = nn.Conv2d(C, 2 * H, 1)                                # beta, alpha logits
         with torch.no_grad():
@@ -1457,15 +1513,45 @@ class ConvDeltaBlock(nn.Module):
         # base decay windows log-spaced 4 .. 4096 ticks over the heads
         w = torch.logspace(math.log10(4), math.log10(4096), H) if H > 1 else torch.tensor([64.0])
         self.lam = nn.Parameter(-torch.log(w))
-        self.out = nn.Conv2d(H * d, C, 1)
+        self.out = nn.Conv2d((H + self.fw) * d, C, 1)
         with torch.no_grad():
             self.out.weight.zero_()
             self.out.bias.zero_()
 
     @property
+    def fw_ch(self):
+        """--cd_fw: state channels holding the conv memories (F x d x 9d values, padded to the grid)."""
+        return -(-self.fw * self.d * 9 * self.d // (self.S * self.S)) if self.fw else 0
+
+    @property
     def state_ch(self):
-        """State channels per grid position: the memories, then the FIFO of past RMS(x)."""
-        return self.H * self.d * self.d + (self.taps - 1) * self.C
+        """State channels per grid position: the memories, the FIFO of past RMS(x), the conv memories."""
+        return self.H * self.d * self.d + (self.taps - 1) * self.C + self.fw_ch
+
+    def _fw_get(self, st):
+        """The conv memories of a block state [B, state_ch, S, S] -> [B * F, d, 9 d]."""
+        o = self.state_ch - self.fw_ch
+        return st[:, o:].flatten(1)[:, :self.fw * self.d * 9 * self.d].reshape(-1, self.d, 9 * self.d)
+
+    def _fw_put(self, Sf, B):
+        """[B * F, d, 9 d] -> the state's conv-memory channels [B, fw_ch, S, S]."""
+        h = Sf.new_zeros(B, self.fw_ch * self.S * self.S)
+        h[:, :self.fw * self.d * 9 * self.d] = Sf.reshape(B, -1)
+        return h.view(B, self.fw_ch, self.S, self.S)
+
+    def _fw_proj(self, u):
+        """u [M, C, S, S] -> q, k [M, F, P, 9d] (unit 3x3 patches), v [M, F, P, d], b [M, F, P]
+        (beta / P), loga [M, F]."""
+        M, P, F_, d, S = u.shape[0], self.S * self.S, self.fw, self.d, self.S
+        with torch.autocast(u.device.type, dtype=torch.bfloat16, enabled=u.is_cuda):
+            qkv = self.fw_qkv(u)
+        q, k, v = qkv.to(u.dtype).view(M, 3, F_ * d, S, S).unbind(1)
+
+        def patch(x):
+            return F.normalize(F.unfold(x, 3, padding=1).view(M, F_, d * 9, P).transpose(2, 3), dim=-1)
+        b = torch.sigmoid(self.fw_beta(u)).view(M, F_, P) / P
+        loga = -self.fw_lam.exp() * 2 * torch.sigmoid(self.fw_alpha(u.mean((2, 3), keepdim=True)).view(M, F_))
+        return patch(q), patch(k), v.view(M, F_, d, P).transpose(2, 3), b, loga
 
     def _mixed(self, u):
         """u + the spatial mixing branch; the convs in bf16 on the GPU."""
@@ -1486,15 +1572,15 @@ class ConvDeltaBlock(nn.Module):
         return q, k, v, beta, loga
 
     def _read_out(self, o, M):
-        """o [M, P, H, d] -> the block's addend [M, C, S, S]."""
-        return self.out(o.permute(0, 2, 3, 1).reshape(M, self.H * self.d, self.S, self.S))
+        """o [M, P, H (+ F), d] -> the block's addend [M, C, S, S]."""
+        return self.out(o.permute(0, 2, 3, 1).reshape(M, -1, self.S, self.S))
 
     def step(self, x, st):
         """One tick: x [B, C, S, S], st [B, state_ch, S, S] -> (x', st')."""
         B, P, H, d, C = x.shape[0], self.S * self.S, self.H, self.d, self.C
         nm = H * d * d
         Sm = st[:, :nm].reshape(B, H, d, d, P).permute(0, 4, 1, 2, 3)      # [B, P, H, dv, dk]
-        fifo = st[:, nm:].reshape(B, self.taps - 1, C, self.S, self.S)     # newest first
+        fifo = st[:, nm:nm + (self.taps - 1) * C].reshape(B, self.taps - 1, C, self.S, self.S)   # newest first
         r = _rms_pos(x)
         hist = torch.cat([r[:, None], fifo], 1)                            # lags 0 .. taps-1
         u = self._mixed(x + (hist * self.tconv[None, :, :, None, None]).sum(1))
@@ -1503,10 +1589,19 @@ class ConvDeltaBlock(nn.Module):
         Sk = Sm @ k[..., None]                                             # [B, P, H, dv, 1]
         Sm = a * Sm - (a * b) * Sk @ k[..., None, :] + b * v[..., None] @ k[..., None, :]
         o = (Sm @ q[..., None])[..., 0]
+        parts = [Sm.permute(0, 2, 3, 4, 1).reshape(B, nm, self.S, self.S),
+                 hist[:, :self.taps - 1].reshape(B, -1, self.S, self.S)]
+        if self.fw:                  # the conv memories: one rank-P write per head
+            fq, fk, fv, fb, fa = self._fw_proj(u)
+            Sf = self._fw_get(st)
+            a2 = fa.reshape(-1).exp()[:, None, None]
+            fk, fq = fk.flatten(0, 1), fq.flatten(0, 1)
+            Sk = fk @ Sf.transpose(1, 2)
+            Sf = a2 * Sf + (fb.reshape(-1, P)[..., None] * (fv.flatten(0, 1) - a2 * Sk)).transpose(1, 2) @ fk
+            o = torch.cat([o, (fq @ Sf.transpose(1, 2)).view(B, self.fw, P, d).transpose(1, 2)], 2)
+            parts.append(self._fw_put(Sf, B))
         x = u + self._read_out(o, B)
-        st = torch.cat([Sm.permute(0, 2, 3, 4, 1).reshape(B, nm, self.S, self.S),
-                        hist[:, :self.taps - 1].reshape(B, -1, self.S, self.S)], 1)
-        return x, st
+        return x, torch.cat(parts, 1)
 
     def seq(self, x, st, reset, chunk=64):
         """A sequence: x [B, T, C, S, S], st [B, state_ch, S, S] entering tick 0, reset [B, T]
@@ -1514,7 +1609,7 @@ class ConvDeltaBlock(nn.Module):
         B, T, C = x.shape[:3]
         P, H, d, n = self.S * self.S, self.H, self.d, self.taps - 1
         nm = H * d * d
-        fifo = st[:, nm:].reshape(B, n, C, self.S, self.S)
+        fifo = st[:, nm:nm + n * C].reshape(B, n, C, self.S, self.S)
         r = _rms_pos(x.flatten(0, 1)).view(B, T, C, self.S, self.S)
         ext = torch.cat([fifo.flip(1), r], 1)                              # [B, n + T]: oldest first
         doc = torch.cat([reset.new_zeros(B, n, dtype=torch.long), torch.cumsum(reset.long(), 1)], 1)
@@ -1533,13 +1628,25 @@ class ConvDeltaBlock(nn.Module):
         rs = reset[:, None, None, :].expand(B, P, H, T).reshape(B * P * H, T)
         o, ST = _delta_scan(heads(q), heads(k), heads(v), heads(beta), heads(loga), rs, S0, chunk)
         o = o.view(B, P, H, T, d).permute(0, 3, 1, 2, 4).reshape(B * T, P, H, d)
+        if self.fw:                  # the conv memories over the window
+            fq, fk, fv, fb, fa = self._fw_proj(u)                          # [B*T, F, P, ...]
+
+            def fh(t):                                                     # -> [B*F, T, ...]
+                t = t.view(B, T, self.fw, *t.shape[2:])
+                return t.transpose(1, 2).reshape(B * self.fw, T, *t.shape[3:])
+            rsf = reset[:, None, :].expand(B, self.fw, T).reshape(B * self.fw, T)
+            of, SfT = _convfw_scan(fh(fq), fh(fk), fh(fv), fh(fb), fh(fa), rsf, self._fw_get(st), self.fw_chunk)
+            of = of.view(B, self.fw, T, P, d).permute(0, 2, 3, 1, 4).reshape(B * T, P, self.fw, d)
+            o = torch.cat([o, of], 2)
         x = (u + self._read_out(o, B * T)).view(B, T, C, self.S, self.S)
         # the FIFO after the last tick: the last n RMS(x), zero where a reset came after them
         last = ext[:, T:].flip(1)                                          # newest first
         okl = (doc[:, T:].flip(1) == doc[:, -1:]).to(x.dtype)
         ST = ST.view(B, P, H, d, d).permute(0, 2, 3, 4, 1).reshape(B, nm, self.S, self.S)
-        st = torch.cat([ST, (last * okl[:, :, None, None, None]).reshape(B, n * C, self.S, self.S)], 1)
-        return x, st
+        parts = [ST, (last * okl[:, :, None, None, None]).reshape(B, n * C, self.S, self.S)]
+        if self.fw:
+            parts.append(self._fw_put(SfT, B))
+        return x, torch.cat(parts, 1)
 
 
 def _linear_init(conv):
@@ -2197,7 +2304,8 @@ class VLAModel(nn.Module, _HubMixin):
                  text_nul=False, surprise=None, linout_kernel=1, learn_win=False,
                  learn_regs=(), lmu=False, attn=0, attn_ch=2, attn_heads=8, attn_dim=64, attn_age=True,
                  read_rmsnorm=False, layers=1, up_windows=None, write_gate=False,
-                 convdelta=0, cd_heads=6, cd_dim=32, cd_taps=4, cd_chunk=64, grid_hist=0):
+                 convdelta=0, cd_heads=6, cd_dim=32, cd_taps=4, cd_chunk=64, grid_hist=0,
+                 cd_convs=2, cd_fw=0, cd_fw_chunk=2):
         super().__init__()
         from transformers import AutoModelForCausalLM
         repo = _TOKENIZERS[tokenizer]
@@ -2353,7 +2461,8 @@ class VLAModel(nn.Module, _HubMixin):
         # registers, the input grid scaled and shifted per position (cd_G, cd_P) so the 49
         # positions can differ; the state is every block's memories and FIFO in turn
         self.cd = (nn.ModuleList(ConvDeltaBlock(c_context, int(cd_heads), int(cd_dim), int(cd_taps), S,
-                                                bn_momentum) for _ in range(int(convdelta)))
+                                                bn_momentum, int(cd_convs or 2), int(cd_fw or 0), int(cd_fw_chunk))
+                                 for _ in range(int(convdelta)))
                    if convdelta else None)
         self.cd_chunk, self.cd_ckpt = int(cd_chunk), False   # cd_ckpt: checkpoint each block (seq)
         if self.cd is not None:
@@ -2664,6 +2773,8 @@ class VLAModel(nn.Module, _HubMixin):
         if self.cd is None or self.streams != 1 or X.dim() != 2:
             yield
             return
+        if any(b.fw for b in self.cd):   # --cd_fw: the 3x3 key patches are 9x the grid; smaller windows
+            window = min(window, 16)
         self._replay = dict(X=X, t=0, t0=0, o=None, w=window)
         try:
             yield
@@ -3765,7 +3876,7 @@ model = VLAModel(S=args.context, n_hidden=args.n_hidden, c_context=args.c_contex
                  attn_dim=args.attn_dim, attn_age=args.attn_age, read_rmsnorm=args.read_rmsnorm,
                  layers=args.layers, write_gate=args.write_gate,
                  convdelta=args.convdelta, cd_heads=args.cd_heads, cd_dim=args.cd_dim, cd_taps=args.cd_taps,
-                 grid_hist=args.grid_hist,
+                 grid_hist=args.grid_hist, cd_convs=args.cd_convs, cd_fw=args.cd_fw, cd_fw_chunk=args.cd_fw_chunk,
                  cd_chunk=args.cd_chunk,
                  up_windows=[float(w) for w in str(args.up_ema).split(',') if w.strip()] if args.up_ema else None)
 if _loaded_ckpt is not None:
