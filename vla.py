@@ -516,6 +516,10 @@ parser.add_argument('--gate_lr_mult', default=1.0, type=float, metavar='M',
                     help='--write_gate: the gate\'s weights train at M times the lr (their own '
                          'optimizer group, on the same schedule): through the sigmoid at 1/W and a '
                          'rate that moves the register by only (o - R) per tick, they learn slowly')
+parser.add_argument('--gamma_lr_mult', default=1.0, type=float, metavar='M',
+                    help='--cd_gamma: the ladder\'s c parameters train at M times the lr (their own optimizer '
+                         'group, on the same schedule): their gradients are tiny, so at the network\'s lr c '
+                         'barely moves from 0 (the plain FIFO)')
 parser.add_argument('--nesterov', default=False, action=argparse.BooleanOptionalAction,
                     help='Nesterov momentum (needs --momentum > 0)')
 parser.add_argument('--optimizer', default='sgd', choices=['sgd', 'adamw'],
@@ -7307,9 +7311,16 @@ if _win_opt is not None and _loaded_ckpt is not None and _loaded_ckpt.get('win_o
     _win_opt.load_state_dict(_loaded_ckpt['win_optimizer'])
 _bn_layers = [m for m in model.modules() if isinstance(m, nn.BatchNorm2d)]
 _gate_ids = {id(p) for n, p in model.named_parameters() if n.startswith('wgate.')}
-_groups = ([{'params': [p for p in _trainable if id(p) not in _gate_ids]},     # --gate_lr_mult
-            {'params': [p for p in _trainable if id(p) in _gate_ids], 'lr': args.lr_max * args.gate_lr_mult}]
-           if _gate_ids and args.gate_lr_mult != 1 else _trainable)
+_gamma_ids = {id(p) for n, p in model.named_parameters() if re.match(r'cd\.\d+\.gz$', n)}
+_mults = [(ids, m) for ids, m in ((_gate_ids, args.gate_lr_mult), (_gamma_ids, args.gamma_lr_mult))
+          if ids and m != 1]         # --gate_lr_mult, --gamma_lr_mult: their own groups
+_sep_ids = set().union(*[ids for ids, _ in _mults]) if _mults else set()
+_groups = ([{'params': [p for p in _trainable if id(p) not in _sep_ids]}] +
+           [{'params': [p for p in _trainable if id(p) in ids], 'lr': args.lr_max * m} for ids, m in _mults]
+           if _mults else _trainable)
+for _ids, _m in _mults:
+    print(f'lr x{_m:g} for {sum(p.numel() for p in _trainable if id(p) in _ids):,} parameters '
+          f'({"ladder c" if _ids is _gamma_ids else "write gate"})', flush=True)
 if args.optimizer == 'adamw':
     optimizer = torch.optim.AdamW(_groups, lr=args.lr_max, weight_decay=args.weight_decay,
                                   betas=tuple(float(b) for b in args.betas.split(',')))
