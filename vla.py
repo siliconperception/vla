@@ -304,7 +304,9 @@ parser.add_argument('--cd_fw', default=0, type=int, metavar='F',
                          'delta rule from every position\'s key patch and read by convolving it over the '
                          'query grid (translation-invariant; its size does not grow with the grid)')
 parser.add_argument('--cd_dim', default=32, type=int, help='--convdelta: key/value width per head')
-parser.add_argument('--cd_taps', default=4, type=int, help='--convdelta: causal time conv taps (this tick + taps-1)')
+parser.add_argument('--cd_taps', default=4, type=int,
+                    help='--convdelta: causal time conv taps (this tick + taps-1 in a FIFO); 0 = no time conv at all '
+                         '(no FIFO, no RMS(x) term: the convs read x directly)')
 parser.add_argument('--cd_chunk', default=64, type=int, help='--convdelta: scan chunk (ticks)')
 parser.add_argument('--write_gate', default=False, action=argparse.BooleanOptionalAction,
                     help='selective write: each windowed register of the first layer is written at a '
@@ -1623,7 +1625,7 @@ class ConvDeltaBlock(nn.Module):
         # projection, no patches
         self.fw_k = int(fw_kernel or 0)
         self.fw_D = int(fw_dk) if self.fw_k else 9 * d
-        self.tconv = nn.Parameter(torch.zeros(taps, C))                    # [lag, channel]
+        self.tconv = nn.Parameter(torch.zeros(taps, C)) if taps else None  # [lag, channel]; 0: none
         # --cd_gamma: the FIFO is a gamma ladder, c = 0.99 tanh(gz) per channel (0: the FIFO)
         self.gz = nn.Parameter(torch.zeros(C)) if gamma and taps > 1 else None
         bn = dict(affine=False, momentum=bn_momentum or None)
@@ -1674,7 +1676,7 @@ class ConvDeltaBlock(nn.Module):
     @property
     def state_ch(self):
         """State channels per grid position: the memories, the FIFO of past RMS(x), the conv memories."""
-        return self.H * self.d * self.d + (self.taps - 1) * self.C + self.fw_ch
+        return self.H * self.d * self.d + max(self.taps - 1, 0) * self.C + self.fw_ch
 
     def _fw_get(self, st):
         """The conv memories of a block state [B, state_ch, S, S] -> [B * F, d, 9 d]."""
@@ -1737,21 +1739,25 @@ class ConvDeltaBlock(nn.Module):
         B, P, H, d, C = x.shape[0], self.S * self.S, self.H, self.d, self.C
         nm = H * d * d
         Sm = st[:, :nm].reshape(B, H, d, d, P).permute(0, 4, 1, 2, 3)      # [B, P, H, dv, dk]
-        fifo = st[:, nm:nm + (self.taps - 1) * C].reshape(B, self.taps - 1, C, self.S, self.S)   # newest first
-        r = _rms_pos(x)
-        hist = torch.cat([r[:, None], fifo], 1)                            # lags 0 .. taps-1
-        u = self._mixed(x + (hist * self.tconv[None, :, :, None, None]).sum(1))
+        if self.taps:
+            fifo = st[:, nm:nm + (self.taps - 1) * C].reshape(B, self.taps - 1, C, self.S, self.S)   # newest first
+            r = _rms_pos(x)
+            hist = torch.cat([r[:, None], fifo], 1)                        # lags 0 .. taps-1
+            u = self._mixed(x + (hist * self.tconv[None, :, :, None, None]).sum(1))
+        else:                        # --cd_taps 0: no time conv
+            u = self._mixed(x)
         q, k, v, beta, loga = self._proj(u)
         a, b = loga.exp()[..., None, None], beta[..., None, None]
         Sk = Sm @ k[..., None]                                             # [B, P, H, dv, 1]
         Sm = a * Sm - (a * b) * Sk @ k[..., None, :] + b * v[..., None] @ k[..., None, :]
         o = (Sm @ q[..., None])[..., 0]
-        nxt = hist[:, :self.taps - 1]                                      # the FIFO shifted by a tick
-        if self.gz is not None:      # the gamma ladder: each stage leaks toward the one below
-            c = 0.99 * torch.tanh(self.gz)[None, None, :, None, None]
-            nxt = c * fifo + (1 - c) * nxt
-        parts = [Sm.permute(0, 2, 3, 4, 1).reshape(B, nm, self.S, self.S),
-                 nxt.reshape(B, -1, self.S, self.S)]
+        parts = [Sm.permute(0, 2, 3, 4, 1).reshape(B, nm, self.S, self.S)]
+        if self.taps:
+            nxt = hist[:, :self.taps - 1]                                  # the FIFO shifted by a tick
+            if self.gz is not None:  # the gamma ladder: each stage leaks toward the one below
+                c = 0.99 * torch.tanh(self.gz)[None, None, :, None, None]
+                nxt = c * fifo + (1 - c) * nxt
+            parts.append(nxt.reshape(B, -1, self.S, self.S))
         if self.fw:                  # the conv memories: one rank-P write per head
             fq, fk, fv, fb, fa = self._fw_proj(u)
             Sf = self._fw_get(st)
@@ -1781,11 +1787,13 @@ class ConvDeltaBlock(nn.Module):
         """A sequence: x [B, T, C, S, S], st [B, state_ch, S, S] entering tick 0, reset [B, T]
         (zero state entering that tick) -> (x' [B, T, C, S, S], st' after the last tick)."""
         B, T, C = x.shape[:3]
-        P, H, d, n = self.S * self.S, self.H, self.d, self.taps - 1
+        P, H, d, n = self.S * self.S, self.H, self.d, max(self.taps - 1, 0)
         nm = H * d * d
         fifo = st[:, nm:nm + n * C].reshape(B, n, C, self.S, self.S)
-        r = _rms_pos(x.flatten(0, 1)).view(B, T, C, self.S, self.S)
-        if self.gz is not None:      # --cd_gamma: the ladder's stages over the window, one scan each;
+        r = _rms_pos(x.flatten(0, 1)).view(B, T, C, self.S, self.S) if self.taps else None
+        if not self.taps:            # --cd_taps 0: no time conv
+            y = 0
+        elif self.gz is not None:      # --cd_gamma: the ladder's stages over the window, one scan each;
             if torch.is_grad_enabled():  # checkpointed, so its stages are not held through the block
                 y, ends = torch.utils.checkpoint.checkpoint(self._ladder, r, reset, fifo, use_reentrant=False)
             else:
@@ -1820,7 +1828,9 @@ class ConvDeltaBlock(nn.Module):
             o = torch.cat([o, of], 2)
         x = (u + self._read_out(o, B * T)).view(B, T, C, self.S, self.S)
         ST = ST.view(B, P, H, d, d).permute(0, 2, 3, 4, 1).reshape(B, nm, self.S, self.S)
-        if self.gz is not None:      # the ladder after the last tick
+        if not self.taps:
+            parts = [ST]
+        elif self.gz is not None:    # the ladder after the last tick
             parts = [ST, ends.reshape(B, n * C, self.S, self.S)]
         else:                        # the FIFO after the last tick: the last n RMS(x), zero where a reset came after them
             last = ext[:, T:].flip(1)                                      # newest first
@@ -4072,9 +4082,11 @@ if _loaded_ckpt is not None:
             _k = f'cd.{_i}.tconv'
             if _k in _sd and _sd[_k].shape[0] > _b.taps:
                 if _i == 0:
-                    print(f'--cd_taps {_b.taps}: the time conv keeps lags 0..{_b.taps - 1} of '
-                          f'{_sd[_k].shape[0]} (the FIFO shrinks)', flush=True)
-                _sd = dict(_sd, **{_k: _sd[_k][:_b.taps]})
+                    print(f'--cd_taps {_b.taps}: ' + (f'the time conv keeps lags 0..{_b.taps - 1} of '
+                          f'{_sd[_k].shape[0]} (the FIFO shrinks)' if _b.taps else
+                          'the time conv and its FIFO are removed'), flush=True)
+                _sd = dict(_sd, **{_k: _sd[_k][:_b.taps]}) if _b.taps else \
+                    {k: v for k, v in _sd.items() if k != _k}
         if model.cd[0].gz is None and any(re.match(r'cd\.\d+\.gz$', k) for k in _sd):
             print('no ladder (--no-cd_gamma or --cd_taps 1): the checkpoint\'s ladder c are dropped', flush=True)
             _sd = {k: v for k, v in _sd.items() if not re.match(r'cd\.\d+\.gz$', k)}
@@ -4191,7 +4203,7 @@ def _model_graph(model):
     cd, G = model.cd, getattr(model, 'grid_hist', 0)
     for r in rows:
         mb = re.match(r'cd\.(\d+)\.(mix\.0|out)$', r['name']) if cd is not None else None
-        if mb and mb.group(2) == 'mix.0':        # --convdelta: the block's time conv, then its convs
+        if mb and mb.group(2) == 'mix.0' and cd[int(mb.group(1))].taps:   # --convdelta: the time conv, then the convs
             b = cd[int(mb.group(1))]
             out.append(dict(name=f'cd.{mb.group(1)}.tconv <- RMS(x)' + (', FIFO[t-1]' if b.taps > 1 else ''),
                             op=(f'depthwise conv over RMS(x) and a {b.taps - 1}-stage gamma ladder, residual add'
