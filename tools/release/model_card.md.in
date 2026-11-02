@@ -7,20 +7,23 @@ pipeline_tag: text-generation
 tags:
 - recurrent
 - cnn
+- delta-rule
+- fast-weights
 - vla
 datasets:
 - HuggingFaceFW/fineweb
 ---
 
-# VLA (recurrent CNN)
+# VLA (ConvDelta)
 
 **Release {{VERSION}}, step {{STEP}}** ({{TOKENS}} training tokens).
 
-A language model with a fixed-size state and no positional encoding. It is one recurrent convolutional layer
-with two 2-D registers of 512 × 7 × 7: a slow one, an average written through a learned gate (its rate, set
-every tick for each channel and grid position, starts at 1/16, a 16-tick average), and a copy of the rest.
-Every tick the layer reads the current token and its registers, writes the registers back, and its output is
-decoded into the next token.
+A language model with a fixed-size state and no positional encoding, built from convolutions on a 7 × 7 grid. Its
+input is the last 8 tokens, placed on the grid by a learned map. Six residual ConvDelta blocks follow. Each one
+is a causal time conv over the last 4 ticks, three 3 × 3 conv + BatchNorm + ReLU layers, and, at every grid
+position, 6 heads of a 32 × 32 associative memory written by the gated delta rule and read by a query. Every
+tick the model reads one token, updates its memories, and decodes the next token. The state is 2.1 M values and
+never grows.
 
 It is the text-trained core of a vision-language-action design. Most commercial applications for autonomous,
 agile robots do not require superintelligence; they need conversational common sense, grounded in and modulated by
@@ -34,7 +37,7 @@ one fetched from off-chip DRAM.
 
 Code, functional spec and figures: [github.com/siliconperception/vla](https://github.com/siliconperception/vla)
 
-![One clock tick](https://raw.githubusercontent.com/siliconperception/vla/main/docs/figures/vla_v533.svg)
+![One clock tick](https://raw.githubusercontent.com/siliconperception/vla/main/docs/figures/vla_v540.svg)
 
 ## Use
 
@@ -47,10 +50,6 @@ for p in "The colors of the rainbow are" \
          "The history of the bicycle began in"; do
   python vla.py --pretrained --generate --n 120 --prompt "$p" --device cuda
 done
-
-# prompt tuning: fit the starting registers (weights frozen) until the model predicts the prompt,
-# then continue from them; prints the cold and the tuned continuation
-python vla.py --pretrained --generate --prompt_tune 200 --n 120 --prompt "The colors of the rainbow are" --device cuda
 ```
 
 `--pretrained` downloads `model.safetensors` and `vla_args.json` (the settings the weights were trained with)
@@ -62,67 +61,79 @@ kept.
 
 | | |
 |---|---|
-| Parameters | 46.2 M: 20.5 M trained, 25.8 M frozen (token embedding and output layer from pythia-31m) |
-| State | 2 registers × 512 × 7 × 7: 50,176 values, fixed in size |
-| Registers | a gated average (rate learned per channel and position, starting at 1/16: 16 ticks, 0.64 s at 25 Hz) and a one-tick copy of the rest |
-| Layer | 1×1 mix (2,048 → 384) of the token, sound and the two registers (RMS-normalized reads), 8 × (3×3 conv, BatchNorm, ReLU) at 384, 3×3 project (384 → 512), cascade write |
-| Write gate | 1×1 conv (384 → 512) of the working channels and a sigmoid: the slow register's write rate |
-| Readout | 3 decoders (text, voice, image), each a tree of three 3×3 convs and the frozen pythia-31m output layer |
+| Parameters | 55.7 M: 30.0 M trained, 25.8 M frozen (token embedding and output layer from pythia-31m) |
+| State | 2,145,073 values, fixed in size: per block 49 positions × 6 heads × 32 × 32 memories and a 3-tick FIFO, plus the last 7 token ids |
+| Input | the last 8 tokens, each embedded and mixed 1×1 (256 → 384), placed on the 7 × 7 grid by a learned map (starting as concentric rings, newest outside), then a learned gain and bias per position |
+| Blocks | 6 × ConvDelta at 384 channels: causal depthwise time conv (4 ticks), 3 × (3×3 conv, BatchNorm, ReLU), 1×1 q, k, v, β, α, gated delta-rule memory per position and head, 1×1 out, residual adds |
+| Memory | M ← α M (I − β k kᵀ) + β v kᵀ, read M q; q, k unit length; β, α computed from the input every tick; base decay windows 4 to 4,096 ticks |
+| Readout | 3×3 projection (384 → 512), a tree of three 3×3 convs (7 → 5 → 3 → 1), the frozen pythia-31m output layer |
 | Tokenizer | pythia-31m BPE (50,304) plus a `<NUL>` token ("say nothing this tick") |
+| Compute | about 1.4 G multiply-accumulates per tick, the same every tick |
 
 ## Training
 
-- {{STEP}} steps × 250 rows, one token per row per step ({{TOKENS}} tokens), SGD (at the end with Nesterov
-  momentum 0.95, learning rate 0.001, the write gate at 100 × that). Truncated backpropagation through time over
-  64 steps (16 before step 2,566,001); the loss is normalized per word rather than per token.
-- Data: FineWeb sample-10BT, text only. Every document starts from a zero state.
-- The configuration changed during training, always resuming from the latest weights: one layer with a 512-tick
-  average and a 1,024-tick recall ring from scratch; the ring removed at step 1,065,312; the second layer added
-  as the identity at 1,127,936; the slow windows shortened to 16 / 64 ticks by 1,456,944; the learning rate
-  stepped down by half cosines, 0.02 → 0.01 → 0.005 → 0.0025 → 0.00125 → 0.001, from 1,501,536 to 2,263,328, with
-  trials of momentum; layer 2's window 64 → 256 at 2,538,191. At 2,566,001 the second layer was removed (it
-  never used its registers), the write gate added (starting at the fixed rate 1/16, the rate it replaced) and
-  backpropagation lengthened to 64 steps, at learning rate 0.01; then momentum 0.5 from 2,960,001, Nesterov
-  momentum 0.95 from 2,987,329 and learning rate 0.001 from 2,994,305. The
-  [spec](https://github.com/siliconperception/vla/blob/main/docs/spec/README.md) lists every step.
+- From scratch, in one configuration: {{STEP}} steps × 32 rows, one token per row per step ({{TOKENS}} tokens).
+  Each row trains on 256-tick windows, all ticks of a window at once (the memories through an exact chunked
+  parallel scan); the state carries on between windows and the gradient stops at a window's start.
+- AdamW (β 0.9, 0.95, no weight decay), learning rate warmed from 1e-5 to 0.001 over the first 256,000 steps,
+  then held. The loss is normalized per word rather than per token.
+- Data: FineWeb sample-10BT, text only. In training, a document start resets the state only half the time; in
+  the other half the previous document's memories carry on, and the model must learn to drop them itself
+  (a stress test for discontinuities in a robot's continuous perception). Evaluation resets at every document.
+- The [spec](https://github.com/siliconperception/vla/blob/main/docs/spec/README.md) gives the exact computation.
 
 ## Evaluation (at the published step, {{STEP}})
 
 The reference is EleutherAI's [pythia-70m](https://huggingface.co/EleutherAI/pythia-70m): a transformer of a
 similar total size (70 M parameters, 19 M of them outside the token embedding and output layer) with the same
 tokenizer, so losses per token compare directly. Pythia publishes checkpoints from early in training, so it is
-shown at about this model's training tokens (steps 256 and 512 bracket it) as well as fully trained. Every model
-is scored on the same documents and pairs, by the same rule.
+shown at about this model's training tokens (steps 4 and 8 bracket it) as well as fully trained. Every model is
+scored on the same documents and pairs, by the same rule.
 
 | | **this model** | pythia-70m | pythia-70m | pythia-70m |
 |---|---|---|---|---|
-| training tokens | **{{TOKENS}}** | 537 M (step 256) | 1,074 M (step 512) | 300 B (final) |
-| FineWeb held-out (100 documents, nats/token) | **{{FW}}** | {{P256_FW}} | {{P512_FW}} | {{PMAIN_FW}} |
-| BabyLM 2026 dev (100 pieces, nats/token) | **{{BABY}}** | {{P256_BABY}} | {{P512_BABY}} | {{PMAIN_BABY}} |
-| BLiMP (1,005 pairs from all 67 paradigms), % | **{{BLIMP}}** | {{P256_BLIMP}} | {{P512_BLIMP}} | {{PMAIN_BLIMP}} |
-| ComVE (999 pairs, common sense), % | **{{COMVE}}** | {{P256_COMVE}} | {{P512_COMVE}} | {{PMAIN_COMVE}} |
+| training tokens | **{{TOKENS}}** | 8.4 M (step 4) | 16.8 M (step 8) | 300 B (final) |
+| FineWeb held-out (100 documents, nats/token) | **{{FW}}** | {{PSTEP4_FW}} | {{PSTEP8_FW}} | {{PMAIN_FW}} |
+| BabyLM 2026 dev (100 pieces, nats/token) | **{{BABY}}** | {{PSTEP4_BABY}} | {{PSTEP8_BABY}} | {{PMAIN_BABY}} |
+| BLiMP (1,005 pairs from all 67 paradigms), % | **{{BLIMP}}** | {{PSTEP4_BLIMP}} | {{PSTEP8_BLIMP}} | {{PMAIN_BLIMP}} |
+| ComVE (999 pairs, common sense), % | **{{COMVE}}** | {{PSTEP4_COMVE}} | {{PSTEP8_COMVE}} | {{PMAIN_COMVE}} |
 
 Losses are the mean over documents of each document's mean loss per token, from a zero state (this model) or a
 bare document start (pythia); a document with any token over 20 nats is counted as a runaway and left out
-({{RUNAWAY}} of the FineWeb documents for this model). Pythia was trained on the Pile, this model on FineWeb, so the FineWeb row is
-in-domain for this model only. Matched tokens are not matched training: pythia's 537 M and 1,074 M tokens are only
-256 and 512 optimizer updates of 2 M tokens each, still inside its learning-rate warm-up, while this model's are
-{{STEP}} updates of 250 tokens. Fully trained pythia-70m is the fair reference, and this model is still well
-short of it. A pair is right when the model gives the correct sentence the lower total loss,
-each sentence read without context. For scale on the pairs: babyllama-10m-2024 (trained on 10 M words) scores
-70.0 / 63.7 and SmolLM2-135M 80.9 / 79.3.
+({{RUNAWAY}} of the FineWeb documents for this model). Pythia was trained on the Pile, this model on FineWeb, so
+the FineWeb row is in-domain for this model only. Matched tokens are not matched training: pythia's 8.4 M and
+16.8 M tokens are only 4 and 8 optimizer updates of 2 M tokens each, at the very start of its learning-rate
+warm-up, while this model's are {{STEP}} steps of 32 tokens (1,562 updates). Fully trained pythia-70m is the fair
+reference, and this model is far short of it. A pair is right when the model gives the correct sentence the lower
+total loss, each sentence read without context; chance is 50 %. For scale on the pairs: babyllama-10m-2024
+(trained on 10 M words) scores 70.0 / 63.7 and SmolLM2-135M 80.9 / 79.3.
 
 ## Samples
 
-From the prompt in bold, with these weights. Locally fluent, not yet coherent:
+From the prompt in bold, with these weights. Locally fluent in places, repetitive, not yet coherent:
 
 {{SAMPLES_MD}}
 
 ## Limits
 
-A small model early in training: it writes locally fluent text that is often not factual or consistent. Not
-instruction-tuned, not safety filtered beyond its training corpora. The voice and image decoders are present but
-this model has been trained on text only.
+A small model very early in training: its text is often repetitive, not factual and not consistent. Not
+instruction-tuned, not safety filtered beyond its training corpora. Text only.
+
+## References
+
+The model builds on the gated delta rule ([Yang, Kautz, Hatamizadeh 2024](https://arxiv.org/abs/2412.06464)),
+its chunked parallel form ([Yang et al. 2024](https://arxiv.org/abs/2406.06484)) and the fast-weight view of
+linear attention ([Schlag, Irie, Schmidhuber 2021](https://arxiv.org/abs/2102.11174);
+[Katharopoulos et al. 2020](https://arxiv.org/abs/2006.16236)), with a per-head decay as in Mamba-2
+([Dao, Gu 2024](https://arxiv.org/abs/2405.21060)) and a short causal conv before the memory as in H3 and Mamba
+([Fu et al. 2022](https://arxiv.org/abs/2212.14052); [Gu, Dao 2023](https://arxiv.org/abs/2312.00752)). A state
+at every position of a conv grid follows ConvLSTM ([Shi et al. 2015](https://arxiv.org/abs/1506.04214)); the
+blocks use residual connections ([He et al. 2015](https://arxiv.org/abs/1512.03385)), BatchNorm
+([Ioffe, Szegedy 2015](https://arxiv.org/abs/1502.03167)) and RMS normalization
+([Zhang, Sennrich 2019](https://arxiv.org/abs/1910.07467)). Tokenizer, frozen embedding and output layer, and the
+reference model: Pythia ([Biderman et al. 2023](https://arxiv.org/abs/2304.01373)). Optimizer: AdamW
+([Loshchilov, Hutter 2017](https://arxiv.org/abs/1711.05101)). Data: FineWeb
+([Penedo et al. 2024](https://arxiv.org/abs/2406.17557)).
 
 ## License
 

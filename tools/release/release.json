@@ -1,25 +1,25 @@
 {
- "version": "v533",
- "step": 3043841,
- "rows": 250,
- "fineweb": 4.579951,
- "babylm": 4.564411,
- "blimp": 70.2,
+ "version": "v540",
+ "step": 400000,
+ "rows": 32,
+ "fineweb": 5.186256,
+ "babylm": 4.987792,
+ "blimp": 64.0,
  "comve": 65.0,
- "runaway": 4,
- "min_p": 0.008785064762800927,
+ "runaway": 1,
+ "min_p": 0.03435659916414424,
  "pythia70m": {
-  "256": {
-   "fw": 6.3546,
-   "baby": 5.718,
-   "blimp": 51.4,
-   "comve": 57.1
+  "step4": {
+   "fw": 11.0253,
+   "baby": 11.0332,
+   "blimp": 53.3,
+   "comve": 53.5
   },
-  "512": {
-   "fw": 5.4674,
-   "baby": 4.9845,
-   "blimp": 54.7,
-   "comve": 59.7
+  "step8": {
+   "fw": 10.8942,
+   "baby": 10.8478,
+   "blimp": 52.7,
+   "comve": 54.0
   },
   "main": {
    "fw": 3.7312,
@@ -30,12 +30,12 @@
  },
  "samples": [
   {
-   "prompt": "My grandmother's recipe for apple pie starts with",
-   "text": "a creamy teta sauce with cheese in its usual small butter and egg yolks, although they have been a tadota taste! You will love it too!"
+   "prompt": "The colors of the rainbow are",
+   "text": "also unique, but not the most recognizable images of the color. The colour images are dark and decorating with pink colors."
   },
   {
-   "prompt": "The colors of the rainbow are",
-   "text": "the few parts of the image. The flower has a sparkling blue colour which I’ve written in my mind."
+   "prompt": "My grandmother's recipe for apple pie starts with",
+   "text": "2/1 cup cream: 1 cup. Sweet syrup, chocolate syrup (food & wine) to cook with tasty desserts, plus 6 cups, sugar syrup, baking and baking, cook cooking and cook."
   }
  ]
 }

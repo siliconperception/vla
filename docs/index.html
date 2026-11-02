@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Recurrent CNN VLA</title>
-<meta name="description" content="A recurrent CNN vision-language-action model with a fixed-size state, designed for a single battery-powered chip running at up to 500 Hz with low, deterministic latency. Open source (MIT) by Silicon Perception Inc.">
+<meta name="description" content="A recurrent CNN vision-language-action model with a fixed-size state of gated delta-rule memories, designed for a single battery-powered chip running at up to 500 Hz with low, deterministic latency. Open source (MIT) by Silicon Perception Inc.">
 <style>
   :root {
     --bg: #fbfaf7; --fg: #1d1d1f; --muted: #5f5f66; --rule: #e3e1db; --card: #ffffff;
@@ -81,7 +81,8 @@
     saves power: there are no DRAM chips to keep refreshed and no high-speed interface driving signals between chips,
     and reading a weight from on-chip SRAM takes on the order of a hundred times less energy than fetching it from
     off-chip DRAM. The same small kernels run at
-    every grid position and every tick, so about twenty million weights drive a state of 50,176 values.</p>
+    every grid position and every tick, so about thirty million weights drive a state of 2.1 million values:
+    associative memories at every grid position, written by the gated delta rule.</p>
     <p class="lede">The state also has a fixed size. Every tick does exactly the same work and finishes in the same
     time, however long the model has been running.</p>
     <nav class="links">
@@ -90,38 +91,44 @@
       <a href="https://github.com/siliconperception/vla/blob/main/docs/spec/README.md">Functional spec</a>
       <a href="https://github.com/siliconperception/vla/tree/main/paper">Paper (in preparation)</a>
     </nav>
-    <p class="note">Current release: <b>v533</b>, step 3,043,841 (761 M training tokens).</p>
+    <p class="note">Current release: <b>v540</b>, step 400,000 (12.8 M training tokens).</p>
   </header>
 
   <figure>
-    <a class="fig" href="figures/vla_v533.svg" title="Open the full-size figure">
-      <img src="figures/vla_v533.svg" alt="Block diagram of one clock tick. Token and audio grids and the two registers are concatenated, mixed by a 1x1 convolution, transformed by eight 3x3 convolutions into the working state h and projected to the output x. A write gate, a 1x1 convolution of h and a sigmoid, sets the slow register's write rate per channel and position; the slow register moves that fraction of the way toward x and the copy register holds the remainder. Three decoders read x and produce text, voice and image tokens, each fed back as the next input.">
+    <a class="fig" href="figures/vla_v540.svg" title="Open the full-size figure">
+      <img src="figures/vla_v540.svg" alt="Block diagram of one clock tick, in two panes. Top: the last 8 tokens are embedded, normalized, mixed by a 1x1 convolution and placed on a 7x7 grid by a learned map, scaled and shifted per position, and passed through six ConvDelta blocks, each a causal time conv, three 3x3 conv-BatchNorm-ReLU layers and a delta-rule memory with its state S; a 3x3 projection, a decoder tree of three 3x3 convolutions and the frozen output layer give the next token, which is fed back as the next input. Bottom: one block in detail: RMS norm and a 3-tick FIFO feeding the time conv, the three convs with a residual, five 1x1 projections to q, k, v, beta and alpha, the gated delta rule S = alpha S (I - beta k k^T) + beta v k^T on a 32x32 memory per position and head, the read S q, and a 1x1 output added back.">
     </a>
-    <figcaption>One clock tick of the published model (v533): three token streams (text, voice, image) and one
-    recurrent layer with two registers, a slow average whose write rate a learned gate sets for every channel and
-    grid position (starting at 1/16, a 16-tick average), and a one-tick copy of the rest. The image encoder is
-    drawn as the design intends; this model is trained on text. Select the figure to open it full size.</figcaption>
+    <figcaption>One clock tick of the published model (v540). Top: the whole model, text only: the last 8
+    tokens on a learned 7 × 7 map, six ConvDelta blocks, and the decoder. Bottom: one block, a causal time conv,
+    three 3 × 3 convs, and a gated delta-rule memory at every grid position (6 heads of 32 × 32). The
+    <a href="https://github.com/siliconperception/vla/blob/main/docs/spec/README.md">functional spec</a> walks
+    through every part. Select the figure to open it full size.</figcaption>
   </figure>
 
   <div class="facts">
     <div class="fact"><b>500 Hz</b><span>target tick rate on one chip, with the same work every tick</span></div>
-    <div class="fact"><b>50,176</b><span>values of state, fixed in size: 2 registers of 512 × 7 × 7</span></div>
-    <div class="fact"><b>20.5 M</b><span>trained parameters, small enough to hold every weight in on-chip SRAM</span></div>
-    <div class="fact"><b>0</b><span>positional encodings; the state is reset only at the start of an example</span></div>
+    <div class="fact"><b>2.1 M</b><span>values of state, fixed in size: 6 blocks × 49 positions × 6 heads of 32 × 32 memories, and short FIFOs</span></div>
+    <div class="fact"><b>30.0 M</b><span>trained parameters, small enough to hold every weight in on-chip SRAM</span></div>
+    <div class="fact"><b>0</b><span>positional encodings; trained with half the document starts left unreset</span></div>
   </div>
 
   <h2>How a tick works</h2>
   <ol>
-    <li>The current token's embedding is normalized and copied to every position of a 7 × 7 grid.</li>
-    <li>That grid, the sound grid and the two registers (each normalized per position) are concatenated and mixed
-    by a 1 × 1 convolution; eight 3 × 3 convolutions with BatchNorm and ReLU transform the result, and a 3 × 3
-    convolution projects it to register width.</li>
-    <li>A write gate, a 1 × 1 convolution of the working channels and a sigmoid, sets a write rate for every
-    channel and position of the slow register.</li>
-    <li>The output is written into the registers as a cascade: the first moves that fraction of the way toward it
-    (the rate started at 1/16, a 16-tick average), the second holds the remainder, so the two always sum to it.</li>
-    <li>A small tree of convolutions collapses the output to one vector, and a frozen output layer gives the next token.</li>
+    <li>The last 8 tokens are each embedded, normalized and mixed by a 1 × 1 convolution, then placed on a 7 × 7
+    grid by a learned map (it starts as concentric rings, the newest token outside), so neighbouring positions
+    hold neighbouring moments. A learned gain and bias per position follow.</li>
+    <li>Six ConvDelta blocks, in series. Each adds a causal depthwise convolution over the last 4 ticks, then
+    three 3 × 3 convolutions with BatchNorm and ReLU, around a residual.</li>
+    <li>At every grid position, 1 × 1 convolutions give 6 heads of query, key and value, a write strength β and a
+    decay α. Each head's 32 × 32 memory is updated by the gated delta rule, M ← α M (I − β k kᵀ) + β v kᵀ: decay,
+    erase what was stored at key k, write v there. It is read with the query and added back through a 1 × 1
+    convolution.</li>
+    <li>A 3 × 3 projection and a small tree of convolutions collapse the grid to one vector, and a frozen output
+    layer gives the next token, which is fed back as the next input.</li>
   </ol>
+  <p class="note">In training, the convolutions run on all 256 ticks of a window at once, and the memories are
+  trained over the window by an exact chunked parallel scan. On a chip the model runs one tick at a time, with the
+  same result.</p>
 
   <h2>Results</h2>
   <div class="placeholder">
@@ -145,25 +152,25 @@
 
   <h2>Scores</h2>
   <div class="tablewrap"><table>
-    <tr><th></th><th class="n">VLA v533</th><th class="n">pythia-70m</th><th class="n">pythia-70m</th><th class="n">pythia-70m</th></tr>
-    <tr><td>training tokens</td><td class="n">761 M</td><td class="n">537 M</td><td class="n">1,074 M</td><td class="n">300 B</td></tr>
-    <tr><td>FineWeb held-out, nats/token</td><td class="n">4.580</td><td class="n">6.355</td><td class="n">5.467</td><td class="n">3.731</td></tr>
-    <tr><td>BabyLM 2026 dev, nats/token</td><td class="n">4.564</td><td class="n">5.718</td><td class="n">4.984</td><td class="n">3.250</td></tr>
-    <tr><td>BLiMP, % of 1,005 pairs</td><td class="n">70.2</td><td class="n">51.4</td><td class="n">54.7</td><td class="n">75.7</td></tr>
-    <tr><td>ComVE, % of 999 pairs</td><td class="n">65.0</td><td class="n">57.1</td><td class="n">59.7</td><td class="n">69.7</td></tr>
+    <tr><th></th><th class="n">VLA v540</th><th class="n">pythia-70m</th><th class="n">pythia-70m</th><th class="n">pythia-70m</th></tr>
+    <tr><td>training tokens</td><td class="n">12.8 M</td><td class="n">8.4 M</td><td class="n">16.8 M</td><td class="n">300 B</td></tr>
+    <tr><td>FineWeb held-out, nats/token</td><td class="n">5.186</td><td class="n">11.025</td><td class="n">10.894</td><td class="n">3.731</td></tr>
+    <tr><td>BabyLM 2026 dev, nats/token</td><td class="n">4.988</td><td class="n">11.033</td><td class="n">10.848</td><td class="n">3.250</td></tr>
+    <tr><td>BLiMP, % of 1,005 pairs</td><td class="n">64.0</td><td class="n">53.3</td><td class="n">52.7</td><td class="n">75.7</td></tr>
+    <tr><td>ComVE, % of 999 pairs</td><td class="n">65.0</td><td class="n">53.5</td><td class="n">54.0</td><td class="n">69.7</td></tr>
   </table></div>
   <p class="note">pythia-70m (EleutherAI) is a transformer of similar total size with the same tokenizer, shown
   at about this model's training tokens and fully trained; same documents, same pairs, same scoring rule (see the
   <a href="https://huggingface.co/siliconperception/vla">model card</a>). Pythia was trained on the Pile, this
-  model on FineWeb. Matched tokens are not matched training: at 537 M and 1,074 M tokens pythia has made only 256
-  and 512 updates (of 2 M tokens each), this model 3,043,841 (of 250). Fully trained pythia-70m is the fair
-  reference.</p>
+  model on FineWeb. Matched tokens are not matched training: at 8.4 M and 16.8 M tokens pythia has made only 4
+  and 8 updates (of 2 M tokens each), at the very start of its warm-up; this model has made 1,562 (of 8,192
+  tokens). Fully trained pythia-70m is the fair reference.</p>
 
   <h2>Samples</h2>
-  <p>From the prompt in bold, with the published weights (761 M tokens of training). Locally fluent, not yet
-  coherent:</p>
-  <blockquote><b>My grandmother&#x27;s recipe for apple pie starts with</b> a creamy teta sauce with cheese in its usual small butter and egg yolks, although they have been a tadota taste! You will love it too!</blockquote>
-  <blockquote><b>The colors of the rainbow are</b> the few parts of the image. The flower has a sparkling blue colour which I’ve written in my mind.</blockquote>
+  <p>From the prompt in bold, with the published weights (12.8 M tokens of training). Locally fluent in places,
+  repetitive, not yet coherent:</p>
+  <blockquote><b>The colors of the rainbow are</b> also unique, but not the most recognizable images of the color. The colour images are dark and decorating with pink colors.</blockquote>
+  <blockquote><b>My grandmother&#x27;s recipe for apple pie starts with</b> 2/1 cup cream: 1 cup. Sweet syrup, chocolate syrup (food &amp; wine) to cook with tasty desserts, plus 6 cups, sugar syrup, baking and baking, cook cooking and cook.</blockquote>
 
   <h2>Try it</h2>
 <pre><code>git clone https://github.com/siliconperception/vla && cd vla
@@ -174,11 +181,21 @@ for p in "The colors of the rainbow are" \
          "When you plant a vegetable garden, the first thing to do is" \
          "The history of the bicycle began in"; do
   python vla.py --pretrained --generate --n 120 --prompt "$p" --device cuda
-done
+done</code></pre>
 
-# prompt tuning: fit the starting registers (weights frozen) until the model predicts the prompt,
-# then continue from them; prints the cold and the tuned continuation
-python vla.py --pretrained --generate --prompt_tune 200 --n 120 --prompt "The colors of the rainbow are" --device cuda</code></pre>
+  <h2>Built on</h2>
+  <ul>
+    <li>Gated delta rule: Yang, Kautz, Hatamizadeh, <a href="https://arxiv.org/abs/2412.06464">Gated Delta Networks: Improving Mamba2 with Delta Rule</a> (2024)</li>
+    <li>Chunked parallel training of the delta rule: Yang et al., <a href="https://arxiv.org/abs/2406.06484">Parallelizing Linear Transformers with the Delta Rule over Sequence Length</a> (2024)</li>
+    <li>Delta-rule fast weights: Schlag, Irie, Schmidhuber, <a href="https://arxiv.org/abs/2102.11174">Linear Transformers Are Secretly Fast Weight Programmers</a> (2021)</li>
+    <li>Matrix-valued recurrent state: Katharopoulos et al., <a href="https://arxiv.org/abs/2006.16236">Transformers are RNNs: Fast Autoregressive Transformers with Linear Attention</a> (2020)</li>
+    <li>Data-dependent decay per head: Dao, Gu, <a href="https://arxiv.org/abs/2405.21060">Transformers are SSMs</a> (Mamba-2, 2024)</li>
+    <li>Short causal conv before the memory: Fu et al., <a href="https://arxiv.org/abs/2212.14052">Hungry Hungry Hippos</a> (2022); Gu, Dao, <a href="https://arxiv.org/abs/2312.00752">Mamba</a> (2023)</li>
+    <li>A state at every position of a conv grid: Shi et al., <a href="https://arxiv.org/abs/1506.04214">Convolutional LSTM Network</a> (2015)</li>
+    <li>Residual blocks: He et al., <a href="https://arxiv.org/abs/1512.03385">Deep Residual Learning for Image Recognition</a> (2015); BatchNorm: Ioffe, Szegedy, <a href="https://arxiv.org/abs/1502.03167">Batch Normalization</a> (2015); RMS norm: Zhang, Sennrich, <a href="https://arxiv.org/abs/1910.07467">Root Mean Square Layer Normalization</a> (2019)</li>
+    <li>Tokenizer, frozen embedding and output layer, reference model: Biderman et al., <a href="https://arxiv.org/abs/2304.01373">Pythia</a> (2023)</li>
+    <li>Optimizer: Loshchilov, Hutter, <a href="https://arxiv.org/abs/1711.05101">Decoupled Weight Decay Regularization</a> (2017); data: Penedo et al., <a href="https://arxiv.org/abs/2406.17557">The FineWeb Datasets</a> (2024)</li>
+  </ul>
 
   <footer>
     © 2024-2026 Silicon Perception Inc. Code and weights under the
