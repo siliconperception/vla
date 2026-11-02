@@ -271,6 +271,11 @@ parser.add_argument('--grid_hist', default=0, type=int, metavar='K',
                          'on the outer ring and t-1, t-2, t-3 inward to the centre; older tokens at 0)')
 parser.add_argument('--cd_heads', default=6, type=int, help='--convdelta: memory heads per position')
 parser.add_argument('--cd_convs', default=2, type=int, help='--convdelta: 3x3 conv + BN + ReLU layers per block')
+parser.add_argument('--cd_fw_kernel', default=0, type=int, metavar='K',
+                    help='--cd_fw: 0 = the memory is a 3x3 kernel, its keys/queries the 3x3 patches of a 1x1 '
+                         'projection (d x 9d per head); K >= 1 = a 1x1 kernel, each position\'s own key/query '
+                         'from a KxK projection (d x --cd_fw_dk per head; no patches: far less memory)')
+parser.add_argument('--cd_fw_dk', default=64, type=int, help='--cd_fw_kernel >= 1: key/query width per head')
 parser.add_argument('--cd_fw_chunk', default=2, type=int,
                     help='--cd_fw: scan chunk (ticks); its backward keeps ~T x chunk x P^2 values per head')
 parser.add_argument('--cd_fw', default=0, type=int, metavar='F',
@@ -863,7 +868,7 @@ _ARCH_ARGS = ('context', 'n_hidden', 'c_context', 'depth', 'kernel', 'tokenizer'
               'image_encoder', 'audio_encoder', 'streams', 'linout_kernel', 'learn_win',
               'learn_regs', 'lmu', 'attn', 'attn_ch', 'attn_heads', 'attn_dim', 'attn_age', 'read_rmsnorm',
               'layers', 'write_gate', 'convdelta', 'cd_heads', 'cd_dim', 'cd_taps', 'lm', 'grid_hist',
-              'cd_convs', 'cd_fw')
+              'cd_convs', 'cd_fw', 'cd_fw_kernel', 'cd_fw_dk')
 
 
 def _parse_mix():
@@ -1484,10 +1489,15 @@ class ConvDeltaBlock(nn.Module):
     The convs never read the state, so a whole sequence runs at once (seq) and only the
     memories S are carried tick to tick (_delta_scan); step does one tick."""
 
-    def __init__(self, C, H, d, taps, S, bn_momentum=0.1, n_convs=2, fw=0, fw_chunk=2):
+    def __init__(self, C, H, d, taps, S, bn_momentum=0.1, n_convs=2, fw=0, fw_chunk=2, fw_kernel=0, fw_dk=64):
         super().__init__()
         self.C, self.H, self.d, self.taps, self.S = C, H, d, taps, S
         self.fw, self.fw_chunk = int(fw), int(fw_chunk)
+        # fw_kernel 0: keys/queries are the 3x3 patches of a 1x1 projection (memory d x 9d, a 3x3
+        # kernel); K >= 1: each position's own key/query (memory d x fw_dk, a 1x1 kernel) from a KxK
+        # projection, no patches
+        self.fw_k = int(fw_kernel or 0)
+        self.fw_D = int(fw_dk) if self.fw_k else 9 * d
         self.tconv = nn.Parameter(torch.zeros(taps, C))                    # [lag, channel]
         bn = dict(affine=False, momentum=bn_momentum or None)
         self.mix = nn.Sequential(*[m for _ in range(int(n_convs)) for m in
@@ -1496,7 +1506,8 @@ class ConvDeltaBlock(nn.Module):
         # (a 3x3 kernel over the key grid): written from every position's 3x3 key patch at once,
         # read by convolving it over the query grid (see _convfw_scan)
         if self.fw:
-            self.fw_qkv = nn.Conv2d(C, 3 * self.fw * d, 1)
+            self.fw_qkv = (nn.Conv2d(C, self.fw * (2 * self.fw_D + d), self.fw_k, padding=self.fw_k // 2)
+                           if self.fw_k else nn.Conv2d(C, 3 * self.fw * d, 1))
             self.fw_beta = nn.Conv2d(C, self.fw, 1)                        # per position
             self.fw_alpha = nn.Conv2d(C, self.fw, 1)                       # on the grid mean: per head
             with torch.no_grad():
@@ -1521,7 +1532,7 @@ class ConvDeltaBlock(nn.Module):
     @property
     def fw_ch(self):
         """--cd_fw: state channels holding the conv memories (F x d x 9d values, padded to the grid)."""
-        return -(-self.fw * self.d * 9 * self.d // (self.S * self.S)) if self.fw else 0
+        return -(-self.fw * self.d * self.fw_D // (self.S * self.S)) if self.fw else 0
 
     @property
     def state_ch(self):
@@ -1531,12 +1542,12 @@ class ConvDeltaBlock(nn.Module):
     def _fw_get(self, st):
         """The conv memories of a block state [B, state_ch, S, S] -> [B * F, d, 9 d]."""
         o = self.state_ch - self.fw_ch
-        return st[:, o:].flatten(1)[:, :self.fw * self.d * 9 * self.d].reshape(-1, self.d, 9 * self.d)
+        return st[:, o:].flatten(1)[:, :self.fw * self.d * self.fw_D].reshape(-1, self.d, self.fw_D)
 
     def _fw_put(self, Sf, B):
         """[B * F, d, 9 d] -> the state's conv-memory channels [B, fw_ch, S, S]."""
         h = Sf.new_zeros(B, self.fw_ch * self.S * self.S)
-        h[:, :self.fw * self.d * 9 * self.d] = Sf.reshape(B, -1)
+        h[:, :self.fw * self.d * self.fw_D] = Sf.reshape(B, -1)
         return h.view(B, self.fw_ch, self.S, self.S)
 
     def _fw_proj(self, u):
@@ -1545,12 +1556,16 @@ class ConvDeltaBlock(nn.Module):
         M, P, F_, d, S = u.shape[0], self.S * self.S, self.fw, self.d, self.S
         with torch.autocast(u.device.type, dtype=torch.bfloat16, enabled=u.is_cuda):
             qkv = self.fw_qkv(u)
+        b = torch.sigmoid(self.fw_beta(u)).view(M, F_, P) / P
+        loga = -self.fw_lam.exp() * 2 * torch.sigmoid(self.fw_alpha(u.mean((2, 3), keepdim=True)).view(M, F_))
+        if self.fw_k:                # each position's own key and query
+            D = self.fw_D
+            q, k, v = qkv.to(u.dtype).view(M, F_, 2 * D + d, P).transpose(2, 3).split([D, D, d], -1)
+            return F.normalize(q, dim=-1), F.normalize(k, dim=-1), v, b, loga
         q, k, v = qkv.to(u.dtype).view(M, 3, F_ * d, S, S).unbind(1)
 
         def patch(x):
             return F.normalize(F.unfold(x, 3, padding=1).view(M, F_, d * 9, P).transpose(2, 3), dim=-1)
-        b = torch.sigmoid(self.fw_beta(u)).view(M, F_, P) / P
-        loga = -self.fw_lam.exp() * 2 * torch.sigmoid(self.fw_alpha(u.mean((2, 3), keepdim=True)).view(M, F_))
         return patch(q), patch(k), v.view(M, F_, d, P).transpose(2, 3), b, loga
 
     def _mixed(self, u):
@@ -2305,7 +2320,7 @@ class VLAModel(nn.Module, _HubMixin):
                  learn_regs=(), lmu=False, attn=0, attn_ch=2, attn_heads=8, attn_dim=64, attn_age=True,
                  read_rmsnorm=False, layers=1, up_windows=None, write_gate=False,
                  convdelta=0, cd_heads=6, cd_dim=32, cd_taps=4, cd_chunk=64, grid_hist=0,
-                 cd_convs=2, cd_fw=0, cd_fw_chunk=2):
+                 cd_convs=2, cd_fw=0, cd_fw_chunk=2, cd_fw_kernel=0, cd_fw_dk=64):
         super().__init__()
         from transformers import AutoModelForCausalLM
         repo = _TOKENIZERS[tokenizer]
@@ -2461,7 +2476,8 @@ class VLAModel(nn.Module, _HubMixin):
         # registers, the input grid scaled and shifted per position (cd_G, cd_P) so the 49
         # positions can differ; the state is every block's memories and FIFO in turn
         self.cd = (nn.ModuleList(ConvDeltaBlock(c_context, int(cd_heads), int(cd_dim), int(cd_taps), S,
-                                                bn_momentum, int(cd_convs or 2), int(cd_fw or 0), int(cd_fw_chunk))
+                                                bn_momentum, int(cd_convs or 2), int(cd_fw or 0), int(cd_fw_chunk),
+                                                int(cd_fw_kernel or 0), int(cd_fw_dk or 64))
                                  for _ in range(int(convdelta)))
                    if convdelta else None)
         self.cd_chunk, self.cd_ckpt = int(cd_chunk), False   # cd_ckpt: checkpoint each block (seq)
@@ -3878,6 +3894,7 @@ model = VLAModel(S=args.context, n_hidden=args.n_hidden, c_context=args.c_contex
                  layers=args.layers, write_gate=args.write_gate,
                  convdelta=args.convdelta, cd_heads=args.cd_heads, cd_dim=args.cd_dim, cd_taps=args.cd_taps,
                  grid_hist=args.grid_hist, cd_convs=args.cd_convs, cd_fw=args.cd_fw, cd_fw_chunk=args.cd_fw_chunk,
+                 cd_fw_kernel=args.cd_fw_kernel, cd_fw_dk=args.cd_fw_dk,
                  cd_chunk=args.cd_chunk,
                  up_windows=[float(w) for w in str(args.up_ema).split(',') if w.strip()] if args.up_ema else None)
 if _loaded_ckpt is not None:
