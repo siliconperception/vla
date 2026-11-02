@@ -898,7 +898,7 @@ _ARCH_ARGS = ('context', 'n_hidden', 'c_context', 'depth', 'kernel', 'tokenizer'
               'cd_convs', 'cd_fw', 'cd_fw_kernel', 'cd_fw_dk', 'cd_neg', 'cd_band', 'cd_gamma')
 # architecture switches that load onto a trained model starting from the same function: when
 # given on the command line, the given value wins over the checkpoint's
-_ARCH_SWITCHES = ('cd_neg', 'cd_band', 'cd_gamma')
+_ARCH_SWITCHES = ('cd_neg', 'cd_band', 'cd_gamma', 'cd_taps')
 
 
 def _parse_mix():
@@ -1625,7 +1625,7 @@ class ConvDeltaBlock(nn.Module):
         self.fw_D = int(fw_dk) if self.fw_k else 9 * d
         self.tconv = nn.Parameter(torch.zeros(taps, C))                    # [lag, channel]
         # --cd_gamma: the FIFO is a gamma ladder, c = 0.99 tanh(gz) per channel (0: the FIFO)
-        self.gz = nn.Parameter(torch.zeros(C)) if gamma else None
+        self.gz = nn.Parameter(torch.zeros(C)) if gamma and taps > 1 else None
         bn = dict(affine=False, momentum=bn_momentum or None)
         self.mix = nn.Sequential(*[m for _ in range(int(n_convs)) for m in
                                    (nn.Conv2d(C, C, 3, padding=1), nn.BatchNorm2d(C, **bn), nn.ReLU())])
@@ -4067,6 +4067,17 @@ model = VLAModel(S=args.context, n_hidden=args.n_hidden, c_context=args.c_contex
                  up_windows=[float(w) for w in str(args.up_ema).split(',') if w.strip()] if args.up_ema else None)
 if _loaded_ckpt is not None:
     _sd = _upgrade_state_dict(_loaded_ckpt['state_dict'])
+    if model.cd is not None:     # --cd_taps fewer than saved: keep the time conv's first lags
+        for _i, _b in enumerate(model.cd):
+            _k = f'cd.{_i}.tconv'
+            if _k in _sd and _sd[_k].shape[0] > _b.taps:
+                if _i == 0:
+                    print(f'--cd_taps {_b.taps}: the time conv keeps lags 0..{_b.taps - 1} of '
+                          f'{_sd[_k].shape[0]} (the FIFO shrinks)', flush=True)
+                _sd = dict(_sd, **{_k: _sd[_k][:_b.taps]})
+        if model.cd[0].gz is None and any(re.match(r'cd\.\d+\.gz$', k) for k in _sd):
+            print('no ladder (--no-cd_gamma or --cd_taps 1): the checkpoint\'s ladder c are dropped', flush=True)
+            _sd = {k: v for k, v in _sd.items() if not re.match(r'cd\.\d+\.gz$', k)}
     if _aud_switch:
         _sd = _switch_audio_state_dict(_sd, model, *_aud_switch)
     if model.streams == 3 and 'voc_dec.proj.weight' not in _sd:
