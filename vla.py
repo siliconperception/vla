@@ -889,6 +889,9 @@ _ARCH_ARGS = ('context', 'n_hidden', 'c_context', 'depth', 'kernel', 'tokenizer'
               'learn_regs', 'lmu', 'attn', 'attn_ch', 'attn_heads', 'attn_dim', 'attn_age', 'read_rmsnorm',
               'layers', 'write_gate', 'convdelta', 'cd_heads', 'cd_dim', 'cd_taps', 'lm', 'grid_hist',
               'cd_convs', 'cd_fw', 'cd_fw_kernel', 'cd_fw_dk', 'cd_neg', 'cd_band', 'cd_gamma')
+# architecture switches that load onto a trained model starting from the same function: when
+# given on the command line, the given value wins over the checkpoint's
+_ARCH_SWITCHES = ('cd_neg', 'cd_band', 'cd_gamma')
 
 
 def _parse_mix():
@@ -974,6 +977,10 @@ if _loaded_ckpt is not None:
                                             for a in sys.argv) else None)
     for k in _ARCH_ARGS:
         if k in _saved:
+            if k in _ARCH_SWITCHES and any(re.match(rf'--(no-)?{k}(=|$)', a) for a in sys.argv):
+                if _saved[k] != getattr(args, k):
+                    print(f'--{k}: {getattr(args, k)} (the checkpoint has {_saved[k]})', flush=True)
+                continue             # given: a switch added to a trained model
             setattr(args, k, _saved[k])
     if _aud_given and _aud_given != (_saved.get('audio_encoder') or 'none'):
         _aud_switch = (_saved.get('audio_encoder') or 'none', _aud_given)   # a new audio encoder
