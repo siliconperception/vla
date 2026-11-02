@@ -1699,6 +1699,19 @@ class ConvDeltaBlock(nn.Module):
         x = u + self._read_out(o, B)
         return x, torch.cat(parts, 1)
 
+    def _ladder(self, r, reset, fifo):
+        """--cd_gamma over a window: r [B, T, C, S, S] (RMS(x)), fifo [B, n, C, S, S] the stages
+        entering it -> (the time conv's sum over r and the stages [B, T, C, S, S], the stages after
+        the last tick [B, n, C, S, S])."""
+        B, T, C = r.shape[:3]
+        c, P_ = 0.99 * torch.tanh(self.gz), self.S * self.S
+        stage, y, ends = r.reshape(B, T, C, P_), r * self.tconv[0][None, None, :, None, None], []
+        for j in range(1, self.taps):
+            stage, sT = _ema_scan(stage, c, reset, fifo[:, j - 1].reshape(B, C, P_))
+            y = y + stage.view(B, T, C, self.S, self.S) * self.tconv[j][None, None, :, None, None]
+            ends.append(sT.view(B, C, self.S, self.S))
+        return y, torch.stack(ends, 1)
+
     def seq(self, x, st, reset, chunk=64):
         """A sequence: x [B, T, C, S, S], st [B, state_ch, S, S] entering tick 0, reset [B, T]
         (zero state entering that tick) -> (x' [B, T, C, S, S], st' after the last tick)."""
@@ -1707,13 +1720,11 @@ class ConvDeltaBlock(nn.Module):
         nm = H * d * d
         fifo = st[:, nm:nm + n * C].reshape(B, n, C, self.S, self.S)
         r = _rms_pos(x.flatten(0, 1)).view(B, T, C, self.S, self.S)
-        if self.gz is not None:      # --cd_gamma: the ladder's stages over the window, one scan each
-            c, P_ = 0.99 * torch.tanh(self.gz), self.S * self.S
-            stage, y, ends = r.reshape(B, T, C, P_), r * self.tconv[0][None, None, :, None, None], []
-            for j in range(1, self.taps):
-                stage, sT = _ema_scan(stage, c, reset, fifo[:, j - 1].reshape(B, C, P_))
-                y = y + stage.view(B, T, C, self.S, self.S) * self.tconv[j][None, None, :, None, None]
-                ends.append(sT.view(B, C, self.S, self.S))
+        if self.gz is not None:      # --cd_gamma: the ladder's stages over the window, one scan each;
+            if torch.is_grad_enabled():  # checkpointed, so its stages are not held through the block
+                y, ends = torch.utils.checkpoint.checkpoint(self._ladder, r, reset, fifo, use_reentrant=False)
+            else:
+                y, ends = self._ladder(r, reset, fifo)
         else:
             ext = torch.cat([fifo.flip(1), r], 1)                          # [B, n + T]: oldest first
             doc = torch.cat([reset.new_zeros(B, n, dtype=torch.long), torch.cumsum(reset.long(), 1)], 1)
@@ -1745,7 +1756,7 @@ class ConvDeltaBlock(nn.Module):
         x = (u + self._read_out(o, B * T)).view(B, T, C, self.S, self.S)
         ST = ST.view(B, P, H, d, d).permute(0, 2, 3, 4, 1).reshape(B, nm, self.S, self.S)
         if self.gz is not None:      # the ladder after the last tick
-            parts = [ST, torch.stack(ends, 1).reshape(B, n * C, self.S, self.S)]
+            parts = [ST, ends.reshape(B, n * C, self.S, self.S)]
         else:                        # the FIFO after the last tick: the last n RMS(x), zero where a reset came after them
             last = ext[:, T:].flip(1)                                      # newest first
             okl = (doc[:, T:].flip(1) == doc[:, -1:]).to(x.dtype)
