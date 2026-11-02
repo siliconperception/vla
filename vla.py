@@ -516,6 +516,9 @@ parser.add_argument('--gate_lr_mult', default=1.0, type=float, metavar='M',
                     help='--write_gate: the gate\'s weights train at M times the lr (their own '
                          'optimizer group, on the same schedule): through the sigmoid at 1/W and a '
                          'rate that moves the register by only (o - R) per tick, they learn slowly')
+parser.add_argument('--cd_gamma_init', default=None, type=float, metavar='C',
+                    help='--cd_gamma: set every ladder c to C (|C| < 0.99), once: a run whose checkpoint was '
+                         'saved with the same --cd_gamma_init keeps its learned c (so a relaunch does not reset it)')
 parser.add_argument('--gamma_lr_mult', default=1.0, type=float, metavar='M',
                     help='--cd_gamma: the ladder\'s c parameters train at M times the lr (their own optimizer '
                          'group, on the same schedule): their gradients are tiny, so at the network\'s lr c '
@@ -4115,6 +4118,16 @@ if args.cd_windows and model.cd is not None:     # --cd_windows: the base window
             _b.lam.copy_(-torch.log(_w))
     print('--cd_windows: base windows ' + ' | '.join(
         ' '.join(f'{w:g}' for w in (1 / _b.lam.exp()).round().tolist()) for _b in model.cd), flush=True)
+if args.cd_gamma_init is not None and model.cd is not None and model.cd[0].gz is not None:
+    if _loaded_ckpt is not None and _loaded_ckpt['saved_args'].get('cd_gamma_init') == args.cd_gamma_init:
+        pass                         # already set in this run: keep the learned c
+    elif not abs(args.cd_gamma_init) < 0.99:
+        raise SystemExit(f'--cd_gamma_init {args.cd_gamma_init}: |C| < 0.99')
+    else:
+        with torch.no_grad():
+            for _b in model.cd:
+                _b.gz.fill_(math.atanh(args.cd_gamma_init / 0.99))
+        print(f'--cd_gamma_init: every ladder c set to {args.cd_gamma_init:g}', flush=True)
 model = model.to(args.device)
 if args.prompt_tune and model.cd is not None:
     raise SystemExit('--prompt_tune tunes the registers of a register model; a --convdelta model has none')
