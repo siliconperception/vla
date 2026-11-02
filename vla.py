@@ -4205,8 +4205,10 @@ def _model_graph(model):
         mb = re.match(r'cd\.(\d+)\.(mix\.0|out)$', r['name']) if cd is not None else None
         if mb and mb.group(2) == 'mix.0' and cd[int(mb.group(1))].taps:   # --convdelta: the time conv, then the convs
             b = cd[int(mb.group(1))]
-            out.append(dict(name=f'cd.{mb.group(1)}.tconv <- RMS(x)' + (', FIFO[t-1]' if b.taps > 1 else ''),
-                            op=(f'depthwise conv over RMS(x) and a {b.taps - 1}-stage gamma ladder, residual add'
+            out.append(dict(name=f'cd.{mb.group(1)}.tconv <- RMS(x)' + ('' if b.taps < 2 else
+                                 ', LADDER[t-1]' if b.gz is not None else ', FIFO[t-1]'),
+                            op=(f'per-channel weighted sum of RMS(x) and a {b.taps - 1}-stage gamma ladder '
+                                f'(c learned per channel), residual add'
                                 if b.gz is not None else
                                 f'causal depthwise time conv over {b.taps} ticks, residual add' if b.taps > 1 else
                                 'per-channel scale of RMS(x), residual add (no FIFO)'),
