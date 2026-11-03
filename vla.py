@@ -4433,7 +4433,7 @@ def _model_graph(model):
             out.append(dict(name='(token history)', op='RMSnorm per token', inp=r['out'], out=r['out'],
                             tr=0, fr=0))
             if isinstance(model.ctx_cat, nn.Identity) and model.grid_c1 is None:   # --cd_no_cat: the map next
-                out.append(_grid_map_row(model, G, r['out']))
+                out.append(_grid_map_row(model, G, r['out'].split('x')[-1]))
             continue
         if r['name'] == 'ctx_cat':
             srcs = ['(token grid)'] + [f'{g}[t-1]' for g in regs]
