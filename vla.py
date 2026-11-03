@@ -1167,6 +1167,8 @@ def _narrow_state_dict(sd, model, old):
               ([('image', 2048)] if old['image_encoder'] != 'none' else []) +
               ([('audio', _AUD_DIMS[old['audio_encoder']])] if old['audio_encoder'] != 'none' else []) +
               [('tok', model.c_text)] * (int(old['streams']) - 1))
+    if 'ctx_cat.weight' not in sd:   # --cd_no_cat: no input columns to narrow
+        return sd
     w = sd['ctx_cat.weight']
     keep, o = [], 0
     for name, n in widths:
