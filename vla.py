@@ -5227,14 +5227,6 @@ if args.vis:
     ci = rows                                        # its first row
     rows += (2 + bool(model.grid_hist and model.grid_a is not None)) if cdv else 0
     _cd_last = {}
-    _pca = None                                      # the input grid as RGB: its top 3 principal components
-    if cdv and isinstance(model.ctx_cat, nn.Identity) and model.cd_G is None:
-        with torch.no_grad():                        # (the grid is the RMS-normalized embeddings themselves)
-            _e = model.tok_embed.weight.float()
-            _e = _e * torch.rsqrt(_e.pow(2).mean(-1, keepdim=True) + 1e-12)
-            _mu = _e.mean(0)
-            _, _sv, _vh = torch.linalg.svd(_e - _mu, full_matrices=False)
-            _pca = (_mu, _vh[:3], _sv[:3] / math.sqrt(_e.shape[0]))   # mean, components [3, C], their std
     if cdv:
         _cd_fn = model._cd_in
 
@@ -5281,10 +5273,9 @@ if args.vis:
         ax_p = fig.add_subplot(gs[:rows, 1])
     for r, ax in enumerate(axes):
         if cdv and r >= ci:
-            ax.set_title(['input grid: top 3 principal components of the token embeddings as RGB' if _pca else
-                          'input grid (std over channels)',
+            ax.set_title(['ctx_cat grid (std over channels)',
                           f'memories: |S| per cell, blocks 1-{len(model.cd)} (3 per row)',
-                          ('learned' if isinstance(model.grid_a, nn.Parameter) else 'fixed') +
+                          ('learned' if isinstance(getattr(model, 'grid_a', None), nn.Parameter) else 'fixed') +
                           f' input map a[j, p]: tokens t .. t-{model.grid_hist - 1} '
                           f'(4 per row; red +, blue -)'][r - ci], fontsize=9, pad=3)
             continue
@@ -5360,13 +5351,7 @@ if args.vis:
             else:
                 imgs[r].set_clim(0.0, vmax[r] or 1e-9)
         if cdv:                                      # --convdelta rows
-            x0 = _cd_last['x'][0].float()
-            if _pca:                                 # each component at +-2.5 std -> 0 .. 1
-                mu_, vh_, sd_ = (t.to(x0.device) for t in _pca)
-                pc = torch.einsum('kc,chw->hwk', vh_, x0 - mu_[:, None, None]) / sd_
-                mos = [(0.5 + pc / 5).clamp(0, 1).cpu().numpy()]
-            else:
-                mos = [x0.std(dim=0).cpu().numpy()]
+            mos = [_cd_last['x'][0].float().std(dim=0).cpu().numpy()]   # the ctx_cat grid, std over channels
             off = model.hist_ch
             mem = []
             for blk in model.cd:
@@ -5378,13 +5363,6 @@ if args.vis:
                 mos.append(_mosaic(list(model.grid_a.detach().float().cpu().numpy()), 4))
             for j, m in enumerate(mos):
                 r = ci + j
-                if m.ndim == 3:                      # RGB: no colour scale
-                    if imgs[r] is None:
-                        imgs[r] = axes[r].imshow(m, interpolation='nearest')
-                        axes[r].set_xticks([])
-                        axes[r].set_yticks([])
-                    imgs[r].set_data(m)
-                    continue
                 sym = j == 2
                 hi = float(np.nanmax(np.abs(m))) if sym else float(np.nanmax(m))
                 vmax[r] = hi if vmax[r] is None or sym else max(hi, 0.98 * vmax[r])
