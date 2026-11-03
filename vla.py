@@ -269,6 +269,9 @@ parser.add_argument('--grid_hist', default=0, type=int, metavar='K',
                     help='--convdelta --lm: the input grid mixes the last K tokens, each cell p its own '
                          'learned weights a[j, p] over tokens t-j (start: concentric rings, the current token '
                          'on the outer ring and t-1, t-2, t-3 inward to the centre; older tokens at 0)')
+parser.add_argument('--grid_rings', default=False, action=argparse.BooleanOptionalAction,
+                    help='--grid_hist K: the concentric-ring map fixed, not learned (t on the outer ring, '
+                         't-1, t-2, t-3 inward to the centre). Restored by --load')
 parser.add_argument('--grid_spiral', default=False, action=argparse.BooleanOptionalAction,
                     help='--grid_hist K (<= S*S, e.g. 49): no learned map; token t-j sits at cell j of a square '
                          'spiral from the centre (t) outward, so the grid is a serpentine shift register of the '
@@ -918,7 +921,7 @@ _ARCH_ARGS = ('context', 'n_hidden', 'c_context', 'depth', 'kernel', 'tokenizer'
               'ctx_read_norm', 'dec_tree_kernels', 'dec_width', 'bn_momentum', 'init',
               'image_encoder', 'audio_encoder', 'streams', 'linout_kernel', 'learn_win',
               'learn_regs', 'lmu', 'attn', 'attn_ch', 'attn_heads', 'attn_dim', 'attn_age', 'read_rmsnorm',
-              'layers', 'write_gate', 'convdelta', 'cd_heads', 'cd_dim', 'cd_taps', 'lm', 'grid_hist', 'grid_spiral',
+              'layers', 'write_gate', 'convdelta', 'cd_heads', 'cd_dim', 'cd_taps', 'lm', 'grid_hist', 'grid_spiral', 'grid_rings',
               'cd_convs', 'cd_fw', 'cd_fw_kernel', 'cd_fw_dk', 'cd_neg', 'cd_band', 'cd_gamma', 'cd_stem', 'cd_delta_first', 'grid_conv1d', 'cd_recur',
               'cd_no_res', 'cd_no_cat', 'cd_no_gp')
 # architecture switches that can be loaded onto a trained model: when given on the command line,
@@ -2597,7 +2600,7 @@ class VLAModel(nn.Module, _HubMixin):
                  text_nul=False, surprise=None, linout_kernel=1, learn_win=False,
                  learn_regs=(), lmu=False, attn=0, attn_ch=2, attn_heads=8, attn_dim=64, attn_age=True,
                  read_rmsnorm=False, layers=1, up_windows=None, write_gate=False,
-                 convdelta=0, cd_heads=6, cd_dim=32, cd_taps=4, cd_chunk=64, grid_hist=0, grid_spiral=False,
+                 convdelta=0, cd_heads=6, cd_dim=32, cd_taps=4, cd_chunk=64, grid_hist=0, grid_spiral=False, grid_rings=False,
                  cd_convs=2, cd_fw=0, cd_fw_chunk=2, cd_fw_kernel=0, cd_fw_dk=64, cd_neg=False, cd_band=0.0, cd_gamma=False,
                  cd_stem=0, cd_delta_first=False, grid_conv1d=0,
                  cd_recur=False, cd_no_res=False, cd_no_cat=False, cd_no_gp=False):
@@ -2820,7 +2823,10 @@ class VLAModel(nn.Module, _HubMixin):
                 a = torch.zeros(self.grid_hist, S, S)
                 for j in range(min(self.grid_hist, S // 2 + 1)):
                     a[j][ring == S // 2 - j] = 1.0
-                self.grid_a = nn.Parameter(a)
+                if grid_rings:       # --grid_rings: the rings, fixed
+                    self.register_buffer('grid_a', a)
+                else:
+                    self.grid_a = nn.Parameter(a)
             self.hist_ch = 1
             self.ring_off += 1
         self.dff = None              # [B, K*n_hidden, S, S], detached; None until first step
@@ -4235,7 +4241,7 @@ model = VLAModel(S=args.context, n_hidden=args.n_hidden, c_context=args.c_contex
                  attn_dim=args.attn_dim, attn_age=args.attn_age, read_rmsnorm=args.read_rmsnorm,
                  layers=args.layers, write_gate=args.write_gate,
                  convdelta=args.convdelta, cd_heads=args.cd_heads, cd_dim=args.cd_dim, cd_taps=args.cd_taps,
-                 grid_hist=args.grid_hist, grid_spiral=args.grid_spiral, cd_convs=args.cd_convs, cd_fw=args.cd_fw, cd_fw_chunk=args.cd_fw_chunk,
+                 grid_hist=args.grid_hist, grid_spiral=args.grid_spiral, grid_rings=args.grid_rings, cd_convs=args.cd_convs, cd_fw=args.cd_fw, cd_fw_chunk=args.cd_fw_chunk,
                  cd_fw_kernel=args.cd_fw_kernel, cd_fw_dk=args.cd_fw_dk, cd_neg=args.cd_neg, cd_band=args.cd_band, cd_gamma=args.cd_gamma,
                  cd_stem=args.cd_stem, cd_delta_first=args.cd_delta_first,
                  grid_conv1d=args.grid_conv1d, cd_recur=args.cd_recur, cd_no_res=args.cd_no_res, cd_no_cat=args.cd_no_cat, cd_no_gp=args.cd_no_gp, cd_chunk=args.cd_chunk,
@@ -4327,6 +4333,21 @@ _NUL_ID = model.nul_id
 _SIL = _NUL_ID if _NUL_ID is not None else -100
 
 
+def _grid_map_row(model, G, C):
+    """--grid_hist: the graph row mapping the G history tokens onto the grid."""
+    S, sp = model.S, model.grid_a is None
+    fixed = not sp and not isinstance(model.grid_a, nn.Parameter)
+    op = ('fixed spiral: token t-j at cell j from the centre (t) out, one per cell' if sp else
+          f'fixed rings: t on the outer ring, t-1 .. t-{G - 1} inward' if fixed else
+          f'learned map of the {G} tokens onto {S}x{S}')
+    gp = model.cd_G is not None
+    return dict(name=('spiral' if sp else 'grid_a') + (', cd_G, cd_P' if gp else ''),
+                op=op + (', then scale + shift per position' if gp else ''),
+                inp=f'{G}x{C}', out=f'{C}x{S}x{S}',
+                tr=(0 if sp or fixed else model.grid_a.numel()) +
+                   (model.cd_G.numel() + model.cd_P.numel() if gp else 0), fr=0)
+
+
 def _model_graph(model):
     """One token step as a table, modules in execution order (conv rows absorb their
     BN/ReLU/pool), with marker rows for the tensor ops between modules."""
@@ -4405,18 +4426,14 @@ def _model_graph(model):
                 out.append(dict(name='(token window)', op=f'tokens in time order t-{G - 1} .. t, a 1-d sequence',
                                 inp=f'{G}x{C}', out=f'{C}x{G}', tr=0, fr=0))
                 continue
-            sp = model.grid_a is None
-            out.append(dict(name='spiral, cd_G, cd_P' if sp else 'grid_a, cd_G, cd_P',
-                            op=(f'fixed spiral: token t-j at cell j from the centre (t) out, one per cell'
-                                if sp else f'learned map of the {G} tokens onto {model.S}x{model.S}') +
-                            ', then scale + shift per position',
-                            inp=f'{G}x{C}', out=f'{C}x{model.S}x{model.S}',
-                            tr=(0 if sp else model.grid_a.numel()) + model.cd_G.numel() + model.cd_P.numel(), fr=0))
+            out.append(_grid_map_row(model, G, C))
             continue
         if r['name'] == 'tok_embed' and cd is not None and G:
             out.append(dict(r, name=f'tok_embed <- tokens t .. t-{G - 1} (HIST[t-1])'))
             out.append(dict(name='(token history)', op='RMSnorm per token', inp=r['out'], out=r['out'],
                             tr=0, fr=0))
+            if isinstance(model.ctx_cat, nn.Identity) and model.grid_c1 is None:   # --cd_no_cat: the map next
+                out.append(_grid_map_row(model, G, r['out']))
             continue
         if r['name'] == 'ctx_cat':
             srcs = ['(token grid)'] + [f'{g}[t-1]' for g in regs]
