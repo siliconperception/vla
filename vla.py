@@ -269,6 +269,10 @@ parser.add_argument('--grid_hist', default=0, type=int, metavar='K',
                     help='--convdelta --lm: the input grid mixes the last K tokens, each cell p its own '
                          'learned weights a[j, p] over tokens t-j (start: concentric rings, the current token '
                          'on the outer ring and t-1, t-2, t-3 inward to the centre; older tokens at 0)')
+parser.add_argument('--grid_spiral', default=False, action=argparse.BooleanOptionalAction,
+                    help='--grid_hist K (<= S*S, e.g. 49): no learned map; token t-j sits at cell j of a square '
+                         'spiral from the centre (t) outward, so the grid is a serpentine shift register of the '
+                         'last K tokens, one token per cell. Restored by --load')
 parser.add_argument('--cd_heads', default=6, type=int, help='--convdelta: memory heads per position')
 parser.add_argument('--cd_convs', default=2, type=int, help='--convdelta: 3x3 conv + BN + ReLU layers per block')
 parser.add_argument('--cd_neg', default=False, action=argparse.BooleanOptionalAction,
@@ -896,11 +900,11 @@ _ARCH_ARGS = ('context', 'n_hidden', 'c_context', 'depth', 'kernel', 'tokenizer'
               'ctx_read_norm', 'dec_tree_kernels', 'dec_width', 'bn_momentum', 'init',
               'image_encoder', 'audio_encoder', 'streams', 'linout_kernel', 'learn_win',
               'learn_regs', 'lmu', 'attn', 'attn_ch', 'attn_heads', 'attn_dim', 'attn_age', 'read_rmsnorm',
-              'layers', 'write_gate', 'convdelta', 'cd_heads', 'cd_dim', 'cd_taps', 'lm', 'grid_hist',
+              'layers', 'write_gate', 'convdelta', 'cd_heads', 'cd_dim', 'cd_taps', 'lm', 'grid_hist', 'grid_spiral',
               'cd_convs', 'cd_fw', 'cd_fw_kernel', 'cd_fw_dk', 'cd_neg', 'cd_band', 'cd_gamma')
-# architecture switches that load onto a trained model starting from the same function: when
-# given on the command line, the given value wins over the checkpoint's
-_ARCH_SWITCHES = ('cd_neg', 'cd_band', 'cd_gamma', 'cd_taps')
+# architecture switches that can be loaded onto a trained model: when given on the command line,
+# the given value wins over the checkpoint's
+_ARCH_SWITCHES = ('cd_neg', 'cd_band', 'cd_gamma', 'cd_taps', 'grid_hist', 'grid_spiral')
 
 
 def _parse_mix():
@@ -1524,6 +1528,23 @@ class _EmaScan(torch.autograd.Function):
 def _ema_scan(y, c, reset, h0, chunk=16):
     """--cd_gamma: one stage of the ladder (see _EmaScan) -> (s'(t) [B, T, C, P], s(T))."""
     return _EmaScan.apply(y, c, reset, h0, chunk)
+
+
+def _spiral_cells(S):
+    """The S*S cells of an SxS grid (S odd) in square-spiral order from the centre, as flat indices:
+    each cell is a grid neighbour of the one before (right, down, left, up, legs 1, 1, 2, 2, ...)."""
+    r = c = S // 2
+    cells, d, leg = [r * S + c], 0, 1
+    dirs = ((0, 1), (1, 0), (0, -1), (-1, 0))
+    while len(cells) < S * S:
+        for _ in range(2):
+            for _ in range(leg):
+                r, c = r + dirs[d][0], c + dirs[d][1]
+                if 0 <= r < S and 0 <= c < S and len(cells) < S * S:
+                    cells.append(r * S + c)
+            d = (d + 1) % 4
+        leg += 1
+    return cells
 
 
 def _delta_scan(q, k, v, beta, loga, reset, S0, chunk=64):
@@ -2496,7 +2517,7 @@ class VLAModel(nn.Module, _HubMixin):
                  text_nul=False, surprise=None, linout_kernel=1, learn_win=False,
                  learn_regs=(), lmu=False, attn=0, attn_ch=2, attn_heads=8, attn_dim=64, attn_age=True,
                  read_rmsnorm=False, layers=1, up_windows=None, write_gate=False,
-                 convdelta=0, cd_heads=6, cd_dim=32, cd_taps=4, cd_chunk=64, grid_hist=0,
+                 convdelta=0, cd_heads=6, cd_dim=32, cd_taps=4, cd_chunk=64, grid_hist=0, grid_spiral=False,
                  cd_convs=2, cd_fw=0, cd_fw_chunk=2, cd_fw_kernel=0, cd_fw_dk=64, cd_neg=False, cd_band=0.0, cd_gamma=False):
         super().__init__()
         from transformers import AutoModelForCausalLM
@@ -2675,12 +2696,22 @@ class VLAModel(nn.Module, _HubMixin):
                 raise SystemExit('--grid_hist needs --convdelta and --lm (one text stream, no media)')
             if not 2 <= self.grid_hist <= S * S + 1:
                 raise SystemExit(f'--grid_hist {self.grid_hist}: 2 .. {S * S + 1}')
-            r = torch.arange(S) - S // 2
-            ring = torch.maximum(r.abs()[:, None], r.abs()[None, :])          # 0 centre .. S//2 outer
-            a = torch.zeros(self.grid_hist, S, S)
-            for j in range(min(self.grid_hist, S // 2 + 1)):
-                a[j][ring == S // 2 - j] = 1.0
-            self.grid_a = nn.Parameter(a)
+            if grid_spiral:          # --grid_spiral: token t-j at the j-th cell of a square spiral, no map
+                if self.grid_hist > S * S:
+                    raise SystemExit(f'--grid_spiral: --grid_hist {self.grid_hist} > {S * S} cells')
+                cells = _spiral_cells(S)
+                inv = torch.full((S * S,), self.grid_hist, dtype=torch.long)   # cell -> lag (K: empty)
+                for j in range(self.grid_hist):
+                    inv[cells[j]] = j
+                self.register_buffer('spiral_inv', inv, persistent=False)
+                self.grid_a = None
+            else:
+                r = torch.arange(S) - S // 2
+                ring = torch.maximum(r.abs()[:, None], r.abs()[None, :])      # 0 centre .. S//2 outer
+                a = torch.zeros(self.grid_hist, S, S)
+                for j in range(min(self.grid_hist, S // 2 + 1)):
+                    a[j][ring == S // 2 - j] = 1.0
+                self.grid_a = nn.Parameter(a)
             self.hist_ch = 1
             self.ring_off += 1
         self.dff = None              # [B, K*n_hidden, S, S], detached; None until first step
@@ -2930,7 +2961,11 @@ class VLAModel(nn.Module, _HubMixin):
             e = self.tok_embed(idx.clamp(min=0))
             e = (e * torch.rsqrt(e.pow(2).mean(-1, keepdim=True) + 1e-12)).masked_fill((idx < 0)[..., None], 0.0)
             y = self.ctx_cat(e.reshape(M * K, -1, 1, 1)).view(M, K, -1)              # [M, K, C]
-            x = torch.einsum('mkc,kp->mcp', y, self.grid_a.view(K, -1)).view(M, -1, self.S, self.S)
+            if self.grid_a is None:  # --grid_spiral: each cell holds its token (empty cells 0)
+                y = torch.cat([y, y.new_zeros(M, 1, y.shape[2])], 1)
+                x = y.index_select(1, self.spiral_inv).transpose(1, 2).reshape(M, -1, self.S, self.S)
+            else:
+                x = torch.einsum('mkc,kp->mcp', y, self.grid_a.view(K, -1)).view(M, -1, self.S, self.S)
             return x * self.cd_G + self.cd_P
         return self.ctx_cat(torch.cat(self._inputs(idx, img, aud), 1)) * self.cd_G + self.cd_P
 
@@ -4071,7 +4106,7 @@ model = VLAModel(S=args.context, n_hidden=args.n_hidden, c_context=args.c_contex
                  attn_dim=args.attn_dim, attn_age=args.attn_age, read_rmsnorm=args.read_rmsnorm,
                  layers=args.layers, write_gate=args.write_gate,
                  convdelta=args.convdelta, cd_heads=args.cd_heads, cd_dim=args.cd_dim, cd_taps=args.cd_taps,
-                 grid_hist=args.grid_hist, cd_convs=args.cd_convs, cd_fw=args.cd_fw, cd_fw_chunk=args.cd_fw_chunk,
+                 grid_hist=args.grid_hist, grid_spiral=args.grid_spiral, cd_convs=args.cd_convs, cd_fw=args.cd_fw, cd_fw_chunk=args.cd_fw_chunk,
                  cd_fw_kernel=args.cd_fw_kernel, cd_fw_dk=args.cd_fw_dk, cd_neg=args.cd_neg, cd_band=args.cd_band, cd_gamma=args.cd_gamma,
                  cd_chunk=args.cd_chunk,
                  up_windows=[float(w) for w in str(args.up_ema).split(',') if w.strip()] if args.up_ema else None)
@@ -4087,6 +4122,9 @@ if _loaded_ckpt is not None:
                           'the time conv and its FIFO are removed'), flush=True)
                 _sd = dict(_sd, **{_k: _sd[_k][:_b.taps]}) if _b.taps else \
                     {k: v for k, v in _sd.items() if k != _k}
+        if model.grid_hist and model.grid_a is None and 'grid_a' in _sd:
+            print('--grid_spiral: the checkpoint\'s learned input map grid_a is dropped', flush=True)
+            _sd = {k: v for k, v in _sd.items() if k != 'grid_a'}
         if model.cd[0].gz is None and any(re.match(r'cd\.\d+\.gz$', k) for k in _sd):
             print('no ladder (--no-cd_gamma or --cd_taps 1): the checkpoint\'s ladder c are dropped', flush=True)
             _sd = {k: v for k, v in _sd.items() if not re.match(r'cd\.\d+\.gz$', k)}
@@ -4233,10 +4271,13 @@ def _model_graph(model):
             C = r['out'].split('x')[0]
             out.append(dict(r, op=r['op'] + ', per token', inp=f'{G}x{r["inp"].split("x")[0]}',
                             out=f'{G}x{C}'))
-            out.append(dict(name='grid_a, cd_G, cd_P', op=f'learned map of the {G} tokens onto '
-                            f'{model.S}x{model.S}, then scale + shift per position',
+            sp = model.grid_a is None
+            out.append(dict(name='spiral, cd_G, cd_P' if sp else 'grid_a, cd_G, cd_P',
+                            op=(f'fixed spiral: token t-j at cell j from the centre (t) out, one per cell'
+                                if sp else f'learned map of the {G} tokens onto {model.S}x{model.S}') +
+                            ', then scale + shift per position',
                             inp=f'{G}x{C}', out=f'{C}x{model.S}x{model.S}',
-                            tr=model.grid_a.numel() + model.cd_G.numel() + model.cd_P.numel(), fr=0))
+                            tr=(0 if sp else model.grid_a.numel()) + model.cd_G.numel() + model.cd_P.numel(), fr=0))
             continue
         if r['name'] == 'tok_embed' and cd is not None and G:
             out.append(dict(r, name=f'tok_embed <- tokens t .. t-{G - 1} (HIST[t-1])'))
@@ -4990,7 +5031,7 @@ if args.vis:
     rows = nr + len(gated)                           # --write_gate: a rate map per gated register
     cdv = model.cd is not None                       # --convdelta: input grid, memories, (input map)
     ci = rows                                        # its first row
-    rows += (2 + bool(model.grid_hist)) if cdv else 0
+    rows += (2 + bool(model.grid_hist and model.grid_a is not None)) if cdv else 0
     _cd_last = {}
     if cdv:
         _cd_fn = model._cd_in
@@ -5122,7 +5163,7 @@ if args.vis:
                 mem.append(dff[0, off:off + nm].float().pow(2).sum(0).sqrt().cpu().numpy())
                 off += blk.state_ch
             mos.append(_mosaic(mem, 3))
-            if model.grid_hist:
+            if model.grid_hist and model.grid_a is not None:
                 mos.append(_mosaic(list(model.grid_a.detach().float().cpu().numpy()), 4))
             for j, m in enumerate(mos):
                 r = ci + j
