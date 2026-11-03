@@ -1,6 +1,6 @@
 """Draw docs/figures/vla_<model>.svg: one clock tick of a VLA model, 16:9 (1920 x 1080).
 
-usage: python tools/figure_vla.py [--model v498|v499|v502|v505|v511|v531|v533|v536|v538|v540|v541|v552|v564|v569|v579] [--out OUT]
+usage: python tools/figure_vla.py [--model v498|v499|v502|v505|v511|v531|v533|v536|v538|v540|v541|v552|v564|v569|v579|v583] [--out OUT]
 
 v498: recurrent CNN + two order-2 Legendre memories (4096, 64 ticks) + copy + recall attention, never
 reset. v499: no registers, the recall attention's ring is the whole state, reset at each example.
@@ -25,11 +25,13 @@ v569: 7 blocks of 7 convs at 256 channels (--c_context 256 --convdelta 7 --cd_co
 memory first, then its convs (--cd_delta_first); otherwise as v564.
 v579: 7 blocks at 256 channels, convs then memory, no skip around the convs (--cd_no_res --cd_mem_res: the
 only add is the per-position one around the memory read), no ctx_cat, no per-position G, P, no linout, the
-input grid the last 4 tokens on fixed concentric rings (--grid_hist 4 --grid_rings)."""
+input grid the last 4 tokens on fixed concentric rings (--grid_hist 4 --grid_rings).
+v583: v579 with a 1x1 conv after each block's convs (--cd_mix_out), base windows 16 … 16,384 ticks
+(--cd_windows 16:16384), and the state never reset between documents (--reset_prob 0)."""
 import argparse
 
 ap = argparse.ArgumentParser()
-ap.add_argument('--model', default='v498', choices=('v498', 'v499', 'v502', 'v505', 'v511', 'v531', 'v533', 'v536', 'v538', 'v540', 'v541', 'v552', 'v564', 'v569', 'v579'))
+ap.add_argument('--model', default='v498', choices=('v498', 'v499', 'v502', 'v505', 'v511', 'v531', 'v533', 'v536', 'v538', 'v540', 'v541', 'v552', 'v564', 'v569', 'v579', 'v583'))
 ap.add_argument('--out', default=None)
 a = ap.parse_args()
 NAME = a.model                            # the title and file name
@@ -40,7 +42,7 @@ CASC = a.model == 'v502'                  # EMA + residual copy, RMSnorm reads
 REGS = LMU or CASC                        # (v499: the ring alone)
 CAT = {'v498': ('3×256 + 2048 + 256 + 256 + 5×512', 5888), 'v499': ('3×256 + 2048 + 256 + 256', 3328),
        'v502': ('3×256 + 2048 + 256 + 256 + 2×512', 4352), 'v505': ('', 0), 'v511': ('', 0),
-       'v531': ('', 0), 'v533': ('', 0), 'v536': ('', 0), 'v538': ('', 0), 'v540': ('', 0), 'v552': ('', 0), 'v564': ('', 0), 'v569': ('', 0), 'v579': ('', 0)}[a.model]
+       'v531': ('', 0), 'v533': ('', 0), 'v536': ('', 0), 'v538': ('', 0), 'v540': ('', 0), 'v552': ('', 0), 'v564': ('', 0), 'v569': ('', 0), 'v579': ('', 0), 'v583': ('', 0)}[a.model]
 EMA1, EMA2 = (16, 64) if a.model == 'v511' else (512, 512)    # two-layer models: each layer's EMA window
 
 W, H = 1920, 1080
@@ -557,8 +559,9 @@ def draw_v536():
     NC = 3 if a.model in ('v540', 'v552') else 2   # --cd_convs: conv 3x3 + BN + ReLU layers per block
     NF = a.model == 'v552'                # no FIFO, beta in (0, 2), banded windows, every document reset
     DF = a.model == 'v569'                # the memory first, then the convs; 7 blocks at 256 channels
-    R9 = a.model == 'v579'                # rings input, no ctx_cat / G, P / linout, the only add around the memory
-    NT = a.model in ('v564', 'v569', 'v579')   # no time conv at all, blocks of 7 convs, every document reset
+    R9 = a.model in ('v579', 'v583')      # rings input, no ctx_cat / G, P / linout, the only add around the memory
+    MO = a.model == 'v583'                # a 1x1 conv after the convs, windows 16 … 16,384, never reset
+    NT = a.model in ('v564', 'v569', 'v579', 'v583')   # no time conv at all, blocks of 7 convs, every document reset
     if NT:
         NC = 7
     NB = 7 if DF or R9 else 3 if NT else 6   # --convdelta: blocks
@@ -568,7 +571,9 @@ def draw_v536():
          f'VLA {NAME} — one clock tick (40 ms): a ConvDelta language model, {NB} residual blocks of '
          'per-tick convs, each with a gated delta-rule memory per grid position', 22, anchor='start', weight='bold')
     text(30, 62, f'A · the whole model.  --lm: text only · C {CC} · 7×7 grid · {NB} blocks · H 6 heads × d 32 per position '
-         '· 25 Hz · ' + ('32.09M trainable · fixed state 2,107,441 values · input: the last 4 tokens on fixed rings '
+         '· 25 Hz · ' + ('32.55M trainable · fixed state 2,107,441 values · input: the last 4 tokens on fixed rings '
+                         '· trained 256 ticks at a time, the state never reset' if MO else
+                         '32.09M trainable · fixed state 2,107,441 values · input: the last 4 tokens on fixed rings '
                          '· trained 256 ticks at a time, every document reset' if R9 else
                          '33.95M trainable · fixed state 2,107,392 values · input: this token, copied to every grid position '
                          '· trained 256 ticks at a time, every document reset' if DF else
@@ -668,9 +673,12 @@ def draw_v536():
                        f'stroke="{COL["ink"]}" stroke-width="1.4"/>')
             text(bx + BW / 2, CY - 150, f'block {i + 1}', 12, weight='bold')
             line([(bx, CY), (bx + 8, CY)], arrow=False)
+            st_ = 10 if MO else 11
             for j in range(NC):
-                box(bx + 8 + 11 * j, CY - 50, 7, 100, COL['cnn'], rx=1)
-            line([(bx + 8 + 11 * NC - 4, CY), (bx + 100, CY)])
+                box(bx + 8 + st_ * j, CY - 50, 7, 100, COL['cnn'], rx=1)
+            if MO:                                        # the 1x1 after the convs
+                box(bx + 8 + st_ * NC + 2, CY - 50, 7, 100, COL['lin'], rx=1)
+            line([(bx + 8 + st_ * NC + (6 if MO else -4), CY), (bx + 100, CY)])
             out.append(f'<circle cx="{bx + 111}" cy="{CY}" r="11" fill="{COL["lmu"]}" stroke="{COL["ink"]}" '
                        f'stroke-width="1.2"/>')
             text(bx + 111, CY + 4, 'Δ', 11, weight='bold')
@@ -680,7 +688,7 @@ def draw_v536():
             text(bx + 111, CY + 80, 'S', 11, weight='bold')
             line([(bx + 108, CY + 11), (bx + 108, CY + 62)])
             line([(bx + 115, CY + 62), (bx + 115, CY + 13)], dash=True, color='#757575')
-            text(bx + 46, CY + 72, f'{NC} × conv', 9.5, fill=COL['soft'])
+            text(bx + 46, CY + 72, f'{NC} × conv, 1×1' if MO else f'{NC} × conv', 9.5, fill=COL['soft'])
             text(bx + BW / 2, CY + 118, '49×6×32×32', 9, fill=COL['soft'])
             continue
         if DF:                                            # the memory, then 7 convs
@@ -750,7 +758,8 @@ def draw_v536():
         line([(bx + 84, CY + 62), (bx + 84, CY + 15)], dash=True, color='#757575')
         text(bx + BW / 2, CY + 118, '49×6×32×32', 9.5, fill=COL['soft'])
     text(x0 + NB * (BW + GAP) / 2 - GAP / 2, CY + 172, ('each block: delta-rule memory Δ with its state S → '
-         f'{NC} × (conv 3×3 + BN + ReLU)' if DF else f'each block: {NC} × (conv 3×3 + BN + ReLU) → u, '
+         f'{NC} × (conv 3×3 + BN + ReLU)' if DF else f'each block: {NC} × (conv 3×3 + BN + ReLU) → '
+         '1×1 conv → u, then x′ = u + (delta-rule memory Δ read)' if MO else f'each block: {NC} × (conv 3×3 + BN + ReLU) → u, '
          'then x′ = u + (delta-rule memory Δ read)' if R9 else '') or (('each block:' if NT else 'each block: scaled RMS(x) added →' if NF else
          'each block: causal time conv (4 ticks) →') + f' {NC} × (conv 3×3 + BN + '
          'ReLU) → delta-rule memory Δ with its state S'), 12, fill='#424242')
@@ -791,7 +800,7 @@ def draw_v536():
                       'RMS norm · replicate 1×1 → 7×7')] +
            ([('#3949ab', False, 'learned input map a[j, p]: tokens t … t−7 onto the grid')] if V8 else
             [('#3949ab', False, 'fixed rings: tokens t … t−3 onto the grid, one ring each')] if R9 else []) +
-           ([] if R9 else [
+           ([(COL['lin'], False, 'conv 1×1 (linear) after each block\'s convs')] if MO else [] if R9 else [
                      (COL['lin'], False, 'conv 1×1 / 3×3 (linear): ctx_cat, linout'),
                      (COL['gate'], False, 'per-position gain G and bias P (learned)')]) +
            ([] if NT else [(COL['tconv'], False, 'per-channel scale of RMS(x), this tick only (no FIFO)' if NF else
@@ -801,6 +810,7 @@ def draw_v536():
                      (COL['dec'], False, 'decoder convs 3×3, 7→5→3→1 (linear)'),
                      (COL['smp'], False, 'softmax + sample (+ <NUL> logit)')],
            '(training: reset at half the document starts)' if V8 and not NF else
+           '(S: never reset; it carries across documents)' if MO else
            '(S: reset to 0 at each document start)', w=560)
     if NC == 2:                           # (v540: no revision notes)
         nx = 650
@@ -843,7 +853,9 @@ def draw_v536():
          anchor='start', weight='bold')
     text(30, 70, f'x: {CC}×7×7 per tick · H = 6 heads of d = 32 at each of the 49 positions · every operation is per '
          'position except the 3×3 convs' + (' · fixed base windows w, log-spaced over the heads: 4 … 4,096 ticks '
-                                            '(blocks 1–4), 64 … 16,384 (blocks 5–6)' if NF else ''),
+                                            '(blocks 1–4), 64 … 16,384 (blocks 5–6)' if NF else
+                                            ' · base windows exp(−λ), learned, starting log-spaced over the heads: '
+                                            '16 … 16,384 ticks' if MO else ''),
          13, anchor='start', fill='#424242')
     CYb = 330
     text(40, CYb - 10, 'x', 14, anchor='start', weight='bold')
@@ -853,12 +865,16 @@ def draw_v536():
     if DF:                                # the memory first: x goes straight to the projections
         pass
     elif NT:                              # no time conv: x goes straight to the convs
-        cx_ = 150
+        cx_, st_ = (140, 66) if MO else (150, 72)
         for j in range(NC):
-            line([(110 if not j else cx_ - 32, CYb), (cx_, CYb)])
+            line([(110 if not j else cx_ - st_ + 40, CYb), (cx_, CYb)])
             box(cx_, CYb - 80, 40, 160, COL['cnn'], ['conv 3×3 · BN · ReLU'], size=11, vertical=True)
-            cx_ += 72
-        if R9:                            # no skip around the convs: straight on to u
+            cx_ += st_
+        if MO:                            # then the 1x1, straight on to u
+            line([(cx_ - st_ + 40, CYb), (cx_, CYb)])
+            box(cx_, CYb - 80, 40, 160, COL['lin'], ['1×1 conv (linear)'], size=11, vertical=True)
+            line([(cx_ + 40, CYb), (740, CYb)], arrow=False)
+        elif R9:                          # no skip around the convs: straight on to u
             line([(cx_ - 32, CYb), (740, CYb)], arrow=False)
         else:
             line([(cx_ - 32, CYb), (663, CYb)])
@@ -972,9 +988,10 @@ def draw_v536():
     line([(RX + 110, 490), (RX + 140, 490)])
     line([(RX + 220, 490), (AX, 490), (AX, CYb + 18)])
     text(AX + 6, 420, 'y', 13, anchor='start', weight='bold')
-    box(800 + OX, 790, 190, 50, '#ffffff', ['document start', 'S zeroed' if NF or NT else 'S and the FIFO zeroed'], size=11,
-        dash=True)
-    line([(895 + OX, 790), (895 + OX, 750)], dash=True, color='#757575')
+    if not MO:                            # (v583: never reset)
+        box(800 + OX, 790, 190, 50, '#ffffff', ['document start', 'S zeroed' if NF or NT else 'S and the FIFO zeroed'],
+            size=11, dash=True)
+        line([(895 + OX, 790), (895 + OX, 750)], dash=True, color='#757575')
 
     out.append(f'<rect x="1530" y="600" width="360" height="420" rx="8" fill="#fafafa" stroke="#bdbdbd"/>')
     text(1548, 628, 'training vs the chip', 14, anchor='start', weight='bold')
@@ -1006,6 +1023,7 @@ def draw_v536():
                       'gates: β = σ(·), α = exp(−2 exp(λ) σ(·)), λ per head'),
                      (COL['lmu'], False, 'delta-rule update / read (linear in S)'),
                      ('#ffffff', False, '(+) residual add')],
+           '(S: never reset; it carries across documents)' if MO else
            '(S: reset at each document start)' if NF or NT else
            '(S and the FIFO; training: reset at half the document starts)' if V8 else
            '(S, and the FIFO: reset at each document start)', w=500 if DF else 640)
@@ -1017,7 +1035,7 @@ def draw_v536():
 if a.model in ('v531', 'v533'):
     draw_v531()
     raise SystemExit(0)
-if a.model in ('v536', 'v538', 'v540', 'v552', 'v564', 'v569', 'v579'):
+if a.model in ('v536', 'v538', 'v540', 'v552', 'v564', 'v569', 'v579', 'v583'):
     draw_v536()
     raise SystemExit(0)
 
