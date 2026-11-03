@@ -4270,7 +4270,7 @@ if _loaded_ckpt is not None:
         if model.cd[0].gz is None and any(re.match(r'cd\.\d+\.gz$', k) for k in _sd):
             print('no ladder (--no-cd_gamma or --cd_taps 1): the checkpoint\'s ladder c are dropped', flush=True)
             _sd = {k: v for k, v in _sd.items() if not re.match(r'cd\.\d+\.gz$', k)}
-    if _aud_switch:
+    if _aud_switch and 'ctx_cat.weight' in _sd:   # (--cd_no_cat: no input columns to switch)
         _sd = _switch_audio_state_dict(_sd, model, *_aud_switch)
     if model.streams == 3 and 'voc_dec.proj.weight' not in _sd:
         _sd = _widen_state_dict(_sd, model)
