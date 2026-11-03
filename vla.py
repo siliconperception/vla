@@ -4278,6 +4278,9 @@ if _loaded_ckpt is not None:
         if model.grid_hist and model.grid_a is None and 'grid_a' in _sd:
             print('--grid_spiral: the checkpoint\'s learned input map grid_a is dropped', flush=True)
             _sd = {k: v for k, v in _sd.items() if k != 'grid_a'}
+        if not model.grid_hist and 'grid_a' in _sd:   # --grid_hist 0 on a history checkpoint
+            print('--grid_hist 0: the checkpoint\'s input map grid_a is dropped (the token replicated)', flush=True)
+            _sd = {k: v for k, v in _sd.items() if k != 'grid_a'}
         if model.cd[0].gz is None and any(re.match(r'cd\.\d+\.gz$', k) for k in _sd):
             print('no ladder (--no-cd_gamma or --cd_taps 1): the checkpoint\'s ladder c are dropped', flush=True)
             _sd = {k: v for k, v in _sd.items() if not re.match(r'cd\.\d+\.gz$', k)}
