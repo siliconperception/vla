@@ -285,6 +285,9 @@ parser.add_argument('--cd_no_cat', default=False, action=argparse.BooleanOptiona
                          '(needs the input width = --c_context)')
 parser.add_argument('--cd_no_gp', default=False, action=argparse.BooleanOptionalAction,
                     help='--convdelta: no per-position scale and shift (cd_G, cd_P) on the input grid')
+parser.add_argument('--cd_mem_res', default=False, action=argparse.BooleanOptionalAction,
+                    help='--cd_no_res: keep the add around the memory, x\' = u + out(S q) (a per-position '
+                         'skip; the convs keep none)')
 parser.add_argument('--cd_no_res', default=False, action=argparse.BooleanOptionalAction,
                     help='--convdelta: no residual adds, x\' = out(S q) with q, k, v, gates from convs(x) '
                          '(--cd_delta_first: x\' = convs(out(S q))); every path runs through the convs and the memory')
@@ -923,7 +926,7 @@ _ARCH_ARGS = ('context', 'n_hidden', 'c_context', 'depth', 'kernel', 'tokenizer'
               'learn_regs', 'lmu', 'attn', 'attn_ch', 'attn_heads', 'attn_dim', 'attn_age', 'read_rmsnorm',
               'layers', 'write_gate', 'convdelta', 'cd_heads', 'cd_dim', 'cd_taps', 'lm', 'grid_hist', 'grid_spiral', 'grid_rings',
               'cd_convs', 'cd_fw', 'cd_fw_kernel', 'cd_fw_dk', 'cd_neg', 'cd_band', 'cd_gamma', 'cd_stem', 'cd_delta_first', 'grid_conv1d', 'cd_recur',
-              'cd_no_res', 'cd_no_cat', 'cd_no_gp')
+              'cd_no_res', 'cd_no_cat', 'cd_no_gp', 'cd_mem_res')
 # architecture switches that can be loaded onto a trained model: when given on the command line,
 # the given value wins over the checkpoint's
 _ARCH_SWITCHES = ('cd_neg', 'cd_band', 'cd_gamma', 'cd_taps', 'grid_hist', 'grid_spiral')
@@ -1658,14 +1661,17 @@ class ConvDeltaBlock(nn.Module):
     (--cd_recur: u = x + ReLU(BN(conv3x3(...(u[t-1])))), the convs on the last tick's u, carried
     in the state; the convs then run tick by tick in seq.)
     (--cd_delta_first: the convs come last, on x' = u + out(S q), u without them.)
-    (--cd_no_res: neither add, u = convs(x) and x' = out(S q); with --cd_delta_first x' = convs(out(S q)).)
+    (--cd_no_res: neither add, u = convs(x) and x' = out(S q); with --cd_delta_first x' = convs(out(S q));
+    --cd_mem_res keeps the second, x' = u + out(S q).)
     The convs never read the state, so a whole sequence runs at once (seq) and only the
     memories S are carried tick to tick (_delta_scan); step does one tick."""
 
     def __init__(self, C, H, d, taps, S, bn_momentum=0.1, n_convs=2, fw=0, fw_chunk=2, fw_kernel=0, fw_dk=64,
-                 neg=False, band=0.0, gamma=False, delta_first=False, recur=False, no_res=False):
+                 neg=False, band=0.0, gamma=False, delta_first=False, recur=False, no_res=False,
+                 mem_res=False):
         super().__init__()
-        self.res = not no_res                  # --cd_no_res: no residual adds
+        self.res = not no_res                  # --cd_no_res: no residual adds around the convs ...
+        self.mem_res = self.res or bool(mem_res)   # ... nor (unless --cd_mem_res) around the memory
         if no_res and recur:
             raise SystemExit('--cd_no_res does not combine with --cd_recur')
         self.delta_first = bool(delta_first)   # --cd_delta_first: the memories, then the convs
@@ -1718,7 +1724,7 @@ class ConvDeltaBlock(nn.Module):
         if self.band:
             self.lam.requires_grad_(False)
         self.out = nn.Conv2d((H + self.fw) * d, C, 1)
-        if self.res:                 # (--cd_no_res: the default init, else the convs see a constant)
+        if self.mem_res:             # (no add here: the default init, else the convs see a constant)
             with torch.no_grad():
                 self.out.weight.zero_()
                 self.out.bias.zero_()
@@ -1849,7 +1855,7 @@ class ConvDeltaBlock(nn.Module):
             Sf = a2 * Sf + (fb.reshape(-1, P)[..., None] * (fv.flatten(0, 1) - a2 * Sk)).transpose(1, 2) @ fk
             o = torch.cat([o, (fq @ Sf.transpose(1, 2)).view(B, self.fw, P, d).transpose(1, 2)], 2)
             parts.append(self._fw_put(Sf, B))
-        x = u + self._read_out(o, B) if self.res else self._read_out(o, B)
+        x = u + self._read_out(o, B) if self.mem_res else self._read_out(o, B)
         if self.delta_first:
             x = self._mixed(x)
         return x, torch.cat(parts, 1)
@@ -1925,7 +1931,7 @@ class ConvDeltaBlock(nn.Module):
             of, SfT = _convfw_scan(fh(fq), fh(fk), fh(fv), fh(fb), fh(fa), rsf, self._fw_get(st), self.fw_chunk)
             of = of.view(B, self.fw, T, P, d).permute(0, 2, 3, 1, 4).reshape(B * T, P, self.fw, d)
             o = torch.cat([o, of], 2)
-        x = u + self._read_out(o, B * T) if self.res else self._read_out(o, B * T)
+        x = u + self._read_out(o, B * T) if self.mem_res else self._read_out(o, B * T)
         if self.delta_first:
             x = self._mixed(x)
         x = x.view(B, T, C, self.S, self.S)
@@ -2603,7 +2609,7 @@ class VLAModel(nn.Module, _HubMixin):
                  convdelta=0, cd_heads=6, cd_dim=32, cd_taps=4, cd_chunk=64, grid_hist=0, grid_spiral=False, grid_rings=False,
                  cd_convs=2, cd_fw=0, cd_fw_chunk=2, cd_fw_kernel=0, cd_fw_dk=64, cd_neg=False, cd_band=0.0, cd_gamma=False,
                  cd_stem=0, cd_delta_first=False, grid_conv1d=0,
-                 cd_recur=False, cd_no_res=False, cd_no_cat=False, cd_no_gp=False):
+                 cd_recur=False, cd_no_res=False, cd_no_cat=False, cd_no_gp=False, cd_mem_res=False):
         super().__init__()
         from transformers import AutoModelForCausalLM
         repo = _TOKENIZERS[tokenizer]
@@ -2773,7 +2779,7 @@ class VLAModel(nn.Module, _HubMixin):
                                                 bn_momentum, int(cd_convs or 2), int(cd_fw or 0), int(cd_fw_chunk),
                                                 int(cd_fw_kernel or 0), int(cd_fw_dk or 64), bool(cd_neg),
                                                 float(cd_band or 0), bool(cd_gamma), bool(cd_delta_first),
-                                                bool(cd_recur), bool(cd_no_res))
+                                                bool(cd_recur), bool(cd_no_res), bool(cd_mem_res))
                                  for _ in range(int(convdelta)))
                    if convdelta else None)
         self.cd_chunk, self.cd_ckpt = int(cd_chunk), False   # cd_ckpt: checkpoint each block (seq)
@@ -4244,7 +4250,7 @@ model = VLAModel(S=args.context, n_hidden=args.n_hidden, c_context=args.c_contex
                  grid_hist=args.grid_hist, grid_spiral=args.grid_spiral, grid_rings=args.grid_rings, cd_convs=args.cd_convs, cd_fw=args.cd_fw, cd_fw_chunk=args.cd_fw_chunk,
                  cd_fw_kernel=args.cd_fw_kernel, cd_fw_dk=args.cd_fw_dk, cd_neg=args.cd_neg, cd_band=args.cd_band, cd_gamma=args.cd_gamma,
                  cd_stem=args.cd_stem, cd_delta_first=args.cd_delta_first,
-                 grid_conv1d=args.grid_conv1d, cd_recur=args.cd_recur, cd_no_res=args.cd_no_res, cd_no_cat=args.cd_no_cat, cd_no_gp=args.cd_no_gp, cd_chunk=args.cd_chunk,
+                 grid_conv1d=args.grid_conv1d, cd_recur=args.cd_recur, cd_no_res=args.cd_no_res, cd_no_cat=args.cd_no_cat, cd_no_gp=args.cd_no_gp, cd_mem_res=args.cd_mem_res, cd_chunk=args.cd_chunk,
                  up_windows=[float(w) for w in str(args.up_ema).split(',') if w.strip()] if args.up_ema else None)
 if _loaded_ckpt is not None:
     _sd = _upgrade_state_dict(_loaded_ckpt['state_dict'])
