@@ -288,6 +288,9 @@ parser.add_argument('--cd_no_gp', default=False, action=argparse.BooleanOptional
 parser.add_argument('--cd_mem_res', default=False, action=argparse.BooleanOptionalAction,
                     help='--cd_no_res: keep the add around the memory, x\' = u + out(S q) (a per-position '
                          'skip; the convs keep none)')
+parser.add_argument('--cd_mix_ch', default=0, type=int, metavar='M',
+                    help='--cd_mix_out: the convs inside each block M channels wide (0: --c_context); the first '
+                         'conv C -> M, the 1x1 after them M -> C (starting at zero with the skip, else orthogonal)')
 parser.add_argument('--cd_mix_out', default=False, action=argparse.BooleanOptionalAction,
                     help='--convdelta: a 1x1 conv (linear, starts as the identity) after each block\'s convs, '
                          'so their output is signed, not just ReLU\'s >= 0')
@@ -929,7 +932,7 @@ _ARCH_ARGS = ('context', 'n_hidden', 'c_context', 'depth', 'kernel', 'tokenizer'
               'learn_regs', 'lmu', 'attn', 'attn_ch', 'attn_heads', 'attn_dim', 'attn_age', 'read_rmsnorm',
               'layers', 'write_gate', 'convdelta', 'cd_heads', 'cd_dim', 'cd_taps', 'lm', 'grid_hist', 'grid_spiral', 'grid_rings',
               'cd_convs', 'cd_fw', 'cd_fw_kernel', 'cd_fw_dk', 'cd_neg', 'cd_band', 'cd_gamma', 'cd_stem', 'cd_delta_first', 'grid_conv1d', 'cd_recur',
-              'cd_no_res', 'cd_no_cat', 'cd_no_gp', 'cd_mem_res', 'cd_mix_out')
+              'cd_no_res', 'cd_no_cat', 'cd_no_gp', 'cd_mem_res', 'cd_mix_out', 'cd_mix_ch')
 # architecture switches that can be loaded onto a trained model: when given on the command line,
 # the given value wins over the checkpoint's
 _ARCH_SWITCHES = ('cd_neg', 'cd_band', 'cd_gamma', 'cd_taps', 'grid_hist', 'grid_spiral')
@@ -1675,7 +1678,7 @@ class ConvDeltaBlock(nn.Module):
 
     def __init__(self, C, H, d, taps, S, bn_momentum=0.1, n_convs=2, fw=0, fw_chunk=2, fw_kernel=0, fw_dk=64,
                  neg=False, band=0.0, gamma=False, delta_first=False, recur=False, no_res=False,
-                 mem_res=False, mix_out=False):
+                 mem_res=False, mix_out=False, mix_ch=0):
         super().__init__()
         self.res = not no_res                  # --cd_no_res: no residual adds around the convs ...
         self.mem_res = self.res or bool(mem_res)   # ... nor (unless --cd_mem_res) around the memory
@@ -1696,12 +1699,21 @@ class ConvDeltaBlock(nn.Module):
         # --cd_gamma: the FIFO is a gamma ladder, c = 0.99 tanh(gz) per channel (0: the FIFO)
         self.gz = nn.Parameter(torch.zeros(C)) if gamma and taps > 1 else None
         bn = dict(affine=False, momentum=bn_momentum or None)
-        self.mix = nn.Sequential(*[m for _ in range(int(n_convs)) for m in
-                                   (nn.Conv2d(C, C, 3, padding=1), nn.BatchNorm2d(C, **bn), nn.ReLU())])
+        Cm = int(mix_ch or 0) or C             # --cd_mix_ch: the convs' own width
+        if Cm != C and not mix_out:
+            raise SystemExit('--cd_mix_ch needs --cd_mix_out (the 1x1 back to --c_context)')
+        self.mix = nn.Sequential(*[m for j in range(int(n_convs)) for m in
+                                   (nn.Conv2d(C if j == 0 else Cm, Cm, 3, padding=1), nn.BatchNorm2d(Cm, **bn),
+                                    nn.ReLU())])
         if mix_out:                  # --cd_mix_out: a 1x1 conv after the convs, starting as the identity
-            self.mix.append(nn.Conv2d(C, C, 1))
+            self.mix.append(nn.Conv2d(Cm, C, 1))
             with torch.no_grad():
-                self.mix[-1].weight.copy_(torch.eye(C)[:, :, None, None])
+                if Cm == C:
+                    self.mix[-1].weight.copy_(torch.eye(C)[:, :, None, None])
+                elif self.res:       # (--cd_mix_ch, with the skip: zero, the block starts as the skip)
+                    self.mix[-1].weight.zero_()
+                else:                # (no skip: semi-orthogonal, the convs' output gets through)
+                    self.mix[-1].weight.copy_(nn.init.orthogonal_(torch.empty(C, Cm))[:, :, None, None])
                 self.mix[-1].bias.zero_()
         # --cd_fw F: F conv fast-weight heads, each one memory [d, 9 d] shared by every position
         # (a 3x3 kernel over the key grid): written from every position's 3x3 key patch at once,
@@ -2621,7 +2633,7 @@ class VLAModel(nn.Module, _HubMixin):
                  convdelta=0, cd_heads=6, cd_dim=32, cd_taps=4, cd_chunk=64, grid_hist=0, grid_spiral=False, grid_rings=False,
                  cd_convs=2, cd_fw=0, cd_fw_chunk=2, cd_fw_kernel=0, cd_fw_dk=64, cd_neg=False, cd_band=0.0, cd_gamma=False,
                  cd_stem=0, cd_delta_first=False, grid_conv1d=0,
-                 cd_recur=False, cd_no_res=False, cd_no_cat=False, cd_no_gp=False, cd_mem_res=False, cd_mix_out=False):
+                 cd_recur=False, cd_no_res=False, cd_no_cat=False, cd_no_gp=False, cd_mem_res=False, cd_mix_out=False, cd_mix_ch=0):
         super().__init__()
         from transformers import AutoModelForCausalLM
         repo = _TOKENIZERS[tokenizer]
@@ -2792,7 +2804,7 @@ class VLAModel(nn.Module, _HubMixin):
                                                 int(cd_fw_kernel or 0), int(cd_fw_dk or 64), bool(cd_neg),
                                                 float(cd_band or 0), bool(cd_gamma), bool(cd_delta_first),
                                                 bool(cd_recur), bool(cd_no_res), bool(cd_mem_res),
-                                                bool(cd_mix_out))
+                                                bool(cd_mix_out), int(cd_mix_ch or 0))
                                  for _ in range(int(convdelta)))
                    if convdelta else None)
         self.cd_chunk, self.cd_ckpt = int(cd_chunk), False   # cd_ckpt: checkpoint each block (seq)
@@ -4263,7 +4275,7 @@ model = VLAModel(S=args.context, n_hidden=args.n_hidden, c_context=args.c_contex
                  grid_hist=args.grid_hist, grid_spiral=args.grid_spiral, grid_rings=args.grid_rings, cd_convs=args.cd_convs, cd_fw=args.cd_fw, cd_fw_chunk=args.cd_fw_chunk,
                  cd_fw_kernel=args.cd_fw_kernel, cd_fw_dk=args.cd_fw_dk, cd_neg=args.cd_neg, cd_band=args.cd_band, cd_gamma=args.cd_gamma,
                  cd_stem=args.cd_stem, cd_delta_first=args.cd_delta_first,
-                 grid_conv1d=args.grid_conv1d, cd_recur=args.cd_recur, cd_no_res=args.cd_no_res, cd_no_cat=args.cd_no_cat, cd_no_gp=args.cd_no_gp, cd_mem_res=args.cd_mem_res, cd_mix_out=args.cd_mix_out, cd_chunk=args.cd_chunk,
+                 grid_conv1d=args.grid_conv1d, cd_recur=args.cd_recur, cd_no_res=args.cd_no_res, cd_no_cat=args.cd_no_cat, cd_no_gp=args.cd_no_gp, cd_mem_res=args.cd_mem_res, cd_mix_out=args.cd_mix_out, cd_mix_ch=args.cd_mix_ch, cd_chunk=args.cd_chunk,
                  up_windows=[float(w) for w in str(args.up_ema).split(',') if w.strip()] if args.up_ema else None)
 if _loaded_ckpt is not None:
     _sd = _upgrade_state_dict(_loaded_ckpt['state_dict'])
