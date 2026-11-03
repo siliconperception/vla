@@ -277,6 +277,9 @@ parser.add_argument('--cd_heads', default=6, type=int, help='--convdelta: memory
 parser.add_argument('--cd_convs', default=2, type=int, help='--convdelta: 3x3 conv + BN + ReLU layers per block')
 parser.add_argument('--cd_delta_first', default=False, action=argparse.BooleanOptionalAction,
                     help='--convdelta: each block reads and writes its memories first, then the convs (a DeltaConv block)')
+parser.add_argument('--grid_conv1d', default=0, type=int,
+                    help='--grid_hist S*S: the last S*S tokens in time order (oldest first) as a 1-d '
+                         'sequence through N conv1d(3) + BN + ReLU layers, then reshaped to the SxS grid')
 parser.add_argument('--cd_stem', default=0, type=int,
                     help='--convdelta: 3x3 conv + BN + ReLU layers on the input grid before the first block')
 parser.add_argument('--cd_neg', default=False, action=argparse.BooleanOptionalAction,
@@ -905,7 +908,7 @@ _ARCH_ARGS = ('context', 'n_hidden', 'c_context', 'depth', 'kernel', 'tokenizer'
               'image_encoder', 'audio_encoder', 'streams', 'linout_kernel', 'learn_win',
               'learn_regs', 'lmu', 'attn', 'attn_ch', 'attn_heads', 'attn_dim', 'attn_age', 'read_rmsnorm',
               'layers', 'write_gate', 'convdelta', 'cd_heads', 'cd_dim', 'cd_taps', 'lm', 'grid_hist', 'grid_spiral',
-              'cd_convs', 'cd_fw', 'cd_fw_kernel', 'cd_fw_dk', 'cd_neg', 'cd_band', 'cd_gamma', 'cd_stem', 'cd_delta_first')
+              'cd_convs', 'cd_fw', 'cd_fw_kernel', 'cd_fw_dk', 'cd_neg', 'cd_band', 'cd_gamma', 'cd_stem', 'cd_delta_first', 'grid_conv1d')
 # architecture switches that can be loaded onto a trained model: when given on the command line,
 # the given value wins over the checkpoint's
 _ARCH_SWITCHES = ('cd_neg', 'cd_band', 'cd_gamma', 'cd_taps', 'grid_hist', 'grid_spiral')
@@ -2534,7 +2537,7 @@ class VLAModel(nn.Module, _HubMixin):
                  read_rmsnorm=False, layers=1, up_windows=None, write_gate=False,
                  convdelta=0, cd_heads=6, cd_dim=32, cd_taps=4, cd_chunk=64, grid_hist=0, grid_spiral=False,
                  cd_convs=2, cd_fw=0, cd_fw_chunk=2, cd_fw_kernel=0, cd_fw_dk=64, cd_neg=False, cd_band=0.0, cd_gamma=False,
-                 cd_stem=0, cd_delta_first=False):
+                 cd_stem=0, cd_delta_first=False, grid_conv1d=0):
         super().__init__()
         from transformers import AutoModelForCausalLM
         repo = _TOKENIZERS[tokenizer]
@@ -2707,6 +2710,11 @@ class VLAModel(nn.Module, _HubMixin):
                                         (nn.Conv2d(c_context, c_context, 3, padding=1),
                                          nn.BatchNorm2d(c_context, **bn), nn.ReLU())])
                         if self.cd is not None and cd_stem else None)
+        # --grid_conv1d N: N conv1d(3) + BN + ReLU layers over the token window (padded, length S*S)
+        self.grid_c1 = (nn.Sequential(*[m for _ in range(int(grid_conv1d)) for m in
+                                        (nn.Conv1d(c_context, c_context, 3, padding=1),
+                                         nn.BatchNorm1d(c_context, **bn), nn.ReLU())])
+                        if self.cd is not None and grid_conv1d else None)
         # --grid_hist K: cell p of the input grid is sum_j a[j, p] ctx_cat(token t-j); a starts as
         # concentric rings (outer ring t, inward t-1, t-2, ..., the centre the oldest of them),
         # the tokens beyond the rings at 0. The last K-1 token ids ride in the state's first
@@ -2718,7 +2726,11 @@ class VLAModel(nn.Module, _HubMixin):
                 raise SystemExit('--grid_hist needs --convdelta and --lm (one text stream, no media)')
             if not 2 <= self.grid_hist <= S * S + 1:
                 raise SystemExit(f'--grid_hist {self.grid_hist}: 2 .. {S * S + 1}')
-            if grid_spiral:          # --grid_spiral: token t-j at the j-th cell of a square spiral, no map
+            if grid_conv1d and (grid_spiral or self.grid_hist != S * S):
+                raise SystemExit(f'--grid_conv1d: needs --grid_hist {S * S}, no --grid_spiral')
+            if grid_conv1d:          # --grid_conv1d: the window in time order, convs over time, no map
+                self.grid_a = None
+            elif grid_spiral:        # --grid_spiral: token t-j at the j-th cell of a square spiral, no map
                 if self.grid_hist > S * S:
                     raise SystemExit(f'--grid_spiral: --grid_hist {self.grid_hist} > {S * S} cells')
                 cells = _spiral_cells(S)
@@ -2983,6 +2995,8 @@ class VLAModel(nn.Module, _HubMixin):
             e = self.tok_embed(idx.clamp(min=0))
             e = (e * torch.rsqrt(e.pow(2).mean(-1, keepdim=True) + 1e-12)).masked_fill((idx < 0)[..., None], 0.0)
             y = self.ctx_cat(e.reshape(M * K, -1, 1, 1)).view(M, K, -1)              # [M, K, C]
+            if self.grid_c1 is not None:   # --grid_conv1d: oldest .. newest, the convs in _pre
+                return y.flip(1).transpose(1, 2).reshape(M, -1, self.S, self.S)
             if self.grid_a is None:  # --grid_spiral: each cell holds its token (empty cells 0)
                 y = torch.cat([y, y.new_zeros(M, 1, y.shape[2])], 1)
                 x = y.index_select(1, self.spiral_inv).transpose(1, 2).reshape(M, -1, self.S, self.S)
@@ -2990,6 +3004,13 @@ class VLAModel(nn.Module, _HubMixin):
                 x = torch.einsum('mkc,kp->mcp', y, self.grid_a.view(K, -1)).view(M, -1, self.S, self.S)
             return x * self.cd_G + self.cd_P
         return self.ctx_cat(torch.cat(self._inputs(idx, img, aud), 1)) * self.cd_G + self.cd_P
+
+    def _pre(self, x):
+        """The input grid [M, C, S, S] -> the first block's input: --grid_conv1d's convs over the
+        window (then the per-position scale and shift), --cd_stem's convs."""
+        if self.grid_c1 is not None:
+            x = self.grid_c1(x.flatten(2)).view_as(x) * self.cd_G + self.cd_P
+        return self.cd_stem(x) if self.cd_stem is not None else x
 
     def _hist_get(self, dff):
         """--grid_hist: the last K-1 token ids in a state [B, K-1], newest first (-1: none)."""
@@ -3064,12 +3085,12 @@ class VLAModel(nn.Module, _HubMixin):
             sts.append(self._hist_put(last))
         else:
             x = self._cd_in(idx.flatten(0, 1), img, aud)
-        if self.cd_stem is not None:
+        if self.cd_stem is not None or self.grid_c1 is not None:
             if self.cd_ckpt and torch.is_grad_enabled():
-                x = torch.utils.checkpoint.checkpoint(self.cd_stem, x, use_reentrant=False,
+                x = torch.utils.checkpoint.checkpoint(self._pre, x, use_reentrant=False,
                                                       context_fn=lambda: (contextlib.nullcontext(), self._bn_hold()))
             else:
-                x = self.cd_stem(x)
+                x = self._pre(x)
         x = x.view(B, T, self.c_context, self.S, self.S)
         for blk in self.cd:
             st = dff[:, off:off + blk.state_ch]
@@ -3091,8 +3112,7 @@ class VLAModel(nn.Module, _HubMixin):
                 x, sts, off = self._cd_in(ids), [self._hist_put(ids[:, :self.grid_hist - 1])], 1
             else:
                 x, sts, off = self._cd_in(idx, img, aud), [], 0
-            if self.cd_stem is not None:
-                x = self.cd_stem(x)
+            x = self._pre(x)
             for blk in self.cd:
                 x, st = blk.step(x, dff[:, off:off + blk.state_ch])
                 off += blk.state_ch
@@ -4138,7 +4158,8 @@ model = VLAModel(S=args.context, n_hidden=args.n_hidden, c_context=args.c_contex
                  convdelta=args.convdelta, cd_heads=args.cd_heads, cd_dim=args.cd_dim, cd_taps=args.cd_taps,
                  grid_hist=args.grid_hist, grid_spiral=args.grid_spiral, cd_convs=args.cd_convs, cd_fw=args.cd_fw, cd_fw_chunk=args.cd_fw_chunk,
                  cd_fw_kernel=args.cd_fw_kernel, cd_fw_dk=args.cd_fw_dk, cd_neg=args.cd_neg, cd_band=args.cd_band, cd_gamma=args.cd_gamma,
-                 cd_stem=args.cd_stem, cd_delta_first=args.cd_delta_first, cd_chunk=args.cd_chunk,
+                 cd_stem=args.cd_stem, cd_delta_first=args.cd_delta_first,
+                 grid_conv1d=args.grid_conv1d, cd_chunk=args.cd_chunk,
                  up_windows=[float(w) for w in str(args.up_ema).split(',') if w.strip()] if args.up_ema else None)
 if _loaded_ckpt is not None:
     _sd = _upgrade_state_dict(_loaded_ckpt['state_dict'])
@@ -4241,12 +4262,12 @@ def _model_graph(model):
         n = names[m]
         tr = sum(p.numel() for p in m.parameters(recurse=False) if p.requires_grad)
         fr = sum(p.numel() for p in m.parameters(recurse=False) if not p.requires_grad)
-        if isinstance(m, (nn.BatchNorm2d, nn.ReLU, nn.AvgPool2d)) and rows:
-            rows[-1]['op'] += '+' + type(m).__name__.replace('BatchNorm2d', 'BN')
+        if isinstance(m, (nn.BatchNorm2d, nn.BatchNorm1d, nn.ReLU, nn.AvgPool2d)) and rows:
+            rows[-1]['op'] += '+' + type(m).__name__.replace('BatchNorm2d', 'BN').replace('BatchNorm1d', 'BN')
             rows[-1]['out'] = shape(out)
             return
         op = (f'Conv2d {m.kernel_size[0]}x{m.kernel_size[1]}' if isinstance(m, nn.Conv2d)
-              else type(m).__name__)
+              else f'Conv1d {m.kernel_size[0]}' if isinstance(m, nn.Conv1d) else type(m).__name__)
         rows.append(dict(name=n, op=op, inp=shape(inp), out=shape(out), tr=tr, fr=fr))
 
     hooks = [m.register_forward_hook(hook) for n, m in model.named_modules()
@@ -4301,6 +4322,10 @@ def _model_graph(model):
             C = r['out'].split('x')[0]
             out.append(dict(r, op=r['op'] + ', per token', inp=f'{G}x{r["inp"].split("x")[0]}',
                             out=f'{G}x{C}'))
+            if model.grid_c1 is not None:   # --grid_conv1d: the window as a sequence, convs after
+                out.append(dict(name='(token window)', op=f'tokens in time order t-{G - 1} .. t, a 1-d sequence',
+                                inp=f'{G}x{C}', out=f'{C}x{G}', tr=0, fr=0))
+                continue
             sp = model.grid_a is None
             out.append(dict(name='spiral, cd_G, cd_P' if sp else 'grid_a, cd_G, cd_P',
                             op=(f'fixed spiral: token t-j at cell j from the centre (t) out, one per cell'
@@ -4378,6 +4403,10 @@ def _model_graph(model):
                                    'attn.entry': ' of (token grid), linout',
                                    }.get(r['name'], ''))
         out.append(r)
+        if model.cd is not None and model.grid_c1 is not None and r['name'] == f'grid_c1.{len(model.grid_c1) - 3}':
+            out.append(dict(name='reshape, cd_G, cd_P', op=f'{G} -> {S}x{S} row-major, scale + shift per position',
+                            inp=r['out'], out=f'{r["out"].split("x")[0]}x{S}x{S}',
+                            tr=model.cd_G.numel() + model.cd_P.numel(), fr=0))
         if r['name'] == 'ctx_cat' and cd is not None:
             out.append(dict(name='cd_G, cd_P', op='scale + shift per position', inp=r['out'],
                             out=r['out'], tr=model.cd_G.numel() + model.cd_P.numel(), fr=0))
