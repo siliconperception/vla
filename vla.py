@@ -1050,10 +1050,12 @@ if not 0 <= args.reset_prob <= 1:
     raise SystemExit(f'--reset_prob {args.reset_prob}: a probability, 0 .. 1')
 _lm_from = None                 # --lm: the loaded checkpoint's media arch args, when it had any
 if args.lm:
-    if _loaded_ckpt is not None and (args.streams != 1 or (args.audio_encoder or 'none') != 'none'
-                                     or (args.image_encoder or 'none') != 'none'):
-        _lm_from = dict(streams=args.streams, audio_encoder=args.audio_encoder or 'none',
-                        image_encoder=args.image_encoder or 'none')
+    _sv = _loaded_ckpt['saved_args'] if _loaded_ckpt is not None else {}   # (the checkpoint's own, not the
+    if _loaded_ckpt is not None and (int(_sv.get('streams') or 1) != 1    # command line's media flags)
+                                     or (_sv.get('audio_encoder') or 'none') != 'none'
+                                     or (_sv.get('image_encoder') or 'none') != 'none'):
+        _lm_from = dict(streams=int(_sv.get('streams') or 1), audio_encoder=_sv.get('audio_encoder') or 'none',
+                        image_encoder=_sv.get('image_encoder') or 'none')
     args.streams, args.audio_encoder, args.image_encoder = 1, 'none', 'none'
     args.fifo3 = args.speech_align = args.inner_voice = False
     args.voice_drop = args.caption_feed = args.text_feed = 0.0
@@ -4284,7 +4286,7 @@ if _loaded_ckpt is not None:
         if model.cd[0].gz is None and any(re.match(r'cd\.\d+\.gz$', k) for k in _sd):
             print('no ladder (--no-cd_gamma or --cd_taps 1): the checkpoint\'s ladder c are dropped', flush=True)
             _sd = {k: v for k, v in _sd.items() if not re.match(r'cd\.\d+\.gz$', k)}
-    if _aud_switch and 'ctx_cat.weight' in _sd:   # (--cd_no_cat: no input columns to switch)
+    if _aud_switch and not args.lm and 'ctx_cat.weight' in _sd:   # (--lm: no audio grid; --cd_no_cat: no columns)
         _sd = _switch_audio_state_dict(_sd, model, *_aud_switch)
     if model.streams == 3 and 'voc_dec.proj.weight' not in _sd:
         _sd = _widen_state_dict(_sd, model)
