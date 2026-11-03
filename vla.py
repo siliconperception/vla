@@ -280,6 +280,8 @@ parser.add_argument('--cd_delta_first', default=False, action=argparse.BooleanOp
 parser.add_argument('--cd_no_cat', default=False, action=argparse.BooleanOptionalAction,
                     help='--convdelta: no ctx_cat; the RMS-normalized token grid goes straight to cd_G, cd_P '
                          '(needs the input width = --c_context)')
+parser.add_argument('--cd_no_gp', default=False, action=argparse.BooleanOptionalAction,
+                    help='--convdelta: no per-position scale and shift (cd_G, cd_P) on the input grid')
 parser.add_argument('--cd_no_res', default=False, action=argparse.BooleanOptionalAction,
                     help='--cd_delta_first: no residual adds, x\' = convs(out(S q)); every path runs through '
                          'the memory and then the convs')
@@ -918,7 +920,7 @@ _ARCH_ARGS = ('context', 'n_hidden', 'c_context', 'depth', 'kernel', 'tokenizer'
               'learn_regs', 'lmu', 'attn', 'attn_ch', 'attn_heads', 'attn_dim', 'attn_age', 'read_rmsnorm',
               'layers', 'write_gate', 'convdelta', 'cd_heads', 'cd_dim', 'cd_taps', 'lm', 'grid_hist', 'grid_spiral',
               'cd_convs', 'cd_fw', 'cd_fw_kernel', 'cd_fw_dk', 'cd_neg', 'cd_band', 'cd_gamma', 'cd_stem', 'cd_delta_first', 'grid_conv1d', 'cd_recur',
-              'cd_no_res', 'cd_no_cat')
+              'cd_no_res', 'cd_no_cat', 'cd_no_gp')
 # architecture switches that can be loaded onto a trained model: when given on the command line,
 # the given value wins over the checkpoint's
 _ARCH_SWITCHES = ('cd_neg', 'cd_band', 'cd_gamma', 'cd_taps', 'grid_hist', 'grid_spiral')
@@ -2598,7 +2600,7 @@ class VLAModel(nn.Module, _HubMixin):
                  convdelta=0, cd_heads=6, cd_dim=32, cd_taps=4, cd_chunk=64, grid_hist=0, grid_spiral=False,
                  cd_convs=2, cd_fw=0, cd_fw_chunk=2, cd_fw_kernel=0, cd_fw_dk=64, cd_neg=False, cd_band=0.0, cd_gamma=False,
                  cd_stem=0, cd_delta_first=False, grid_conv1d=0,
-                 cd_recur=False, cd_no_res=False, cd_no_cat=False):
+                 cd_recur=False, cd_no_res=False, cd_no_cat=False, cd_no_gp=False):
         super().__init__()
         from transformers import AutoModelForCausalLM
         repo = _TOKENIZERS[tokenizer]
@@ -2774,8 +2776,8 @@ class VLAModel(nn.Module, _HubMixin):
         self.cd_chunk, self.cd_ckpt = int(cd_chunk), False   # cd_ckpt: checkpoint each block (seq)
         if self.cd is not None:
             torch.set_float32_matmul_precision('high')      # TF32 matmuls (the scan, projections)
-            self.cd_G = nn.Parameter(torch.ones(c_context, S, S))
-            self.cd_P = nn.Parameter(torch.zeros(c_context, S, S))
+            self.cd_G = None if cd_no_gp else nn.Parameter(torch.ones(c_context, S, S))   # --cd_no_gp: none
+            self.cd_P = None if cd_no_gp else nn.Parameter(torch.zeros(c_context, S, S))
             self.ring_off = sum(b.state_ch for b in self.cd)
         # --cd_stem N: N plain 3x3 conv + BN + ReLU layers on the input grid (no state, no residual)
         bn = dict(affine=False, momentum=bn_momentum or None)
@@ -3075,14 +3077,18 @@ class VLAModel(nn.Module, _HubMixin):
                 x = y.index_select(1, self.spiral_inv).transpose(1, 2).reshape(M, -1, self.S, self.S)
             else:
                 x = torch.einsum('mkc,kp->mcp', y, self.grid_a.view(K, -1)).view(M, -1, self.S, self.S)
-            return x * self.cd_G + self.cd_P
-        return self.ctx_cat(torch.cat(self._inputs(idx, img, aud), 1)) * self.cd_G + self.cd_P
+            return self._gp(x)
+        return self._gp(self.ctx_cat(torch.cat(self._inputs(idx, img, aud), 1)))
+
+    def _gp(self, x):
+        """The per-position scale and shift (--cd_no_gp: none)."""
+        return x if self.cd_G is None else x * self.cd_G + self.cd_P
 
     def _pre(self, x):
         """The input grid [M, C, S, S] -> the first block's input: --grid_conv1d's convs over the
         window (then the per-position scale and shift), --cd_stem's convs."""
         if self.grid_c1 is not None:
-            x = self.grid_c1(x.flatten(2)).view_as(x) * self.cd_G + self.cd_P
+            x = self._gp(self.grid_c1(x.flatten(2)).view_as(x))
         return self.cd_stem(x) if self.cd_stem is not None else x
 
     def _hist_get(self, dff):
@@ -4232,7 +4238,7 @@ model = VLAModel(S=args.context, n_hidden=args.n_hidden, c_context=args.c_contex
                  grid_hist=args.grid_hist, grid_spiral=args.grid_spiral, cd_convs=args.cd_convs, cd_fw=args.cd_fw, cd_fw_chunk=args.cd_fw_chunk,
                  cd_fw_kernel=args.cd_fw_kernel, cd_fw_dk=args.cd_fw_dk, cd_neg=args.cd_neg, cd_band=args.cd_band, cd_gamma=args.cd_gamma,
                  cd_stem=args.cd_stem, cd_delta_first=args.cd_delta_first,
-                 grid_conv1d=args.grid_conv1d, cd_recur=args.cd_recur, cd_no_res=args.cd_no_res, cd_no_cat=args.cd_no_cat, cd_chunk=args.cd_chunk,
+                 grid_conv1d=args.grid_conv1d, cd_recur=args.cd_recur, cd_no_res=args.cd_no_res, cd_no_cat=args.cd_no_cat, cd_no_gp=args.cd_no_gp, cd_chunk=args.cd_chunk,
                  up_windows=[float(w) for w in str(args.up_ema).split(',') if w.strip()] if args.up_ema else None)
 if _loaded_ckpt is not None:
     _sd = _upgrade_state_dict(_loaded_ckpt['state_dict'])
@@ -4480,7 +4486,7 @@ def _model_graph(model):
             out.append(dict(name='reshape, cd_G, cd_P', op=f'{G} -> {S}x{S} row-major, scale + shift per position',
                             inp=r['out'], out=f'{r["out"].split("x")[0]}x{S}x{S}',
                             tr=model.cd_G.numel() + model.cd_P.numel(), fr=0))
-        if r['name'] == 'ctx_cat' and cd is not None:
+        if r['name'] == 'ctx_cat' and cd is not None and model.cd_G is not None:
             out.append(dict(name='cd_G, cd_P', op='scale + shift per position', inp=r['out'],
                             out=r['out'], tr=model.cd_G.numel() + model.cd_P.numel(), fr=0))
         if r['name'] == 'attn.out':
