@@ -275,6 +275,8 @@ parser.add_argument('--grid_spiral', default=False, action=argparse.BooleanOptio
                          'last K tokens, one token per cell. Restored by --load')
 parser.add_argument('--cd_heads', default=6, type=int, help='--convdelta: memory heads per position')
 parser.add_argument('--cd_convs', default=2, type=int, help='--convdelta: 3x3 conv + BN + ReLU layers per block')
+parser.add_argument('--cd_delta_first', default=False, action=argparse.BooleanOptionalAction,
+                    help='--convdelta: each block reads and writes its memories first, then the convs (a DeltaConv block)')
 parser.add_argument('--cd_stem', default=0, type=int,
                     help='--convdelta: 3x3 conv + BN + ReLU layers on the input grid before the first block')
 parser.add_argument('--cd_neg', default=False, action=argparse.BooleanOptionalAction,
@@ -903,7 +905,7 @@ _ARCH_ARGS = ('context', 'n_hidden', 'c_context', 'depth', 'kernel', 'tokenizer'
               'image_encoder', 'audio_encoder', 'streams', 'linout_kernel', 'learn_win',
               'learn_regs', 'lmu', 'attn', 'attn_ch', 'attn_heads', 'attn_dim', 'attn_age', 'read_rmsnorm',
               'layers', 'write_gate', 'convdelta', 'cd_heads', 'cd_dim', 'cd_taps', 'lm', 'grid_hist', 'grid_spiral',
-              'cd_convs', 'cd_fw', 'cd_fw_kernel', 'cd_fw_dk', 'cd_neg', 'cd_band', 'cd_gamma', 'cd_stem')
+              'cd_convs', 'cd_fw', 'cd_fw_kernel', 'cd_fw_dk', 'cd_neg', 'cd_band', 'cd_gamma', 'cd_stem', 'cd_delta_first')
 # architecture switches that can be loaded onto a trained model: when given on the command line,
 # the given value wins over the checkpoint's
 _ARCH_SWITCHES = ('cd_neg', 'cd_band', 'cd_gamma', 'cd_taps', 'grid_hist', 'grid_spiral')
@@ -1635,12 +1637,14 @@ class ConvDeltaBlock(nn.Module):
                                              b = sigmoid, a = exp(-exp(lam_h) * 2 sigmoid))
          S = a S (I - b k k^T) + b v k^T    a d x d memory per head and grid position
          x' = u + out(S q)                   out starts at zero
+    (--cd_delta_first: the convs come last, on x' = u + out(S q), u without them.)
     The convs never read the state, so a whole sequence runs at once (seq) and only the
     memories S are carried tick to tick (_delta_scan); step does one tick."""
 
     def __init__(self, C, H, d, taps, S, bn_momentum=0.1, n_convs=2, fw=0, fw_chunk=2, fw_kernel=0, fw_dk=64,
-                 neg=False, band=0.0, gamma=False):
+                 neg=False, band=0.0, gamma=False, delta_first=False):
         super().__init__()
+        self.delta_first = bool(delta_first)   # --cd_delta_first: the memories, then the convs
         self.C, self.H, self.d, self.taps, self.S = C, H, d, taps, S
         self.fw, self.fw_chunk = int(fw), int(fw_chunk)
         # fw_kernel 0: keys/queries are the 3x3 patches of a 1x1 projection (memory d x 9d, a 3x3
@@ -1766,9 +1770,11 @@ class ConvDeltaBlock(nn.Module):
             fifo = st[:, nm:nm + (self.taps - 1) * C].reshape(B, self.taps - 1, C, self.S, self.S)   # newest first
             r = _rms_pos(x)
             hist = torch.cat([r[:, None], fifo], 1)                        # lags 0 .. taps-1
-            u = self._mixed(x + (hist * self.tconv[None, :, :, None, None]).sum(1))
+            u = x + (hist * self.tconv[None, :, :, None, None]).sum(1)
         else:                        # --cd_taps 0: no time conv
-            u = self._mixed(x)
+            u = x
+        if not self.delta_first:
+            u = self._mixed(u)
         q, k, v, beta, loga = self._proj(u)
         a, b = loga.exp()[..., None, None], beta[..., None, None]
         Sk = Sm @ k[..., None]                                             # [B, P, H, dv, 1]
@@ -1791,6 +1797,8 @@ class ConvDeltaBlock(nn.Module):
             o = torch.cat([o, (fq @ Sf.transpose(1, 2)).view(B, self.fw, P, d).transpose(1, 2)], 2)
             parts.append(self._fw_put(Sf, B))
         x = u + self._read_out(o, B)
+        if self.delta_first:
+            x = self._mixed(x)
         return x, torch.cat(parts, 1)
 
     def _ladder(self, r, reset, fifo):
@@ -1829,7 +1837,9 @@ class ConvDeltaBlock(nn.Module):
                 src = ext[:, n - j:n - j + T]
                 ok = (doc[:, n - j:n - j + T] == doc[:, n:]).to(x.dtype)
                 y = y + src * (self.tconv[j][None, None, :, None, None] * ok[:, :, None, None, None])
-        u = self._mixed((x + y).flatten(0, 1))
+        u = (x + y).flatten(0, 1)
+        if not self.delta_first:
+            u = self._mixed(u)
         q, k, v, beta, loga = self._proj(u)                                # [B*T, P, H, ...]
 
         def heads(t):                                                      # -> [B*P*H, T, ...]
@@ -1849,7 +1859,10 @@ class ConvDeltaBlock(nn.Module):
             of, SfT = _convfw_scan(fh(fq), fh(fk), fh(fv), fh(fb), fh(fa), rsf, self._fw_get(st), self.fw_chunk)
             of = of.view(B, self.fw, T, P, d).permute(0, 2, 3, 1, 4).reshape(B * T, P, self.fw, d)
             o = torch.cat([o, of], 2)
-        x = (u + self._read_out(o, B * T)).view(B, T, C, self.S, self.S)
+        x = u + self._read_out(o, B * T)
+        if self.delta_first:
+            x = self._mixed(x)
+        x = x.view(B, T, C, self.S, self.S)
         ST = ST.view(B, P, H, d, d).permute(0, 2, 3, 4, 1).reshape(B, nm, self.S, self.S)
         if not self.taps:
             parts = [ST]
@@ -2521,7 +2534,7 @@ class VLAModel(nn.Module, _HubMixin):
                  read_rmsnorm=False, layers=1, up_windows=None, write_gate=False,
                  convdelta=0, cd_heads=6, cd_dim=32, cd_taps=4, cd_chunk=64, grid_hist=0, grid_spiral=False,
                  cd_convs=2, cd_fw=0, cd_fw_chunk=2, cd_fw_kernel=0, cd_fw_dk=64, cd_neg=False, cd_band=0.0, cd_gamma=False,
-                 cd_stem=0):
+                 cd_stem=0, cd_delta_first=False):
         super().__init__()
         from transformers import AutoModelForCausalLM
         repo = _TOKENIZERS[tokenizer]
@@ -2679,7 +2692,7 @@ class VLAModel(nn.Module, _HubMixin):
         self.cd = (nn.ModuleList(ConvDeltaBlock(c_context, int(cd_heads), int(cd_dim), int(cd_taps), S,
                                                 bn_momentum, int(cd_convs or 2), int(cd_fw or 0), int(cd_fw_chunk),
                                                 int(cd_fw_kernel or 0), int(cd_fw_dk or 64), bool(cd_neg),
-                                                float(cd_band or 0), bool(cd_gamma))
+                                                float(cd_band or 0), bool(cd_gamma), bool(cd_delta_first))
                                  for _ in range(int(convdelta)))
                    if convdelta else None)
         self.cd_chunk, self.cd_ckpt = int(cd_chunk), False   # cd_ckpt: checkpoint each block (seq)
@@ -4125,7 +4138,7 @@ model = VLAModel(S=args.context, n_hidden=args.n_hidden, c_context=args.c_contex
                  convdelta=args.convdelta, cd_heads=args.cd_heads, cd_dim=args.cd_dim, cd_taps=args.cd_taps,
                  grid_hist=args.grid_hist, grid_spiral=args.grid_spiral, cd_convs=args.cd_convs, cd_fw=args.cd_fw, cd_fw_chunk=args.cd_fw_chunk,
                  cd_fw_kernel=args.cd_fw_kernel, cd_fw_dk=args.cd_fw_dk, cd_neg=args.cd_neg, cd_band=args.cd_band, cd_gamma=args.cd_gamma,
-                 cd_stem=args.cd_stem, cd_chunk=args.cd_chunk,
+                 cd_stem=args.cd_stem, cd_delta_first=args.cd_delta_first, cd_chunk=args.cd_chunk,
                  up_windows=[float(w) for w in str(args.up_ema).split(',') if w.strip()] if args.up_ema else None)
 if _loaded_ckpt is not None:
     _sd = _upgrade_state_dict(_loaded_ckpt['state_dict'])
