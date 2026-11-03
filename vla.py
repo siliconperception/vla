@@ -369,7 +369,7 @@ parser.add_argument('--attn_heads', default=8, type=int, help='--attn: query hea
 parser.add_argument('--attn_dim', default=64, type=int, help='--attn: key/value/head width; restored by --load')
 parser.add_argument('--linout_kernel', default=1, type=int, metavar='K',
                     help='linout kernel (odd): KxK, padded, mixes neighbouring positions on the '
-                         'way back into the registers; restored by --load')
+                         'way back into the registers; 0: no linout (needs --n_hidden = --c_context); restored by --load')
 parser.add_argument('--tokenizer',  default='pythia31m', choices=sorted(_TOKENIZERS),
                     help='borrowed vocabulary, token embedding and lm_head (frozen)')
 parser.add_argument('--ctx_ema',    default='256,64,16,4,1', metavar='W1,W2,...',
@@ -2665,15 +2665,21 @@ class VLAModel(nn.Module, _HubMixin):
 
         # linout: c_context -> n_hidden, semi-orthogonal (norm-preserving, dense and signed) at
         # the centre tap of its K x K kernel, the other taps zero
+        # (--linout_kernel 0: none, the last layer's output goes straight on; needs n_hidden == c_context)
         lk = int(linout_kernel)
-        if lk < 1 or lk % 2 == 0:
-            raise SystemExit(f'--linout_kernel {lk}: must be odd')
-        self.linout = nn.Conv2d(c_context, n_hidden, lk, padding=lk // 2)
-        with torch.no_grad():
-            self.linout.weight.zero_()
-            self.linout.weight[:, :, lk // 2, lk // 2] = nn.init.orthogonal_(
-                torch.empty(n_hidden, c_context))
-            self.linout.bias.zero_()
+        if lk == 0:
+            if n_hidden != c_context:
+                raise SystemExit(f'--linout_kernel 0 needs --n_hidden {c_context} (= --c_context)')
+            self.linout = nn.Identity()
+        elif lk < 1 or lk % 2 == 0:
+            raise SystemExit(f'--linout_kernel {lk}: must be odd (or 0: none)')
+        else:
+            self.linout = nn.Conv2d(c_context, n_hidden, lk, padding=lk // 2)
+            with torch.no_grad():
+                self.linout.weight.zero_()
+                self.linout.weight[:, :, lk // 2, lk // 2] = nn.init.orthogonal_(
+                    torch.empty(n_hidden, c_context))
+                self.linout.bias.zero_()
 
         self.img_enc = ImageEncoder(self.image_encoder) if self.img_width else None   # frozen
         self.aud_enc = (None if not self.aud_width else QuartzNetEncoder()       # frozen
