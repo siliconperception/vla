@@ -275,6 +275,8 @@ parser.add_argument('--grid_spiral', default=False, action=argparse.BooleanOptio
                          'last K tokens, one token per cell. Restored by --load')
 parser.add_argument('--cd_heads', default=6, type=int, help='--convdelta: memory heads per position')
 parser.add_argument('--cd_convs', default=2, type=int, help='--convdelta: 3x3 conv + BN + ReLU layers per block')
+parser.add_argument('--cd_stem', default=0, type=int,
+                    help='--convdelta: 3x3 conv + BN + ReLU layers on the input grid before the first block')
 parser.add_argument('--cd_neg', default=False, action=argparse.BooleanOptionalAction,
                     help='--convdelta: write strength beta in (0, 2), not (0, 1): beta = sigmoid(g) (1 + tanh(n)), n a '
                          '1x1 conv starting at zero, so it can be added to a trained model. Beyond 1 the delta rule '
@@ -901,7 +903,7 @@ _ARCH_ARGS = ('context', 'n_hidden', 'c_context', 'depth', 'kernel', 'tokenizer'
               'image_encoder', 'audio_encoder', 'streams', 'linout_kernel', 'learn_win',
               'learn_regs', 'lmu', 'attn', 'attn_ch', 'attn_heads', 'attn_dim', 'attn_age', 'read_rmsnorm',
               'layers', 'write_gate', 'convdelta', 'cd_heads', 'cd_dim', 'cd_taps', 'lm', 'grid_hist', 'grid_spiral',
-              'cd_convs', 'cd_fw', 'cd_fw_kernel', 'cd_fw_dk', 'cd_neg', 'cd_band', 'cd_gamma')
+              'cd_convs', 'cd_fw', 'cd_fw_kernel', 'cd_fw_dk', 'cd_neg', 'cd_band', 'cd_gamma', 'cd_stem')
 # architecture switches that can be loaded onto a trained model: when given on the command line,
 # the given value wins over the checkpoint's
 _ARCH_SWITCHES = ('cd_neg', 'cd_band', 'cd_gamma', 'cd_taps', 'grid_hist', 'grid_spiral')
@@ -2518,7 +2520,8 @@ class VLAModel(nn.Module, _HubMixin):
                  learn_regs=(), lmu=False, attn=0, attn_ch=2, attn_heads=8, attn_dim=64, attn_age=True,
                  read_rmsnorm=False, layers=1, up_windows=None, write_gate=False,
                  convdelta=0, cd_heads=6, cd_dim=32, cd_taps=4, cd_chunk=64, grid_hist=0, grid_spiral=False,
-                 cd_convs=2, cd_fw=0, cd_fw_chunk=2, cd_fw_kernel=0, cd_fw_dk=64, cd_neg=False, cd_band=0.0, cd_gamma=False):
+                 cd_convs=2, cd_fw=0, cd_fw_chunk=2, cd_fw_kernel=0, cd_fw_dk=64, cd_neg=False, cd_band=0.0, cd_gamma=False,
+                 cd_stem=0):
         super().__init__()
         from transformers import AutoModelForCausalLM
         repo = _TOKENIZERS[tokenizer]
@@ -2685,6 +2688,12 @@ class VLAModel(nn.Module, _HubMixin):
             self.cd_G = nn.Parameter(torch.ones(c_context, S, S))
             self.cd_P = nn.Parameter(torch.zeros(c_context, S, S))
             self.ring_off = sum(b.state_ch for b in self.cd)
+        # --cd_stem N: N plain 3x3 conv + BN + ReLU layers on the input grid (no state, no residual)
+        bn = dict(affine=False, momentum=bn_momentum or None)
+        self.cd_stem = (nn.Sequential(*[m for _ in range(int(cd_stem)) for m in
+                                        (nn.Conv2d(c_context, c_context, 3, padding=1),
+                                         nn.BatchNorm2d(c_context, **bn), nn.ReLU())])
+                        if self.cd is not None and cd_stem else None)
         # --grid_hist K: cell p of the input grid is sum_j a[j, p] ctx_cat(token t-j); a starts as
         # concentric rings (outer ring t, inward t-1, t-2, ..., the centre the oldest of them),
         # the tokens beyond the rings at 0. The last K-1 token ids ride in the state's first
@@ -3042,6 +3051,12 @@ class VLAModel(nn.Module, _HubMixin):
             sts.append(self._hist_put(last))
         else:
             x = self._cd_in(idx.flatten(0, 1), img, aud)
+        if self.cd_stem is not None:
+            if self.cd_ckpt and torch.is_grad_enabled():
+                x = torch.utils.checkpoint.checkpoint(self.cd_stem, x, use_reentrant=False,
+                                                      context_fn=lambda: (contextlib.nullcontext(), self._bn_hold()))
+            else:
+                x = self.cd_stem(x)
         x = x.view(B, T, self.c_context, self.S, self.S)
         for blk in self.cd:
             st = dff[:, off:off + blk.state_ch]
@@ -3063,6 +3078,8 @@ class VLAModel(nn.Module, _HubMixin):
                 x, sts, off = self._cd_in(ids), [self._hist_put(ids[:, :self.grid_hist - 1])], 1
             else:
                 x, sts, off = self._cd_in(idx, img, aud), [], 0
+            if self.cd_stem is not None:
+                x = self.cd_stem(x)
             for blk in self.cd:
                 x, st = blk.step(x, dff[:, off:off + blk.state_ch])
                 off += blk.state_ch
@@ -4108,7 +4125,7 @@ model = VLAModel(S=args.context, n_hidden=args.n_hidden, c_context=args.c_contex
                  convdelta=args.convdelta, cd_heads=args.cd_heads, cd_dim=args.cd_dim, cd_taps=args.cd_taps,
                  grid_hist=args.grid_hist, grid_spiral=args.grid_spiral, cd_convs=args.cd_convs, cd_fw=args.cd_fw, cd_fw_chunk=args.cd_fw_chunk,
                  cd_fw_kernel=args.cd_fw_kernel, cd_fw_dk=args.cd_fw_dk, cd_neg=args.cd_neg, cd_band=args.cd_band, cd_gamma=args.cd_gamma,
-                 cd_chunk=args.cd_chunk,
+                 cd_stem=args.cd_stem, cd_chunk=args.cd_chunk,
                  up_windows=[float(w) for w in str(args.up_ema).split(',') if w.strip()] if args.up_ema else None)
 if _loaded_ckpt is not None:
     _sd = _upgrade_state_dict(_loaded_ckpt['state_dict'])
