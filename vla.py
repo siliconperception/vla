@@ -283,8 +283,8 @@ parser.add_argument('--cd_no_cat', default=False, action=argparse.BooleanOptiona
 parser.add_argument('--cd_no_gp', default=False, action=argparse.BooleanOptionalAction,
                     help='--convdelta: no per-position scale and shift (cd_G, cd_P) on the input grid')
 parser.add_argument('--cd_no_res', default=False, action=argparse.BooleanOptionalAction,
-                    help='--cd_delta_first: no residual adds, x\' = convs(out(S q)); every path runs through '
-                         'the memory and then the convs')
+                    help='--convdelta: no residual adds, x\' = out(S q) with q, k, v, gates from convs(x) '
+                         '(--cd_delta_first: x\' = convs(out(S q))); every path runs through the convs and the memory')
 parser.add_argument('--grid_conv1d', default=0, type=int,
                     help='--grid_hist S*S: the last S*S tokens in time order (oldest first) as a 1-d '
                          'sequence through N conv1d(3) + BN + ReLU layers, then reshaped to the SxS grid')
@@ -1655,16 +1655,16 @@ class ConvDeltaBlock(nn.Module):
     (--cd_recur: u = x + ReLU(BN(conv3x3(...(u[t-1])))), the convs on the last tick's u, carried
     in the state; the convs then run tick by tick in seq.)
     (--cd_delta_first: the convs come last, on x' = u + out(S q), u without them.)
-    (--cd_no_res, with --cd_delta_first: neither add, x' = convs(out(S q)).)
+    (--cd_no_res: neither add, u = convs(x) and x' = out(S q); with --cd_delta_first x' = convs(out(S q)).)
     The convs never read the state, so a whole sequence runs at once (seq) and only the
     memories S are carried tick to tick (_delta_scan); step does one tick."""
 
     def __init__(self, C, H, d, taps, S, bn_momentum=0.1, n_convs=2, fw=0, fw_chunk=2, fw_kernel=0, fw_dk=64,
                  neg=False, band=0.0, gamma=False, delta_first=False, recur=False, no_res=False):
         super().__init__()
-        self.res = not no_res                  # --cd_no_res: no residual adds (delta first only)
-        if no_res and not delta_first:
-            raise SystemExit('--cd_no_res needs --cd_delta_first')
+        self.res = not no_res                  # --cd_no_res: no residual adds
+        if no_res and recur:
+            raise SystemExit('--cd_no_res does not combine with --cd_recur')
         self.delta_first = bool(delta_first)   # --cd_delta_first: the memories, then the convs
         self.recur = bool(recur)               # --cd_recur: the convs read the last tick's u
         if self.recur and self.delta_first:
