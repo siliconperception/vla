@@ -4304,6 +4304,11 @@ if _loaded_ckpt is not None:
     if any(re.match(r'cd\.\d+\.gz$', k) for k in missing) and not any(k.endswith('.gz') for k in _sd):
         print('--cd_gamma: the ladder is new, starting as the FIFO (c = 0)', flush=True)
         missing = [k for k in missing if not re.match(r'cd\.\d+\.gz$', k)]
+    if model.cd is not None and len(model.cd[0].mix) % 3:   # --cd_mix_out: the 1x1 after the convs
+        _mo = [k for k in missing if re.match(rf'cd\.\d+\.mix\.{len(model.cd[0].mix) - 1}\.', k)]
+        if _mo and not any(k in _sd for k in _mo):
+            print('--cd_mix_out: the 1x1 after each block\'s convs is new, starting as the identity', flush=True)
+            missing = [k for k in missing if k not in _mo]
     bad = [k for k in missing if not re.match(r'(text|voc|img)_dec\.nul\.|surp_mean$|gain_mean$|win_theta$', k)] + \
           [k for k in unexpected if not ((args.inner_voice or model.streams == 3)
                                          and k.startswith('text_dec.nul.'))]
