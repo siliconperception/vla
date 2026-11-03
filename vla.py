@@ -277,6 +277,9 @@ parser.add_argument('--cd_heads', default=6, type=int, help='--convdelta: memory
 parser.add_argument('--cd_convs', default=2, type=int, help='--convdelta: 3x3 conv + BN + ReLU layers per block')
 parser.add_argument('--cd_delta_first', default=False, action=argparse.BooleanOptionalAction,
                     help='--convdelta: each block reads and writes its memories first, then the convs (a DeltaConv block)')
+parser.add_argument('--cd_no_cat', default=False, action=argparse.BooleanOptionalAction,
+                    help='--convdelta: no ctx_cat; the RMS-normalized token grid goes straight to cd_G, cd_P '
+                         '(needs the input width = --c_context)')
 parser.add_argument('--cd_no_res', default=False, action=argparse.BooleanOptionalAction,
                     help='--cd_delta_first: no residual adds, x\' = convs(out(S q)); every path runs through '
                          'the memory and then the convs')
@@ -915,7 +918,7 @@ _ARCH_ARGS = ('context', 'n_hidden', 'c_context', 'depth', 'kernel', 'tokenizer'
               'learn_regs', 'lmu', 'attn', 'attn_ch', 'attn_heads', 'attn_dim', 'attn_age', 'read_rmsnorm',
               'layers', 'write_gate', 'convdelta', 'cd_heads', 'cd_dim', 'cd_taps', 'lm', 'grid_hist', 'grid_spiral',
               'cd_convs', 'cd_fw', 'cd_fw_kernel', 'cd_fw_dk', 'cd_neg', 'cd_band', 'cd_gamma', 'cd_stem', 'cd_delta_first', 'grid_conv1d', 'cd_recur',
-              'cd_no_res')
+              'cd_no_res', 'cd_no_cat')
 # architecture switches that can be loaded onto a trained model: when given on the command line,
 # the given value wins over the checkpoint's
 _ARCH_SWITCHES = ('cd_neg', 'cd_band', 'cd_gamma', 'cd_taps', 'grid_hist', 'grid_spiral')
@@ -1710,9 +1713,10 @@ class ConvDeltaBlock(nn.Module):
         if self.band:
             self.lam.requires_grad_(False)
         self.out = nn.Conv2d((H + self.fw) * d, C, 1)
-        with torch.no_grad():
-            self.out.weight.zero_()
-            self.out.bias.zero_()
+        if self.res:                 # (--cd_no_res: the default init, else the convs see a constant)
+            with torch.no_grad():
+                self.out.weight.zero_()
+                self.out.bias.zero_()
 
     @property
     def fw_ch(self):
@@ -2594,7 +2598,7 @@ class VLAModel(nn.Module, _HubMixin):
                  convdelta=0, cd_heads=6, cd_dim=32, cd_taps=4, cd_chunk=64, grid_hist=0, grid_spiral=False,
                  cd_convs=2, cd_fw=0, cd_fw_chunk=2, cd_fw_kernel=0, cd_fw_dk=64, cd_neg=False, cd_band=0.0, cd_gamma=False,
                  cd_stem=0, cd_delta_first=False, grid_conv1d=0,
-                 cd_recur=False, cd_no_res=False):
+                 cd_recur=False, cd_no_res=False, cd_no_cat=False):
         super().__init__()
         from transformers import AutoModelForCausalLM
         repo = _TOKENIZERS[tokenizer]
@@ -2652,16 +2656,21 @@ class VLAModel(nn.Module, _HubMixin):
         self.att_width = self.c_text if attn else 0
         widths = self.in_widths + ([self.att_width] if attn else []) + [n_hidden] * self.K
         n_tok_extra = self.streams - 1
-        self.ctx_cat = nn.Conv2d(sum(widths), c_context, 1)
-        with torch.no_grad():
-            self.ctx_cat.weight.zero_()
-            o = 0
-            for i, w in enumerate(widths):
-                if i == 0 or len(self.in_widths) - n_tok_extra <= i < len(self.in_widths):
-                    n = min(w, c_context)
-                    self.ctx_cat.weight[:n, o:o + n, 0, 0] = torch.eye(n)
-                o += w
-            self.ctx_cat.bias.zero_()
+        if cd_no_cat:                # --cd_no_cat: the input grid as it is
+            if not convdelta or sum(widths) != c_context:
+                raise SystemExit(f'--cd_no_cat needs --convdelta and input width {sum(widths)} = --c_context')
+            self.ctx_cat = nn.Identity()
+        else:
+            self.ctx_cat = nn.Conv2d(sum(widths), c_context, 1)
+            with torch.no_grad():
+                self.ctx_cat.weight.zero_()
+                o = 0
+                for i, w in enumerate(widths):
+                    if i == 0 or len(self.in_widths) - n_tok_extra <= i < len(self.in_widths):
+                        n = min(w, c_context)
+                        self.ctx_cat.weight[:n, o:o + n, 0, 0] = torch.eye(n)
+                    o += w
+                self.ctx_cat.bias.zero_()
 
         # linout: c_context -> n_hidden, semi-orthogonal (norm-preserving, dense and signed) at
         # the centre tap of its K x K kernel, the other taps zero
@@ -4223,7 +4232,7 @@ model = VLAModel(S=args.context, n_hidden=args.n_hidden, c_context=args.c_contex
                  grid_hist=args.grid_hist, grid_spiral=args.grid_spiral, cd_convs=args.cd_convs, cd_fw=args.cd_fw, cd_fw_chunk=args.cd_fw_chunk,
                  cd_fw_kernel=args.cd_fw_kernel, cd_fw_dk=args.cd_fw_dk, cd_neg=args.cd_neg, cd_band=args.cd_band, cd_gamma=args.cd_gamma,
                  cd_stem=args.cd_stem, cd_delta_first=args.cd_delta_first,
-                 grid_conv1d=args.grid_conv1d, cd_recur=args.cd_recur, cd_no_res=args.cd_no_res, cd_chunk=args.cd_chunk,
+                 grid_conv1d=args.grid_conv1d, cd_recur=args.cd_recur, cd_no_res=args.cd_no_res, cd_no_cat=args.cd_no_cat, cd_chunk=args.cd_chunk,
                  up_windows=[float(w) for w in str(args.up_ema).split(',') if w.strip()] if args.up_ema else None)
 if _loaded_ckpt is not None:
     _sd = _upgrade_state_dict(_loaded_ckpt['state_dict'])
