@@ -899,8 +899,9 @@ parser.add_argument('--vis',        default=False, action='store_true',
                          'channels per grid cell), --write_gate rates (mean across channels) and '
                          'P(next token); x exits')
 parser.add_argument('--vis_alt',    default='default', choices=['default', 'alt1'],
-                    help='--vis layout: default, one row with each --convdelta block\'s output (std '
-                         'across channels per cell), each block\'s memory read and P(next token); '
+                    help='--vis layout: default, a column per --convdelta block with four rows, its input x, '
+                         'u after the convs, y the memory read\'s 1x1 out and the output x\' (std across '
+                         'channels per cell, as in vla_v594.svg), and P(next token); '
                          'alt1, the full view (outputs, registers, ctx_cat grid, memories)')
 parser.add_argument('--delay',      default=0.1,  type=float, help='--vis seconds per frame')
 parser.add_argument('--cmap',       default='viridis', help='--vis colormap')
@@ -5227,35 +5228,40 @@ if args.vis and args.vis_alt == 'default' and model.cd is None:
     print('--vis_alt default needs --convdelta; showing alt1')
 if args.vis and args.vis_alt == 'default' and model.cd is not None:
     nb_ = len(model.cd)
-    _blk_out, _blk_read = [None] * nb_, [None] * nb_
+    _VIS_ROWS = ('x', 'u', 'y', 'x′')             # vla_v594.svg pane B: in, after the convs, the read's 1x1 out, out
+    _bk = [{} for _ in range(nb_)]
     for i, blk in enumerate(model.cd):
-        def _blk_keep(x, st, i=i, fn=blk.step, ro=blk._read_out):
+        def _blk_keep(x, st, i=i, blk=blk, fn=blk.step, mx=blk._mixed, ro=blk._read_out):
+            def _mx(u):
+                r = mx(u)
+                _bk[i]['u'] = r
+                return r
+
             def _ro(o, M):
                 r = ro(o, M)
-                _blk_read[i] = r
+                _bk[i]['y'] = r
                 return r
-            blk_ = model.cd[i]
-            blk_._read_out = _ro                     # the instance attribute shadows the method
+            _bk[i]['x'] = _bk[i]['u'] = x               # (u = x when the block has no convs before its memory)
+            blk._mixed, blk._read_out = _mx, _ro     # the instance attributes shadow the methods
             x, st = fn(x, st)
-            del blk_._read_out
-            _blk_out[i] = x
+            del blk._mixed, blk._read_out
+            _bk[i]['x′'] = x
             return x, st
         blk.step = _blk_keep
-    fig = plt.figure(figsize=(max(7.5, _VIS_WIN * 7 * 0.602 / 72 * 1.05), 4.6))
-    gs = fig.add_gridspec(2, nb_ + 1, width_ratios=[1] * nb_ + [2], top=0.80, bottom=0.06,
-                          left=0.02, right=0.99, hspace=0.25, wspace=0.08)
-    ax_o = [fig.add_subplot(gs[0, i]) for i in range(nb_)]
-    ax_r = [fig.add_subplot(gs[1, i]) for i in range(nb_)]
+    fig = plt.figure(figsize=(max(7.5, _VIS_WIN * 7 * 0.602 / 72 * 1.05), 7.6))
+    gs = fig.add_gridspec(4, nb_ + 1, width_ratios=[1] * nb_ + [2], top=0.88, bottom=0.04,
+                          left=0.03, right=0.99, hspace=0.30, wspace=0.08)
+    axs = [fig.add_subplot(gs[r, i]) for r in range(4) for i in range(nb_)]
     ax_p = fig.add_subplot(gs[:, nb_])
-    for i in range(nb_):
-        ax_o[i].set_title(f'block {i + 1} out', fontsize=8, pad=2)
-        ax_r[i].set_title(f'block {i + 1} read', fontsize=8, pad=2)
+    for r, nm in enumerate(_VIS_ROWS):
+        for i in range(nb_):
+            axs[r * nb_ + i].set_title(f'block {i + 1}  {nm}', fontsize=8, pad=2)
     ax_p.set_title('P(next token)', fontsize=9, pad=3)
-    for ax in ax_o + ax_r + [ax_p]:
+    for ax in axs + [ax_p]:
         ax.set_xticks([])
         ax.set_yticks([])
     fig.text(0.02, 0.008, f'maps: std across channels at each of the {model.S}x{model.S} positions, '
-             f'running max scale per map', fontsize=8, color='0.7', va='bottom')
+             f'running min-max scale per map', fontsize=8, color='0.7', va='bottom')
     header = fig.text(0.01, 0.99, '', family='monospace', fontsize=7, va='top', ha='left')
     PR = int(math.ceil(math.sqrt(model.vocab)))
     PC = int(math.ceil(model.vocab / PR))
@@ -5269,8 +5275,7 @@ if args.vis and args.vis_alt == 'default' and model.cd is not None:
     cur = list(prompt)
     dff = model.new_state(1, dev)
     bank = _bank([_image], dev) if _image is not None else None
-    axs = ax_o + ax_r
-    imgs, vmax, img_p, nstep = [None] * len(axs), [None] * len(axs), None, 0
+    imgs, vmax, vmin, img_p, nstep = [None] * len(axs), [None] * len(axs), [None] * len(axs), None, 0
     while not _exit[0] and plt.fignum_exists(fig.number):
         with torch.no_grad():
             img = model.image_grid(_views(*bank)) if bank is not None else None
@@ -5282,15 +5287,16 @@ if args.vis and args.vis_alt == 'default' and model.cd is not None:
         else:
             b = int(torch.multinomial(_truncate(prob), 1).item())
             cur = (cur + [b])[-2 * _VIS_WIN:]
-        for r, t in enumerate(_blk_out + _blk_read):
+        for r, t in enumerate([_bk[i][nm] for nm in _VIS_ROWS for i in range(nb_)]):
             m = t[0].float().std(dim=0).cpu().numpy()
             vmax[r] = float(m.max()) if vmax[r] is None else max(float(m.max()), 0.98 * vmax[r])
             if imgs[r] is None:
                 imgs[r] = axs[r].matshow(m, cmap=args.cmap)
                 axs[r].set_xticks([])
                 axs[r].set_yticks([])
+            vmin[r] = float(m.min()) if vmin[r] is None else min(float(m.min()), vmin[r] + 0.02 * (vmax[r] - vmin[r]))
             imgs[r].set_data(m)
-            imgs[r].set_clim(0.0, vmax[r] or 1e-9)
+            imgs[r].set_clim(vmin[r], max(vmax[r], vmin[r] + 1e-6))
         pg = np.zeros(PR * PC, dtype=np.float32)
         pg[:model.vocab] = prob.cpu().numpy()
         pg = pg.reshape(PR, PC)
@@ -5301,7 +5307,7 @@ if args.vis and args.vis_alt == 'default' and model.cd is not None:
         img_p.set_data(pg)
         img_p.set_clim(0, float(pg.max()) or 1e-9)
         ticker = ''.join(DOT_TEXT if c in '$\\' else c for c in _render(cur))[-_VIS_WIN:]
-        header.set_text(f'step {nstep:8d}  out_std ' + ' '.join(f'{float(t.std()):.3f}' for t in _blk_out) +
+        header.set_text(f'step {nstep:8d}  out_std ' + ' '.join(f'{float(b_["x′"].std()):.3f}' for b_ in _bk) +
                         f'  p_max {float(prob.max()):5.3f}  min_p {args.min_p:.4f}  T {args.temperature:.2f}'
                         f'\ngen: {ticker}')
         fig.canvas.draw()
