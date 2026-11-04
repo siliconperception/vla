@@ -7769,7 +7769,7 @@ def _wema_eval(step):
         _wema_swap(T)
         try:
             for corpus in [c for c in _eval_corpus_names() if c not in _MEDIA_DATASETS][:1]:
-                _score(step, corpus, _eval_docs(corpus), tag=f'{corpus}~ema{T // 1000}K',
+                _score(step, corpus, _eval_docs(corpus), tag=f'{corpus}~ema{T // 1000}K' if T % 1000 == 0 else f'{corpus}~ema{T}',
                        bands=False)
         except Exception as e:
             print(f'WARNING: --weight_ema eval failed at step {step}: {e!r}', flush=True)
