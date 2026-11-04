@@ -901,8 +901,13 @@ parser.add_argument('--vis',        default=False, action='store_true',
 parser.add_argument('--vis_alt',    default='default', choices=['default', 'alt1'],
                     help='--vis layout: default, a column per --convdelta block with four rows, its input x, '
                          'u after the convs, y the memory read\'s 1x1 out and the output x\' (std across '
-                         'channels per cell, as in vla_v594.svg), and P(next token); '
+                         'channels per cell, see --vis_metric, as in vla_v594.svg), and P(next token); '
                          'alt1, the full view (outputs, registers, ctx_cat grid, memories)')
+parser.add_argument('--vis_metric', default='dev', choices=['dev', 'std'],
+                    help='--vis_alt default maps per cell: dev, the RMS over channels of the change from '
+                         'its running mean (EMA over --vis_ema ticks: what is new this tick); std, the std '
+                         'across channels')
+parser.add_argument('--vis_ema',    default=16.0, type=float, help='--vis_metric dev: the running mean\'s window, ticks')
 parser.add_argument('--delay',      default=0.1,  type=float, help='--vis seconds per frame')
 parser.add_argument('--cmap',       default='viridis', help='--vis colormap')
 parser.add_argument('--push',       default=False, action='store_true',
@@ -5260,8 +5265,10 @@ if args.vis and args.vis_alt == 'default' and model.cd is not None:
     for ax in axs + [ax_p]:
         ax.set_xticks([])
         ax.set_yticks([])
-    fig.text(0.02, 0.008, f'maps: std across channels at each of the {model.S}x{model.S} positions, '
-             f'running min-max scale per map', fontsize=8, color='0.7', va='bottom')
+    fig.text(0.02, 0.008, (f'maps: std across channels at each of the {model.S}x{model.S} positions'
+                           if args.vis_metric == 'std' else
+                           f'maps: RMS over channels of the change from a {args.vis_ema:g}-tick running mean, '
+                           f'at each of the {model.S}x{model.S} positions') + ', each map on its own min-max scale every tick', fontsize=8, color='0.7', va='bottom')
     header = fig.text(0.01, 0.99, '', family='monospace', fontsize=7, va='top', ha='left')
     PR = int(math.ceil(math.sqrt(model.vocab)))
     PC = int(math.ceil(model.vocab / PR))
@@ -5275,7 +5282,8 @@ if args.vis and args.vis_alt == 'default' and model.cd is not None:
     cur = list(prompt)
     dff = model.new_state(1, dev)
     bank = _bank([_image], dev) if _image is not None else None
-    imgs, vmax, vmin, img_p, nstep = [None] * len(axs), [None] * len(axs), [None] * len(axs), None, 0
+    imgs, img_p, nstep = [None] * len(axs), None, 0
+    ema = [None] * len(axs)                          # --vis_metric dev: each map's running mean [C, S, S]
     while not _exit[0] and plt.fignum_exists(fig.number):
         with torch.no_grad():
             img = model.image_grid(_views(*bank)) if bank is not None else None
@@ -5288,15 +5296,19 @@ if args.vis and args.vis_alt == 'default' and model.cd is not None:
             b = int(torch.multinomial(_truncate(prob), 1).item())
             cur = (cur + [b])[-2 * _VIS_WIN:]
         for r, t in enumerate([_bk[i][nm] for nm in _VIS_ROWS for i in range(nb_)]):
-            m = t[0].float().std(dim=0).cpu().numpy()
-            vmax[r] = float(m.max()) if vmax[r] is None else max(float(m.max()), 0.98 * vmax[r])
+            t = t[0].float()
+            if args.vis_metric == 'std':
+                m = t.std(dim=0).cpu().numpy()
+            else:                                    # the change from the running mean, RMS over channels
+                ema[r] = t.clone() if ema[r] is None else ema[r]
+                m = (t - ema[r]).pow(2).mean(0).sqrt().cpu().numpy()
+                ema[r].lerp_(t, 1.0 / max(args.vis_ema, 1.0))
             if imgs[r] is None:
                 imgs[r] = axs[r].matshow(m, cmap=args.cmap)
                 axs[r].set_xticks([])
                 axs[r].set_yticks([])
-            vmin[r] = float(m.min()) if vmin[r] is None else min(float(m.min()), vmin[r] + 0.02 * (vmax[r] - vmin[r]))
-            imgs[r].set_data(m)
-            imgs[r].set_clim(vmin[r], max(vmax[r], vmin[r] + 1e-6))
+            imgs[r].set_data(m)                      # each frame on its own min-max scale
+            imgs[r].set_clim(float(m.min()), max(float(m.max()), float(m.min()) + 1e-6))
         pg = np.zeros(PR * PC, dtype=np.float32)
         pg[:model.vocab] = prob.cpu().numpy()
         pg = pg.reshape(PR, PC)
