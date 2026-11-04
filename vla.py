@@ -659,11 +659,12 @@ parser.add_argument('--eval_recent', default=0, type=int, metavar='K',
                          'the model last read them), and K held-out ones: loss on them, on their '
                          'continuation after --eval_gen_prompt tokens, and EVALG delta from that '
                          'prefix -- does the model know what it read recently better than old?')
-parser.add_argument('--weight_ema', default='', metavar='T1,T2,...',
+parser.add_argument('--weight_ema', default='300', metavar='T1,T2,...',
                     help='keep a running average of the weights (and BatchNorm statistics) with '
-                         'each time constant T (steps), updated every step, saved in the '
+                         'each time constant T (optimizer updates), updated every update, saved in the '
                          'checkpoint; at every eval, EVAL lines for each average (corpus '
-                         '<name>~emaTK). Training is unchanged: these are slow copies to measure')
+                         '<name>~emaTK). Training is unchanged: these are slow copies to measure. '
+                         'Default 300; "" for none')
 parser.add_argument('--use_ema', default=0, type=int, metavar='T',
                     help='after --load, replace the weights by the checkpoint\'s --weight_ema '
                          'average with time constant T (for --eval, --doc_score, --generate...)')
