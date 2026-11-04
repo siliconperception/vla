@@ -898,6 +898,10 @@ parser.add_argument('--vis',        default=False, action='store_true',
                     help='live generation view: layer output and registers (std across '
                          'channels per grid cell), --write_gate rates (mean across channels) and '
                          'P(next token); x exits')
+parser.add_argument('--vis_alt',    default='default', choices=['default', 'alt1'],
+                    help='--vis layout: default, one row with each --convdelta block\'s output (std '
+                         'across channels per cell), each block\'s memory read and P(next token); '
+                         'alt1, the full view (outputs, registers, ctx_cat grid, memories)')
 parser.add_argument('--delay',      default=0.1,  type=float, help='--vis seconds per frame')
 parser.add_argument('--cmap',       default='viridis', help='--vis colormap')
 parser.add_argument('--push',       default=False, action='store_true',
@@ -5219,6 +5223,92 @@ if args.vis:
     _VIS_WIN = 180                                   # ticker width in characters
     plt.style.use('dark_background')
     plt.ion()
+if args.vis and args.vis_alt == 'default' and model.cd is None:
+    print('--vis_alt default needs --convdelta; showing alt1')
+if args.vis and args.vis_alt == 'default' and model.cd is not None:
+    nb_ = len(model.cd)
+    _blk_out, _blk_read = [None] * nb_, [None] * nb_
+    for i, blk in enumerate(model.cd):
+        def _blk_keep(x, st, i=i, fn=blk.step, ro=blk._read_out):
+            def _ro(o, M):
+                r = ro(o, M)
+                _blk_read[i] = r
+                return r
+            blk_ = model.cd[i]
+            blk_._read_out = _ro                     # the instance attribute shadows the method
+            x, st = fn(x, st)
+            del blk_._read_out
+            _blk_out[i] = x
+            return x, st
+        blk.step = _blk_keep
+    fig = plt.figure(figsize=(max(7.5, _VIS_WIN * 7 * 0.602 / 72 * 1.05), 4.6))
+    gs = fig.add_gridspec(2, nb_ + 1, width_ratios=[1] * nb_ + [2], top=0.80, bottom=0.06,
+                          left=0.02, right=0.99, hspace=0.25, wspace=0.08)
+    ax_o = [fig.add_subplot(gs[0, i]) for i in range(nb_)]
+    ax_r = [fig.add_subplot(gs[1, i]) for i in range(nb_)]
+    ax_p = fig.add_subplot(gs[:, nb_])
+    for i in range(nb_):
+        ax_o[i].set_title(f'block {i + 1} out', fontsize=8, pad=2)
+        ax_r[i].set_title(f'block {i + 1} read', fontsize=8, pad=2)
+    ax_p.set_title('P(next token)', fontsize=9, pad=3)
+    for ax in ax_o + ax_r + [ax_p]:
+        ax.set_xticks([])
+        ax.set_yticks([])
+    fig.text(0.02, 0.008, f'maps: std across channels at each of the {model.S}x{model.S} positions, '
+             f'running max scale per map', fontsize=8, color='0.7', va='bottom')
+    header = fig.text(0.01, 0.99, '', family='monospace', fontsize=7, va='top', ha='left')
+    PR = int(math.ceil(math.sqrt(model.vocab)))
+    PC = int(math.ceil(model.vocab / PR))
+    _exit = [False]
+    fig.canvas.mpl_connect('key_press_event',
+                           lambda e: _exit.__setitem__(0, _exit[0] or e.key in ('x', 'X')))
+    model.eval()
+    dev = next(model.parameters()).device
+    prompt = _prompt_ids(args.prompt)
+    pending, b = list(prompt[1:]), prompt[0]
+    cur = list(prompt)
+    dff = model.new_state(1, dev)
+    bank = _bank([_image], dev) if _image is not None else None
+    axs = ax_o + ax_r
+    imgs, vmax, img_p, nstep = [None] * len(axs), [None] * len(axs), None, 0
+    while not _exit[0] and plt.fignum_exists(fig.number):
+        with torch.no_grad():
+            img = model.image_grid(_views(*bank)) if bank is not None else None
+            dff, o = model.step(torch.tensor([b], device=dev), dff, img)
+            prob = F.softmax(model.text_dec(o)[0] / max(args.temperature, 1e-6), dim=-1)
+        nstep += 1
+        if pending:
+            b = pending.pop(0)
+        else:
+            b = int(torch.multinomial(_truncate(prob), 1).item())
+            cur = (cur + [b])[-2 * _VIS_WIN:]
+        for r, t in enumerate(_blk_out + _blk_read):
+            m = t[0].float().std(dim=0).cpu().numpy()
+            vmax[r] = float(m.max()) if vmax[r] is None else max(float(m.max()), 0.98 * vmax[r])
+            if imgs[r] is None:
+                imgs[r] = axs[r].matshow(m, cmap=args.cmap)
+                axs[r].set_xticks([])
+                axs[r].set_yticks([])
+            imgs[r].set_data(m)
+            imgs[r].set_clim(0.0, vmax[r] or 1e-9)
+        pg = np.zeros(PR * PC, dtype=np.float32)
+        pg[:model.vocab] = prob.cpu().numpy()
+        pg = pg.reshape(PR, PC)
+        if img_p is None:
+            img_p = ax_p.matshow(pg, cmap=args.cmap)
+            ax_p.set_xticks([])
+            ax_p.set_yticks([])
+        img_p.set_data(pg)
+        img_p.set_clim(0, float(pg.max()) or 1e-9)
+        ticker = ''.join(DOT_TEXT if c in '$\\' else c for c in _render(cur))[-_VIS_WIN:]
+        header.set_text(f'step {nstep:8d}  out_std ' + ' '.join(f'{float(t.std()):.3f}' for t in _blk_out) +
+                        f'  p_max {float(prob.max()):5.3f}  min_p {args.min_p:.4f}  T {args.temperature:.2f}'
+                        f'\ngen: {ticker}')
+        fig.canvas.draw()
+        fig.canvas.flush_events()
+        time.sleep(args.delay)
+    raise SystemExit(0)
+if args.vis:
     nup = len(model.up)
     gated = list(model.gated) if model.wgate is not None else []
     nr = 1 + model.K * (1 + nup)                    # output and register rows
