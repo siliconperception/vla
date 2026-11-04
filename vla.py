@@ -1594,35 +1594,63 @@ def _spiral_cells(S):
     return cells
 
 
-def _delta_scan(q, k, v, beta, loga, reset, S0, chunk=64):
+def _delta_chunk(qc, kc, vc, bc, lc, rc, S):
+    """_delta_scan's work on one chunk of ticks: -> (o [N, C, dv], S at its end)."""
+    C = kc.shape[1]
+    G = torch.cumsum(lc, 1)                                            # log decay since chunk start
+    seg = torch.cumsum(rc.long(), 1)                                   # resets so far in the chunk
+    tri = torch.ones(C, C, dtype=torch.bool, device=kc.device).tril()
+    live = tri & (seg[:, :, None] == seg[:, None, :])                  # [N, r, i]: i reaches r
+    Gam = torch.exp(torch.where(live, G[:, :, None] - G[:, None, :], float('-inf')))
+    g0 = torch.exp(G) * (seg == 0)                                     # S0 reaches r
+    A = (Gam * (kc @ kc.transpose(1, 2))).tril(-1)
+    L = torch.eye(C, device=kc.device) + bc[:, :, None] * A
+    Ut = torch.linalg.solve_triangular(L, bc[:, :, None] * vc, upper=False, unitriangular=True)
+    Wk = torch.linalg.solve_triangular(L, (bc * g0)[:, :, None] * kc, upper=False, unitriangular=True)
+    U = Ut - Wk @ S.transpose(1, 2)                                    # [N, C, dv]
+    o = g0[:, :, None] * (qc @ S.transpose(1, 2)) + (Gam * (qc @ kc.transpose(1, 2))) @ U
+    gC = Gam[:, -1]                                                    # [N, C]: i reaches the end
+    return o, g0[:, -1, None, None] * S + (U * gC[:, :, None]).transpose(1, 2) @ kc
+
+
+def _delta_scan(q, k, v, beta, loga, reset, S0, chunk=64, grid=None):
     """--convdelta: the gated delta rule over a sequence, chunkwise in parallel.
     q, k [N, T, dk] (L2-normalized), v [N, T, dv], beta, loga [N, T] (write strength, log decay),
     reset [N, T] bool (the state entering that tick is zero), S0 [N, dv, dk]
     -> (o [N, T, dv], S_T [N, dv, dk]), the same as stepping, per tick,
        S <- a S (I - b k k^T) + b v k^T  (S = 0 first where reset),  o = S q.
     Within a chunk the updates are u_r k_r^T with u_r = b_r (v_r - a_r S_{r-1} k_r), solved
-    for all r at once from a unit lower-triangular system (the WY form of the delta rule)."""
-    N, T, dk = k.shape
-    outs = []
-    S = S0
-    for c0 in range(0, T, chunk):
+    for all r at once from a unit lower-triangular system (the WY form of the delta rule).
+    Under autograd each chunk is checkpointed: only the chunk-boundary states [N, dv, dk] are
+    kept, and a chunk's own state-sized products are rebuilt in the backward (they grow as d^2).
+    grid=(B, P, H): q, k, v [B, T, P, H, d], beta, loga [B, T, P, H], reset [B, T] instead (N = B P H),
+    and o comes back [B, T, P, H, dv]; each chunk is put in the [N, C, ...] order on its own, so no
+    whole-window copy of the inputs is made."""
+    T = k.shape[1]
+    if grid is None:
+        take = lambda t, sl: t[:, sl]
+    else:
+        B, P, H = grid
+
+        def take(t, sl):                                                   # [B, C, P, H, ...] -> [N, C, ...]
+            t = t[:, sl]
+            if t.dim() == 2:                                               # reset [B, C]
+                return t[:, None, None, :].expand(B, P, H, t.shape[1]).reshape(B * P * H, t.shape[1])
+            return t.permute(0, 2, 3, 1, *range(4, t.dim())).reshape(B * P * H, t.shape[1], *t.shape[4:])
+
+    def run(q, k, v, beta, loga, reset, S, c0):                            # one chunk, from the whole window
         sl = slice(c0, min(T, c0 + chunk))
-        qc, kc, vc, bc, rc = q[:, sl], k[:, sl], v[:, sl], beta[:, sl], reset[:, sl]
-        C = kc.shape[1]
-        G = torch.cumsum(loga[:, sl], 1)                                   # log decay since chunk start
-        seg = torch.cumsum(rc.long(), 1)                                   # resets so far in the chunk
-        tri = torch.ones(C, C, dtype=torch.bool, device=k.device).tril()
-        live = tri & (seg[:, :, None] == seg[:, None, :])                  # [N, r, i]: i reaches r
-        Gam = torch.exp(torch.where(live, G[:, :, None] - G[:, None, :], float('-inf')))
-        g0 = torch.exp(G) * (seg == 0)                                     # S0 reaches r
-        A = (Gam * (kc @ kc.transpose(1, 2))).tril(-1)
-        L = torch.eye(C, device=k.device) + bc[:, :, None] * A
-        Ut = torch.linalg.solve_triangular(L, bc[:, :, None] * vc, upper=False, unitriangular=True)
-        Wk = torch.linalg.solve_triangular(L, (bc * g0)[:, :, None] * kc, upper=False, unitriangular=True)
-        U = Ut - Wk @ S.transpose(1, 2)                                    # [N, C, dv]
-        outs.append(g0[:, :, None] * (qc @ S.transpose(1, 2)) + (Gam * (qc @ kc.transpose(1, 2))) @ U)
-        gC = Gam[:, -1]                                                    # [N, C]: i reaches the end
-        S = g0[:, -1, None, None] * S + (U * gC[:, :, None]).transpose(1, 2) @ kc
+        return _delta_chunk(take(q, sl), take(k, sl), take(v, sl), take(beta, sl), take(loga, sl),
+                            take(reset, sl), S)
+    outs, S = [], S0
+    for c0 in range(0, T, chunk):
+        if torch.is_grad_enabled():  # the checkpoint keeps the window's tensors, not chunk copies of them
+            o, S = torch.utils.checkpoint.checkpoint(run, q, k, v, beta, loga, reset, S, c0, use_reentrant=False)
+        else:
+            o, S = run(q, k, v, beta, loga, reset, S, c0)
+        if grid is not None:
+            o = o.view(B, P, H, o.shape[1], -1).permute(0, 3, 1, 2, 4)
+        outs.append(o)
     return torch.cat(outs, 1), S
 
 
@@ -1909,6 +1937,29 @@ class ConvDeltaBlock(nn.Module):
             ends.append(sT.view(B, C, self.S, self.S))
         return y, torch.stack(ends, 1)
 
+    def _memory(self, u, st, reset, B, T, chunk):
+        """seq's memories over the window: u [B*T, C, S, S] -> (u + their read-out, the memories' end
+        state, the conv memories' end state or None)."""
+        P, H, d = self.S * self.S, self.H, self.d
+        nm = H * d * d
+        SfT = None
+        q, k, v, beta, loga = (t.unflatten(0, (B, T)) for t in self._proj(u))   # [B, T, P, H, ...]
+        S0 = st[:, :nm].reshape(B, H, d, d, P).permute(0, 4, 1, 2, 3).reshape(B * P * H, d, d)
+        o, ST = _delta_scan(q, k, v, beta, loga, reset, S0, chunk, grid=(B, P, H))
+        o = o.reshape(B * T, P, H, d)
+        if self.fw:                  # the conv memories over the window
+            fq, fk, fv, fb, fa = self._fw_proj(u)                          # [B*T, F, P, ...]
+
+            def fh(t):                                                     # -> [B*F, T, ...]
+                t = t.view(B, T, self.fw, *t.shape[2:])
+                return t.transpose(1, 2).reshape(B * self.fw, T, *t.shape[3:])
+            rsf = reset[:, None, :].expand(B, self.fw, T).reshape(B * self.fw, T)
+            of, SfT = _convfw_scan(fh(fq), fh(fk), fh(fv), fh(fb), fh(fa), rsf, self._fw_get(st), self.fw_chunk)
+            of = of.view(B, self.fw, T, P, d).permute(0, 2, 3, 1, 4).reshape(B * T, P, self.fw, d)
+            o = torch.cat([o, of], 2)
+        x = u + self._read_out(o, B * T) if self.mem_res else self._read_out(o, B * T)
+        return x, ST, SfT
+
     def seq(self, x, st, reset, chunk=64):
         """A sequence: x [B, T, C, S, S], st [B, state_ch, S, S] entering tick 0, reset [B, T]
         (zero state entering that tick) -> (x' [B, T, C, S, S], st' after the last tick)."""
@@ -1948,26 +1999,7 @@ class ConvDeltaBlock(nn.Module):
             u = (x + y).flatten(0, 1)
         if not self.delta_first and not self.recur:
             u = self._mixed(u)
-        q, k, v, beta, loga = self._proj(u)                                # [B*T, P, H, ...]
-
-        def heads(t):                                                      # -> [B*P*H, T, ...]
-            t = t.view(B, T, P, H, *t.shape[3:])
-            return t.permute(0, 2, 3, 1, *range(4, t.dim())).reshape(B * P * H, T, *t.shape[4:])
-        S0 = st[:, :nm].reshape(B, H, d, d, P).permute(0, 4, 1, 2, 3).reshape(B * P * H, d, d)
-        rs = reset[:, None, None, :].expand(B, P, H, T).reshape(B * P * H, T)
-        o, ST = _delta_scan(heads(q), heads(k), heads(v), heads(beta), heads(loga), rs, S0, chunk)
-        o = o.view(B, P, H, T, d).permute(0, 3, 1, 2, 4).reshape(B * T, P, H, d)
-        if self.fw:                  # the conv memories over the window
-            fq, fk, fv, fb, fa = self._fw_proj(u)                          # [B*T, F, P, ...]
-
-            def fh(t):                                                     # -> [B*F, T, ...]
-                t = t.view(B, T, self.fw, *t.shape[2:])
-                return t.transpose(1, 2).reshape(B * self.fw, T, *t.shape[3:])
-            rsf = reset[:, None, :].expand(B, self.fw, T).reshape(B * self.fw, T)
-            of, SfT = _convfw_scan(fh(fq), fh(fk), fh(fv), fh(fb), fh(fa), rsf, self._fw_get(st), self.fw_chunk)
-            of = of.view(B, self.fw, T, P, d).permute(0, 2, 3, 1, 4).reshape(B * T, P, self.fw, d)
-            o = torch.cat([o, of], 2)
-        x = u + self._read_out(o, B * T) if self.mem_res else self._read_out(o, B * T)
+        x, ST, SfT = self._memory(u, st, reset, B, T, chunk)
         if self.delta_first:
             x = self._mixed(x)
         x = x.view(B, T, C, self.S, self.S)
@@ -8659,7 +8691,7 @@ try:
             if len(_cdb) == args.bptt:
                 Xb, Yb, Rb = (torch.stack([t[j] for t in _cdb], 1) for j in range(3))
                 model.cd_ckpt = bool(args.ckpt_ticks)
-                o, _ = model.seq_forward(Xb, Rb, _blk_start)
+                o = model.seq_forward(Xb, Rb, _blk_start)[0]   # (the end state is not held through backward)
                 o = o.view(len(x_list), args.bptt, *o.shape[1:])
                 tl, tce = [], []
                 for s0 in range(0, args.bptt, _CD_SLICE):  # decoders + loss, recomputed in backward
@@ -8691,7 +8723,7 @@ try:
                 # the state carried on: the window again with the updated weights, eval-mode BN
                 model.eval()
                 with torch.no_grad():
-                    _, model.dff = model.seq_forward(Xb, Rb, _blk_start)
+                    model.dff = model.seq_forward(Xb, Rb, _blk_start)[1]
                 _pt('recompute')
                 larr.extend(tl.detach().unbind(0))
                 for j in range(args.bptt):
@@ -8815,6 +8847,7 @@ try:
                     ).format(i, datetime.datetime.now(), torch.stack(larr[-args.monitor:]).mean().item(),
                              np.mean(garr[-args.monitor:]), _g0['lr'],
                              flat.mean().item(), flat.std().item(), flat.abs().max().item())
+            del flat         # a view of this state: holding it would keep it alive past the next window
             line += _ex_ep()
             if model.learn:
                 line += ' win ' + '/'.join(f'{w:.1f}' for w in model.windows)
