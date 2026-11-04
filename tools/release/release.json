@@ -1,25 +1,25 @@
 {
- "version": "v541",
- "step": 2560000,
- "rows": 32,
- "fineweb": 4.679966,
- "babylm": 4.383574,
- "blimp": 68.6,
- "comve": 65.7,
- "runaway": 2,
- "min_p": 0.0078,
+ "version": "v597",
+ "step": 4160000,
+ "rows": 40,
+ "fineweb": 4.476875,
+ "babylm": 4.017926,
+ "blimp": 70.5,
+ "comve": 68.2,
+ "runaway": 6,
+ "min_p": 0.0031,
  "pythia70m": {
-  "step32": {
-   "fw": 9.8234,
-   "baby": 9.4483,
-   "blimp": 52.0,
-   "comve": 54.0
-  },
   "step64": {
    "fw": 9.0023,
    "baby": 8.6347,
    "blimp": 52.7,
    "comve": 56.3
+  },
+  "step128": {
+   "fw": 7.4203,
+   "baby": 6.8661,
+   "blimp": 51.8,
+   "comve": 56.5
   },
   "main": {
    "fw": 3.7312,
@@ -30,12 +30,14 @@
  },
  "samples": [
   {
-   "prompt": "The best way to learn a new language is",
-   "text": "to get comfortable with its touch. It is as if they don't want to be in the way of a book."
+   "prompt": "My grandmother's recipe for apple pie starts with",
+   "text": "a touch of me. She sounds wonderful. I already have a my favorite pie tasting bowl and I will always try again so I can get the recipe I love, I think more."
   },
   {
    "prompt": "The history of the bicycle began in",
-   "text": "2005. From the very first time, I’m doing this by myself or our big body to climb with my bike."
+   "text": "2001 by the founder of the National Park Service Project."
   }
- ]
+ ],
+ "tokens": 161531904,
+ "updates": 16250
 }

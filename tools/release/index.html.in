@@ -81,7 +81,7 @@
     saves power: there are no DRAM chips to keep refreshed and no high-speed interface driving signals between chips,
     and reading a weight from on-chip SRAM takes on the order of a hundred times less energy than fetching it from
     off-chip DRAM. The same small kernels run at
-    every grid position and every tick, so about thirty million weights drive a state of 2.1 million values:
+    every grid position and every tick, so about sixteen million trained weights drive a state of 2.1 million values:
     associative memories at every grid position, written by the gated delta rule.</p>
     <p class="lede">The state also has a fixed size. Every tick does exactly the same work and finishes in the same
     time, however long the model has been running.</p>
@@ -95,36 +95,35 @@
   </header>
 
   <figure>
-    <a class="fig" href="figures/vla_v541.svg" title="Open the full-size figure">
-      <img src="figures/vla_v541.svg" alt="Block diagram of one clock tick, in two panes. Top: the last 8 tokens are embedded, normalized, mixed by a 1x1 convolution and placed on a 7x7 grid by a learned map, scaled and shifted per position, and passed through six ConvDelta blocks, each a causal time conv, three 3x3 conv-BatchNorm-ReLU layers and a delta-rule memory with its state S; a 3x3 projection, a decoder tree of three 3x3 convolutions and the frozen output layer give the next token, which is fed back as the next input. Bottom: one block in detail: RMS norm and a 3-tick FIFO feeding the time conv, the three convs with a residual, five 1x1 projections to q, k, v, beta and alpha, the gated delta rule S = alpha S (I - beta k k^T) + beta v k^T on a 32x32 memory per position and head, the read S q, and a 1x1 output added back.">
+    <a class="fig" href="figures/vla_{{VERSION}}.svg" title="Open the full-size figure">
+      <img src="figures/vla_{{VERSION}}.svg" alt="Block diagram of one clock tick, in two panes. Top: the current token is embedded, normalized, copied to every position of a 7x7 grid and mixed by a 1x1 convolution, then passes through seven ConvDelta blocks, each three 3x3 conv-BatchNorm-ReLU layers and a 1x1 convolution around a skip, then a delta-rule memory with its state S whose read is added back; a tree of three 3x3 convolutions and the frozen output layer give the next token, which is fed back as the next input. Bottom: one block in detail, the convs and skip giving u, the q, k, v, beta and alpha projections, the gated delta-rule update of the memory S, its read, and the 1x1 output added to u.">
     </a>
-    <figcaption>One clock tick of the published model ({{VERSION}}). Top: the whole model, text only: the last 8
-    tokens on a learned 7 × 7 map, six ConvDelta blocks, and the decoder. Bottom: one block, a causal time conv,
-    three 3 × 3 convs, and a gated delta-rule memory at every grid position (6 heads of 32 × 32). The
+    <figcaption>One clock tick of the published model ({{VERSION}}). Top: the whole model, text only: the
+    current token on every position of the 7 × 7 grid, seven ConvDelta blocks, and the decoder. Bottom: one
+    block, three 3 × 3 convs and a 1 × 1 around a skip, then a gated delta-rule memory at every grid position (6
+    heads of 32 × 32). The
     <a href="https://github.com/siliconperception/vla/blob/main/docs/spec/README.md">functional spec</a> walks
     through every part. Select the figure to open it full size.</figcaption>
   </figure>
-
   <div class="facts">
     <div class="fact"><b>500 Hz</b><span>target tick rate on one chip, with the same work every tick</span></div>
-    <div class="fact"><b>2.1 M</b><span>values of state, fixed in size: 6 blocks × 49 positions × 6 heads of 32 × 32 memories, and short FIFOs</span></div>
-    <div class="fact"><b>30.0 M</b><span>trained parameters, small enough to hold every weight in on-chip SRAM</span></div>
-    <div class="fact"><b>0</b><span>positional encodings; trained with half the document starts left unreset</span></div>
+    <div class="fact"><b>2.1 M</b><span>values of state, fixed in size: 7 blocks × 49 positions × 6 heads of 32 × 32 memories, and nothing else</span></div>
+    <div class="fact"><b>16.1 M</b><span>trained parameters, small enough to hold every weight in on-chip SRAM</span></div>
+    <div class="fact"><b>0</b><span>positional encodings and state resets: trained with the memories carrying on across documents</span></div>
   </div>
 
   <h2>How a tick works</h2>
   <ol>
-    <li>The last 8 tokens are each embedded, normalized and mixed by a 1 × 1 convolution, then placed on a 7 × 7
-    grid by a learned map (it starts as concentric rings, the newest token outside), so neighbouring positions
-    hold neighbouring moments. A learned gain and bias per position follow.</li>
-    <li>Six ConvDelta blocks, in series. Each adds a causal depthwise convolution over the last 4 ticks, then
-    three 3 × 3 convolutions with BatchNorm and ReLU, around a residual.</li>
+    <li>The current token is embedded, normalized and copied to all 49 positions of a 7 × 7 grid, then mixed by a
+    1 × 1 convolution. Earlier tokens reach the model only through its memories.</li>
+    <li>Seven ConvDelta blocks, in series. Each applies three 3 × 3 convolutions with BatchNorm and ReLU and a
+    1 × 1 convolution, around a skip.</li>
     <li>At every grid position, 1 × 1 convolutions give 6 heads of query, key and value, a write strength β and a
     decay α. Each head's 32 × 32 memory is updated by the gated delta rule, M ← α M (I − β k kᵀ) + β v kᵀ: decay,
     erase what was stored at key k, write v there. It is read with the query and added back through a 1 × 1
     convolution.</li>
-    <li>A 3 × 3 projection and a small tree of convolutions collapse the grid to one vector, and a frozen output
-    layer gives the next token, which is fed back as the next input.</li>
+    <li>A small tree of convolutions collapses the last block's grid to one vector, and a frozen output layer gives
+    the next token, which is fed back as the next input.</li>
   </ol>
   <p class="note">In training, the convolutions run on all 256 ticks of a window at once, and the memories are
   trained over the window by an exact chunked parallel scan. On a chip the model runs one tick at a time, with the
@@ -153,17 +152,17 @@
   <h2>Scores</h2>
   <div class="tablewrap"><table>
     <tr><th></th><th class="n">VLA {{VERSION}}</th><th class="n">pythia-70m</th><th class="n">pythia-70m</th><th class="n">pythia-70m</th></tr>
-    <tr><td>training tokens</td><td class="n">{{TOKENS}}</td><td class="n">67.1 M</td><td class="n">134.2 M</td><td class="n">300 B</td></tr>
-    <tr><td>FineWeb held-out, nats/token</td><td class="n">{{FW}}</td><td class="n">{{PSTEP32_FW}}</td><td class="n">{{PSTEP64_FW}}</td><td class="n">{{PMAIN_FW}}</td></tr>
-    <tr><td>BabyLM 2026 dev, nats/token</td><td class="n">{{BABY}}</td><td class="n">{{PSTEP32_BABY}}</td><td class="n">{{PSTEP64_BABY}}</td><td class="n">{{PMAIN_BABY}}</td></tr>
-    <tr><td>BLiMP, % of 1,005 pairs</td><td class="n">{{BLIMP}}</td><td class="n">{{PSTEP32_BLIMP}}</td><td class="n">{{PSTEP64_BLIMP}}</td><td class="n">{{PMAIN_BLIMP}}</td></tr>
-    <tr><td>ComVE, % of 999 pairs</td><td class="n">{{COMVE}}</td><td class="n">{{PSTEP32_COMVE}}</td><td class="n">{{PSTEP64_COMVE}}</td><td class="n">{{PMAIN_COMVE}}</td></tr>
+    <tr><td>training tokens</td><td class="n">{{TOKENS}}</td><td class="n">134.2 M</td><td class="n">268.4 M</td><td class="n">300 B</td></tr>
+    <tr><td>FineWeb held-out, nats/token</td><td class="n">{{FW}}</td><td class="n">{{PSTEP64_FW}}</td><td class="n">{{PSTEP128_FW}}</td><td class="n">{{PMAIN_FW}}</td></tr>
+    <tr><td>BabyLM 2026 dev, nats/token</td><td class="n">{{BABY}}</td><td class="n">{{PSTEP64_BABY}}</td><td class="n">{{PSTEP128_BABY}}</td><td class="n">{{PMAIN_BABY}}</td></tr>
+    <tr><td>BLiMP, % of 1,005 pairs</td><td class="n">{{BLIMP}}</td><td class="n">{{PSTEP64_BLIMP}}</td><td class="n">{{PSTEP128_BLIMP}}</td><td class="n">{{PMAIN_BLIMP}}</td></tr>
+    <tr><td>ComVE, % of 999 pairs</td><td class="n">{{COMVE}}</td><td class="n">{{PSTEP64_COMVE}}</td><td class="n">{{PSTEP128_COMVE}}</td><td class="n">{{PMAIN_COMVE}}</td></tr>
   </table></div>
-  <p class="note">pythia-70m (EleutherAI) is a transformer of similar total size with the same tokenizer, shown
+  <p class="note">pythia-70m (EleutherAI) is a transformer with the same tokenizer and 19 M parameters outside its embedding and output layer, shown
   at about this model's training tokens and fully trained; same documents, same pairs, same scoring rule (see the
   <a href="https://huggingface.co/siliconperception/vla">model card</a>). Pythia was trained on the Pile, this
-  model on FineWeb. Matched tokens are not matched training: at 67.1 M and 134.2 M tokens pythia has made only 32
-  and 64 updates (of 2 M tokens each), early in its warm-up; this model has made 10,000 (of 8,192
+  model on FineWeb. Matched tokens are not matched training: at 134.2 M and 268.4 M tokens pythia has made only 64
+  and 128 updates (of 2 M tokens each), early in its warm-up; this model has made {{UPDATES}} (of 8,192 to 10,240
   tokens). Fully trained pythia-70m is the fair reference.</p>
 
   <h2>Samples</h2>
@@ -189,7 +188,6 @@ done</code></pre>
     <li>Delta-rule fast weights: Schlag, Irie, Schmidhuber, <a href="https://arxiv.org/abs/2102.11174">Linear Transformers Are Secretly Fast Weight Programmers</a> (2021)</li>
     <li>Matrix-valued recurrent state: Katharopoulos et al., <a href="https://arxiv.org/abs/2006.16236">Transformers are RNNs: Fast Autoregressive Transformers with Linear Attention</a> (2020)</li>
     <li>Data-dependent decay per head: Dao, Gu, <a href="https://arxiv.org/abs/2405.21060">Transformers are SSMs</a> (Mamba-2, 2024)</li>
-    <li>Short causal conv before the memory: Fu et al., <a href="https://arxiv.org/abs/2212.14052">Hungry Hungry Hippos</a> (2022); Gu, Dao, <a href="https://arxiv.org/abs/2312.00752">Mamba</a> (2023)</li>
     <li>A state at every position of a conv grid: Shi et al., <a href="https://arxiv.org/abs/1506.04214">Convolutional LSTM Network</a> (2015)</li>
     <li>Residual blocks: He et al., <a href="https://arxiv.org/abs/1512.03385">Deep Residual Learning for Image Recognition</a> (2015); BatchNorm: Ioffe, Szegedy, <a href="https://arxiv.org/abs/1502.03167">Batch Normalization</a> (2015); RMS norm: Zhang, Sennrich, <a href="https://arxiv.org/abs/1910.07467">Root Mean Square Layer Normalization</a> (2019)</li>
     <li>Tokenizer, frozen embedding and output layer, reference model: Biderman et al., <a href="https://arxiv.org/abs/2304.01373">Pythia</a> (2023)</li>

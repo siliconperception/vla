@@ -16,7 +16,9 @@ OUT = {'model_card.md.in': 'docs/model_card.md', 'index.html.in': 'docs/index.ht
        'spec.md.in': 'docs/spec/README.md'}
 
 r = json.load(open(os.path.join(SRC, 'release.json')))
-v = {'VERSION': r['version'], 'STEP': f'{r["step"]:,}', 'TOKENS': f'{r["step"] * r["rows"] / 1e6:,.{1 if r["step"] * r["rows"] < 1e8 else 0}f} M',
+_tok = r.get('tokens') or r['step'] * r['rows']    # (tokens: when the rows per step changed during training)
+v = {'VERSION': r['version'], 'STEP': f'{r["step"]:,}', 'TOKENS': f'{_tok / 1e6:,.{1 if _tok < 1e9 else 0}f} M',
+     'UPDATES': f'{r.get("updates", 0):,}',
      'FW': f'{r["fineweb"]:.3f}', 'BABY': f'{r["babylm"]:.3f}', 'BLIMP': f'{r["blimp"]:.1f}',
      'COMVE': f'{r["comve"]:.1f}', 'MINP': f'{r["min_p"]:.4f}', 'RUNAWAY': f'{r["runaway"]:g} %',
      **{f'P{k.upper()}_{f.upper()}': (f'{r["pythia70m"][k][f]:.3f}' if f in ('fw', 'baby') else
