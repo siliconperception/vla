@@ -1094,8 +1094,6 @@ if args.write_surprise:
     if _surprise is None:
         raise SystemExit(f'--write_surprise {args.write_surprise}: want rat,H[,MEAN] with H > 1, '
                          f'or LO,HI[,MEAN] with 0 < LO <= 1 <= HI')
-if args.convdelta and args.bptt < 2 and not _ONESHOT:
-    raise SystemExit('--convdelta trains a --bptt window of ticks at once: give --bptt > 1')
 if args.ckpt_ticks and not args.convdelta and (args.bptt < 2 or args.learn_win or args.write_surprise
                         or (not args.read_rmsnorm and args.ctx_read_norm > 0)):
     # the backward recomputes each step: state kept outside the registers (the --learn_win
