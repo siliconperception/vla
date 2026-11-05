@@ -633,7 +633,7 @@ parser.add_argument('--eval_pairs', default=0,    type=int, metavar='N',
                          'where the acceptable one costs fewer nats. Up to N pairs from each of '
                          'BLiMP (grammar, spread over its 67 paradigms) and ComVE (which '
                          'statement makes sense). Winogrande was tried and dropped: it sits at '
-                         'chance up to pythia-160m (Qwen2.5-1.5B 63.7%)')
+                         'chance up to pythia-160m (Qwen2.5-1.5B 63.7%%)')
 parser.add_argument('--eval_warm',  default=0,    type=int, metavar='N',
                     help='EVALW: N held-out documents of the first text corpus, each scored from a zero '
                          'state (cold) and after another held-out document run through the same state '
