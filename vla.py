@@ -198,7 +198,9 @@ _TOKENIZERS = {
     'pythia70m':  'EleutherAI/pythia-70m',       # hidden 512, vocab 50304
     'pythia160m': 'EleutherAI/pythia-160m',      # hidden 768, vocab 50304
     'tiny8m':     'roneneldan/TinyStories-8M',   # hidden 256, vocab 50257 (tied embed/head)
+    'byte':       None,                          # UTF-8 bytes: vocab 256, own embed/head (trained)
 }
+_BYTE_WIDTH = 256           # --tokenizer byte: the embedding / lm_head width
 
 
 class HFTokenizer:
@@ -212,6 +214,19 @@ class HFTokenizer:
 
     def encode(self, text): return self.tok.encode(text, add_special_tokens=False)
     def decode(self, ids):  return self.tok.decode(ids)
+
+
+class ByteTokenizer:
+    """--tokenizer byte: UTF-8 bytes as the vocabulary (256 ids, no merges, nothing borrowed)."""
+
+    vocab_size = 256
+
+    def __init__(self):
+        self.tok = self                         # (len(model.tok.tok): the ids the tokenizer uses)
+
+    def __len__(self): return 256
+    def encode(self, text): return list(text.encode('utf-8'))
+    def decode(self, ids):  return bytes(int(i) & 255 for i in ids).decode('utf-8', errors='replace')
 
 
 _tokenizer = None           # bound to model.tok once the model is built
@@ -392,7 +407,8 @@ parser.add_argument('--linout_kernel', default=1, type=int, metavar='K',
                     help='linout kernel (odd): KxK, padded, mixes neighbouring positions on the '
                          'way back into the registers; 0: no linout (needs --n_hidden = --c_context); restored by --load')
 parser.add_argument('--tokenizer',  default='pythia31m', choices=sorted(_TOKENIZERS),
-                    help='borrowed vocabulary, token embedding and lm_head (frozen)')
+                    help='borrowed vocabulary, token embedding and lm_head (frozen); byte: UTF-8 bytes, '
+                         'vocab 256, with a trainable embedding and lm_head of width 256 (from scratch)')
 parser.add_argument('--ctx_ema',    default='256,64,16,4,1', metavar='W1,W2,...',
                     help='register windows in tokens, slowest first: register k blends at '
                          'rate 1/W_k toward the layer output minus registers 1..k-1, so with a '
@@ -2690,7 +2706,8 @@ class VLAModel(nn.Module, _HubMixin):
         super().__init__()
         from transformers import AutoModelForCausalLM
         repo = _TOKENIZERS[tokenizer]
-        lm = AutoModelForCausalLM.from_pretrained(repo, dtype=torch.float32)
+        self.byte = tokenizer == 'byte'
+        lm = None if self.byte else AutoModelForCausalLM.from_pretrained(repo, dtype=torch.float32)
         self.S, self.n_hidden, self.c_context = S, n_hidden, c_context
         self._windows = [float(w) for w in windows]
         self.learn = []              # --learn_win: indices of the learned windows
@@ -2705,15 +2722,22 @@ class VLAModel(nn.Module, _HubMixin):
         self.read_norm = float(read_norm)
         self.read_rmsnorm = bool(read_rmsnorm)
         self.init_mode = init
-        self.vocab, self.c_text = lm.config.vocab_size, lm.config.hidden_size
-        self.tok = HFTokenizer(repo, self.vocab)
-
-        self.tok_embed = lm.get_input_embeddings()                      # frozen
+        if self.byte:                # --tokenizer byte: its own embedding and lm_head, trained
+            self.vocab, self.c_text = ByteTokenizer.vocab_size, _BYTE_WIDTH
+            self.tok = ByteTokenizer()
+            self.tok_embed = nn.Embedding(self.vocab, self.c_text)
+            nn.init.normal_(self.tok_embed.weight, std=0.02)
+            byte_head = nn.Linear(self.c_text, self.vocab, bias=False)
+            nn.init.normal_(byte_head.weight, std=0.02)
+        else:
+            self.vocab, self.c_text = lm.config.vocab_size, lm.config.hidden_size
+            self.tok = HFTokenizer(repo, self.vocab)
+            self.tok_embed = lm.get_input_embeddings()                  # frozen
         self.context = None if convdelta else ContextCNN(c_context, depth, kernel, bn_momentum)
         self.streams = int(streams)
         self.nul_id = len(self.tok.tok) if (nul_head or self.streams == 3) and \
             len(self.tok.tok) < self.vocab else None
-        lmhead = lm.get_output_embeddings()                             # frozen, shared
+        lmhead = byte_head if self.byte else lm.get_output_embeddings()   # frozen (byte: trained), shared
         # streams 3: the text stream never says <NUL> (but --fifo3: text_nul); voice and image do
         self.text_dec = TextDecoder(n_hidden, S, list(dec_kernels), dec_width, lmhead,
                                     nul_id=None if self.streams == 3 and not text_nul
@@ -2935,7 +2959,9 @@ class VLAModel(nn.Module, _HubMixin):
         return a
 
     def pretrained_params(self):
-        """The borrowed embedding and lm_head, deduplicated (tiny8m ties them)."""
+        """The borrowed embedding and lm_head, deduplicated (tiny8m ties them); none for byte."""
+        if self.byte:
+            return []
         seen, out = set(), []
         for m in (self.tok_embed, self.text_dec.lmhead):
             for p in m.parameters():
