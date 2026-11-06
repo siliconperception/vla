@@ -543,10 +543,11 @@ parser.add_argument('--bptt', default=1, type=int, metavar='K',
                     help='truncated backpropagation through time: K steps run forward keeping the graph '
                          'through the register writes, then one backward of their mean loss and one '
                          'optimizer step (the gradient horizon grows from 1 token to up to K); 1 = off')
-parser.add_argument('--cd_scan_ckpt', action='store_true',
-                    help='--convdelta --ckpt_ticks: also checkpoint each --cd_chunk of the delta scan, so the '
-                         'block\'s recompute keeps only chunk-boundary states, not the window\'s d^2 products '
-                         '(for --cd_dim 64); one more forward of the scan. Without --ckpt_ticks it is always on')
+parser.add_argument('--cd_scan_ckpt', default=True, action=argparse.BooleanOptionalAction,
+                    help='--convdelta: checkpoint each --cd_chunk of the delta scan, so a block keeps only '
+                         'chunk-boundary states, not the window\'s d^2 products. --no-cd_scan_ckpt under '
+                         '--ckpt_ticks (the block already checkpointed): 6%% faster, +3.6 GiB at batch 40 x bptt 256, '
+                         'and batch 64 x bptt 256 no longer fits 24 GB')
 parser.add_argument('--ckpt_ticks', action='store_true',
                     help='--bptt: keep only each step\'s starting registers and inputs, and recompute the '
                          'step (state update, decoders and loss) during the backward, so memory grows by '
@@ -1628,8 +1629,8 @@ def _delta_scan(q, k, v, beta, loga, reset, S0, chunk=64, grid=None, ckpt=True):
     for all r at once from a unit lower-triangular system (the WY form of the delta rule).
     Under autograd (and ckpt) each chunk is checkpointed: only the chunk-boundary states [N, dv, dk]
     are kept, and a chunk's own state-sized products are rebuilt in the backward (they grow as d^2).
-    ckpt=False when the whole block is already checkpointed (--ckpt_ticks without --cd_scan_ckpt):
-    a third forward of the scan for no memory a d=32 window needs.
+    ckpt=False (--no-cd_scan_ckpt under --ckpt_ticks, the block already checkpointed): one forward
+    of the scan fewer, its whole window's products held in the block's backward instead.
     grid=(B, P, H): q, k, v [B, T, P, H, d], beta, loga [B, T, P, H], reset [B, T] instead (N = B P H),
     and o comes back [B, T, P, H, dv]; each chunk is put in the [N, C, ...] order on its own, so no
     whole-window copy of the inputs is made."""
@@ -8702,7 +8703,7 @@ try:
             if len(_cdb) == args.bptt:
                 Xb, Yb, Rb = (torch.stack([t[j] for t in _cdb], 1) for j in range(3))
                 model.cd_ckpt = bool(args.ckpt_ticks)
-                for _b in model.cd:      # the block checkpoint already bounds the scan's memory
+                for _b in model.cd:      # --no-cd_scan_ckpt: only under the block checkpoint
                     _b.scan_ckpt = args.cd_scan_ckpt or not model.cd_ckpt
                 o = model.seq_forward(Xb, Rb, _blk_start)[0]   # (the end state is not held through backward)
                 o = o.view(len(x_list), args.bptt, *o.shape[1:])
