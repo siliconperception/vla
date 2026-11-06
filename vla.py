@@ -279,7 +279,9 @@ parser.add_argument('--lm', default=None, action=argparse.BooleanOptionalAction,
 parser.add_argument('--convdelta', default=0, type=int, metavar='N',
                     help='ConvDelta: N residual blocks (causal time conv, 2 x conv 3x3, a gated delta-rule '
                          'memory per grid position) between ctx_cat and linout instead of the ContextCNN '
-                         'and registers; trained a whole --bptt window at once (parallel over ticks)')
+                         'and registers; trained a whole --bptt window at once (parallel over ticks). '
+                         'On --load, N above the checkpoint\'s grows the model: the new blocks go last and '
+                         'start as the identity (their 1x1 after the convs and their read-out zero)')
 parser.add_argument('--grid_hist', default=0, type=int, metavar='K',
                     help='--convdelta --lm: the input grid mixes the last K tokens, each cell p its own '
                          'learned weights a[j, p] over tokens t-j (start: concentric rings, the current token '
@@ -600,6 +602,9 @@ parser.add_argument('--mom_period', default=20000, type=int, help='--mom_schedul
 parser.add_argument('--mom_start', default=None, type=int,
                     help='--mom_schedule: global step where it starts (default: this run\'s first step)')
 parser.add_argument('--weight_decay', default=0.0, type=float, help='SGD weight decay')
+parser.add_argument('--wd_mem',     default=True, action=argparse.BooleanOptionalAction,
+                    help='--no-wd_mem: no --weight_decay on the ConvDelta memory time constants: each '
+                         'block\'s base windows lam (decay pulls them to 1 tick) and its gate biases')
 parser.add_argument('--run_steps',  default=None, type=int, help='stop after N steps of this run')
 parser.add_argument('--seed',       default=None, type=int)
 parser.add_argument('--device',     default=None)
@@ -742,6 +747,8 @@ parser.add_argument('--eval_rare',  default=10,   type=int, metavar='N',
 parser.add_argument('--eval_reach', default=0,    type=int, metavar='N',
                     help='EVALX on N spliced rows: excess loss from losing history older than c')
 parser.add_argument('--eval_reach_period', default=256, type=int, metavar='P')
+parser.add_argument('--eval_reach_every', default=False, action=argparse.BooleanOptionalAction,
+                    help='EVALX at every eval (default: every --eval_rare-th, with the other slow evals)')
 # one-shot modes (no training)
 parser.add_argument('--generate',   default=False, action='store_true',
                     help='load, generate --n tokens from <NUL>+--prompt, print, exit')
@@ -971,7 +978,7 @@ _ARCH_ARGS = ('context', 'n_hidden', 'c_context', 'depth', 'kernel', 'tokenizer'
               'cd_no_res', 'cd_no_cat', 'cd_no_gp', 'cd_mem_res', 'cd_mix_out', 'cd_mix_ch', 'cd_no_bn')
 # architecture switches that can be loaded onto a trained model: when given on the command line,
 # the given value wins over the checkpoint's
-_ARCH_SWITCHES = ('cd_neg', 'cd_band', 'cd_gamma', 'cd_taps', 'grid_hist', 'grid_spiral')
+_ARCH_SWITCHES = ('cd_neg', 'cd_band', 'cd_gamma', 'cd_taps', 'grid_hist', 'grid_spiral', 'convdelta')
 
 
 def _parse_mix():
@@ -1021,6 +1028,7 @@ _FIXED_ARCH = dict(n_layers=1, linout=True, linin=False, ctx_mix='none',
                    qproj='none', tap=False, clip_dff=0.0, char_onehot=False)
 
 _loaded_ckpt = None
+_cd_grown = []               # --convdelta above a checkpoint's: the indices of the new blocks
 _aud_switch = None           # --load with another --audio_encoder: (old, new)
 _start_step = 0
 _start_exs = 0
@@ -1808,6 +1816,7 @@ class ConvDeltaBlock(nn.Module):
         w = torch.logspace(math.log10(4), math.log10(4096), H) if H > 1 else torch.tensor([64.0])
         self.lam = nn.Parameter(-torch.log(w))
         self.scan_ckpt = True        # each scan chunk checkpointed (off under a block checkpoint)
+        self.stats = None            # training: [2, H], the last window's mean log tau and mean beta per head
         # --cd_band F: the window stays within [w/F, w F] and w is fixed
         self.band = float(band or 0)
         if self.band:
@@ -1898,6 +1907,10 @@ class ConvDeltaBlock(nn.Module):
             loga = -self.lam.exp() * self.band ** torch.tanh(ga)
         else:
             loga = -self.lam.exp() * 2 * torch.sigmoid(ga)
+        if self.training:            # for the STEP line's tau, beta and the MEM lines
+            with torch.no_grad():
+                self.stats = torch.stack([-torch.log((-loga.detach().float()).clamp_min(1e-12)).mean((0, 1)),
+                                          beta.detach().float().mean((0, 1))])
         return q, k, v, beta, loga
 
     def _read_out(self, o, M):
@@ -4384,6 +4397,25 @@ if _loaded_ckpt is not None:
     if _lm_from is not None:
         _sd = _narrow_state_dict(_sd, model, _lm_from)
     missing, unexpected = model.load_state_dict(_sd, strict=False)
+    if model.cd is not None:     # --convdelta above the checkpoint's: the new blocks start as the identity
+        _cd_saved = len({k.split('.')[1] for k in _sd if re.match(r'cd\.\d+\.lam$', k)})
+        if _cd_saved > len(model.cd):
+            raise SystemExit(f'--convdelta {len(model.cd)}: the checkpoint has {_cd_saved} blocks (fewer is not supported)')
+        _cd_grown = list(range(_cd_saved, len(model.cd)))
+        if _cd_grown:
+            if not model.cd[0].mem_res:
+                raise SystemExit('--convdelta: growing a model needs the residual around the memory')
+            with torch.no_grad():
+                for _i in _cd_grown:   # the convs' last conv (the --cd_mix_out 1x1) and the read-out zero
+                    _b = model.cd[_i]
+                    _last = [m for m in _b.mix if isinstance(m, nn.Conv2d)][-1]
+                    _last.weight.zero_()
+                    _last.bias.zero_()
+                    _b.out.weight.zero_()
+                    _b.out.bias.zero_()
+            print(f'--convdelta {len(model.cd)}: block(s) {", ".join(map(str, _cd_grown))} new (the checkpoint '
+                  f'has {_cd_saved}), starting as the identity', flush=True)
+            missing = [k for k in missing if not re.match(rf'cd\.({"|".join(map(str, _cd_grown))})\.', k)]
     _new_up = sorted({k.split('.')[1] for k in missing if k.startswith('up.')})
     if _new_up and not any(k.startswith(f'up.{i}.') for k in _sd for i in _new_up):
         print(f'--layers {args.layers}: layer(s) {", ".join(str(int(i) + 2) for i in _new_up)} new, '
@@ -4425,13 +4457,19 @@ if args.use_ema:
     print(f'--use_ema: weights replaced by the T={args.use_ema} running average', flush=True)
 if (args.cd_windows and model.cd is not None and _loaded_ckpt is not None
         and _loaded_ckpt['saved_args'].get('cd_windows') == args.cd_windows):
-    print(f'--cd_windows {args.cd_windows}: already set in this run, the learned windows kept', flush=True)
-elif args.cd_windows and model.cd is not None:   # --cd_windows: the base windows, block by block
+    print(f'--cd_windows {args.cd_windows}: already set in this run, the learned windows kept'
+          + (' (the new blocks get them)' if _cd_grown else ''), flush=True)
+if args.cd_windows and model.cd is not None and (_cd_grown or not (
+        _loaded_ckpt is not None and _loaded_ckpt['saved_args'].get('cd_windows') == args.cd_windows)):
     _cw = [tuple(float(x) for x in b.split(':')) for b in args.cd_windows.split(',')]
+    _cw_set = (set(_cd_grown) if _loaded_ckpt is not None and
+               _loaded_ckpt['saved_args'].get('cd_windows') == args.cd_windows else set(range(len(model.cd))))
     if len(_cw) not in (1, len(model.cd)) or any(len(b) != 2 for b in _cw):
         raise SystemExit(f'--cd_windows {args.cd_windows}: one LO:HI, or one per block ({len(model.cd)})')
     with torch.no_grad():
-        for _b, (_lo, _hi) in zip(model.cd, _cw * len(model.cd) if len(_cw) == 1 else _cw):
+        for _i, (_b, (_lo, _hi)) in enumerate(zip(model.cd, _cw * len(model.cd) if len(_cw) == 1 else _cw)):
+            if _i not in _cw_set:
+                continue
             _w = torch.logspace(math.log10(_lo), math.log10(_hi), _b.H) if _b.H > 1 else torch.tensor([_lo])
             _b.lam.copy_(-torch.log(_w))
     print('--cd_windows: base windows ' + ' | '.join(
@@ -6897,6 +6935,27 @@ _VIDEO_VARIANTS = ((True, True, ''), (False, True, '-blind'), (True, False, '-de
                    (False, False, '-off'))
 
 
+def _mem_lines(step):
+    """MEM, one line per ConvDelta block, per head: w the base window (ticks), tau the effective window
+    (geometric mean over the last training window), beta the mean write strength, S the mean Frobenius
+    norm of the memory in the training state. Training only (the statistics come from its windows)."""
+    if model.cd is None or model.cd[0].stats is None:
+        return
+    dff, off = model.dff, 0
+    for bi, b in enumerate(model.cd):
+        nm = b.H * b.d * b.d
+        S_ = ''
+        if dff is not None and dff.dim() == 4:
+            Sm = dff[:, off:off + nm].detach().float().reshape(dff.shape[0], b.H, b.d * b.d, -1)
+            S_ = ' S ' + '/'.join(f'{x:.2f}' for x in Sm.norm(dim=2).mean((0, 2)).tolist())
+        off += b.state_ch
+        w = (-b.lam.detach().float()).exp().tolist()
+        lt, be = b.stats.tolist()
+        _emit(f'MEM step {step:10} block {bi} w ' + '/'.join(f'{x:.0f}' for x in w) +
+              ' tau ' + '/'.join(f'{math.exp(x):.1f}' for x in lt) +
+              ' beta ' + '/'.join(f'{x:.2f}' for x in be) + S_)
+
+
 def _heldout_eval(step):
     """Every eval corpus: EVAL/EVALB, then for text corpora EVALX, EVALG and EVALI (first
     text corpus only). An image corpus is scored with its images and again blind (image grid
@@ -6906,6 +6965,7 @@ def _heldout_eval(step):
     # --eval_rare: the slow / low-value evals only at every Nth eval (all of them under --eval)
     rare = args.eval or not args.eval_rare or not args.eval_interval or \
         (step // args.eval_interval) % args.eval_rare == 0
+    _mem_lines(step)
     for corpus in _eval_corpus_names():
         if _eval_failed.get(corpus):
             continue
@@ -6941,7 +7001,7 @@ def _heldout_eval(step):
                   flush=True)
             _eval_failed[corpus] = True
             continue
-        for fn, on in ((_reach_eval, args.eval_reach and rare), (_gen_eval, args.eval_gen),
+        for fn, on in ((_reach_eval, args.eval_reach and (rare or args.eval_reach_every)), (_gen_eval, args.eval_gen),
                        (_recent_eval, args.eval_recent and corpus == text[0]),
                        (_warm_eval, args.eval_warm and corpus == text[0]),
                        (_info_eval, args.eval_info and rare and corpus == text[0])):
@@ -7770,10 +7830,18 @@ _gate_ids = {id(p) for n, p in model.named_parameters() if n.startswith('wgate.'
 _gamma_ids = {id(p) for n, p in model.named_parameters() if re.match(r'cd\.\d+\.gz$', n)}
 _mults = [(ids, m) for ids, m in ((_gate_ids, args.gate_lr_mult), (_gamma_ids, args.gamma_lr_mult))
           if ids and m != 1]         # --gate_lr_mult, --gamma_lr_mult: their own groups
-_sep_ids = set().union(*[ids for ids, _ in _mults]) if _mults else set()
+# --no-wd_mem: the memory time constants (base windows, gate biases) in a group of their own, no decay
+_nowd_ids = (set() if args.wd_mem or model.cd is None or not args.weight_decay else
+             {id(p) for n, p in model.named_parameters() if re.match(r'cd\.\d+\.(lam|fw_lam|gates\.bias)$', n)}
+             - set().union(*[ids for ids, _ in _mults]))
+_sep_ids = set().union(*[ids for ids, _ in _mults], _nowd_ids)
 _groups = ([{'params': [p for p in _trainable if id(p) not in _sep_ids]}] +
-           [{'params': [p for p in _trainable if id(p) in ids], 'lr': args.lr_max * m} for ids, m in _mults]
-           if _mults else _trainable)
+           [{'params': [p for p in _trainable if id(p) in ids], 'lr': args.lr_max * m} for ids, m in _mults] +
+           ([{'params': [p for p in _trainable if id(p) in _nowd_ids], 'weight_decay': 0.0}] if _nowd_ids else [])
+           if _sep_ids else _trainable)
+if _nowd_ids:
+    print(f'--no-wd_mem: no weight decay on {sum(p.numel() for p in _trainable if id(p) in _nowd_ids):,} '
+          f'parameters (the memories\' base windows and gate biases)', flush=True)
 for _ids, _m in _mults:
     print(f'lr x{_m:g} for {sum(p.numel() for p in _trainable if id(p) in _ids):,} parameters '
           f'({"ladder c" if _ids is _gamma_ids else "write gate"})', flush=True)
@@ -7787,13 +7855,43 @@ else:
     _opt_keys = {'momentum_buffer'}
 if args.mom_schedule != 'const':
     assert args.optimizer == 'sgd' and not args.nesterov, '--mom_schedule needs sgd without --nesterov'
+_pname = {id(p): n for n, p in model.named_parameters()}
+_opt_names = lambda: [_pname[id(p)] for g in optimizer.param_groups for p in g['params']]
+
+
+def _saved_opt_names(ck):
+    """The checkpoint optimizer's parameter names in its order: saved since --wd_mem; before that,
+    one group of the trainable parameters in model order, which is this model's without its new
+    blocks (--convdelta growth), when the count fits."""
+    if _loaded_ckpt.get('opt_names'):
+        return list(_loaded_ckpt['opt_names'])
+    if len(ck['param_groups']) != 1:
+        return None
+    nm = [n for n, p in model.named_parameters() if p.requires_grad and n != 'win_theta'
+          and not any(n.startswith(f'cd.{i}.') for i in _cd_grown)]
+    return nm if len(nm) == len(ck['param_groups'][0]['params']) else None
+
+
 if _loaded_ckpt is not None and _loaded_ckpt.get('optimizer'):
     osd = optimizer.state_dict()
     ck = _loaded_ckpt['optimizer']
+    _ck_names = _saved_opt_names(ck)
     if _lm_from is not None:     # --lm narrowed the model: the parameters are not the saved ones
         print('--lm: optimizer state NOT restored (the model was narrowed)', flush=True)
     elif any(set(v) != _opt_keys for v in ck['state'].values()):   # saved by the other optimizer
         print(f'WARNING: optimizer state NOT restored: it is not {args.optimizer} state', flush=True)
+    elif _ck_names is not None:  # by parameter name: the groups may differ (--no-wd_mem, new blocks)
+        _at = {n: j for j, n in enumerate(_ck_names)}
+        _cur = [_pname[id(p)] for g in optimizer.param_groups for p in g['params']]
+        _shape = {_pname[id(p)]: p.shape for g in optimizer.param_groups for p in g['params']}
+        osd['state'] = {j: ck['state'][_at[n]] for j, n in enumerate(_cur)
+                        if n in _at and _at[n] in ck['state'] and
+                        all(not torch.is_tensor(v) or v.dim() == 0 or v.shape == _shape[n]
+                            for v in ck['state'][_at[n]].values())}
+        optimizer.load_state_dict(osd)
+        _fresh = len(_cur) - len(osd['state'])
+        print(f'optimizer state restored ({len(osd["state"])} tensors' +
+              (f'; {_fresh} new, starting fresh)' if _fresh else ')'), flush=True)
     elif [len(g['params']) for g in ck['param_groups']] == [len(g['params']) for g in osd['param_groups']]:
         osd['state'] = ck['state']
         optimizer.load_state_dict(osd)
@@ -7807,9 +7905,11 @@ _live.update({n: b for n, b in model.named_buffers() if b.is_floating_point()})
 _wema = {}
 for _T in [int(float(t)) for t in args.weight_ema.split(',') if t]:
     _c = ((_loaded_ckpt or {}).get('weight_ema') or {}).get(_T)
-    if _c is not None and set(_c) == set(_live):
-        _wema[_T] = {n: _c[n].to(_live[n].device).clone() for n in _live}
-        print(f'--weight_ema: T={_T} average restored from the checkpoint', flush=True)
+    if _c is not None and set(_c) <= set(_live) and \
+            all(any(n.startswith(f'cd.{i}.') for i in _cd_grown) for n in set(_live) - set(_c)):
+        _wema[_T] = {n: (_c[n] if n in _c else _live[n].detach()).to(_live[n].device).clone() for n in _live}
+        print(f'--weight_ema: T={_T} average restored from the checkpoint' +
+              (' (the new blocks from their start)' if set(_live) - set(_c) else ''), flush=True)
     else:
         _wema[_T] = {n: t.detach().clone() for n, t in _live.items()}
         print(f'--weight_ema: T={_T} average starts from the loaded weights', flush=True)
@@ -7973,7 +8073,7 @@ def _save(i, n_examples):
     torch.save({'saved_args': vars(args), 'state_dict': model.state_dict(), 'log': log,
                 'step': i, 'examples': n_examples, 'examples_by': dict(_n_by),
                 'lr': optimizer.param_groups[0]['lr'],
-                'optimizer': optimizer.state_dict(),
+                'optimizer': optimizer.state_dict(), 'opt_names': _opt_names(),
                 'win_optimizer': _win_opt.state_dict() if _win_opt is not None else None,
                 'weight_ema': {T: dict(e) for T, e in _wema.items()}}, args.save)
 
@@ -8880,14 +8980,21 @@ try:
                   f'{_t_data:6.1f}s)')
             _T0 = None
         if i % args.monitor == 0 and larr:
-            flat = (model.regs(model.dff) if model.K else model.dff).reshape(-1)
             _g0 = optimizer.param_groups[0]
-            line = ('STEP {:10} wall {} loss {:12.9f} grad {:12.6f} lr {:10.9f} dff_mean {:12.5f} '
-                    'dff_std {:12.5f} dff_max {:11.3f}'
-                    ).format(i, datetime.datetime.now(), torch.stack(larr[-args.monitor:]).mean().item(),
-                             np.mean(garr[-args.monitor:]), _g0['lr'],
-                             flat.mean().item(), flat.std().item(), flat.abs().max().item())
-            del flat         # a view of this state: holding it would keep it alive past the next window
+            line = 'STEP {:10} wall {} loss {:12.9f} grad {:12.6f} lr {:10.9f}'.format(
+                i, datetime.datetime.now(), torch.stack(larr[-args.monitor:]).mean().item(),
+                np.mean(garr[-args.monitor:]), _g0['lr'])
+            if model.cd is not None and model.cd[0].stats is not None:
+                # the memories: tau, the geometric mean over blocks of the slowest head's (geometric) mean
+                # effective window in ticks; beta, the mean write strength
+                _st = torch.stack([b.stats for b in model.cd])
+                line += ' tau {:8.1f} beta {:6.4f}'.format(_st[:, 0].max(1).values.mean().exp().item(),
+                                                             _st[:, 1].mean().item())
+            else:
+                flat = (model.regs(model.dff) if model.K else model.dff).reshape(-1)
+                line += ' dff_mean {:12.5f} dff_std {:12.5f} dff_max {:11.3f}'.format(
+                    flat.mean().item(), flat.std().item(), flat.abs().max().item())
+                del flat     # a view of this state: holding it would keep it alive past the next window
             line += _ex_ep()
             if model.learn:
                 line += ' win ' + '/'.join(f'{w:.1f}' for w in model.windows)
