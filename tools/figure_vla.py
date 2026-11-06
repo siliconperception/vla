@@ -1,6 +1,6 @@
 """Draw docs/figures/vla_<model>.svg: one clock tick of a VLA model, 16:9 (1920 x 1080).
 
-usage: python tools/figure_vla.py [--model v498|v499|v502|v505|v511|v531|v533|v536|v538|v540|v541|v552|v564|v569|v579|v583|v592|v594|v597] [--out OUT]
+usage: python tools/figure_vla.py [--model v498|v499|v502|v505|v511|v531|v533|v536|v538|v540|v541|v552|v564|v569|v579|v583|v592|v594|v597|v624] [--out OUT]
 
 v498: recurrent CNN + two order-2 Legendre memories (4096, 64 ticks) + copy + recall attention, never
 reset. v499: no registers, the recall attention's ring is the whole state, reset at each example.
@@ -32,11 +32,12 @@ v592: 7 blocks at 256 channels, each u = x + 1x1(3 x (conv 3x3 + BN + ReLU)(x)) 
 back), then x' = u + out(S q); the token replicated through ctx_cat (no G, P), no linout, base windows
 2 … 16,384 ticks, the state never reset.
 v594: the same model as v592 (rerun from scratch after v593's 512-channel convs).
-v597: v594 continued (lr 3e-4, batch 40), the same model as v592."""
+v597: v594 continued (lr 3e-4, batch 40), the same model as v592.
+v624: v592 without BatchNorm (--cd_no_bn): each block u = x + 1x1(3 x (conv 3x3 + ReLU)(x))."""
 import argparse
 
 ap = argparse.ArgumentParser()
-ap.add_argument('--model', default='v498', choices=('v498', 'v499', 'v502', 'v505', 'v511', 'v531', 'v533', 'v536', 'v538', 'v540', 'v541', 'v552', 'v564', 'v569', 'v579', 'v583', 'v592', 'v594', 'v597'))
+ap.add_argument('--model', default='v498', choices=('v498', 'v499', 'v502', 'v505', 'v511', 'v531', 'v533', 'v536', 'v538', 'v540', 'v541', 'v552', 'v564', 'v569', 'v579', 'v583', 'v592', 'v594', 'v597', 'v624'))
 ap.add_argument('--out', default=None)
 a = ap.parse_args()
 NAME = a.model                            # the title and file name
@@ -44,6 +45,9 @@ if a.model == 'v541':
     a.model = 'v540'                      # same model as v540
 if a.model in ('v594', 'v597'):
     a.model = 'v592'                      # same model as v592
+NOBN = a.model == 'v624'                  # v592 without BatchNorm (--cd_no_bn)
+if NOBN:
+    a.model = 'v592'
 LMU = a.model == 'v498'                   # Legendre memories + copy
 CASC = a.model == 'v502'                  # EMA + residual copy, RMSnorm reads
 REGS = LMU or CASC                        # (v499: the ring alone)
@@ -1079,6 +1083,9 @@ def draw_v536():
            '(S, and the FIFO: reset at each document start)', w=500 if DF else 640)
     out.append('</g>')
     out.append('</svg>')
+    if NOBN:                              # the convs carry no BatchNorm
+        out[:] = [o.replace('conv 3×3 + BatchNorm + ReLU', 'conv 3×3 + ReLU (no BatchNorm)')
+               .replace(' + BN + ', ' + ').replace(' · BN · ', ' · ') for o in out]
     open(a.out or f'docs/figures/vla_{NAME}.svg', 'w').write('\n'.join(out))
 
 
