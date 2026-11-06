@@ -16,11 +16,11 @@ datasets:
 
 # VLA (ConvDelta)
 
-**Release v597, step 4,160,000** (161.5 M training tokens).
+**Release v626, step 6,160,000** (394.2 M training tokens).
 
 A language model with a fixed-size state and no positional encoding, built from convolutions on a 7 × 7 grid. Its
 input is only the current token, copied to every grid position. Seven residual ConvDelta blocks follow. Each one
-is three 3 × 3 conv + BatchNorm + ReLU layers and a 1 × 1 conv around a skip, then, at every grid position, 6
+is three 3 × 3 conv + ReLU layers (no normalization) and a 1 × 1 conv around a skip, then, at every grid position, 6
 heads of a 32 × 32 associative memory written by the gated delta rule and read by a query. Every tick the model
 reads one token, updates its memories, and decodes the next token. The memories are the whole state: 2.1 M
 values that never grow, and never reset in training.
@@ -37,7 +37,7 @@ one fetched from off-chip DRAM.
 
 Code, functional spec and figures: [github.com/siliconperception/vla](https://github.com/siliconperception/vla)
 
-![One clock tick](https://raw.githubusercontent.com/siliconperception/vla/main/docs/figures/vla_v597.svg)
+![One clock tick](https://raw.githubusercontent.com/siliconperception/vla/main/docs/figures/vla_v626.svg)
 
 ## Use
 
@@ -64,7 +64,7 @@ kept.
 | Parameters | 41.8 M: 16.1 M trained, 25.8 M frozen (token embedding and output layer from pythia-31m) |
 | State | 2,107,392 values, fixed in size: per block 49 positions × 6 heads × 32 × 32 memories; nothing else |
 | Input | the current token, embedded (frozen), RMS-normalized, copied to all 49 positions, mixed 1×1 (256 → 256) |
-| Blocks | 7 × ConvDelta at 256 channels: u = x + 1×1(3 × (3×3 conv, BatchNorm, ReLU)), then 1×1 q, k, v, β, α, a gated delta-rule memory per position and head, and x′ = u + 1×1 out(read) |
+| Blocks | 7 × ConvDelta at 256 channels: u = x + 1×1(3 × (3×3 conv, ReLU)), then 1×1 q, k, v, β, α, a gated delta-rule memory per position and head, and x′ = u + 1×1 out(read) |
 | Memory | M ← α M (I − β k kᵀ) + β v kᵀ, read M q; q, k unit length; β, α computed from the input every tick; base decay windows 2 to 16,384 ticks |
 | Readout | a tree of three 3×3 convs (7 → 5 → 3 → 1) straight from the last block, the frozen pythia-31m output layer |
 | Tokenizer | pythia-31m BPE (50,304) plus a `<NUL>` token ("say nothing this tick") |
@@ -72,41 +72,44 @@ kept.
 
 ## Training
 
-- From scratch: 4,160,000 steps, one token per row per step, 32 rows to step 608,512 and 40 after (161.5 M
-  tokens, 16,250 optimizer updates). Each row trains on 256-tick windows, all ticks of a window at once (the
-  memories through an exact chunked parallel scan); the state carries on between windows and the gradient stops
-  at a window's start.
-- AdamW (β 0.9, 0.9, no weight decay), learning rate warmed from 0 to 5e-4 over the first 20,000 steps, held,
-  then lowered to 3e-4 from step 484,352 (over 20,000 steps) and held. The loss is normalized per word rather
-  than per token.
+- From scratch: 6,160,000 steps, one token per row per step, 64 rows (394.2 M tokens, 24,062 optimizer
+  updates). Each row trains on 256-tick windows, all ticks of a window at once (the memories through an exact
+  chunked parallel scan); the state carries on between windows and the gradient stops at a window's start.
+- AdamW (β 0.9, 0.95, no weight decay), learning rate warmed from 0 to 3e-4 over the first 20,000 steps and
+  held, lowered to 1e-4 from step 2,926,848; plain SGD from step 3,232,512 (learning rate mostly 0.03 to 0.1);
+  AdamW again from step 3,716,096, warmed from 0 to 1e-3 and held, with weight decay 0.1 from step 4,134,912.
+  No gradient clipping. The loss is normalized per word rather than per token.
+- The published weights are a running average of the trained weights (an exponential moving average with a
+  time constant of 300 updates, kept through the whole run), not the last update's weights. At 6,160,000 it scores
+  about 0.2 nats per token lower on FineWeb than the weights it averages.
 - Data: FineWeb sample-10BT, text only. In training the state is never reset: at a document start the previous
   document's memories carry on, marked only by `<NUL>`, and the model must learn to drop them itself (as a
   robot's continuous perception jumps between scenes). Evaluation resets at every document.
 - The [spec](https://github.com/siliconperception/vla/blob/main/docs/spec/README.md) gives the exact computation.
 
-## Evaluation (at the published step, 4,160,000)
+## Evaluation (at the published step, 6,160,000)
 
 The reference is EleutherAI's [pythia-70m](https://huggingface.co/EleutherAI/pythia-70m): a transformer with the
 same tokenizer, so losses per token compare directly. Its 70 M parameters include 19 M outside the token
 embedding and output layer, close to this model's 16.1 M trained ones. Pythia publishes checkpoints from early in training, so it is
-shown at about this model's training tokens (steps 64 and 128 bracket it) as well as fully trained. Every model is
+shown at about this model's training tokens (steps 128 and 256 bracket it) as well as fully trained. Every model is
 scored on the same documents and pairs, by the same rule.
 
 | | **this model** | pythia-70m | pythia-70m | pythia-70m |
 |---|---|---|---|---|
-| training tokens | **161.5 M** | 134.2 M (step 64) | 268.4 M (step 128) | 300 B (final) |
-| FineWeb held-out (100 documents, nats/token) | **4.477** | 9.002 | 7.420 | 3.731 |
-| BabyLM 2026 dev (100 pieces, nats/token) | **4.018** | 8.635 | 6.866 | 3.250 |
-| BLiMP (1,005 pairs from all 67 paradigms), % | **70.5** | 52.7 | 51.8 | 75.7 |
-| ComVE (999 pairs, common sense), % | **68.2** | 56.3 | 56.5 | 69.7 |
+| training tokens | **394.2 M** | 268.4 M (step 128) | 536.9 M (step 256) | 300 B (final) |
+| FineWeb held-out (100 documents, nats/token) | **4.218** | 7.420 | 6.355 | 3.731 |
+| BabyLM 2026 dev (100 pieces, nats/token) | **3.767** | 6.866 | 5.718 | 3.250 |
+| BLiMP (1,005 pairs from all 67 paradigms), % | **74.6** | 51.8 | 51.4 | 75.7 |
+| ComVE (999 pairs, common sense), % | **68.6** | 56.5 | 57.1 | 69.7 |
 
 Losses are the mean over documents of each document's mean loss per token, from a zero state (this model) or a
 bare document start (pythia); a document with any token over 20 nats is counted as a runaway and left out
-(6 % of the FineWeb documents for this model). Pythia was trained on the Pile, this model on FineWeb, so
-the FineWeb row is in-domain for this model only. Matched tokens are not matched training: pythia's 134.2 M and
-268.4 M tokens are only 64 and 128 optimizer updates of 2 M tokens each, early in its learning-rate
-warm-up, while this model's are 16,250 updates of 8,192 to 10,240 tokens. Fully trained pythia-70m is the fair
-reference: this model is still well short of it in loss, and close to it on ComVE. A pair is right when the model gives the correct sentence the lower
+(2 % of the FineWeb documents for this model). Pythia was trained on the Pile, this model on FineWeb, so
+the FineWeb row is in-domain for this model only. Matched tokens are not matched training: pythia's 268.4 M and
+536.9 M tokens are only 128 and 256 optimizer updates of 2 M tokens each, early in its learning-rate
+warm-up, while this model's are 24,062 updates of 16,384 tokens. Fully trained pythia-70m is the fair
+reference: this model is still short of it in loss, and within about a point of it on BLiMP and ComVE. A pair is right when the model gives the correct sentence the lower
 total loss, each sentence read without context; chance is 50 %. For scale on the pairs: babyllama-10m-2024
 (trained on 10 M words) scores 70.0 / 63.7 and SmolLM2-135M 80.9 / 79.3.
 
@@ -114,9 +117,9 @@ total loss, each sentence read without context; chance is 50 %. For scale on the
 
 From the prompt in bold, with these weights. Locally fluent in places, repetitive, not yet coherent:
 
-> **My grandmother's recipe for apple pie starts with** a touch of me. She sounds wonderful. I already have a my favorite pie tasting bowl and I will always try again so I can get the recipe I love, I think more.
+> **My grandmother's recipe for apple pie starts with** a touch of honey and a pint of pecans.
 
-> **The history of the bicycle began in** 2001 by the founder of the National Park Service Project.
+> **The history of the bicycle began in** May after school which occurred Oct. 1. The purpose was to explore some of its neighbourhoods and events.
 
 ## Limits
 
@@ -131,11 +134,11 @@ linear attention ([Schlag, Irie, Schmidhuber 2021](https://arxiv.org/abs/2102.11
 [Katharopoulos et al. 2020](https://arxiv.org/abs/2006.16236)), with a per-head decay as in Mamba-2
 ([Dao, Gu 2024](https://arxiv.org/abs/2405.21060)). A state
 at every position of a conv grid follows ConvLSTM ([Shi et al. 2015](https://arxiv.org/abs/1506.04214)); the
-blocks use residual connections ([He et al. 2015](https://arxiv.org/abs/1512.03385)), BatchNorm
-([Ioffe, Szegedy 2015](https://arxiv.org/abs/1502.03167)) and RMS normalization
+blocks use residual connections ([He et al. 2015](https://arxiv.org/abs/1512.03385)) and RMS normalization
 ([Zhang, Sennrich 2019](https://arxiv.org/abs/1910.07467)). Tokenizer, frozen embedding and output layer, and the
 reference model: Pythia ([Biderman et al. 2023](https://arxiv.org/abs/2304.01373)). Optimizer: AdamW
-([Loshchilov, Hutter 2017](https://arxiv.org/abs/1711.05101)). Data: FineWeb
+([Loshchilov, Hutter 2017](https://arxiv.org/abs/1711.05101)); weight averaging
+([Polyak, Juditsky 1992](https://doi.org/10.1137/0330046)). Data: FineWeb
 ([Penedo et al. 2024](https://arxiv.org/abs/2406.17557)).
 
 ## License

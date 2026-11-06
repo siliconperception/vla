@@ -1,6 +1,6 @@
 """Draw docs/figures/vla_<model>.svg: one clock tick of a VLA model, 16:9 (1920 x 1080).
 
-usage: python tools/figure_vla.py [--model v498|v499|v502|v505|v511|v531|v533|v536|v538|v540|v541|v552|v564|v569|v579|v583|v592|v594|v597|v624] [--out OUT]
+usage: python tools/figure_vla.py [--model v498|v499|v502|v505|v511|v531|v533|v536|v538|v540|v541|v552|v564|v569|v579|v583|v592|v594|v597|v624|v626] [--out OUT]
 
 v498: recurrent CNN + two order-2 Legendre memories (4096, 64 ticks) + copy + recall attention, never
 reset. v499: no registers, the recall attention's ring is the whole state, reset at each example.
@@ -33,11 +33,12 @@ back), then x' = u + out(S q); the token replicated through ctx_cat (no G, P), n
 2 … 16,384 ticks, the state never reset.
 v594: the same model as v592 (rerun from scratch after v593's 512-channel convs).
 v597: v594 continued (lr 3e-4, batch 40), the same model as v592.
-v624: v592 without BatchNorm (--cd_no_bn): each block u = x + 1x1(3 x (conv 3x3 + ReLU)(x))."""
+v624: v592 without BatchNorm (--cd_no_bn): each block u = x + 1x1(3 x (conv 3x3 + ReLU)(x)).
+v626: v624 continued (AdamW lr 1e-3, weight decay 0.1), the same model as v624."""
 import argparse
 
 ap = argparse.ArgumentParser()
-ap.add_argument('--model', default='v498', choices=('v498', 'v499', 'v502', 'v505', 'v511', 'v531', 'v533', 'v536', 'v538', 'v540', 'v541', 'v552', 'v564', 'v569', 'v579', 'v583', 'v592', 'v594', 'v597', 'v624'))
+ap.add_argument('--model', default='v498', choices=('v498', 'v499', 'v502', 'v505', 'v511', 'v531', 'v533', 'v536', 'v538', 'v540', 'v541', 'v552', 'v564', 'v569', 'v579', 'v583', 'v592', 'v594', 'v597', 'v624', 'v626'))
 ap.add_argument('--out', default=None)
 a = ap.parse_args()
 NAME = a.model                            # the title and file name
@@ -45,7 +46,7 @@ if a.model == 'v541':
     a.model = 'v540'                      # same model as v540
 if a.model in ('v594', 'v597'):
     a.model = 'v592'                      # same model as v592
-NOBN = a.model == 'v624'                  # v592 without BatchNorm (--cd_no_bn)
+NOBN = a.model in ('v624', 'v626')       # v592 without BatchNorm (--cd_no_bn)
 if NOBN:
     a.model = 'v592'
 LMU = a.model == 'v498'                   # Legendre memories + copy
@@ -1086,6 +1087,8 @@ def draw_v536():
     if NOBN:                              # the convs carry no BatchNorm
         out[:] = [o.replace('conv 3×3 + BatchNorm + ReLU', 'conv 3×3 + ReLU (no BatchNorm)')
                .replace(' + BN + ', ' + ').replace(' · BN · ', ' · ') for o in out]
+    if NAME == 'v626':                    # trained 64 rows at a time
+        out[:] = [o.replace('(32 rows)', '(64 rows)') for o in out]
     open(a.out or f'docs/figures/vla_{NAME}.svg', 'w').write('\n'.join(out))
 
 

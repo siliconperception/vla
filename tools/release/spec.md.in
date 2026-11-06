@@ -38,8 +38,6 @@ continuously, so the model has learned to let go of an old context on its own.
 
 - RMS(z): z / √(mean over channels of z² + ε), ε = 1e-12, for the token embedding.
 - σ: the logistic sigmoid. ⊙: elementwise product. Conv k×k: zero padding unless "unpadded" is stated.
-- BN: BatchNorm with no learned scale or shift; at inference it normalizes each channel with its stored
-  running mean and variance.
 - Every 1×1 conv acts at each grid position separately; only the k×k convs (k ≥ 3) mix neighbouring positions.
 
 ## One tick
@@ -61,7 +59,7 @@ Only the current token enters. Everything the model knows about earlier tokens i
 Each block b = 1 … 7 maps x (256 × 7 × 7) to x′ of the same shape, using and updating its memories M_b. All seven
 have this structure, each with its own weights:
 
-1. **Spatial mixing.** u = x + Conv1×1_mix(Z(x)), where Z is 3 × [Conv3×3 (256 → 256) → BN → ReLU] and
+1. **Spatial mixing.** u = x + Conv1×1_mix(Z(x)), where Z is 3 × [Conv3×3 (256 → 256) → ReLU] (no normalization) and
    Conv1×1_mix (256 → 256) is linear, initialized to the identity. The residual goes around all three convs and
    the 1×1, so u can carry signed values.
 2. **Projections**, at each position p, from u:
@@ -126,7 +124,7 @@ full copy of an activation grid has to be held from one layer to a later one.
 [`docs/figures/vla_{{VERSION}}.svg`](../figures/vla_{{VERSION}}.svg) draws one clock tick (40 ms at 25 Hz) in two
 panes, 1920 × 2160. Colours encode the kind of operation, the same in both panes: grey hatched = frozen
 (embedding, output layer); violet = RMS norm and replication; blue = linear convs (1×1 or 3×3); green = conv 3×3
-+ BatchNorm + ReLU; yellow = the delta-rule memory (Δ) and its read; orange = the β, α gates; brown = L2
++ ReLU (no BatchNorm); yellow = the delta-rule memory (Δ) and its read; orange = the β, α gates; brown = L2
 normalization; cyan = the decoder convs; pink = softmax and sampling. A box drawn like a D flip-flop (Q, D and a
 clock notch) is state: a register written once per tick. Solid arrows are data and state paths; dashed arrows
 carry the old state into an update.
@@ -145,12 +143,12 @@ Left to right:
    (labelled **256×7×7**).
 4. **ctx_cat 1×1 256 → 256**, blue: the channel mix (input step 3).
 5. **block 1 … block 7**, seven rounded light-blue boxes in series. Inside each, left to right: three green bars
-   (the three conv 3×3 + BN + ReLU) and a blue bar (the 1×1), a skip line from the block's input over them to a
+   (the three conv 3×3 + ReLU) and a blue bar (the 1×1), a skip line from the block's input over them to a
    **(+)**, then a yellow circle **Δ** (the delta-rule memory) whose read is added in. Below each Δ is a
    flip-flop **S**, its memory state: a solid arrow from Δ down into S (the write) and a dashed arrow from S back
    up into Δ (the old state it updates). Under each block, **3 × conv, 1×1** names the mixing and
    **49×6×32×32** is the size of the block's memory. The caption reads "each block: u = x + 1×1(3 × (conv 3×3 +
-   BN + ReLU)), then x′ = u + (delta-rule memory Δ read)".
+   ReLU)), then x′ = u + (delta-rule memory Δ read)".
 6. A dashed orange frame around block 2, "one block, zoomed in: pane B ▼", points to pane B.
 7. The last block's output, the dot labelled **o**, goes straight to the decoder.
 8. **text_dec**: three cyan bars, **3×3 7→5**, **3×3 5→3**, **3×3 3→1**, the decoder tree.
@@ -170,7 +168,7 @@ the 3×3 convs, and the base windows exp(−λ), learned, starting log-spaced ov
 Left to right along the main line:
 
 1. **x from below** (the previous block's output, or the input grid for block 1) splits: one branch goes
-   through three green bars, **conv 3×3 · BN · ReLU**, and a blue **1×1 conv (linear)**, in series; the other
+   through three green bars, **conv 3×3 · ReLU**, and a blue **1×1 conv (linear)**, in series; the other
    runs underneath as the skip, labelled "spatial mixing, per tick". They meet at a **(+)**. The sum is **u**.
 2. From u, the main line runs straight right to a final **(+)** and on as **x′ to the next block**.
 3. Below, u fans out into five 1×1 convs ("per position: 6 heads × 32"): **1×1 conv → q** (query) and **1×1
@@ -185,7 +183,7 @@ Left to right along the main line:
 6. The updated memory, **S (t)**, goes up to **read S q** (yellow), which also takes q from the L2 box along the
    top. The read goes to **1×1 out** (blue), then up, labelled **y**, into the final (+).
 7. The panel **training vs the chip**, at the right: in training, everything before Δ runs on all 256 ticks of
-   a window (32 rows) at once, and q, k, v, β, α for the window go to a chunked scan (the WY form of the delta
+   a window (64 rows) at once, and q, k, v, β, α for the window go to a chunked scan (the WY form of the delta
    rule) that gives every S q exactly; the state carries on between windows, and the gradient stops at a
    window's start. On the chip it runs one tick at a time: per block it holds S and does the convs, five 1×1
    projections, and 49 × 6 small 32×32 updates and reads, with the same results as training, by construction.
@@ -196,8 +194,8 @@ note that S is never reset and carries across documents.
 
 ## Training (for reference)
 
-- From scratch, to step {{STEP}}. A step is one tick (one token) for each row: 32 rows to step 608,512, then 40,
-  so {{TOKENS}} tokens in all, in {{UPDATES}} optimizer updates.
+- From scratch, to step {{STEP}}. A step is one tick (one token) for each of 64 rows, so {{TOKENS}} tokens in all,
+  in {{UPDATES}} optimizer updates.
 - Data: FineWeb sample-10BT, text only.
 - Each row trains on windows of 256 consecutive ticks. Within a window the convs run on all ticks at once, and
   the memories are trained over the whole window by an exact chunked parallel scan. The state carries on from
@@ -208,9 +206,18 @@ note that S is never reset and carries across documents.
   previous, unrelated document's memories carry straight on, marked only by the `<NUL>` separator, as when a
   robot's perception jumps to a new scene, task or speaker. The model has to learn to let go of stale context
   itself, through α and β, which see the input. Evaluations reset at every document.
-- Optimizer: AdamW, β (0.9, 0.9), no weight decay, no gradient clipping. The learning rate rises from 0 to 5e-4
-  over the first 20,000 steps (a half cosine) and is held to step 484,352; it then falls to 3e-4 over 20,000
-  steps (a half cosine) and is held. Cross-entropy is normalized per word, not per token.
+- Optimizer, no gradient clipping throughout; every ramp below is a half cosine over 20,000 steps:
+  - to step 2,926,848: AdamW, β (0.9, 0.95), no weight decay, the learning rate rising from 0 to 3e-4, then held;
+  - to step 3,232,512: the same, the learning rate lowered to 1e-4;
+  - to step 3,716,096: plain SGD (no momentum, no weight decay), the learning rate mostly between 0.03 and 0.1
+    (above about 0.13 training diverged; those attempts were discarded);
+  - to step {{STEP}}: AdamW, β (0.9, 0.95), with fresh moment estimates, the learning rate rising from 0 to
+    1e-3, then held; weight decay 0.1 from step 4,134,912.
+
+  Cross-entropy is normalized per word, not per token.
+- **Published weights:** an exponential moving average of the trained weights, θ̄ ← θ̄ + (θ − θ̄)/300 after every
+  update, kept through the whole run, taken at step {{STEP}}. It removes most of the update-to-update noise:
+  at {{STEP}} it scores about 0.2 nats per token lower on FineWeb than the weights it averages.
 - Frozen: the token embedding and the output layer (pythia-31m).
 - Numerics: the convs and the q, k, v projection run in bf16 on the GPU, the rest in TF32. In float64, the
   parallel scan equals one-tick stepping to about 1e-14.
@@ -235,13 +242,13 @@ The model combines ideas from these papers:
   Learning Approach for Precipitation Nowcasting* (2015), [arXiv:1506.04214](https://arxiv.org/abs/1506.04214).
 - **Residual blocks:** K. He et al., *Deep Residual Learning for Image Recognition* (2015),
   [arXiv:1512.03385](https://arxiv.org/abs/1512.03385).
-- **BatchNorm:** S. Ioffe, C. Szegedy, *Batch Normalization: Accelerating Deep Network Training by Reducing
-  Internal Covariate Shift* (2015), [arXiv:1502.03167](https://arxiv.org/abs/1502.03167).
 - **RMS normalization:** B. Zhang, R. Sennrich, *Root Mean Square Layer Normalization* (2019),
   [arXiv:1910.07467](https://arxiv.org/abs/1910.07467).
 - **Tokenizer, frozen embedding and output layer, and the reference model:** S. Biderman et al., *Pythia: A Suite
   for Analyzing Large Language Models Across Training and Scaling* (2023), [arXiv:2304.01373](https://arxiv.org/abs/2304.01373).
 - **Optimizer:** I. Loshchilov, F. Hutter, *Decoupled Weight Decay Regularization* (2017),
   [arXiv:1711.05101](https://arxiv.org/abs/1711.05101).
+- **Weight averaging:** B. T. Polyak, A. B. Juditsky, *Acceleration of Stochastic Approximation by Averaging*
+  (1992), [doi:10.1137/0330046](https://doi.org/10.1137/0330046).
 - **Training data:** G. Penedo et al., *The FineWeb Datasets: Decanting the Web for the Finest Text Data at
   Scale* (2024), [arXiv:2406.17557](https://arxiv.org/abs/2406.17557).

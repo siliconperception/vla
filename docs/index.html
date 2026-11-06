@@ -91,14 +91,14 @@
       <a href="https://github.com/siliconperception/vla/blob/main/docs/spec/README.md">Functional spec</a>
       <a href="https://github.com/siliconperception/vla/tree/main/paper">Paper (in preparation)</a>
     </nav>
-    <p class="note">Current release: <b>v597</b>, step 4,160,000 (161.5 M training tokens).</p>
+    <p class="note">Current release: <b>v626</b>, step 6,160,000 (394.2 M training tokens).</p>
   </header>
 
   <figure>
-    <a class="fig" href="figures/vla_v597.svg" title="Open the full-size figure">
-      <img src="figures/vla_v597.svg" alt="Block diagram of one clock tick, in two panes. Top: the current token is embedded, normalized, copied to every position of a 7x7 grid and mixed by a 1x1 convolution, then passes through seven ConvDelta blocks, each three 3x3 conv-BatchNorm-ReLU layers and a 1x1 convolution around a skip, then a delta-rule memory with its state S whose read is added back; a tree of three 3x3 convolutions and the frozen output layer give the next token, which is fed back as the next input. Bottom: one block in detail, the convs and skip giving u, the q, k, v, beta and alpha projections, the gated delta-rule update of the memory S, its read, and the 1x1 output added to u.">
+    <a class="fig" href="figures/vla_v626.svg" title="Open the full-size figure">
+      <img src="figures/vla_v626.svg" alt="Block diagram of one clock tick, in two panes. Top: the current token is embedded, normalized, copied to every position of a 7x7 grid and mixed by a 1x1 convolution, then passes through seven ConvDelta blocks, each three 3x3 conv-ReLU layers and a 1x1 convolution around a skip, then a delta-rule memory with its state S whose read is added back; a tree of three 3x3 convolutions and the frozen output layer give the next token, which is fed back as the next input. Bottom: one block in detail, the convs and skip giving u, the q, k, v, beta and alpha projections, the gated delta-rule update of the memory S, its read, and the 1x1 output added to u.">
     </a>
-    <figcaption>One clock tick of the published model (v597). Top: the whole model, text only: the
+    <figcaption>One clock tick of the published model (v626). Top: the whole model, text only: the
     current token on every position of the 7 × 7 grid, seven ConvDelta blocks, and the decoder. Bottom: one
     block, three 3 × 3 convs and a 1 × 1 around a skip, then a gated delta-rule memory at every grid position (6
     heads of 32 × 32). The
@@ -116,8 +116,8 @@
   <ol>
     <li>The current token is embedded, normalized and copied to all 49 positions of a 7 × 7 grid, then mixed by a
     1 × 1 convolution. Earlier tokens reach the model only through its memories.</li>
-    <li>Seven ConvDelta blocks, in series. Each applies three 3 × 3 convolutions with BatchNorm and ReLU and a
-    1 × 1 convolution, around a skip.</li>
+    <li>Seven ConvDelta blocks, in series. Each applies three 3 × 3 convolutions with ReLU (no normalization)
+    and a 1 × 1 convolution, around a skip.</li>
     <li>At every grid position, 1 × 1 convolutions give 6 heads of query, key and value, a write strength β and a
     decay α. Each head's 32 × 32 memory is updated by the gated delta rule, M ← α M (I − β k kᵀ) + β v kᵀ: decay,
     erase what was stored at key k, write v there. It is read with the query and added back through a 1 × 1
@@ -151,25 +151,26 @@
 
   <h2>Scores</h2>
   <div class="tablewrap"><table>
-    <tr><th></th><th class="n">VLA v597</th><th class="n">pythia-70m</th><th class="n">pythia-70m</th><th class="n">pythia-70m</th></tr>
-    <tr><td>training tokens</td><td class="n">161.5 M</td><td class="n">134.2 M</td><td class="n">268.4 M</td><td class="n">300 B</td></tr>
-    <tr><td>FineWeb held-out, nats/token</td><td class="n">4.477</td><td class="n">9.002</td><td class="n">7.420</td><td class="n">3.731</td></tr>
-    <tr><td>BabyLM 2026 dev, nats/token</td><td class="n">4.018</td><td class="n">8.635</td><td class="n">6.866</td><td class="n">3.250</td></tr>
-    <tr><td>BLiMP, % of 1,005 pairs</td><td class="n">70.5</td><td class="n">52.7</td><td class="n">51.8</td><td class="n">75.7</td></tr>
-    <tr><td>ComVE, % of 999 pairs</td><td class="n">68.2</td><td class="n">56.3</td><td class="n">56.5</td><td class="n">69.7</td></tr>
+    <tr><th></th><th class="n">VLA v626</th><th class="n">pythia-70m</th><th class="n">pythia-70m</th><th class="n">pythia-70m</th></tr>
+    <tr><td>training tokens</td><td class="n">394.2 M</td><td class="n">268.4 M</td><td class="n">536.9 M</td><td class="n">300 B</td></tr>
+    <tr><td>FineWeb held-out, nats/token</td><td class="n">4.218</td><td class="n">7.420</td><td class="n">6.355</td><td class="n">3.731</td></tr>
+    <tr><td>BabyLM 2026 dev, nats/token</td><td class="n">3.767</td><td class="n">6.866</td><td class="n">5.718</td><td class="n">3.250</td></tr>
+    <tr><td>BLiMP, % of 1,005 pairs</td><td class="n">74.6</td><td class="n">51.8</td><td class="n">51.4</td><td class="n">75.7</td></tr>
+    <tr><td>ComVE, % of 999 pairs</td><td class="n">68.6</td><td class="n">56.5</td><td class="n">57.1</td><td class="n">69.7</td></tr>
   </table></div>
   <p class="note">pythia-70m (EleutherAI) is a transformer with the same tokenizer and 19 M parameters outside its embedding and output layer, shown
   at about this model's training tokens and fully trained; same documents, same pairs, same scoring rule (see the
   <a href="https://huggingface.co/siliconperception/vla">model card</a>). Pythia was trained on the Pile, this
-  model on FineWeb. Matched tokens are not matched training: at 134.2 M and 268.4 M tokens pythia has made only 64
-  and 128 updates (of 2 M tokens each), early in its warm-up; this model has made 16,250 (of 8,192 to 10,240
-  tokens). Fully trained pythia-70m is the fair reference.</p>
+  model on FineWeb. Matched tokens are not matched training: at 268.4 M and 536.9 M tokens pythia has made only 128
+  and 256 updates (of 2 M tokens each), early in its warm-up; this model has made 24,062 (of 16,384
+  tokens). Fully trained pythia-70m is the fair reference. The published weights are a running average of the
+  trained weights (time constant 300 updates).</p>
 
   <h2>Samples</h2>
-  <p>From the prompt in bold, with the published weights (161.5 M tokens of training). Locally fluent in places,
+  <p>From the prompt in bold, with the published weights (394.2 M tokens of training). Locally fluent in places,
   repetitive, not yet coherent:</p>
-  <blockquote><b>My grandmother&#x27;s recipe for apple pie starts with</b> a touch of me. She sounds wonderful. I already have a my favorite pie tasting bowl and I will always try again so I can get the recipe I love, I think more.</blockquote>
-  <blockquote><b>The history of the bicycle began in</b> 2001 by the founder of the National Park Service Project.</blockquote>
+  <blockquote><b>My grandmother&#x27;s recipe for apple pie starts with</b> a touch of honey and a pint of pecans.</blockquote>
+  <blockquote><b>The history of the bicycle began in</b> May after school which occurred Oct. 1. The purpose was to explore some of its neighbourhoods and events.</blockquote>
 
   <h2>Try it</h2>
 <pre><code>git clone https://github.com/siliconperception/vla && cd vla
@@ -190,9 +191,9 @@ done</code></pre>
     <li>Matrix-valued recurrent state: Katharopoulos et al., <a href="https://arxiv.org/abs/2006.16236">Transformers are RNNs: Fast Autoregressive Transformers with Linear Attention</a> (2020)</li>
     <li>Data-dependent decay per head: Dao, Gu, <a href="https://arxiv.org/abs/2405.21060">Transformers are SSMs</a> (Mamba-2, 2024)</li>
     <li>A state at every position of a conv grid: Shi et al., <a href="https://arxiv.org/abs/1506.04214">Convolutional LSTM Network</a> (2015)</li>
-    <li>Residual blocks: He et al., <a href="https://arxiv.org/abs/1512.03385">Deep Residual Learning for Image Recognition</a> (2015); BatchNorm: Ioffe, Szegedy, <a href="https://arxiv.org/abs/1502.03167">Batch Normalization</a> (2015); RMS norm: Zhang, Sennrich, <a href="https://arxiv.org/abs/1910.07467">Root Mean Square Layer Normalization</a> (2019)</li>
+    <li>Residual blocks: He et al., <a href="https://arxiv.org/abs/1512.03385">Deep Residual Learning for Image Recognition</a> (2015); RMS norm: Zhang, Sennrich, <a href="https://arxiv.org/abs/1910.07467">Root Mean Square Layer Normalization</a> (2019)</li>
     <li>Tokenizer, frozen embedding and output layer, reference model: Biderman et al., <a href="https://arxiv.org/abs/2304.01373">Pythia</a> (2023)</li>
-    <li>Optimizer: Loshchilov, Hutter, <a href="https://arxiv.org/abs/1711.05101">Decoupled Weight Decay Regularization</a> (2017); data: Penedo et al., <a href="https://arxiv.org/abs/2406.17557">The FineWeb Datasets</a> (2024)</li>
+    <li>Optimizer: Loshchilov, Hutter, <a href="https://arxiv.org/abs/1711.05101">Decoupled Weight Decay Regularization</a> (2017); weight averaging: Polyak, Juditsky, <a href="https://doi.org/10.1137/0330046">Acceleration of Stochastic Approximation by Averaging</a> (1992); data: Penedo et al., <a href="https://arxiv.org/abs/2406.17557">The FineWeb Datasets</a> (2024)</li>
   </ul>
 
   <footer>

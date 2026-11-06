@@ -1,25 +1,25 @@
 {
- "version": "v597",
- "step": 4160000,
- "rows": 40,
- "fineweb": 4.476875,
- "babylm": 4.017926,
- "blimp": 70.5,
- "comve": 68.2,
- "runaway": 6,
- "min_p": 0.0031,
+ "version": "v626",
+ "step": 6160000,
+ "rows": 64,
+ "fineweb": 4.21782,
+ "babylm": 3.766849,
+ "blimp": 74.6,
+ "comve": 68.6,
+ "runaway": 2,
+ "min_p": 0.0041,
  "pythia70m": {
-  "step64": {
-   "fw": 9.0023,
-   "baby": 8.6347,
-   "blimp": 52.7,
-   "comve": 56.3
-  },
   "step128": {
    "fw": 7.4203,
    "baby": 6.8661,
    "blimp": 51.8,
    "comve": 56.5
+  },
+  "step256": {
+   "fw": 6.3546,
+   "baby": 5.718,
+   "blimp": 51.4,
+   "comve": 57.1
   },
   "main": {
    "fw": 3.7312,
@@ -31,13 +31,13 @@
  "samples": [
   {
    "prompt": "My grandmother's recipe for apple pie starts with",
-   "text": "a touch of me. She sounds wonderful. I already have a my favorite pie tasting bowl and I will always try again so I can get the recipe I love, I think more."
+   "text": "a touch of honey and a pint of pecans."
   },
   {
    "prompt": "The history of the bicycle began in",
-   "text": "2001 by the founder of the National Park Service Project."
+   "text": "May after school which occurred Oct. 1. The purpose was to explore some of its neighbourhoods and events."
   }
  ],
- "tokens": 161531904,
- "updates": 16250
+ "tokens": 394240000,
+ "updates": 24062
 }
