@@ -335,6 +335,11 @@ parser.add_argument('--cd_band', default=0.0, type=float, metavar='F',
                          'and fix w: log a = -(1/w) F^tanh(g) (0 = off: log a = -(1/w) 2 sigmoid(g), the window '
                          'free to grow without bound, and w learned). A bank of fixed, log-spaced timescales: '
                          'forgetting as a power law, not drift to "never forget". Restored by --load')
+parser.add_argument('--cd_tau', default=None, metavar='T1,...,TH',
+                    help='--convdelta: fixed decay, the same in every block: head h forgets at the constant rate '
+                         'log a = -1/T_h (one window per head, in ticks), no data-dependent decay gate and no '
+                         'learned base window (beta, the write strength, stays gated). An architecture switch: '
+                         'applies to a loaded model and is restored by --load. E.g. 2.5,3.5,8.6,43,290,1000')
 parser.add_argument('--cd_windows', default=None, metavar='LO:HI,...',
                     help='--convdelta: base windows per block, log-spaced from LO to HI over its heads; one '
                          'LO:HI for every block, or one per block (default 4:4096). Given with --load, it '
@@ -975,10 +980,10 @@ _ARCH_ARGS = ('context', 'n_hidden', 'c_context', 'depth', 'kernel', 'tokenizer'
               'learn_regs', 'lmu', 'attn', 'attn_ch', 'attn_heads', 'attn_dim', 'attn_age', 'read_rmsnorm',
               'layers', 'write_gate', 'convdelta', 'cd_heads', 'cd_dim', 'cd_taps', 'lm', 'grid_hist', 'grid_spiral', 'grid_rings',
               'cd_convs', 'cd_fw', 'cd_fw_kernel', 'cd_fw_dk', 'cd_neg', 'cd_band', 'cd_gamma', 'cd_stem', 'cd_delta_first', 'grid_conv1d', 'cd_recur',
-              'cd_no_res', 'cd_no_cat', 'cd_no_gp', 'cd_mem_res', 'cd_mix_out', 'cd_mix_ch', 'cd_no_bn')
+              'cd_no_res', 'cd_no_cat', 'cd_no_gp', 'cd_mem_res', 'cd_mix_out', 'cd_mix_ch', 'cd_no_bn', 'cd_tau')
 # architecture switches that can be loaded onto a trained model: when given on the command line,
 # the given value wins over the checkpoint's
-_ARCH_SWITCHES = ('cd_neg', 'cd_band', 'cd_gamma', 'cd_taps', 'grid_hist', 'grid_spiral', 'convdelta')
+_ARCH_SWITCHES = ('cd_neg', 'cd_band', 'cd_gamma', 'cd_taps', 'grid_hist', 'grid_spiral', 'convdelta', 'cd_tau')
 
 
 def _parse_mix():
@@ -1750,7 +1755,7 @@ class ConvDeltaBlock(nn.Module):
 
     def __init__(self, C, H, d, taps, S, bn_momentum=0.1, n_convs=2, fw=0, fw_chunk=2, fw_kernel=0, fw_dk=64,
                  neg=False, band=0.0, gamma=False, delta_first=False, recur=False, no_res=False,
-                 mem_res=False, mix_out=False, mix_ch=0, no_bn=False):
+                 mem_res=False, mix_out=False, mix_ch=0, no_bn=False, tau=None):
         super().__init__()
         self.res = not no_res                  # --cd_no_res: no residual adds around the convs ...
         self.mem_res = self.res or bool(mem_res)   # ... nor (unless --cd_mem_res) around the memory
@@ -1820,6 +1825,14 @@ class ConvDeltaBlock(nn.Module):
         # --cd_band F: the window stays within [w/F, w F] and w is fixed
         self.band = float(band or 0)
         if self.band:
+            self.lam.requires_grad_(False)
+        # --cd_tau: a fixed decay per head, log a = -1/T_h (no gate, lam unused and frozen)
+        self.tau = [float(t) for t in str(tau).split(',') if t.strip()] if tau else None
+        if self.tau is not None:
+            if len(self.tau) != H or min(self.tau) <= 0:
+                raise SystemExit(f'--cd_tau {tau}: {H} positive windows, one per head (--cd_heads)')
+            if self.band:
+                raise SystemExit('--cd_tau does not combine with --cd_band')
             self.lam.requires_grad_(False)
         self.out = nn.Conv2d((H + self.fw) * d, C, 1)
         if self.mem_res:             # (no add here: the default init, else the convs see a constant)
@@ -1903,7 +1916,9 @@ class ConvDeltaBlock(nn.Module):
         beta = torch.sigmoid(gb)
         if self.neg is not None:
             beta = beta * (1 + torch.tanh(self.neg(u).view(M, H, P).transpose(1, 2)))
-        if self.band:
+        if self.tau is not None:     # --cd_tau: constant per head
+            loga = (-1.0 / torch.tensor(self.tau, device=beta.device, dtype=beta.dtype)).expand_as(beta).contiguous()
+        elif self.band:
             loga = -self.lam.exp() * self.band ** torch.tanh(ga)
         else:
             loga = -self.lam.exp() * 2 * torch.sigmoid(ga)
@@ -2715,7 +2730,7 @@ class VLAModel(nn.Module, _HubMixin):
                  convdelta=0, cd_heads=6, cd_dim=32, cd_taps=4, cd_chunk=64, grid_hist=0, grid_spiral=False, grid_rings=False,
                  cd_convs=2, cd_fw=0, cd_fw_chunk=2, cd_fw_kernel=0, cd_fw_dk=64, cd_neg=False, cd_band=0.0, cd_gamma=False,
                  cd_stem=0, cd_delta_first=False, grid_conv1d=0,
-                 cd_recur=False, cd_no_res=False, cd_no_cat=False, cd_no_gp=False, cd_mem_res=False, cd_mix_out=False, cd_mix_ch=0, cd_no_bn=False):
+                 cd_recur=False, cd_no_res=False, cd_no_cat=False, cd_no_gp=False, cd_mem_res=False, cd_mix_out=False, cd_mix_ch=0, cd_no_bn=False, cd_tau=None):
         super().__init__()
         from transformers import AutoModelForCausalLM
         repo = _TOKENIZERS[tokenizer]
@@ -2894,7 +2909,7 @@ class VLAModel(nn.Module, _HubMixin):
                                                 int(cd_fw_kernel or 0), int(cd_fw_dk or 64), bool(cd_neg),
                                                 float(cd_band or 0), bool(cd_gamma), bool(cd_delta_first),
                                                 bool(cd_recur), bool(cd_no_res), bool(cd_mem_res),
-                                                bool(cd_mix_out), int(cd_mix_ch or 0), bool(cd_no_bn))
+                                                bool(cd_mix_out), int(cd_mix_ch or 0), bool(cd_no_bn), cd_tau)
                                  for _ in range(int(convdelta)))
                    if convdelta else None)
         self.cd_chunk, self.cd_ckpt = int(cd_chunk), False   # cd_ckpt: checkpoint each block (seq)
@@ -4367,7 +4382,7 @@ model = VLAModel(S=args.context, n_hidden=args.n_hidden, c_context=args.c_contex
                  grid_hist=args.grid_hist, grid_spiral=args.grid_spiral, grid_rings=args.grid_rings, cd_convs=args.cd_convs, cd_fw=args.cd_fw, cd_fw_chunk=args.cd_fw_chunk,
                  cd_fw_kernel=args.cd_fw_kernel, cd_fw_dk=args.cd_fw_dk, cd_neg=args.cd_neg, cd_band=args.cd_band, cd_gamma=args.cd_gamma,
                  cd_stem=args.cd_stem, cd_delta_first=args.cd_delta_first,
-                 grid_conv1d=args.grid_conv1d, cd_recur=args.cd_recur, cd_no_res=args.cd_no_res, cd_no_cat=args.cd_no_cat, cd_no_gp=args.cd_no_gp, cd_mem_res=args.cd_mem_res, cd_mix_out=args.cd_mix_out, cd_mix_ch=args.cd_mix_ch, cd_no_bn=args.cd_no_bn, cd_chunk=args.cd_chunk,
+                 grid_conv1d=args.grid_conv1d, cd_recur=args.cd_recur, cd_no_res=args.cd_no_res, cd_no_cat=args.cd_no_cat, cd_no_gp=args.cd_no_gp, cd_mem_res=args.cd_mem_res, cd_mix_out=args.cd_mix_out, cd_mix_ch=args.cd_mix_ch, cd_no_bn=args.cd_no_bn, cd_chunk=args.cd_chunk, cd_tau=args.cd_tau,
                  up_windows=[float(w) for w in str(args.up_ema).split(',') if w.strip()] if args.up_ema else None)
 if _loaded_ckpt is not None:
     _sd = _upgrade_state_dict(_loaded_ckpt['state_dict'])
@@ -6949,7 +6964,7 @@ def _mem_lines(step):
             Sm = dff[:, off:off + nm].detach().float().reshape(dff.shape[0], b.H, b.d * b.d, -1)
             S_ = ' S ' + '/'.join(f'{x:.2f}' for x in Sm.norm(dim=2).mean((0, 2)).tolist())
         off += b.state_ch
-        w = (-b.lam.detach().float()).exp().tolist()
+        w = b.tau or (-b.lam.detach().float()).exp().tolist()   # (--cd_tau: the fixed windows)
         lt, be = b.stats.tolist()
         _emit(f'MEM step {step:10} block {bi} w ' + '/'.join(f'{x:.0f}' for x in w) +
               ' tau ' + '/'.join(f'{math.exp(x):.1f}' for x in lt) +
