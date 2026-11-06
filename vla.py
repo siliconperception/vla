@@ -543,6 +543,10 @@ parser.add_argument('--bptt', default=1, type=int, metavar='K',
                     help='truncated backpropagation through time: K steps run forward keeping the graph '
                          'through the register writes, then one backward of their mean loss and one '
                          'optimizer step (the gradient horizon grows from 1 token to up to K); 1 = off')
+parser.add_argument('--cd_scan_ckpt', action='store_true',
+                    help='--convdelta --ckpt_ticks: also checkpoint each --cd_chunk of the delta scan, so the '
+                         'block\'s recompute keeps only chunk-boundary states, not the window\'s d^2 products '
+                         '(for --cd_dim 64); one more forward of the scan. Without --ckpt_ticks it is always on')
 parser.add_argument('--ckpt_ticks', action='store_true',
                     help='--bptt: keep only each step\'s starting registers and inputs, and recompute the '
                          'step (state update, decoders and loss) during the backward, so memory grows by '
@@ -1614,7 +1618,7 @@ def _delta_chunk(qc, kc, vc, bc, lc, rc, S):
     return o, g0[:, -1, None, None] * S + (U * gC[:, :, None]).transpose(1, 2) @ kc
 
 
-def _delta_scan(q, k, v, beta, loga, reset, S0, chunk=64, grid=None):
+def _delta_scan(q, k, v, beta, loga, reset, S0, chunk=64, grid=None, ckpt=True):
     """--convdelta: the gated delta rule over a sequence, chunkwise in parallel.
     q, k [N, T, dk] (L2-normalized), v [N, T, dv], beta, loga [N, T] (write strength, log decay),
     reset [N, T] bool (the state entering that tick is zero), S0 [N, dv, dk]
@@ -1622,8 +1626,10 @@ def _delta_scan(q, k, v, beta, loga, reset, S0, chunk=64, grid=None):
        S <- a S (I - b k k^T) + b v k^T  (S = 0 first where reset),  o = S q.
     Within a chunk the updates are u_r k_r^T with u_r = b_r (v_r - a_r S_{r-1} k_r), solved
     for all r at once from a unit lower-triangular system (the WY form of the delta rule).
-    Under autograd each chunk is checkpointed: only the chunk-boundary states [N, dv, dk] are
-    kept, and a chunk's own state-sized products are rebuilt in the backward (they grow as d^2).
+    Under autograd (and ckpt) each chunk is checkpointed: only the chunk-boundary states [N, dv, dk]
+    are kept, and a chunk's own state-sized products are rebuilt in the backward (they grow as d^2).
+    ckpt=False when the whole block is already checkpointed (--ckpt_ticks without --cd_scan_ckpt):
+    a third forward of the scan for no memory a d=32 window needs.
     grid=(B, P, H): q, k, v [B, T, P, H, d], beta, loga [B, T, P, H], reset [B, T] instead (N = B P H),
     and o comes back [B, T, P, H, dv]; each chunk is put in the [N, C, ...] order on its own, so no
     whole-window copy of the inputs is made."""
@@ -1645,7 +1651,7 @@ def _delta_scan(q, k, v, beta, loga, reset, S0, chunk=64, grid=None):
                             take(reset, sl), S)
     outs, S = [], S0
     for c0 in range(0, T, chunk):
-        if torch.is_grad_enabled():  # the checkpoint keeps the window's tensors, not chunk copies of them
+        if ckpt and torch.is_grad_enabled():   # the checkpoint keeps the window's tensors, not chunk copies
             o, S = torch.utils.checkpoint.checkpoint(run, q, k, v, beta, loga, reset, S, c0, use_reentrant=False)
         else:
             o, S = run(q, k, v, beta, loga, reset, S, c0)
@@ -1784,6 +1790,7 @@ class ConvDeltaBlock(nn.Module):
         # base decay windows log-spaced 4 .. 4096 ticks over the heads
         w = torch.logspace(math.log10(4), math.log10(4096), H) if H > 1 else torch.tensor([64.0])
         self.lam = nn.Parameter(-torch.log(w))
+        self.scan_ckpt = True        # each scan chunk checkpointed (off under a block checkpoint)
         # --cd_band F: the window stays within [w/F, w F] and w is fixed
         self.band = float(band or 0)
         if self.band:
@@ -1946,7 +1953,7 @@ class ConvDeltaBlock(nn.Module):
         SfT = None
         q, k, v, beta, loga = (t.unflatten(0, (B, T)) for t in self._proj(u))   # [B, T, P, H, ...]
         S0 = st[:, :nm].reshape(B, H, d, d, P).permute(0, 4, 1, 2, 3).reshape(B * P * H, d, d)
-        o, ST = _delta_scan(q, k, v, beta, loga, reset, S0, chunk, grid=(B, P, H))
+        o, ST = _delta_scan(q, k, v, beta, loga, reset, S0, chunk, grid=(B, P, H), ckpt=self.scan_ckpt)
         o = o.reshape(B * T, P, H, d)
         if self.fw:                  # the conv memories over the window
             fq, fk, fv, fb, fa = self._fw_proj(u)                          # [B*T, F, P, ...]
@@ -8695,6 +8702,8 @@ try:
             if len(_cdb) == args.bptt:
                 Xb, Yb, Rb = (torch.stack([t[j] for t in _cdb], 1) for j in range(3))
                 model.cd_ckpt = bool(args.ckpt_ticks)
+                for _b in model.cd:      # the block checkpoint already bounds the scan's memory
+                    _b.scan_ckpt = args.cd_scan_ckpt or not model.cd_ckpt
                 o = model.seq_forward(Xb, Rb, _blk_start)[0]   # (the end state is not held through backward)
                 o = o.view(len(x_list), args.bptt, *o.shape[1:])
                 tl, tce = [], []
