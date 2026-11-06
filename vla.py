@@ -321,7 +321,8 @@ parser.add_argument('--cd_band', default=0.0, type=float, metavar='F',
 parser.add_argument('--cd_windows', default=None, metavar='LO:HI,...',
                     help='--convdelta: base windows per block, log-spaced from LO to HI over its heads; one '
                          'LO:HI for every block, or one per block (default 4:4096). Given with --load, it '
-                         'replaces the loaded base windows')
+                         'replaces the loaded base windows, unless the checkpoint was saved with the same '
+                         'value (a resume: the learned windows are kept)')
 parser.add_argument('--cd_gamma', default=False, action=argparse.BooleanOptionalAction,
                     help='--convdelta: the time conv\'s FIFO becomes a gamma ladder (de Vries & Principe 1992): '
                          'stage k(t+1) = c stage k(t) + (1 - c) stage k-1(t), stage 0 = RMS(x), c = 0.99 tanh(z) '
@@ -4388,7 +4389,10 @@ if args.use_ema:
                          f'(it has {sorted((_loaded_ckpt or {}).get("weight_ema", {}))})')
     model.load_state_dict(_e, strict=False)
     print(f'--use_ema: weights replaced by the T={args.use_ema} running average', flush=True)
-if args.cd_windows and model.cd is not None:     # --cd_windows: the base windows, block by block
+if (args.cd_windows and model.cd is not None and _loaded_ckpt is not None
+        and _loaded_ckpt['saved_args'].get('cd_windows') == args.cd_windows):
+    print(f'--cd_windows {args.cd_windows}: already set in this run, the learned windows kept', flush=True)
+elif args.cd_windows and model.cd is not None:   # --cd_windows: the base windows, block by block
     _cw = [tuple(float(x) for x in b.split(':')) for b in args.cd_windows.split(',')]
     if len(_cw) not in (1, len(model.cd)) or any(len(b) != 2 for b in _cw):
         raise SystemExit(f'--cd_windows {args.cd_windows}: one LO:HI, or one per block ({len(model.cd)})')
