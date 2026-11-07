@@ -8668,6 +8668,7 @@ class _Imaginer:
 
 _imaginer = _Imaginer(_SYNTH_ROWS) if _SYNTH_ROWS else None
 
+_mem_first = True                # MEM once at the start (_mem_lines needs a training window's stats)
 larr, garr = [], []
 _blk, _blk_start = [], None      # --bptt: the current block's (loss, inputs) and its starting state
 _cdb = []                        # --convdelta: the current window's (x, y, reset) per tick
@@ -8854,6 +8855,9 @@ try:
         # holds its EVAL lines and a run resumed from it keeps them; not at step 0, where it
         # would only measure ln(vocab), nor at a resumed run's first step (the checkpoint it
         # loaded; --eval_at_start to measure it anyway)
+        if _mem_first and model.cd is not None and model.cd[0].stats is not None:
+            _mem_lines(_start_step)      # the run's starting windows (stats of its first window, the starting weights)
+            _mem_first = False
         if args.eval_interval and i > 0 and ((i % args.eval_interval == 0 and i > _start_step) or
                                              (i == _start_step and args.eval_at_start)):
             _heldout_eval(i)
