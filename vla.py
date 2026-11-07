@@ -7106,13 +7106,13 @@ def _mem_lines(step):
         S_ = ''
         if dff is not None and dff.dim() == 4:
             Sm = dff[:, off:off + nm].detach().float().reshape(dff.shape[0], b.H, b.d * b.d, -1)
-            S_ = ' S ' + '/'.join(f'{x:.2f}' for x in Sm.norm(dim=2).mean((0, 2)).tolist())
+            S_ = ' S' + ''.join(f'{x:6.2f}' for x in Sm.norm(dim=2).mean((0, 2)).tolist())
         off += b.state_ch
         w = b.tau or (-b.lam.detach().float()).exp().tolist()   # (--cd_tau: the fixed windows)
         lt, be = b.stats.tolist()
-        _emit(f'MEM step {step:10} block {bi} w ' + '/'.join(f'{x:.0f}' for x in w) +
-              ' tau ' + '/'.join(f'{math.exp(x):.1f}' for x in lt) +
-              ' beta ' + '/'.join(f'{x:.2f}' for x in be) + S_)
+        _emit(f'MEM step {step:10} block {bi:2} w' + ''.join(f'{x:6.0f}' for x in w) +   # fixed widths: columns align
+              ' tau' + ''.join(f'{math.exp(x):8.1f}' for x in lt) +
+              ' beta' + ''.join(f'{x:5.2f}' for x in be) + S_)
 
 
 def _heldout_eval(step):
