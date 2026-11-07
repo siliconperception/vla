@@ -1,6 +1,6 @@
 """Draw docs/figures/vla_<model>.svg: one clock tick of a VLA model, 16:9 (1920 x 1080).
 
-usage: python tools/figure_vla.py [--model v498|v499|v502|v505|v511|v531|v533|v536|v538|v540|v541|v552|v564|v569|v579|v583|v592|v594|v597|v624|v626] [--out OUT]
+usage: python tools/figure_vla.py [--model v498|v499|v502|v505|v511|v531|v533|v536|v538|v540|v541|v552|v564|v569|v579|v583|v592|v594|v597|v624|v626|v646] [--out OUT]
 
 v498: recurrent CNN + two order-2 Legendre memories (4096, 64 ticks) + copy + recall attention, never
 reset. v499: no registers, the recall attention's ring is the whole state, reset at each example.
@@ -34,11 +34,14 @@ back), then x' = u + out(S q); the token replicated through ctx_cat (no G, P), n
 v594: the same model as v592 (rerun from scratch after v593's 512-channel convs).
 v597: v594 continued (lr 3e-4, batch 40), the same model as v592.
 v624: v592 without BatchNorm (--cd_no_bn): each block u = x + 1x1(3 x (conv 3x3 + ReLU)(x)).
-v626: v624 continued (AdamW lr 1e-3, weight decay 0.1), the same model as v624."""
+v626: v624 continued (AdamW lr 1e-3, weight decay 0.1), the same model as v624.
+v646: v624 on a 9x9 grid with 5 convs per block (--context 9 --cd_convs 5), a causal depthwise 3x3 conv over
+4 ticks on q, k, v (--cd_qkv_conv 3x3x4), the decoder 3x3 convs 9->7->5->3->1 with a ReLU after all but the
+last (--dec_tree_kernels 3,3,3,3 --dec_relu), no weight decay, 16 rows."""
 import argparse
 
 ap = argparse.ArgumentParser()
-ap.add_argument('--model', default='v498', choices=('v498', 'v499', 'v502', 'v505', 'v511', 'v531', 'v533', 'v536', 'v538', 'v540', 'v541', 'v552', 'v564', 'v569', 'v579', 'v583', 'v592', 'v594', 'v597', 'v624', 'v626'))
+ap.add_argument('--model', default='v498', choices=('v498', 'v499', 'v502', 'v505', 'v511', 'v531', 'v533', 'v536', 'v538', 'v540', 'v541', 'v552', 'v564', 'v569', 'v579', 'v583', 'v592', 'v594', 'v597', 'v624', 'v626', 'v646'))
 ap.add_argument('--out', default=None)
 a = ap.parse_args()
 NAME = a.model                            # the title and file name
@@ -46,7 +49,8 @@ if a.model == 'v541':
     a.model = 'v540'                      # same model as v540
 if a.model in ('v594', 'v597'):
     a.model = 'v592'                      # same model as v592
-NOBN = a.model in ('v624', 'v626')       # v592 without BatchNorm (--cd_no_bn)
+V646 = a.model == 'v646'                  # 9x9, 5 convs, q/k/v conv, ReLU decoder tree
+NOBN = a.model in ('v624', 'v626', 'v646')   # v592 without BatchNorm (--cd_no_bn)
 if NOBN:
     a.model = 'v592'
 LMU = a.model == 'v498'                   # Legendre memories + copy
@@ -576,7 +580,7 @@ def draw_v536():
     V2 = a.model == 'v592'                # the replicated token through ctx_cat, 3 convs + 1x1 with a skip, never reset
     NT = a.model in ('v564', 'v569', 'v579', 'v583', 'v592')   # no time conv at all, blocks of 7 convs, every document reset
     if NT:
-        NC = 3 if V2 else 7
+        NC = (5 if V646 else 3) if V2 else 7
     NB = 7 if DF or R9 or V2 else 3 if NT else 6   # --convdelta: blocks
     CC = 256 if DF or R9 or V2 else 384   # --c_context
     text(30, 38, f'VLA {NAME} — one clock tick (40 ms): a ConvDelta language model, {NB} blocks of per-tick convs, '
@@ -586,7 +590,9 @@ def draw_v536():
          f'VLA {NAME} — one clock tick (40 ms): a ConvDelta language model, {NB} residual blocks of '
          'per-tick convs, each with a gated delta-rule memory per grid position', 22, anchor='start', weight='bold')
     text(30, 62, f'A · the whole model.  --lm: text only · C {CC} · 7×7 grid · {NB} blocks · H 6 heads × d 32 per position '
-         '· 25 Hz · ' + ('16.09M trainable · fixed state 2,107,392 values · input: this token, copied to every grid position '
+         '· 25 Hz · ' + ('25.09M trainable · fixed state 4,463,424 values · input: this token, copied to every grid position '
+                         '· trained 256 ticks at a time, the state never reset · AdamW, no weight decay' if V646 else
+                         '16.09M trainable · fixed state 2,107,392 values · input: this token, copied to every grid position '
                          '· trained 256 ticks at a time, the state never reset' if V2 else
                          '32.55M trainable · fixed state 2,107,441 values · input: the last 4 tokens on fixed rings '
                          '· trained 256 ticks at a time, the state never reset' if MO else
@@ -693,10 +699,12 @@ def draw_v536():
             text(bx + BW / 2, CY - 150, f'block {i + 1}', 12, weight='bold')
             line([(bx, CY), (bx + 12, CY)], arrow=False)
             dot(bx + 8, CY)
+            sp_, cw_ = (11, 8) if NC > 3 else (14, 10)
             for j in range(NC):
-                box(bx + 12 + 14 * j, CY - 50, 10, 100, COL['cnn'], rx=1)
-            box(bx + 12 + 14 * NC, CY - 50, 8, 100, COL['lin'], rx=1)
-            line([(bx + 20 + 14 * NC, CY), (bx + 74, CY)])
+                box(bx + 12 + sp_ * j, CY - 50, cw_, 100, COL['cnn'], rx=1)
+            box(bx + 12 + sp_ * NC, CY - 50, 7 if NC > 3 else 8, 100, COL['lin'], rx=1)
+            if bx + 20 + sp_ * NC < bx + 74:
+                line([(bx + 20 + sp_ * NC, CY), (bx + 74, CY)])
             out.append(f'<circle cx="{bx + 82}" cy="{CY}" r="8" fill="#ffffff" stroke="{COL["ink"]}" '
                        f'stroke-width="1.2"/>')
             text(bx + 82, CY + 4, '+', 12, weight='bold')
@@ -826,17 +834,19 @@ def draw_v536():
     text(BX + 4, CY - 10, 'o', 13, anchor='start', weight='bold')
     DX = BX + 30
     line([(BX, CY), (DX, CY)])
-    text(DX + 62, CY - 42, 'text_dec', 12, weight='bold')
+    text(DX + (74 if V646 else 62), CY - (60 if V646 else 42), 'text_dec', 12, weight='bold')
     xx = DX
-    for lab in ('3×3 7→5', '3×3 5→3', '3×3 3→1'):
-        box(xx, CY - 34, 32, 68, COL['dec'], [lab], size=10, vertical=True)
-        if xx < DX + 100:
-            line([(xx + 32, CY), (xx + 50, CY)])
-        xx += 50
+    labs = ('3×3 9→7 · ReLU', '3×3 7→5 · ReLU', '3×3 5→3 · ReLU', '3×3 3→1') if V646 else ('3×3 7→5', '3×3 5→3', '3×3 3→1')
+    dst, bw_ = (38, 28) if V646 else (50, 32)
+    for j, lab in enumerate(labs):
+        box(xx, CY - 50 if V646 else CY - 34, bw_, 100 if V646 else 68, COL['dec'], [lab], size=10, vertical=True)
+        if j < len(labs) - 1:
+            line([(xx + bw_, CY), (xx + dst, CY)])
+        xx += dst
     HX = xx + 10
     line([(xx - 18, CY), (HX, CY)])
     box(HX, CY - 120, 44, 240, COL['frozen'], ['lmhead 256 → 50304 (frozen)'], hatch=True, vertical=True)
-    SX = HX + 80
+    SX = HX + (70 if V646 else 80)
     line([(HX + 44, CY), (SX, CY)])
     box(SX, CY - 30, 110, 60, COL['smp'], ['softmax', 'sample (+ <NUL>)'], size=11)
     line([(SX + 110, CY), (SX + 132, CY), (SX + 132, 140), (30, 140), (30, CY), (40, CY)])
@@ -856,7 +866,8 @@ def draw_v536():
                             'causal depthwise conv over the last 4 ticks')]) + [
                      (COL['cnn'], False, 'conv 3×3 + BatchNorm + ReLU'),
                      (COL['lmu'], False, 'Δ: gated delta-rule memory update and read'),
-                     (COL['dec'], False, 'decoder convs 3×3, 7→5→3→1 (linear)'),
+                     (COL['dec'], False, 'decoder convs 3×3, 9→7→5→3→1, ReLU after all but the last' if V646 else
+                      'decoder convs 3×3, 7→5→3→1 (linear)'),
                      (COL['smp'], False, 'softmax + sample (+ <NUL> logit)')],
            '(training: reset at half the document starts)' if V8 and not NF else
            '(S: never reset; it carries across documents)' if MO or V2 else
@@ -1010,11 +1021,17 @@ def draw_v536():
     line([(UX, CYb), (UX, 730)], arrow=False)
     for nm, desc, y, l2 in pr:
         line([(UX, y), (800 + OX, y)])
-        box(800 + OX, y - 18, 190, 36, COL['lin'] if nm in 'qkv' else COL['gate'], [f'1×1 conv → {nm}', desc], size=11)
+        if V646 and nm in 'qkv':          # the 1x1, then the causal depthwise conv over this tick and the last 3
+            box(800 + OX, y - 18, 110, 36, COL['lin'], [f'1×1 conv → {nm}', desc], size=11)
+            line([(910 + OX, y), (926 + OX, y)])
+        else:
+            box(800 + OX, y - 18, 190, 36, COL['lin'] if nm in 'qkv' else COL['gate'], [f'1×1 conv → {nm}', desc], size=11)
         if l2:
             line([(990 + OX, y), (1010 + OX, y)])
             box(1010 + OX, y - 13, 40, 26, COL['norm'], ['L2'], size=10)
     text(895 + OX, 452, 'per position: 6 heads × 32', 10.5, fill=COL['soft'])
+    if V646:                              # --cd_qkv_conv 3x3x4: Conv3d 4x3x3, groups 576, residual
+        box(926 + OX, 468, 64, 164, COL['tconv'], ['dw conv 3×3', '× 4 ticks', '(causal)', '+ residual'], size=10)
     DX0, DY0, DW, DH = 1110 + OX, 520, 300, 240               # the delta-rule update
     box(DX0, DY0, DW, DH, COL['lmu'], [], rx=8)
     text(DX0 + DW / 2, DY0 + 30, 'gated delta rule', 14, weight='bold')
@@ -1062,6 +1079,7 @@ def draw_v536():
             'windows; the gradient stops at a window\'s start.',
             '',
             'Chip: one tick at a time. Per block it',
+            'holds S and the 3-tick q, k, v FIFO, and does' if V646 else
             'holds S, and does' if NF or NT else 'holds S and the 3-tick FIFO, and does',
             'the convs, five 1×1 projections and',
             '49 × 6 small 32×32 updates and reads.',
@@ -1074,6 +1092,8 @@ def draw_v536():
                                           'causal depthwise conv over time, 4 taps')]) + [
                      (COL['cnn'], False, 'conv 3×3 + BatchNorm + ReLU'),
                      (COL['lin'], False, 'conv 1×1 (linear): q, k, v, out'),
+                     ] + ([(COL['tconv'], False, 'q, k, v: causal depthwise conv 3×3 × 4 ticks, residual (FIFO: 3 past ticks)')]
+                          if V646 else []) + [
                      (COL['gate'], False, 'gates: β = σ(·)(1 + tanh(·)); α: window w · 2^(−tanh(·)), w fixed per head' if NF else
                       'gates: β = σ(·), α = exp(−2 exp(λ) σ(·)), λ per head'),
                      (COL['lmu'], False, 'delta-rule update / read (linear in S)'),
@@ -1089,6 +1109,11 @@ def draw_v536():
                .replace(' + BN + ', ' + ').replace(' · BN · ', ' · ') for o in out]
     if NAME == 'v626':                    # trained 64 rows at a time
         out[:] = [o.replace('(32 rows)', '(64 rows)') for o in out]
+    if V646:                              # a 9x9 grid, 16 rows
+        out[:] = [o.replace('(32 rows)', '(16 rows)').replace('7×7', '9×9').replace('49×6×32×32', '81×6×32×32')
+                  .replace('49 × 6 × 32×32 = 301,056', '81 × 6 × 32×32 = 497,664')
+                  .replace('each of the 49 positions', 'each of the 81 positions')
+                  .replace('49 × 6 small', '81 × 6 small') for o in out]
     open(a.out or f'docs/figures/vla_{NAME}.svg', 'w').write('\n'.join(out))
 
 
