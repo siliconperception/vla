@@ -1187,6 +1187,10 @@ def _upgrade_state_dict(sd):
         k = re.sub(r'^lmhead\.', 'text_dec.lmhead.', k)
         if k == 'ctx_read_rms' and v.dim() == 2:
             v = v[0]
+        if re.match(r'cd\.\d+\.qc_w$', k):          # --cd_qkv_conv as raw parameters (lag 0 first) -> the Conv3d
+            k, v = k[:-5] + '.qc.weight', v.flip(1)[:, None].contiguous()
+        elif re.match(r'cd\.\d+\.qc_b$', k):
+            k = k[:-5] + '.qc.bias'
         out[k] = v
     return out
 
@@ -1824,15 +1828,19 @@ class ConvDeltaBlock(nn.Module):
             self.fw_lam = nn.Parameter(-torch.log(wf))
         self.qkv = nn.Conv2d(C, 3 * H * d, 1)
         # --cd_qkv_conv SxSxT: qkv += depthwise (S x S over the grid, T causal taps over ticks) conv of
-        # the last T ticks' qkv; zero at the start. qc_w [3Hd, T, S, S], lag 0 first
+        # the last T ticks' qkv; zero at the start. self.qc: an nn.Conv3d over (ticks, grid), depthwise
+        # (groups 3Hd), weight [3Hd, 1, T, S, S] with the oldest tick first, unpadded in ticks (causal)
         self.qc_s, self.qc_t = 0, 0
         if qkv_conv:
             m_ = re.fullmatch(r'(\d+)x(\d+)x(\d+)', str(qkv_conv).strip())
             if not m_ or m_.group(1) != m_.group(2) or int(m_.group(1)) % 2 == 0 or int(m_.group(3)) < 1:
                 raise SystemExit(f'--cd_qkv_conv {qkv_conv}: SxSxT with S odd, e.g. 3x3x4')
             self.qc_s, self.qc_t = int(m_.group(1)), int(m_.group(3))
-            self.qc_w = nn.Parameter(torch.zeros(3 * H * d, self.qc_t, self.qc_s, self.qc_s))
-            self.qc_b = nn.Parameter(torch.zeros(3 * H * d))
+            self.qc = nn.Conv3d(3 * H * d, 3 * H * d, (self.qc_t, self.qc_s, self.qc_s), groups=3 * H * d,
+                                padding=(0, self.qc_s // 2, self.qc_s // 2))
+            with torch.no_grad():
+                self.qc.weight.zero_()
+                self.qc.bias.zero_()
         self.gates = nn.Conv2d(C, 2 * H, 1)                                # beta, alpha logits
         with torch.no_grad():
             self.gates.weight.zero_()
@@ -1893,23 +1901,21 @@ class ConvDeltaBlock(nn.Module):
         if reset is None:
             reset = torch.zeros(B, T, dtype=torch.bool, device=qkv.device)
         doc = torch.cat([reset.new_zeros(B, n, dtype=torch.long), torch.cumsum(reset.long(), 1)], 1)
-        bias = self.qc_b.to(qkv.dtype)[None, :, None, None]
         if not reset[:, 1:].any() and not getattr(self, '_qc_loop', False):
-            # no reset after tick 0: one 3-D depthwise conv over (ticks, grid); a reset at tick 0 drops the FIFO
+            # no reset after tick 0: the Conv3d over (ticks, grid); a reset at tick 0 drops the FIFO
             f = fifo.to(z.dtype) * (~reset[:, 0]).to(z.dtype)[:, None, None, None, None] if n else None
             ext = torch.cat([f.flip(1), z], 1) if n else z                              # oldest first
-            w = self.qc_w.flip(1)[:, None].to(qkv.dtype)                                 # [Q, 1, T, S, S], oldest tap first
-            y = F.conv3d(ext.transpose(1, 2), w, padding=(0, self.qc_s // 2, self.qc_s // 2), groups=Q)
-            y = qkv + bias + y.transpose(1, 2).reshape(B * T, Q, S, S)
-        else:                        # resets inside the window: lag by lag, masked
+            y = self.qc(ext.transpose(1, 2)).to(qkv.dtype)                              # [B, Q, T, S, S]
+            y = qkv + y.transpose(1, 2).reshape(B * T, Q, S, S)
+        else:                        # resets inside the window: lag by lag, masked (the Conv3d's taps as conv2ds)
             ext = torch.cat([fifo.flip(1).to(z.dtype), z], 1) if n else z
-            y = qkv + bias
+            y = qkv + self.qc.bias.to(qkv.dtype)[None, :, None, None]
             for j in range(self.qc_t):                                               # lag j
                 src = ext[:, n - j:n - j + T]
                 if j:
                     ok = (doc[:, n - j:n - j + T] == doc[:, n:]).to(z.dtype)
                     src = src * ok[:, :, None, None, None]
-                y = y + F.conv2d(src.reshape(B * T, Q, S, S), self.qc_w[:, j:j + 1].to(qkv.dtype),
+                y = y + F.conv2d(src.reshape(B * T, Q, S, S), self.qc.weight[:, :, self.qc_t - 1 - j].to(qkv.dtype),
                                  padding=self.qc_s // 2, groups=Q)
         if n:
             ext = torch.cat([fifo.flip(1).to(z.dtype), z], 1)
@@ -4542,10 +4548,10 @@ if _loaded_ckpt is not None:
     if any(re.match(r'cd\.\d+\.neg\.', k) for k in missing) and not any('.neg.' in k for k in _sd):
         print('--cd_neg: the beta extension is new, starting at zero (beta unchanged)', flush=True)
         missing = [k for k in missing if not re.match(r'cd\.\d+\.neg\.', k)]
-    if any(re.match(r'cd\.\d+\.qc_[wb]$', k) for k in missing) and not any('.qc_' in k for k in _sd):
+    if any(re.match(r'cd\.\d+\.qc\.(weight|bias)$', k) for k in missing) and not any('.qc.' in k for k in _sd):
         print(f'--cd_qkv_conv {args.cd_qkv_conv}: the q, k, v conv is new, starting at zero (q, k, v unchanged)', flush=True)
-        missing = [k for k in missing if not re.match(r'cd\.\d+\.qc_[wb]$', k)]
-        _new_names.append(r'cd\.\d+\.qc_[wb]$')
+        missing = [k for k in missing if not re.match(r'cd\.\d+\.qc\.(weight|bias)$', k)]
+        _new_names.append(r'cd\.\d+\.qc\.(weight|bias)$')
     _dt_new = sorted({int(k.split('.')[2]) for k in missing if re.match(r'text_dec\.tree\.\d+\.', k)})
     if _dt_new and not any(k.startswith(f'text_dec.tree.{i}.') for k in _sd for i in _dt_new):
         # --dec_tree_kernels deeper than the checkpoint's: the new 3x3 tree convs start as factors of the
@@ -4673,7 +4679,7 @@ def _model_graph(model):
 
     hooks = [m.register_forward_hook(hook) for n, m in model.named_modules()
              if not list(m.children()) and not isinstance(m, nn.Identity)
-             and not n.startswith('img_enc')]
+             and not n.startswith('img_enc') and not re.match(r'cd\.\d+\.qc$', n)]   # (qc: its own row below)
     was = model.training
     model.eval()
     try:
@@ -4698,9 +4704,9 @@ def _model_graph(model):
             b = cd[int(mg.group(1))]
             Q = 3 * b.H * b.d
             out.append(dict(name=f'cd.{mg.group(1)}.qc <- QKV[t-1..t-{b.qc_t - 1}]' if b.qc_t > 1 else f'cd.{mg.group(1)}.qc',
-                            op=f'Conv3d {b.qc_t}x{b.qc_s}x{b.qc_s} groups={Q} (depthwise; causal in ticks), residual add',
+                            op=f'{b.qc}, causal in ticks, residual add',
                             inp=f'{Q}x{b.qc_t}x{model.S}x{model.S}', out=f'{Q}x{model.S}x{model.S}',
-                            tr=b.qc_w.numel() + b.qc_b.numel(), fr=0))
+                            tr=b.qc.weight.numel() + b.qc.bias.numel(), fr=0))
         if mb and mb.group(2) == 'mix.0' and cd[int(mb.group(1))].taps:   # --convdelta: the time conv, then the convs
             b = cd[int(mb.group(1))]
             out.append(dict(name=f'cd.{mb.group(1)}.tconv <- RMS(x)' + ('' if b.taps < 2 else
@@ -4725,7 +4731,7 @@ def _model_graph(model):
             out.append(dict(name=f'cd.{mb.group(1)} (delta memory)', op=mem,
                             inp=f'{3 * (b.H + b.fw)}x{b.d}x{model.S}x{model.S}', out=r['inp'],
                             tr=sum(p.numel() for n, p in b.named_parameters(recurse=False)
-                                   if n not in ('tconv', 'gz', 'qc_w', 'qc_b') and p.requires_grad),
+                                   if n not in ('tconv', 'gz') and p.requires_grad),
                             fr=sum(p.numel() for n, p in b.named_parameters(recurse=False) if not p.requires_grad)))
         if r['name'] == 'ctx_cat' and cd is not None and G:   # --grid_hist: per history token, then the map
             C = r['out'].split('x')[0]
@@ -8073,6 +8079,7 @@ _live.update({n: b for n, b in model.named_buffers() if b.is_floating_point()})
 _wema = {}
 for _T in [int(float(t)) for t in args.weight_ema.split(',') if t]:
     _c = ((_loaded_ckpt or {}).get('weight_ema') or {}).get(_T)
+    _c = _upgrade_state_dict(_c) if _c is not None else None     # (renamed parameters, as the weights)
     if _c is not None and set(_c) <= set(_live) and \
             all(any(n.startswith(f'cd.{i}.') for i in _cd_grown) or any(re.match(r_, n) for r_ in _new_names)
                 for n in set(_live) - set(_c)):
