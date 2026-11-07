@@ -452,6 +452,8 @@ parser.add_argument('--dec_width',  default=256,  type=int, help='text decoder t
 parser.add_argument('--dec_relu', default=False, action=argparse.BooleanOptionalAction,
                     help='text decoder: a ReLU after each tree conv (all but the last conv, the projection '
                          'to the embedding width)')
+parser.add_argument('--dec_bn', default=False, action=argparse.BooleanOptionalAction,
+                    help='--dec_relu: a BatchNorm (no affine, --bn_momentum) before each of the decoder\'s ReLUs')
 parser.add_argument('--bn_frozen', action='store_true',
                     help='train with BatchNorm in eval mode: its running statistics normalize and '
                          'are not updated (no batch statistics), as a batch-1 continual learner '
@@ -992,11 +994,11 @@ _ARCH_ARGS = ('context', 'n_hidden', 'c_context', 'depth', 'kernel', 'tokenizer'
               'layers', 'write_gate', 'convdelta', 'cd_heads', 'cd_dim', 'cd_taps', 'lm', 'grid_hist', 'grid_spiral', 'grid_rings',
               'cd_convs', 'cd_fw', 'cd_fw_kernel', 'cd_fw_dk', 'cd_neg', 'cd_band', 'cd_gamma', 'cd_stem', 'cd_delta_first', 'grid_conv1d', 'cd_recur',
               'cd_no_res', 'cd_no_cat', 'cd_no_gp', 'cd_mem_res', 'cd_mix_out', 'cd_mix_ch', 'cd_no_bn', 'cd_tau',
-              'cd_qkv_conv', 'dec_relu')
+              'cd_qkv_conv', 'dec_relu', 'dec_bn')
 # architecture switches that can be loaded onto a trained model: when given on the command line,
 # the given value wins over the checkpoint's
 _ARCH_SWITCHES = ('cd_neg', 'cd_band', 'cd_gamma', 'cd_taps', 'grid_hist', 'grid_spiral', 'convdelta', 'cd_tau',
-                  'cd_qkv_conv', 'dec_tree_kernels', 'dec_relu')
+                  'cd_qkv_conv', 'dec_tree_kernels', 'dec_relu', 'dec_bn')
 
 
 def _parse_mix():
@@ -2166,9 +2168,9 @@ class TextDecoder(nn.Module):
     """Layer output [B, C, S, S] -> logits [B, vocab]. A linear tree of unpadded convs
     shrinks the grid, the last conv maps to the embedding width, whatever grid remains is
     average-pooled, and the borrowed (frozen) lm_head produces the logits. --dec_relu: a ReLU
-    after each tree conv (not after the projection)."""
+    after each tree conv (not after the projection), --dec_bn: a BatchNorm before each ReLU."""
 
-    def __init__(self, c_in, S, kernels, width, lmhead, nul_id=None, relu=False):
+    def __init__(self, c_in, S, kernels, width, lmhead, nul_id=None, relu=False, bn=False, bn_momentum=0.1):
         super().__init__()
         red = sum(k - 1 for k in kernels)
         if not kernels or min(kernels) < 1 or red > S - 1:
@@ -2181,6 +2183,8 @@ class TextDecoder(nn.Module):
         self.pool = nn.AvgPool2d(S - red) if S - red > 1 else nn.Identity()
         self.S, self.kernels = S, list(kernels)
         self.acts = nn.ModuleList(nn.ReLU() for _ in self.tree) if relu else None   # --dec_relu
+        self.norms = nn.ModuleList(nn.BatchNorm2d(width, affine=False, momentum=bn_momentum or None)
+                                   for _ in self.tree) if relu and bn else None   # --dec_bn
         if relu:     # the convs reading a ReLU: He init (the linear one would halve the variance each layer)
             for c in list(self.tree)[1:] + [self.proj]:
                 nn.init.kaiming_normal_(c.weight, mode='fan_in', nonlinearity='relu')
@@ -2198,6 +2202,8 @@ class TextDecoder(nn.Module):
         for i, conv in enumerate(self.tree):
             x = conv(x)
             if self.acts is not None:
+                if self.norms is not None:
+                    x = self.norms[i](x)
                 x = self.acts[i](x)
         h = self.pool(self.proj(x)).squeeze(-1).squeeze(-1)
         logits = self.lmhead(h)
@@ -2813,7 +2819,7 @@ class VLAModel(nn.Module, _HubMixin):
 
     def __init__(self, S=8, n_hidden=512, c_context=384, depth=8, kernel=3,
                  tokenizer='pythia31m', windows=(256, 64, 16, 4, 1), read_norm=1.0,
-                 dec_kernels=(3, 3, 3), dec_width=256, dec_relu=False, bn_momentum=0.1, init='zero',
+                 dec_kernels=(3, 3, 3), dec_width=256, dec_relu=False, dec_bn=False, bn_momentum=0.1, init='zero',
                  image_encoder='none', audio_encoder='none', nul_head=False, streams=1,
                  text_nul=False, surprise=None, linout_kernel=1, learn_win=False,
                  learn_regs=(), lmu=False, attn=0, attn_ch=2, attn_heads=8, attn_dim=64, attn_age=True,
@@ -2860,7 +2866,7 @@ class VLAModel(nn.Module, _HubMixin):
         # streams 3: the text stream never says <NUL> (but --fifo3: text_nul); voice and image do
         self.text_dec = TextDecoder(n_hidden, S, list(dec_kernels), dec_width, lmhead,
                                     nul_id=None if self.streams == 3 and not text_nul
-                                    else self.nul_id, relu=dec_relu)
+                                    else self.nul_id, relu=dec_relu, bn=dec_bn, bn_momentum=bn_momentum)
         if self.streams == 3:
             self.voc_dec = TextDecoder(n_hidden, S, list(dec_kernels), dec_width, lmhead,
                                        nul_id=self.nul_id)
@@ -4457,7 +4463,7 @@ model = VLAModel(S=args.context, n_hidden=args.n_hidden, c_context=args.c_contex
                  windows=[float(w) for w in str(args.ctx_ema).split(',') if w.strip()],
                  read_norm=args.ctx_read_norm,
                  dec_kernels=[int(k) for k in str(args.dec_tree_kernels).split(',') if k.strip()],
-                 dec_relu=args.dec_relu,
+                 dec_relu=args.dec_relu, dec_bn=args.dec_bn,
                  dec_width=args.dec_width, bn_momentum=args.bn_momentum, init=args.init,
                  image_encoder=args.image_encoder, audio_encoder=args.audio_encoder,
                  nul_head=not args.inner_voice and (
