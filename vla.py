@@ -935,7 +935,7 @@ parser.add_argument('--eval_dump',  default=None, metavar='FILE',
 parser.add_argument('--vis',        default=False, action='store_true',
                     help='live generation view: layer output and registers (std across '
                          'channels per grid cell), --write_gate rates (mean across channels) and '
-                         'P(next token); x exits')
+                         'P(next token); space pauses / resumes, x exits')
 parser.add_argument('--vis_alt',    default='default', choices=['default', 'alt1'],
                     help='--vis layout: default, a column per --convdelta block with four rows, its input x, '
                          'u after the convs, y the memory read\'s 1x1 out and the output x\' (std across '
@@ -5354,6 +5354,25 @@ if args.vis:
     _VIS_WIN = 180                                   # ticker width in characters
     plt.style.use('dark_background')
     plt.ion()
+
+    def _vis_keys(fig):
+        """--vis keys: x exits, space pauses / resumes. Returns the state [exit, paused]."""
+        st = [False, False]
+
+        def key(e):
+            if e.key in ('x', 'X'):
+                st[0] = True
+            elif e.key in (' ', 'space'):
+                st[1] = not st[1]
+        fig.canvas.mpl_connect('key_press_event', key)
+        return st
+
+    def _vis_wait(fig, st):
+        """--delay between frames, then hold while paused (the window stays live)."""
+        time.sleep(args.delay)
+        while st[1] and not st[0] and plt.fignum_exists(fig.number):
+            fig.canvas.flush_events()
+            time.sleep(0.05)
 if args.vis and args.vis_alt == 'default' and model.cd is None:
     print('--vis_alt default needs --convdelta; showing alt1')
 if args.vis and args.vis_alt == 'default' and model.cd is not None:
@@ -5397,9 +5416,7 @@ if args.vis and args.vis_alt == 'default' and model.cd is not None:
     header = fig.text(0.01, 0.99, '', family='monospace', fontsize=7, va='top', ha='left')
     PR = int(math.ceil(math.sqrt(model.vocab)))
     PC = int(math.ceil(model.vocab / PR))
-    _exit = [False]
-    fig.canvas.mpl_connect('key_press_event',
-                           lambda e: _exit.__setitem__(0, _exit[0] or e.key in ('x', 'X')))
+    _exit = _vis_keys(fig)
     model.eval()
     dev = next(model.parameters()).device
     prompt = _prompt_ids(args.prompt)
@@ -5449,7 +5466,7 @@ if args.vis and args.vis_alt == 'default' and model.cd is not None:
                         f'\ngen: {ticker}')
         fig.canvas.draw()
         fig.canvas.flush_events()
-        time.sleep(args.delay)
+        _vis_wait(fig, _exit)
     raise SystemExit(0)
 if args.vis:
     nup = len(model.up)
@@ -5542,9 +5559,7 @@ if args.vis:
     header = fig.text(0.01, 0.99, '', family='monospace', fontsize=7, va='top', ha='left')
     PR = int(math.ceil(math.sqrt(model.vocab)))
     PC = int(math.ceil(model.vocab / PR))
-    _exit = [False]
-    fig.canvas.mpl_connect('key_press_event',
-                           lambda e: _exit.__setitem__(0, _exit[0] or e.key in ('x', 'X')))
+    _exit = _vis_keys(fig)
 
     model.eval()
     dev = next(model.parameters()).device
@@ -5641,7 +5656,7 @@ if args.vis:
                         f'min_p {args.min_p:.4f}  T {args.temperature:.2f}{extra}\ngen: {ticker}')
         fig.canvas.draw()
         fig.canvas.flush_events()
-        time.sleep(args.delay)
+        _vis_wait(fig, _exit)
     raise SystemExit(0)
 
 def _stream_xy(x, y, kin, kout, video):
