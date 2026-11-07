@@ -4636,6 +4636,14 @@ def _model_graph(model):
     cd, G = model.cd, getattr(model, 'grid_hist', 0)
     for r in rows:
         mb = re.match(r'cd\.(\d+)\.(mix\.0|out)$', r['name']) if cd is not None else None
+        mg = re.match(r'cd\.(\d+)\.gates$', r['name']) if cd is not None else None
+        if mg and cd[int(mg.group(1))].qc_t:     # --cd_qkv_conv: after qkv, before the gates
+            b = cd[int(mg.group(1))]
+            Q = 3 * b.H * b.d
+            out.append(dict(name=f'cd.{mg.group(1)}.qc <- QKV[t-1..t-{b.qc_t - 1}]' if b.qc_t > 1 else f'cd.{mg.group(1)}.qc',
+                            op=f'depthwise {b.qc_s}x{b.qc_s} x {b.qc_t}-tick causal conv on q, k, v, residual add',
+                            inp=f'{Q}x{model.S}x{model.S}', out=f'{Q}x{model.S}x{model.S}',
+                            tr=b.qc_w.numel() + b.qc_b.numel(), fr=0))
         if mb and mb.group(2) == 'mix.0' and cd[int(mb.group(1))].taps:   # --convdelta: the time conv, then the convs
             b = cd[int(mb.group(1))]
             out.append(dict(name=f'cd.{mb.group(1)}.tconv <- RMS(x)' + ('' if b.taps < 2 else
@@ -4660,7 +4668,7 @@ def _model_graph(model):
             out.append(dict(name=f'cd.{mb.group(1)} (delta memory)', op=mem,
                             inp=f'{3 * (b.H + b.fw)}x{b.d}x{model.S}x{model.S}', out=r['inp'],
                             tr=sum(p.numel() for n, p in b.named_parameters(recurse=False)
-                                   if n not in ('tconv', 'gz') and p.requires_grad),
+                                   if n not in ('tconv', 'gz', 'qc_w', 'qc_b') and p.requires_grad),
                             fr=sum(p.numel() for n, p in b.named_parameters(recurse=False) if not p.requires_grad)))
         if r['name'] == 'ctx_cat' and cd is not None and G:   # --grid_hist: per history token, then the map
             C = r['out'].split('x')[0]
