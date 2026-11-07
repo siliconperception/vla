@@ -4652,8 +4652,8 @@ def _model_graph(model):
             b = cd[int(mg.group(1))]
             Q = 3 * b.H * b.d
             out.append(dict(name=f'cd.{mg.group(1)}.qc <- QKV[t-1..t-{b.qc_t - 1}]' if b.qc_t > 1 else f'cd.{mg.group(1)}.qc',
-                            op=f'depthwise {b.qc_s}x{b.qc_s} x {b.qc_t}-tick causal conv on q, k, v, residual add',
-                            inp=f'{Q}x{model.S}x{model.S}', out=f'{Q}x{model.S}x{model.S}',
+                            op=f'Conv3d {b.qc_t}x{b.qc_s}x{b.qc_s} groups={Q} (depthwise; causal in ticks), residual add',
+                            inp=f'{Q}x{b.qc_t}x{model.S}x{model.S}', out=f'{Q}x{model.S}x{model.S}',
                             tr=b.qc_w.numel() + b.qc_b.numel(), fr=0))
         if mb and mb.group(2) == 'mix.0' and cd[int(mb.group(1))].taps:   # --convdelta: the time conv, then the convs
             b = cd[int(mb.group(1))]
