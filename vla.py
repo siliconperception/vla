@@ -1878,23 +1878,39 @@ class ConvDeltaBlock(nn.Module):
     def _qconv(self, qkv, fifo, reset, B, T):
         """--cd_qkv_conv over a window: qkv [B*T, Q, S, S] (this window's, Q = 3Hd), fifo [B, n, Q, S, S]
         (the n = T-1 ticks before it, newest first), reset [B, T] or None -> (qkv + the conv [B*T, Q, S, S],
-        the FIFO after the last tick [B, n, Q, S, S]). A tap never reaches back across a reset."""
+        the FIFO after the last tick [B, n, Q, S, S]). A tap never reaches back across a reset. Under
+        autograd it is recomputed in the backward pass (nothing of it held)."""
+        if torch.is_grad_enabled() and (qkv.requires_grad or self.qc_w.requires_grad):
+            return torch.utils.checkpoint.checkpoint(self._qconv_run, qkv, fifo, reset, B, T, use_reentrant=False)
+        return self._qconv_run(qkv, fifo, reset, B, T)
+
+    def _qconv_run(self, qkv, fifo, reset, B, T):
         Q, S, n = qkv.shape[1], self.S, self.qc_t - 1
         z = qkv.view(B, T, Q, S, S)
-        ext = torch.cat([fifo.flip(1).to(z.dtype), z], 1) if n else z               # oldest first
         if reset is None:
             reset = torch.zeros(B, T, dtype=torch.bool, device=qkv.device)
         doc = torch.cat([reset.new_zeros(B, n, dtype=torch.long), torch.cumsum(reset.long(), 1)], 1)
-        y = qkv + self.qc_b.to(qkv.dtype)[None, :, None, None]
-        for j in range(self.qc_t):                                               # lag j
-            src = ext[:, n - j:n - j + T]
-            if j:
-                ok = (doc[:, n - j:n - j + T] == doc[:, n:]).to(z.dtype)
-                src = src * ok[:, :, None, None, None]
-            y = y + F.conv2d(src.reshape(B * T, Q, S, S), self.qc_w[:, j:j + 1].to(qkv.dtype),
-                             padding=self.qc_s // 2, groups=Q)
+        bias = self.qc_b.to(qkv.dtype)[None, :, None, None]
+        if not reset[:, 1:].any() and not getattr(self, '_qc_loop', False):
+            # no reset after tick 0: one 3-D depthwise conv over (ticks, grid); a reset at tick 0 drops the FIFO
+            f = fifo.to(z.dtype) * (~reset[:, 0]).to(z.dtype)[:, None, None, None, None] if n else None
+            ext = torch.cat([f.flip(1), z], 1) if n else z                              # oldest first
+            w = self.qc_w.flip(1)[:, None].to(qkv.dtype)                                 # [Q, 1, T, S, S], oldest tap first
+            y = F.conv3d(ext.transpose(1, 2), w, padding=(0, self.qc_s // 2, self.qc_s // 2), groups=Q)
+            y = qkv + bias + y.transpose(1, 2).reshape(B * T, Q, S, S)
+        else:                        # resets inside the window: lag by lag, masked
+            ext = torch.cat([fifo.flip(1).to(z.dtype), z], 1) if n else z
+            y = qkv + bias
+            for j in range(self.qc_t):                                               # lag j
+                src = ext[:, n - j:n - j + T]
+                if j:
+                    ok = (doc[:, n - j:n - j + T] == doc[:, n:]).to(z.dtype)
+                    src = src * ok[:, :, None, None, None]
+                y = y + F.conv2d(src.reshape(B * T, Q, S, S), self.qc_w[:, j:j + 1].to(qkv.dtype),
+                                 padding=self.qc_s // 2, groups=Q)
         if n:
-            last = ext[:, T:].flip(1)                                             # newest first
+            ext = torch.cat([fifo.flip(1).to(z.dtype), z], 1)
+            last = ext[:, T:].flip(1)                                                 # newest first
             okl = (doc[:, T:].flip(1) == doc[:, -1:]).to(z.dtype)
             end = last * okl[:, :, None, None, None]
         else:
