@@ -993,7 +993,7 @@ _ARCH_ARGS = ('context', 'n_hidden', 'c_context', 'depth', 'kernel', 'tokenizer'
 # architecture switches that can be loaded onto a trained model: when given on the command line,
 # the given value wins over the checkpoint's
 _ARCH_SWITCHES = ('cd_neg', 'cd_band', 'cd_gamma', 'cd_taps', 'grid_hist', 'grid_spiral', 'convdelta', 'cd_tau',
-                  'cd_qkv_conv')
+                  'cd_qkv_conv', 'dec_tree_kernels')
 
 
 def _parse_mix():
@@ -2175,6 +2175,7 @@ class TextDecoder(nn.Module):
         self.tree = nn.ModuleList(_linear_init(nn.Conv2d(c_in if i == 0 else width, width, k))
                                   for i, k in enumerate(kernels[:-1]))
         self.pool = nn.AvgPool2d(S - red) if S - red > 1 else nn.Identity()
+        self.S, self.kernels = S, list(kernels)
         self.lmhead = lmhead
         # --clock_hz: <NUL> is the first embedding row the tokenizer never uses. Those rows of
         # the frozen lm_head were never trained, so its logit gets its own trainable head and
@@ -4528,6 +4529,31 @@ if _loaded_ckpt is not None:
         print(f'--cd_qkv_conv {args.cd_qkv_conv}: the q, k, v conv is new, starting at zero (q, k, v unchanged)', flush=True)
         missing = [k for k in missing if not re.match(r'cd\.\d+\.qc_[wb]$', k)]
         _new_names.append(r'cd\.\d+\.qc_[wb]$')
+    _dt_new = sorted({int(k.split('.')[2]) for k in missing if re.match(r'text_dec\.tree\.\d+\.', k)})
+    if _dt_new and not any(k.startswith(f'text_dec.tree.{i}.') for k in _sd for i in _dt_new):
+        # --dec_tree_kernels deeper than the checkpoint's: the new 3x3 tree convs start as factors of the
+        # average pool they replace. The box polynomial 1 + z + .. + z^(P-1) is the product over
+        # j = 1..(P-1)/2 of z^2 - 2cos(2 pi j / P) z + 1, so (P-1)/2 per-channel 3x3 convs (each the outer
+        # product of one factor, normalized) make the P x P mean exactly. The tree is linear and its convs
+        # shift-invariant, so these commute with the trained convs: the decoder's output is unchanged.
+        _old_k = [int(k) for k in str(_loaded_ckpt['saved_args'].get('dec_tree_kernels', '3,3,3')).split(',') if k.strip()]
+        _P = model.text_dec.S - sum(k - 1 for k in _old_k)
+        _cv = [model.text_dec.tree[i] for i in _dt_new]
+        if any(c.kernel_size != (3, 3) or c.in_channels != c.out_channels for c in _cv) or 2 * len(_cv) != _P - 1 \
+                or sum(k - 1 for k in model.text_dec.kernels) != model.text_dec.S - 1:
+            raise SystemExit(f'--dec_tree_kernels {args.dec_tree_kernels}: new tree convs {_dt_new} must be '
+                             f'{(_P - 1) / 2:g} width-preserving 3x3s replacing the old {_P}x{_P} pool')
+        with torch.no_grad():
+            for j, _c in enumerate(_cv, 1):
+                t = torch.tensor([1.0, -2 * math.cos(2 * math.pi * j / _P), 1.0])
+                t = t / t.sum()
+                _c.weight.zero_()
+                _c.weight[torch.arange(_c.out_channels), torch.arange(_c.in_channels)] = torch.outer(t, t)
+                _c.bias.zero_()
+        print(f'--dec_tree_kernels {args.dec_tree_kernels}: tree conv(s) {", ".join(map(str, _dt_new))} new, '
+              f'starting as exact factors of the old {_P}x{_P} average pool (output unchanged)', flush=True)
+        missing = [k for k in missing if not re.match(rf'text_dec\.tree\.({"|".join(map(str, _dt_new))})\.', k)]
+        _new_names.append(rf'text_dec\.tree\.({"|".join(map(str, _dt_new))})\.')
     if any(re.match(r'cd\.\d+\.gz$', k) for k in missing) and not any(k.endswith('.gz') for k in _sd):
         print('--cd_gamma: the ladder is new, starting as the FIFO (c = 0)', flush=True)
         missing = [k for k in missing if not re.match(r'cd\.\d+\.gz$', k)]
