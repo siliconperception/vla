@@ -1879,12 +1879,7 @@ class ConvDeltaBlock(nn.Module):
         """--cd_qkv_conv over a window: qkv [B*T, Q, S, S] (this window's, Q = 3Hd), fifo [B, n, Q, S, S]
         (the n = T-1 ticks before it, newest first), reset [B, T] or None -> (qkv + the conv [B*T, Q, S, S],
         the FIFO after the last tick [B, n, Q, S, S]). A tap never reaches back across a reset. Under
-        autograd it is recomputed in the backward pass (nothing of it held)."""
-        if torch.is_grad_enabled() and (qkv.requires_grad or self.qc_w.requires_grad):
-            return torch.utils.checkpoint.checkpoint(self._qconv_run, qkv, fifo, reset, B, T, use_reentrant=False)
-        return self._qconv_run(qkv, fifo, reset, B, T)
-
-    def _qconv_run(self, qkv, fifo, reset, B, T):
+        (No checkpoint of its own: --ckpt_ticks recomputes the block anyway.)"""
         Q, S, n = qkv.shape[1], self.S, self.qc_t - 1
         z = qkv.view(B, T, Q, S, S)
         if reset is None:
