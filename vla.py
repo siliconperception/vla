@@ -612,6 +612,9 @@ parser.add_argument('--mom_period', default=20000, type=int, help='--mom_schedul
 parser.add_argument('--mom_start', default=None, type=int,
                     help='--mom_schedule: global step where it starts (default: this run\'s first step)')
 parser.add_argument('--weight_decay', default=0.0, type=float, help='SGD weight decay')
+parser.add_argument('--wd_gates',   default=True, action=argparse.BooleanOptionalAction,
+                    help='--no-wd_gates: no --weight_decay on the ConvDelta gate weights (gates.weight: the '
+                         'per-token beta and decay); with --no-wd_mem, nothing that sets tau or beta decays')
 parser.add_argument('--wd_mem',     default=True, action=argparse.BooleanOptionalAction,
                     help='--no-wd_mem: no --weight_decay on the ConvDelta memory time constants: each '
                          'block\'s base windows lam (decay pulls them to 1 tick) and its gate biases')
@@ -7950,8 +7953,9 @@ _gamma_ids = {id(p) for n, p in model.named_parameters() if re.match(r'cd\.\d+\.
 _mults = [(ids, m) for ids, m in ((_gate_ids, args.gate_lr_mult), (_gamma_ids, args.gamma_lr_mult))
           if ids and m != 1]         # --gate_lr_mult, --gamma_lr_mult: their own groups
 # --no-wd_mem: the memory time constants (base windows, gate biases) in a group of their own, no decay
-_nowd_ids = (set() if args.wd_mem or model.cd is None or not args.weight_decay else
-             {id(p) for n, p in model.named_parameters() if re.match(r'cd\.\d+\.(lam|fw_lam|gates\.bias)$', n)}
+_nowd_re = '|'.join(([] if args.wd_mem else [r'lam', r'fw_lam', r'gates\.bias']) + ([] if args.wd_gates else [r'gates\.weight']))
+_nowd_ids = (set() if not _nowd_re or model.cd is None or not args.weight_decay else
+             {id(p) for n, p in model.named_parameters() if re.match(rf'cd\.\d+\.({_nowd_re})$', n)}
              - set().union(*[ids for ids, _ in _mults]))
 _sep_ids = set().union(*[ids for ids, _ in _mults], _nowd_ids)
 _groups = ([{'params': [p for p in _trainable if id(p) not in _sep_ids]}] +
@@ -7959,8 +7963,10 @@ _groups = ([{'params': [p for p in _trainable if id(p) not in _sep_ids]}] +
            ([{'params': [p for p in _trainable if id(p) in _nowd_ids], 'weight_decay': 0.0}] if _nowd_ids else [])
            if _sep_ids else _trainable)
 if _nowd_ids:
-    print(f'--no-wd_mem: no weight decay on {sum(p.numel() for p in _trainable if id(p) in _nowd_ids):,} '
-          f'parameters (the memories\' base windows and gate biases)', flush=True)
+    print(f'{"--no-wd_mem " if not args.wd_mem else ""}{"--no-wd_gates " if not args.wd_gates else ""}'
+          f'no weight decay on {sum(p.numel() for p in _trainable if id(p) in _nowd_ids):,} parameters ('
+          + ', '.join((["the memories' base windows and gate biases"] if not args.wd_mem else []) +
+                      (["the gate weights"] if not args.wd_gates else [])) + ')', flush=True)
 for _ids, _m in _mults:
     print(f'lr x{_m:g} for {sum(p.numel() for p in _trainable if id(p) in _ids):,} parameters '
           f'({"ladder c" if _ids is _gamma_ids else "write gate"})', flush=True)
