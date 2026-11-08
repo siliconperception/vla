@@ -341,10 +341,13 @@ parser.add_argument('--cd_qkv_conv', default=None, metavar='SxSxT',
                          'over this and the last T-1 ticks (causal; a FIFO of the last T-1 ticks\' q, k, v in the '
                          'state). Starts at zero (q, k, v unchanged), so it can be added to a trained model. E.g. 3x3x4')
 parser.add_argument('--cd_tau', default=None, metavar='T1,...,TH',
-                    help='--convdelta: fixed decay, the same in every block: head h forgets at the constant rate '
-                         'log a = -1/T_h (one window per head, in ticks), no data-dependent decay gate and no '
-                         'learned base window (beta, the write strength, stays gated). An architecture switch: '
-                         'applies to a loaded model and is restored by --load. E.g. 2.5,3.5,8.6,43,290,1000')
+                    help='--convdelta: fixed decay: head h forgets at the constant rate log a = -1/T_h (one '
+                         'window per head, in ticks), no data-dependent decay gate and no learned base window '
+                         '(beta, the write strength, stays gated). H values for every block, or one set per '
+                         'block: blocks separated by ";" (or all --convdelta x H values in one list, block by '
+                         'block). An architecture switch: applies to a loaded model and is restored by --load. '
+                         'E.g. 2.5,3.5,8.6,43,290,1000. With --cd_band F the gate stays: T_h becomes head h\'s fixed '
+                         'base window and its decay window moves within [T_h/F, T_h F] per token')
 parser.add_argument('--cd_windows', default=None, metavar='LO:HI,...',
                     help='--convdelta: base windows per block, log-spaced from LO to HI over its heads; one '
                          'LO:HI for every block, or one per block (default 4:4096). Given with --load, it '
@@ -1761,6 +1764,23 @@ def _convfw_scan(q, k, v, b, loga, reset, S0, chunk=8):
     return torch.cat(outs, 1), S_
 
 
+def _block_taus(tau, n, H):
+    """--cd_tau -> one comma list (or None) per block: the same H windows for every block, H per block
+    separated by ';', or all n*H in one list, block by block."""
+    if not tau:
+        return [None] * n
+    t = str(tau)
+    if ';' in t:
+        parts = [p.strip() for p in t.split(';') if p.strip()]
+        if len(parts) != n:
+            raise SystemExit(f'--cd_tau {tau}: {len(parts)} blocks given, the model has {n} (--convdelta)')
+        return parts
+    v = [x.strip() for x in t.split(',') if x.strip()]
+    if len(v) == n * H and n > 1:
+        return [','.join(v[b * H:(b + 1) * H]) for b in range(n)]
+    return [t] * n
+
+
 class ConvDeltaBlock(nn.Module):
     """--convdelta: one residual block. Per tick, on x [B, C, S, S]:
          u = x + TimeConv(RMS(x))            causal depthwise conv over this and the last
@@ -1867,11 +1887,14 @@ class ConvDeltaBlock(nn.Module):
             self.lam.requires_grad_(False)
         # --cd_tau: a fixed decay per head, log a = -1/T_h (no gate, lam unused and frozen)
         self.tau = [float(t) for t in str(tau).split(',') if t.strip()] if tau else None
+        self.tau_c = None            # --cd_tau with --cd_band: the fixed base windows, the gate still on
         if self.tau is not None:
             if len(self.tau) != H or min(self.tau) <= 0:
                 raise SystemExit(f'--cd_tau {tau}: {H} positive windows, one per head (--cd_heads)')
-            if self.band:
-                raise SystemExit('--cd_tau does not combine with --cd_band')
+            if self.band:            # log a = -(1/T_h) F^tanh(g): the window within [T_h/F, T_h F]
+                self.tau_c, self.tau = self.tau, None
+                with torch.no_grad():
+                    self.lam.copy_(-torch.log(torch.tensor(self.tau_c)))
             self.lam.requires_grad_(False)
         self.out = nn.Conv2d((H + self.fw) * d, C, 1)
         if self.mem_res:             # (no add here: the default init, else the convs see a constant)
@@ -3017,8 +3040,9 @@ class VLAModel(nn.Module, _HubMixin):
                                                 int(cd_fw_kernel or 0), int(cd_fw_dk or 64), bool(cd_neg),
                                                 float(cd_band or 0), bool(cd_gamma), bool(cd_delta_first),
                                                 bool(cd_recur), bool(cd_no_res), bool(cd_mem_res),
-                                                bool(cd_mix_out), int(cd_mix_ch or 0), bool(cd_no_bn), cd_tau, cd_qkv_conv)
-                                 for _ in range(int(convdelta)))
+                                                bool(cd_mix_out), int(cd_mix_ch or 0), bool(cd_no_bn),
+                                                _block_taus(cd_tau, int(convdelta), int(cd_heads))[i], cd_qkv_conv)
+                                 for i in range(int(convdelta)))
                    if convdelta else None)
         self.cd_chunk, self.cd_ckpt = int(cd_chunk), False   # cd_ckpt: checkpoint each block (seq)
         if self.cd is not None:
@@ -4627,6 +4651,13 @@ if args.cd_windows and model.cd is not None and (_cd_grown or not (
             _b.lam.copy_(-torch.log(_w))
     print('--cd_windows: base windows ' + ' | '.join(
         ' '.join(f'{w:g}' for w in (1 / _b.lam.exp()).round().tolist()) for _b in model.cd), flush=True)
+if model.cd is not None and any(_b.tau_c for _b in model.cd):   # --cd_tau + --cd_band: over the loaded lam
+    with torch.no_grad():
+        for _b in model.cd:
+            if _b.tau_c:
+                _b.lam.copy_(-torch.log(torch.tensor(_b.tau_c, dtype=_b.lam.dtype)))
+    print(f'--cd_tau with --cd_band {args.cd_band:g}: fixed base windows ' + ' | '.join(
+        ' '.join(f'{w:g}' for w in _b.tau_c) for _b in model.cd) + ', the gate within x/÷ the band', flush=True)
 if args.cd_gamma_init is not None and model.cd is not None and model.cd[0].gz is not None:
     if _loaded_ckpt is not None and _loaded_ckpt['saved_args'].get('cd_gamma_init') == args.cd_gamma_init:
         pass                         # already set in this run: keep the learned c
@@ -8100,6 +8131,8 @@ _wema = {}
 for _T in [int(float(t)) for t in args.weight_ema.split(',') if t]:
     _c = ((_loaded_ckpt or {}).get('weight_ema') or {}).get(_T)
     _c = _upgrade_state_dict(_c) if _c is not None else None     # (renamed parameters, as the weights)
+    if _c is not None:               # (parameters frozen since, e.g. lam under --cd_band, leave the average)
+        _c = {n: v for n, v in _c.items() if n in _live}
     if _c is not None and set(_c) <= set(_live) and \
             all(any(n.startswith(f'cd.{i}.') for i in _cd_grown) or any(re.match(r_, n) for r_ in _new_names)
                 for n in set(_live) - set(_c)):
