@@ -7138,7 +7138,7 @@ def _mem_lines(step):
         S_ = ''
         if dff is not None and dff.dim() == 4:
             Sm = dff[:, off:off + nm].detach().float().reshape(dff.shape[0], b.H, b.d * b.d, -1)
-            S_ = ' S' + ''.join(f'{x:6.2f}' for x in Sm.norm(dim=2).mean((0, 2)).tolist())
+            S_ = ' S' + ''.join(f'{x:8.2f}' for x in Sm.norm(dim=2).mean((0, 2)).tolist())
         off += b.state_ch
         w = b.tau or (-b.lam.detach().float()).exp().tolist()   # (--cd_tau: the fixed windows)
         lt, be = b.stats.tolist()
