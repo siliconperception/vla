@@ -7118,6 +7118,14 @@ _VIDEO_VARIANTS = ((True, True, ''), (False, True, '-blind'), (True, False, '-de
                    (False, False, '-off'))
 
 
+def _kfmt(x):
+    """A 7-wide number: 9999.9, then 26.9K, 9999.9K, 12.3M, ... (the MEM tau columns)."""
+    for d, u in ((1e9, 'G'), (1e6, 'M'), (1e3, 'K')):
+        if x >= 10 * d:
+            return f'{x / d:6.1f}{u}'
+    return f'{x:7.1f}'
+
+
 def _mem_lines(step):
     """MEM, one line per ConvDelta block, per head: w the base window (ticks), tau the effective window
     (geometric mean over the last training window), beta the mean write strength, S the mean Frobenius
@@ -7135,7 +7143,7 @@ def _mem_lines(step):
         w = b.tau or (-b.lam.detach().float()).exp().tolist()   # (--cd_tau: the fixed windows)
         lt, be = b.stats.tolist()
         _emit(f'MEM step {step:10} block {bi:2} w' + ''.join(f'{x:6.0f}' for x in w) +   # fixed widths: columns align
-              ' tau' + ''.join(f'{math.exp(x):8.1f}' for x in lt) +
+              ' tau' + ''.join(' ' + _kfmt(math.exp(x)) for x in lt) +
               ' beta' + ''.join(f'{x:5.2f}' for x in be) + S_)
 
 
