@@ -1053,6 +1053,7 @@ _new_names = []              # regexes of parameters new on --load (not in the c
 _aud_switch = None           # --load with another --audio_encoder: (old, new)
 _start_step = 0
 _start_exs = 0
+_start_toks = 0
 _start_exs_by = {}            # corpus -> examples trained, for the STEP ex_/ep_ columns
 _HUB_ARGS = 'vla_args.json'  # --push: the checkpoint's saved_args, step and examples beside model.safetensors
 
@@ -1098,6 +1099,8 @@ if _loaded_ckpt is not None:
         args.full_crops = 0.0         # trained before full views existed: keep its crops
     _start_step = int(_loaded_ckpt.get('step', 0))
     _start_exs = int(_loaded_ckpt.get('examples', 0))
+    # tokens trained (one per row per step); a checkpoint from before the count: step x its batch
+    _start_toks = int(_loaded_ckpt.get('tokens', _start_step * int(_saved.get('batch') or args.batch)))
     _start_exs_by = dict(_loaded_ckpt.get('examples_by', {}))
     for k in ('clock_hz', 'ctx_tau', 'vision_hz', 'audio_hz', 'inner_voice', 'min_p', 'top_k', 'voice_drop', 'caption_feed', 'text_feed', 'speech_delay', 'fifo3', 'nul_weight', 'loss_norm', 'speech_align', 'align_min', 'write_surprise', 'up_ema'):     # restored unless given
         if getattr(args, k) is None:
@@ -8247,7 +8250,7 @@ def _save(i, n_examples):
         return
     log = open(args.log).read() if os.path.exists(args.log) else ''
     torch.save({'saved_args': vars(args), 'state_dict': model.state_dict(), 'log': log,
-                'step': i, 'examples': n_examples, 'examples_by': dict(_n_by),
+                'step': i, 'examples': n_examples, 'examples_by': dict(_n_by), 'tokens': n_tokens,
                 'lr': optimizer.param_groups[0]['lr'],
                 'optimizer': optimizer.state_dict(), 'opt_names': _opt_names(),
                 'win_optimizer': _win_opt.state_dict() if _win_opt is not None else None,
@@ -8748,7 +8751,7 @@ _nul_col = {n: 'nul' if sum(m in _VIDEO_DATASETS for m in _rows_of) == 1 else f'
             for n in _rows_of if n in _VIDEO_DATASETS}      # STEP column: loss_nul when one
 if carr and _NUL_ID is not None:
     carr.update({c: [] for c in _nul_col.values()})
-i, n_examples = _start_step, _start_exs
+i, n_examples, n_tokens = _start_step, _start_exs, _start_toks
 _n_by = {n: int(_start_exs_by.get(n, 0)) for n in _rows_of}     # examples trained per corpus
 # STEP columns ex_t/ep_t (text corpora pooled) and ex_i/ep_i (image corpora pooled): examples
 # trained and passes over the data (examples / corpus size; a streaming text corpus, whose
@@ -8901,6 +8904,7 @@ try:
         if args.doc_log:
             _doc_log_step(i, x_one, flag_list)
         n_examples += sum(flag_list)
+        n_tokens += len(x_list)          # one token per row per step
         for n, rows in _rows_of.items():
             _n_by[n] += sum(flag_list[r] for r in rows)
         x = torch.tensor(x_list, dtype=torch.long).to(args.device)
@@ -9175,7 +9179,7 @@ try:
                 line += ' dff_mean {:12.5f} dff_std {:12.5f} dff_max {:11.3f}'.format(
                     flat.mean().item(), flat.std().item(), flat.abs().max().item())
                 del flat     # a view of this state: holding it would keep it alive past the next window
-            line += _ex_ep()
+            line += _ex_ep() + f' tok_t {n_tokens / 1e6:8.2f}M'
             if model.learn:
                 line += ' win ' + '/'.join(f'{w:.1f}' for w in model.windows)
             if model.gate_stats is not None:
