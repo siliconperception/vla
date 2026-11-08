@@ -948,11 +948,13 @@ parser.add_argument('--eval_dump',  default=None, metavar='FILE',
 parser.add_argument('--vis',        default=False, action='store_true',
                     help='live generation view: layer output and registers (std across '
                          'channels per grid cell), --write_gate rates (mean across channels) and '
-                         'P(next token); space pauses / resumes, x exits')
+                         'P(next token) with --vis_ptok; space pauses / resumes, x exits')
+parser.add_argument('--vis_ptok',   default=False, action=argparse.BooleanOptionalAction,
+                    help='--vis: also show the P(next token) map (the whole vocabulary as a grid)')
 parser.add_argument('--vis_alt',    default='default', choices=['default', 'alt1'],
                     help='--vis layout: default, a column per --convdelta block with four rows, its input x, '
                          'u after the convs, y the memory read\'s 1x1 out and the output x\' (std across '
-                         'channels per cell, see --vis_metric, as in vla_v594.svg), and P(next token); '
+                         'channels per cell, see --vis_metric, as in vla_v594.svg), and P(next token) with --vis_ptok; '
                          'alt1, the full view (outputs, registers, ctx_cat grid, memories)')
 parser.add_argument('--vis_metric', default='dev', choices=['dev', 'std'],
                     help='--vis_alt default maps per cell: dev, the RMS over channels of the change from '
@@ -5542,15 +5544,17 @@ if args.vis and args.vis_alt == 'default' and model.cd is not None:
             return x, st
         blk.step = _blk_keep
     fig = plt.figure(figsize=(max(7.5, _VIS_WIN * 7 * 0.602 / 72 * 1.05), 7.6))
-    gs = fig.add_gridspec(4, nb_ + 1, width_ratios=[1] * nb_ + [2], top=0.88, bottom=0.04,
+    _pt = args.vis_ptok
+    gs = fig.add_gridspec(4, nb_ + _pt, width_ratios=[1] * nb_ + [2] * _pt, top=0.88, bottom=0.04,
                           left=0.03, right=0.99, hspace=0.30, wspace=0.08)
     axs = [fig.add_subplot(gs[r, i]) for r in range(4) for i in range(nb_)]
-    ax_p = fig.add_subplot(gs[:, nb_])
+    ax_p = fig.add_subplot(gs[:, nb_]) if _pt else None
     for r, nm in enumerate(_VIS_ROWS):
         for i in range(nb_):
             axs[r * nb_ + i].set_title(f'block {i + 1}  {nm}', fontsize=8, pad=2)
-    ax_p.set_title('P(next token)', fontsize=9, pad=3)
-    for ax in axs + [ax_p]:
+    if ax_p is not None:
+        ax_p.set_title('P(next token)', fontsize=9, pad=3)
+    for ax in axs + [ax_p] * _pt:
         ax.set_xticks([])
         ax.set_yticks([])
     fig.text(0.02, 0.008, (f'maps: std across channels at each of the {model.S}x{model.S} positions'
@@ -5598,12 +5602,13 @@ if args.vis and args.vis_alt == 'default' and model.cd is not None:
         pg = np.zeros(PR * PC, dtype=np.float32)
         pg[:model.vocab] = prob.cpu().numpy()
         pg = pg.reshape(PR, PC)
-        if img_p is None:
-            img_p = ax_p.matshow(pg, cmap=args.cmap)
-            ax_p.set_xticks([])
-            ax_p.set_yticks([])
-        img_p.set_data(pg)
-        img_p.set_clim(0, float(pg.max()) or 1e-9)
+        if ax_p is not None:
+            if img_p is None:
+                img_p = ax_p.matshow(pg, cmap=args.cmap)
+                ax_p.set_xticks([])
+                ax_p.set_yticks([])
+            img_p.set_data(pg)
+            img_p.set_clim(0, float(pg.max()) or 1e-9)
         ticker = ''.join(DOT_TEXT if c in '$\\' else c for c in _render(cur))[-_VIS_WIN:]
         header.set_text(f'step {nstep:8d}  out_std ' + ' '.join(f'{float(b_["x′"].std()):.3f}' for b_ in _bk) +
                         f'  p_max {float(prob.max()):5.3f}  min_p {args.min_p:.4f}  T {args.temperature:.2f}'
@@ -5651,20 +5656,22 @@ if args.vis:
     at = model.attn
     nb = 2 if at is not None else 0                  # --attn: ring and attention strips below
     fig = plt.figure(figsize=(max(7.5, _VIS_WIN * 7 * 0.602 / 72 * 1.05), 2.6 * rows + 1.8 * nb + 1.2))
-    gs = fig.add_gridspec(rows + nb, 2, width_ratios=[1, 1.5], height_ratios=[1] * rows + [0.8] * nb,
+    _pt = args.vis_ptok
+    _rc = 1 if (_pt or _image is not None) else 0    # the right column: the image and / or P(next token)
+    gs = fig.add_gridspec(rows + nb, 1 + _rc, width_ratios=[1] + [1.5] * _rc, height_ratios=[1] * rows + [0.8] * nb,
                           top=0.84 if not nb else 0.88, bottom=0.04, left=0.03, right=0.98,
                           hspace=0.35, wspace=0.10)
     axes = [fig.add_subplot(gs[r, 0]) for r in range(rows)]
     if _image is not None:                           # the prompt image above P(next token)
         ki = max(1, rows // 3)
-        ax_i = fig.add_subplot(gs[:ki, 1])
+        ax_i = fig.add_subplot(gs[:ki if _pt else rows, 1])
         ax_i.imshow(_image.permute(1, 2, 0).numpy())
         ax_i.set_axis_off()
         ax_i.set_title(f'image  {os.path.basename(args.image)}  '
                        f'({_image.shape[2]}x{_image.shape[1]})', fontsize=9, pad=3)
-        ax_p = fig.add_subplot(gs[ki:rows, 1])
+        ax_p = fig.add_subplot(gs[ki:rows, 1]) if _pt else None
     else:
-        ax_p = fig.add_subplot(gs[:rows, 1])
+        ax_p = fig.add_subplot(gs[:rows, 1]) if _pt else None
     for r, ax in enumerate(axes):
         if cdv and r >= ci:
             ax.set_title(['ctx_cat grid (std over channels)',
@@ -5684,7 +5691,8 @@ if args.vis:
                      (f'L{L + 1} ' if nup else '') + f'DFF {k + 1}: ' +
                      ('copy (residual of the others)' if w == 1 and model.K > 1 else
                       f'{w:g}-token window'), fontsize=9, pad=3)
-    ax_p.set_title('P(next token)', fontsize=9, pad=3)
+    if ax_p is not None:
+        ax_p.set_title('P(next token)', fontsize=9, pad=3)
     ax_ring = ax_att = None
     if at is not None:
         at.keep = True
@@ -5694,7 +5702,7 @@ if args.vis:
         ax_att = fig.add_subplot(gs[rows + 1, :])
         ax_att.set_title(f'recall attention this tick: {at.H} heads over the {at.W} slots, '
                          f'sink at the far right', fontsize=9, pad=3)
-    for ax in axes + [ax_p] + [x for x in (ax_ring, ax_att) if x is not None]:
+    for ax in axes + [ax_p] * _pt + [x for x in (ax_ring, ax_att) if x is not None]:
         ax.set_xticks([])
         ax.set_yticks([])
     fig.text(0.03, 0.008, f'maps: std across the {model.n_hidden} channels at each of the '
@@ -5767,12 +5775,13 @@ if args.vis:
         pg = np.zeros(PR * PC, dtype=np.float32)
         pg[:model.vocab] = prob.cpu().numpy()
         pg = pg.reshape(PR, PC)
-        if img_p is None:
-            img_p = ax_p.matshow(pg, cmap=args.cmap)
-            ax_p.set_xticks([])
-            ax_p.set_yticks([])
-        img_p.set_data(pg)
-        img_p.set_clim(0, float(pg.max()) or 1e-9)
+        if ax_p is not None:
+            if img_p is None:
+                img_p = ax_p.matshow(pg, cmap=args.cmap)
+                ax_p.set_xticks([])
+                ax_p.set_yticks([])
+            img_p.set_data(pg)
+            img_p.set_clim(0, float(pg.max()) or 1e-9)
         extra = ''
         if at is not None:
             ring = dff[0, model.ring_off:].reshape(at.W, at.E).T.float().cpu().numpy()
