@@ -1,6 +1,6 @@
 """Draw docs/figures/vla_<model>.svg: one clock tick of a VLA model, 16:9 (1920 x 1080).
 
-usage: python tools/figure_vla.py [--model v498|v499|v502|v505|v511|v531|v533|v536|v538|v540|v541|v552|v564|v569|v579|v583|v592|v594|v597|v624|v626|v646] [--out OUT]
+usage: python tools/figure_vla.py [--model v498|v499|v502|v505|v511|v531|v533|v536|v538|v540|v541|v552|v564|v569|v579|v583|v592|v594|v597|v624|v626|v646|v650] [--out OUT]
 
 v498: recurrent CNN + two order-2 Legendre memories (4096, 64 ticks) + copy + recall attention, never
 reset. v499: no registers, the recall attention's ring is the whole state, reset at each example.
@@ -37,11 +37,14 @@ v624: v592 without BatchNorm (--cd_no_bn): each block u = x + 1x1(3 x (conv 3x3 
 v626: v624 continued (AdamW lr 1e-3, weight decay 0.1), the same model as v624.
 v646: v624 on a 9x9 grid with 5 convs per block (--context 9 --cd_convs 5), a causal depthwise 3x3 conv over
 4 ticks on q, k, v (--cd_qkv_conv 3x3x4), the decoder 3x3 convs 9->7->5->3->1 with a ReLU after all but the
-last (--dec_tree_kernels 3,3,3,3 --dec_relu), no weight decay, 16 rows."""
+last (--dec_tree_kernels 3,3,3,3 --dec_relu), no weight decay, 16 rows.
+v650: v646 with a BatchNorm before every ReLU, in the blocks (--no-cd_no_bn) and the decoder (--dec_bn), base
+windows starting 1 … 256 ticks (--cd_windows 1:256), the q, k, v conv as an nn.Conv3d (the same function)."""
 import argparse
+import re
 
 ap = argparse.ArgumentParser()
-ap.add_argument('--model', default='v498', choices=('v498', 'v499', 'v502', 'v505', 'v511', 'v531', 'v533', 'v536', 'v538', 'v540', 'v541', 'v552', 'v564', 'v569', 'v579', 'v583', 'v592', 'v594', 'v597', 'v624', 'v626', 'v646'))
+ap.add_argument('--model', default='v498', choices=('v498', 'v499', 'v502', 'v505', 'v511', 'v531', 'v533', 'v536', 'v538', 'v540', 'v541', 'v552', 'v564', 'v569', 'v579', 'v583', 'v592', 'v594', 'v597', 'v624', 'v626', 'v646', 'v650'))
 ap.add_argument('--out', default=None)
 a = ap.parse_args()
 NAME = a.model                            # the title and file name
@@ -49,9 +52,12 @@ if a.model == 'v541':
     a.model = 'v540'                      # same model as v540
 if a.model in ('v594', 'v597'):
     a.model = 'v592'                      # same model as v592
+V650 = a.model == 'v650'                  # v646 + BatchNorm before every ReLU, windows 1 … 256
+if V650:
+    a.model = 'v646'
 V646 = a.model == 'v646'                  # 9x9, 5 convs, q/k/v conv, ReLU decoder tree
-NOBN = a.model in ('v624', 'v626', 'v646')   # v592 without BatchNorm (--cd_no_bn)
-if NOBN:
+NOBN = a.model in ('v624', 'v626', 'v646') and not V650   # v592 without BatchNorm (--cd_no_bn)
+if NOBN or V650:
     a.model = 'v592'
 LMU = a.model == 'v498'                   # Legendre memories + copy
 CASC = a.model == 'v502'                  # EMA + residual copy, RMSnorm reads
@@ -1109,6 +1115,9 @@ def draw_v536():
                .replace(' + BN + ', ' + ').replace(' · BN · ', ' · ') for o in out]
     if NAME == 'v626':                    # trained 64 rows at a time
         out[:] = [o.replace('(32 rows)', '(64 rows)') for o in out]
+    if V650:                              # BatchNorm before the decoder ReLUs, base windows from 1 … 256
+        out[:] = [re.sub(r'(\d→\d) · ReLU<', r'\1 · BN · ReLU<', o).replace('ReLU after all but the last', 'BatchNorm + ReLU after all but the last')
+                  .replace('2 … 16,384 ticks', '1 … 256 ticks') for o in out]
     if V646:                              # a 9x9 grid, 16 rows
         out[:] = [o.replace('(32 rows)', '(16 rows)').replace('7×7', '9×9').replace('49×6×32×32', '81×6×32×32')
                   .replace('49 × 6 × 32×32 = 301,056', '81 × 6 × 32×32 = 497,664')
