@@ -4948,6 +4948,34 @@ def _model_graph(model):
 _GRAPH_WIDTH = 270                # INFO model-graph lines fit the terminal
 
 
+def _memory_summary(model):
+    """MEMARCH lines: the ConvDelta memories' size and capacity, and the whole fixed state."""
+    if model.cd is None:
+        return []
+    P = model.S * model.S
+    total = model.new_state(1, 'cpu').numel()
+    mem = fifo = other = heads = 0
+    for b in model.cd:
+        m_ = P * b.H * b.d * b.d
+        q_ = P * b.qc_ch
+        mem, fifo, heads = mem + m_, fifo + q_, heads + b.H
+        other += P * b.state_ch - m_ - q_
+    b = model.cd[0]
+    out = [f'MEMARCH {len(model.cd)} blocks x {P} positions ({model.S}x{model.S}) x {b.H} heads = '
+           f'{len(model.cd) * P * b.H:,} memories of {b.d}x{b.d}: {mem:,} values '
+           f'({mem // len(model.cd):,} per block), each holding up to {b.d} orthogonal key->value pairs '
+           f'({len(model.cd) * P * b.H * b.d:,} in all); per tick {len(model.cd) * P * b.H:,} rank-1 writes and reads']
+    win = [w for bl in model.cd for w in (bl.tau_c or bl.tau or (1 / bl.lam.detach().exp()).tolist())]
+    out.append(f'MEMARCH windows {min(win):g} .. {max(win):g} ticks over the {heads} heads'
+               + (f' (fixed bases; the gate moves each within x/÷{b.band:g}: '
+                  f'{min(win) / b.band:g} .. {max(win) * b.band:g})' if b.band and b.tau_c else
+                  ' (fixed)' if b.tau else ' (base windows, learned)' if b.lam.requires_grad else ' (base windows)'))
+    out.append(f'MEMARCH state {total:,} values ({total * 4 / 2**20:.1f} MiB at fp32): memories {mem:,}'
+               + (f', q,k,v FIFO {fifo:,} ({b.qc_t - 1} past ticks x {3 * b.H * b.d} x {P})' if fifo else '')
+               + (f', other {total - mem - fifo:,}' if total - mem - fifo else ''))
+    return out
+
+
 def _param_summary(model):
     """Trainable/frozen parameter counts per top-level module, and the total."""
     seen, rows = set(), []
@@ -4979,6 +5007,8 @@ if not _ONESHOT or args.verbose:
         print(line)
         _emit(f'INFO {line}', stdout=False)
     for line in _param_summary(model):
+        _emit(line)
+    for line in _memory_summary(model):
         _emit(line)
 
 # ── generation helpers ────────────────────────────────────────────────────────
