@@ -555,6 +555,10 @@ parser.add_argument('--streaming',  default=False, action='store_true')
 parser.add_argument('--shuffle',    default=True, action=argparse.BooleanOptionalAction,
                     help='--no-shuffle reads the corpus in file order; with --seed and '
                          '--workers 1 that makes two runs bit-identical')
+parser.add_argument('--full_shuffle', default=False, action=argparse.BooleanOptionalAction,
+                    help='a true permutation of a large on-disk corpus each epoch (random access: put its '
+                         'arrow cache on an SSD), instead of 64 shards read in turn through a 10,000-'
+                         'document buffer')
 parser.add_argument('--workers',    default=12,   type=int, help='clip-builder threads')
 parser.add_argument('--batch',      default=250,  type=int, help='independent document streams')
 # optimization
@@ -3776,8 +3780,8 @@ def _make_iter(ds, streaming, seed, shuffle=True):
         return iter(split)
     if streaming:
         return iter(split.shuffle(buffer_size=10000, seed=seed))
-    if (getattr(split, 'dataset_size', None) or 1 << 31) <= 1 << 30:
-        return iter(split.shuffle(seed=seed))       # small: a true permutation
+    if args.full_shuffle or (getattr(split, 'dataset_size', None) or 1 << 31) <= 1 << 30:
+        return iter(split.shuffle(seed=seed, keep_in_memory=True))   # a true permutation (small, or --full_shuffle)
     # large and on disk: never Dataset.shuffle() (random access across the arrow file reads
     # ~400x the data); read shards sequentially through a shuffle buffer instead
     return iter(split.to_iterable_dataset(num_shards=64).shuffle(buffer_size=10000, seed=seed))
