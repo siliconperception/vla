@@ -4695,9 +4695,46 @@ def _grid_map_row(model, G, C):
                    (model.cd_G.numel() + model.cd_P.numel() if gp else 0), fr=0)
 
 
+def _op_repr(m):
+    """A module as PyTorch prints it, less the arguments left at their defaults (stride 1,
+    eps 1e-5, momentum 0.1, ...): e.g. Conv2d(256, 256, kernel_size=(3, 3), padding=(1, 1))."""
+    import inspect
+    try:
+        sig = inspect.signature(type(m).__init__).parameters
+        parts, depth, cur = [], 0, ''
+        for ch in m.extra_repr():                    # split on the top-level commas only
+            depth += ch in '([{'
+            depth -= ch in ')]}'
+            if ch == ',' and depth == 0:
+                parts.append(cur.strip())
+                cur = ''
+            else:
+                cur += ch
+        if cur.strip():
+            parts.append(cur.strip())
+        keep = []
+        for part in parts:
+            k, eq, v = part.partition('=')
+            d = sig.get(k.strip()) if eq else None
+            if d is not None and d.default is not inspect.Parameter.empty:
+                dv = d.default
+                same = {repr(dv), str(dv)}
+                if isinstance(dv, int) and not isinstance(dv, bool):
+                    same |= {str((dv,) * n) for n in (1, 2, 3)}
+                if v.strip() in same:
+                    continue
+            if k.strip() == 'bias' and getattr(m, 'affine', True) is False:
+                continue                             # (a BatchNorm with no affine has no bias either)
+            keep.append(part)
+        return f'{type(m).__name__}({", ".join(keep)})'
+    except (TypeError, ValueError):
+        return type(m).__name__
+
+
 def _model_graph(model):
     """One token step as a table, modules in execution order (conv rows absorb their
-    BN/ReLU/pool), with marker rows for the tensor ops between modules."""
+    BN/ReLU/pool), with marker rows for the tensor ops between modules. The op column gives
+    each module as PyTorch prints it, with its non-default arguments (_op_repr)."""
     names = {m: n for n, m in model.named_modules()}
     rows = []
 
@@ -4710,11 +4747,10 @@ def _model_graph(model):
         tr = sum(p.numel() for p in m.parameters(recurse=False) if p.requires_grad)
         fr = sum(p.numel() for p in m.parameters(recurse=False) if not p.requires_grad)
         if isinstance(m, (nn.BatchNorm2d, nn.BatchNorm1d, nn.ReLU, nn.AvgPool2d)) and rows:
-            rows[-1]['op'] += '+' + type(m).__name__.replace('BatchNorm2d', 'BN').replace('BatchNorm1d', 'BN')
+            rows[-1]['op'] += ' + ' + _op_repr(m)
             rows[-1]['out'] = shape(out)
             return
-        op = (f'Conv2d {m.kernel_size[0]}x{m.kernel_size[1]}' if isinstance(m, nn.Conv2d)
-              else f'Conv1d {m.kernel_size[0]}' if isinstance(m, nn.Conv1d) else type(m).__name__)
+        op = _op_repr(m)
         rows.append(dict(name=n, op=op, inp=shape(inp), out=shape(out), tr=tr, fr=fr))
 
     hooks = [m.register_forward_hook(hook) for n, m in model.named_modules()
@@ -4744,7 +4780,7 @@ def _model_graph(model):
             b = cd[int(mg.group(1))]
             Q = 3 * b.H * b.d
             out.append(dict(name=f'cd.{mg.group(1)}.qc <- QKV[t-1..t-{b.qc_t - 1}]' if b.qc_t > 1 else f'cd.{mg.group(1)}.qc',
-                            op=f'{b.qc}, causal in ticks, residual add',
+                            op=f'{_op_repr(b.qc)}, causal in ticks, residual add',
                             inp=f'{Q}x{b.qc_t}x{model.S}x{model.S}', out=f'{Q}x{model.S}x{model.S}',
                             tr=b.qc.weight.numel() + b.qc.bias.numel(), fr=0))
         if mb and mb.group(2) == 'mix.0' and cd[int(mb.group(1))].taps:   # --convdelta: the time conv, then the convs
