@@ -1,27 +1,31 @@
 {
- "version": "v626",
- "step": 6160000,
- "rows": 64,
- "fineweb": 4.21782,
- "babylm": 3.766849,
- "blimp": 74.6,
- "comve": 68.6,
- "runaway": 2,
- "min_p": 0.0041,
+ "version": "v657",
+ "step": 3700000,
+ "rows": 16,
+ "fwedu": 4.242362,
+ "fineweb": 4.519293,
+ "babylm": 3.991235,
+ "blimp": 71.8,
+ "comve": 66.8,
+ "runaway": 3,
+ "min_p": 0.0067,
  "pythia70m": {
-  "step128": {
-   "fw": 7.4203,
-   "baby": 6.8661,
-   "blimp": 51.8,
-   "comve": 56.5
+  "step16": {
+   "fwedu": 10.4888,
+   "fw": 10.489,
+   "baby": 10.2853,
+   "blimp": 53.5,
+   "comve": 54.8
   },
-  "step256": {
-   "fw": 6.3546,
-   "baby": 5.718,
-   "blimp": 51.4,
-   "comve": 57.1
+  "step32": {
+   "fwedu": 9.7928,
+   "fw": 9.8234,
+   "baby": 9.4483,
+   "blimp": 52.0,
+   "comve": 54.0
   },
   "main": {
+   "fwedu": 3.5786,
    "fw": 3.7312,
    "baby": 3.2496,
    "blimp": 75.7,
@@ -30,14 +34,14 @@
  },
  "samples": [
   {
-   "prompt": "My grandmother's recipe for apple pie starts with",
-   "text": "a touch of honey and a pint of pecans."
+   "prompt": "The best way to learn a new language is",
+   "text": "to change grammar and create a new language which will bring it along the way."
   },
   {
    "prompt": "The history of the bicycle began in",
-   "text": "May after school which occurred Oct. 1. The purpose was to explore some of its neighbourhoods and events."
+   "text": "1972, when the first generation of wheelcar engine sold home for the first time, which after the first generation of electric cars became an electrical power."
   }
  ],
- "tokens": 394240000,
- "updates": 24062
+ "tokens": 59200000,
+ "updates": 14453
 }

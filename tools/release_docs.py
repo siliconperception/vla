@@ -19,11 +19,11 @@ r = json.load(open(os.path.join(SRC, 'release.json')))
 _tok = r.get('tokens') or r['step'] * r['rows']    # (tokens: when the rows per step changed during training)
 v = {'VERSION': r['version'], 'STEP': f'{r["step"]:,}', 'TOKENS': f'{_tok / 1e6:,.{1 if _tok < 1e9 else 0}f} M',
      'UPDATES': f'{r.get("updates", 0):,}',
-     'FW': f'{r["fineweb"]:.3f}', 'BABY': f'{r["babylm"]:.3f}', 'BLIMP': f'{r["blimp"]:.1f}',
+     'FW': f'{r["fineweb"]:.3f}', 'FWEDU': f'{r.get("fwedu", 0):.3f}', 'BABY': f'{r["babylm"]:.3f}', 'BLIMP': f'{r["blimp"]:.1f}',
      'COMVE': f'{r["comve"]:.1f}', 'MINP': f'{r["min_p"]:.4f}', 'RUNAWAY': f'{r["runaway"]:g} %',
-     **{f'P{k.upper()}_{f.upper()}': (f'{r["pythia70m"][k][f]:.3f}' if f in ('fw', 'baby') else
+     **{f'P{k.upper()}_{f.upper()}': (f'{r["pythia70m"][k][f]:.3f}' if f in ('fw', 'fwedu', 'baby') else
                                        f'{r["pythia70m"][k][f]:.1f}')
-        for k in r['pythia70m'] for f in ('fw', 'baby', 'blimp', 'comve')},
+        for k in r['pythia70m'] for f in r['pythia70m'][k]},
      'SAMPLES_MD': '\n\n'.join(f'> **{s["prompt"]}** {s["text"]}' for s in r['samples']),
      'SAMPLES_HTML': '\n  '.join(f'<blockquote><b>{html.escape(s["prompt"])}</b> {html.escape(s["text"])}'
                                  '</blockquote>' for s in r['samples'])}

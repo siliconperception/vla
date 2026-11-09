@@ -1,6 +1,6 @@
 """Draw docs/figures/vla_<model>.svg: one clock tick of a VLA model, 16:9 (1920 x 1080).
 
-usage: python tools/figure_vla.py [--model v498|v499|v502|v505|v511|v531|v533|v536|v538|v540|v541|v552|v564|v569|v579|v583|v592|v594|v597|v624|v626|v646|v650] [--out OUT]
+usage: python tools/figure_vla.py [--model v498|v499|v502|v505|v511|v531|v533|v536|v538|v540|v541|v552|v564|v569|v579|v583|v592|v594|v597|v624|v626|v646|v650|v657] [--out OUT]
 
 v498: recurrent CNN + two order-2 Legendre memories (4096, 64 ticks) + copy + recall attention, never
 reset. v499: no registers, the recall attention's ring is the whole state, reset at each example.
@@ -39,12 +39,15 @@ v646: v624 on a 9x9 grid with 5 convs per block (--context 9 --cd_convs 5), a ca
 4 ticks on q, k, v (--cd_qkv_conv 3x3x4), the decoder 3x3 convs 9->7->5->3->1 with a ReLU after all but the
 last (--dec_tree_kernels 3,3,3,3 --dec_relu), no weight decay, 16 rows.
 v650: v646 with a BatchNorm before every ReLU, in the blocks (--no-cd_no_bn) and the decoder (--dec_bn), base
-windows starting 1 … 256 ticks (--cd_windows 1:256), the q, k, v conv as an nn.Conv3d (the same function)."""
+windows starting 1 … 256 ticks (--cd_windows 1:256), the q, k, v conv as an nn.Conv3d (the same function).
+v657: v650 with fixed base windows, 1 … 1,024 ticks log-spaced over all 42 heads (--cd_tau), the gate moving
+each within x/÷4 (--cd_band 4), every document reset (--reset_prob 1), AdamW weight decay 0.01 (none on the
+gates), trained on FineWeb-Edu."""
 import argparse
 import re
 
 ap = argparse.ArgumentParser()
-ap.add_argument('--model', default='v498', choices=('v498', 'v499', 'v502', 'v505', 'v511', 'v531', 'v533', 'v536', 'v538', 'v540', 'v541', 'v552', 'v564', 'v569', 'v579', 'v583', 'v592', 'v594', 'v597', 'v624', 'v626', 'v646', 'v650'))
+ap.add_argument('--model', default='v498', choices=('v498', 'v499', 'v502', 'v505', 'v511', 'v531', 'v533', 'v536', 'v538', 'v540', 'v541', 'v552', 'v564', 'v569', 'v579', 'v583', 'v592', 'v594', 'v597', 'v624', 'v626', 'v646', 'v650', 'v657'))
 ap.add_argument('--out', default=None)
 a = ap.parse_args()
 NAME = a.model                            # the title and file name
@@ -52,6 +55,9 @@ if a.model == 'v541':
     a.model = 'v540'                      # same model as v540
 if a.model in ('v594', 'v597'):
     a.model = 'v592'                      # same model as v592
+V657 = a.model == 'v657'                  # v650 + fixed base windows 1 … 1,024 (x/÷4 band), every document reset
+if V657:
+    a.model = 'v650'
 V650 = a.model == 'v650'                  # v646 + BatchNorm before every ReLU, windows 1 … 256
 if V650:
     a.model = 'v646'
@@ -1066,7 +1072,7 @@ def draw_v536():
     line([(RX + 110, 490), (RX + 140, 490)])
     line([(RX + 220, 490), (AX, 490), (AX, CYb + 18)])
     text(AX + 6, 420, 'y', 13, anchor='start', weight='bold')
-    if not MO and not V2:                 # (v583, v592: never reset)
+    if V657 or (not MO and not V2):       # (v583, v592: never reset)
         box(800 + OX, 790, 190, 50, '#ffffff', ['document start', 'S zeroed' if NF or NT else 'S and the FIFO zeroed'],
             size=11, dash=True)
         line([(895 + OX, 790), (895 + OX, 750)], dash=True, color='#757575')
@@ -1118,6 +1124,15 @@ def draw_v536():
     if V650:                              # BatchNorm before the decoder ReLUs, base windows from 1 … 256
         out[:] = [re.sub(r'(\d→\d) · ReLU<', r'\1 · BN · ReLU<', o).replace('ReLU after all but the last', 'BatchNorm + ReLU after all but the last')
                   .replace('2 … 16,384 ticks', '1 … 256 ticks') for o in out]
+    if V657:                              # fixed base windows in a x/÷4 band, every document reset, FineWeb-Edu
+        out[:] = [o.replace('base windows exp(−λ), learned, starting log-spaced over the heads: 1 … 256 ticks',
+                            'fixed base windows w: 1 … 1,024 ticks, log-spaced over all 7 × 6 heads, the gate moving each within ×/÷4')
+                  .replace('decay exp(−2 exp(λ) σ(·))', 'window w · 4^(−tanh(·))')
+                  .replace('the state never reset · AdamW, no weight decay', 'every document reset · AdamW, weight decay 0.01')
+                  .replace('(S: never reset; it carries across documents)', '(S and the FIFO: reset at each document start)')
+                  .replace('α = exp(−2 exp(λ) σ(·)), λ per head', 'α = exp(−4^tanh(·) / w), w fixed per head')
+                  .replace('>S zeroed<', '>S and the FIFO zeroed<')
+                  for o in out]
     if V646:                              # a 9x9 grid, 16 rows
         out[:] = [o.replace('(32 rows)', '(16 rows)').replace('7×7', '9×9').replace('49×6×32×32', '81×6×32×32')
                   .replace('49 × 6 × 32×32 = 301,056', '81 × 6 × 32×32 = 497,664')

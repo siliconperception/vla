@@ -10,33 +10,36 @@ where this text and the code disagree, the code is right and this text is a bug.
 
 | Symbol | Value | Meaning |
 |---|---|---|
-| S | 7 | grid side (positions P = S × S = 49) |
+| S | 9 | grid side (positions P = S × S = 81) |
 | C | 256 | channels of the working grid x, through every block |
 | B | 7 | ConvDelta blocks, in series |
 | H | 6 | memory heads per block at each grid position |
 | d | 32 | key, query and value width of a head (each memory is d × d) |
-| n | 3 | 3×3 convs per block |
+| n | 5 | 3×3 convs per block |
+| T_q | 4 | ticks spanned by the causal conv on q, k, v (this tick and the 3 before it) |
 | E | 256 | token embedding width (pythia-31m) |
 | V | 50,304 | vocabulary (pythia-31m BPE), plus `<NUL>` |
 | f | 25 Hz | tick rate in training; one token per tick |
 
 ## State
 
-Everything carried from one tick to the next, 2,107,392 values in all, fixed in size:
+Everything carried from one tick to the next, 4,463,424 values in all, fixed in size:
 
 | Part | Shape | Values |
 |---|---|---|
-| Per block b = 1 … 7: memories M_b | 49 positions × 6 heads × 32 × 32 | 301,056 |
-| **Total** | 7 × 301,056 | **2,107,392** |
+| Per block b = 1 … 7: memories M_b | 81 positions × 6 heads × 32 × 32 | 497,664 |
+| Per block b = 1 … 7: q, k, v FIFO F_b | the last 3 ticks × 576 channels × 81 positions | 139,968 |
+| **Total** | 7 × 637,632 | **4,463,424** |
 
-The memories are the whole state: there is no token history and no other register. The state never grows. At
-inference it can be set to zero at the start of an example (a document, opened by `<NUL>`), and the evaluations
-below do so, but it never has to be: in training it is never reset (see Training), as a robot perceives
-continuously, so the model has learned to let go of an old context on its own.
+There is no token history and no other register. The state never grows. It is set to zero at the start of every
+example (a document, opened by `<NUL>`), in training and in evaluation: the memories M and the FIFOs F are zeroed
+together. The BatchNorm statistics (below) are fixed constants at inference, not state.
 
 ## Notation
 
 - RMS(z): z / √(mean over channels of z² + ε), ε = 1e-12, for the token embedding.
+- BN(z): per channel c, (z_c − μ_c) / √(σ²_c + 1e-5), with μ and σ² fixed running statistics gathered in
+  training (a BatchNorm with no learned scale or shift).
 - σ: the logistic sigmoid. ⊙: elementwise product. Conv k×k: zero padding unless "unpadded" is stated.
 - Every 1×1 conv acts at each grid position separately; only the k×k convs (k ≥ 3) mix neighbouring positions.
 
@@ -48,27 +51,46 @@ sampled token.
 ### 1. Input grid
 
 1. **Embed.** e = RMS(Embed(w_t)), with the frozen pythia-31m embedding (V → E = 256); e = 0 for `<NUL>`.
-2. **Replicate.** The same vector e at all 49 grid positions.
+2. **Replicate.** The same vector e at all 81 grid positions.
 3. **Mix channels.** x = Conv1×1_in(e), 256 → 256, at each position (so every position starts out equal; the
    3×3 convs' zero padding is what first tells the positions apart).
 
-Only the current token enters. Everything the model knows about earlier tokens is in its memories.
+Only the current token enters. Everything the model knows about earlier tokens is in its state.
 
 ### 2. Seven ConvDelta blocks
 
-Each block b = 1 … 7 maps x (256 × 7 × 7) to x′ of the same shape, using and updating its memories M_b. All seven
-have this structure, each with its own weights:
+Each block b = 1 … 7 maps x (256 × 9 × 9) to x′ of the same shape, using and updating its memories M_b and its
+FIFO F_b. All seven have this structure, each with its own weights:
 
-1. **Spatial mixing.** u = x + Conv1×1_mix(Z(x)), where Z is 3 × [Conv3×3 (256 → 256) → ReLU] (no normalization) and
-   Conv1×1_mix (256 → 256) is linear, initialized to the identity. The residual goes around all three convs and
+1. **Spatial mixing.** u = x + Conv1×1_mix(Z(x)), where Z is 5 × [Conv3×3 (256 → 256) → BN → ReLU] and
+   Conv1×1_mix (256 → 256) is linear, initialized to the identity. The residual goes around all five convs and
    the 1×1, so u can carry signed values.
 2. **Projections**, at each position p, from u:
-   - q, k, v = Conv1×1(u), 256 → 3 × 6 × 32: one query, key and value of width 32 per head; q and k are scaled
-     to unit length per head (L2).
-   - β = σ(g_β), α = exp(−2 · e^{λ_h} · σ(g_α)), with (g_β, g_α) = Conv1×1(u), 256 → 2 × 6 (weights and bias
-     initialized to 0). β ∈ (0, 1) is the write strength. α ∈ (0, 1) is the decay; λ_h is a learned scalar per
-     head, initialized so that e^{−λ_h} (the head's base window, in ticks) is log-spaced from 2 to 16,384 over
-     the 6 heads.
+   - z_t = Conv1×1_qkv(u), 256 → 576 = 3 × 6 × 32.
+   - A causal depthwise conv over this tick and the last three: [q, k, v] = z_t + c + Σ_{j=0…3} K_j ∗ z_{t−j},
+     where each of the 576 channels has its own 3×3 kernel K_j per lag j (zero padded on the grid) and its own
+     bias c, all initialized to 0. z_{t−1}, z_{t−2}, z_{t−3} come from the FIFO F_b, which then shifts in z_t.
+     A lag never reaches back past the document start (the FIFO is zero there).
+   - The 576 channels split into one query, key and value of width 32 per head; q and k are scaled to unit
+     length per head (L2).
+   - β = σ(g_β) and α = exp(−4^{tanh(g_α)} / w_{b,h}), with (g_β, g_α) = Conv1×1(u), 256 → 2 × 6 (weights and
+     bias initialized to 0). β ∈ (0, 1) is the write strength. α ∈ (0, 1) is the decay: the head forgets over
+     a window of w_{b,h} · 4^{−tanh(g_α)} ticks, which the input can move anywhere between w/4 and 4w. The base
+     windows w_{b,h} are fixed (not trained), log-spaced from 1 to 1,024 ticks over all 42 heads,
+     w_{b,h} = 1024^{(7(h−1) + (b−1)) / 41}, rounded to two significant figures:
+
+     | block | h 1 | h 2 | h 3 | h 4 | h 5 | h 6 |
+     |---|---|---|---|---|---|---|
+     | 1 | 1 | 3.3 | 11 | 35 | 114 | 371 |
+     | 2 | 1.2 | 3.9 | 13 | 41 | 135 | 440 |
+     | 3 | 1.4 | 4.6 | 15 | 49 | 159 | 521 |
+     | 4 | 1.7 | 5.4 | 18 | 58 | 189 | 617 |
+     | 5 | 2 | 6.4 | 21 | 68 | 224 | 730 |
+     | 6 | 2.3 | 7.6 | 25 | 81 | 265 | 865 |
+     | 7 | 2.8 | 9 | 29 | 96 | 314 | 1,024 |
+
+     Every block has a head at every scale; each block's set sits a seventh of a step higher than the one
+     before.
 3. **Gated delta rule**, for each position p and head h, on that position's memory M (32 × 32):
 
    M ← α · M · (I − β k kᵀ) + β v kᵀ
@@ -83,9 +105,10 @@ the projections feeding it.
 
 ### 3. Output and decoding
 
-1. **Decode** the last block's x′ directly (no projection): a linear tree of unpadded convs, 3×3 (256 → 256,
-   7×7 → 5×5), 3×3 (256 → 256, 5×5 → 3×3), 3×3 (256 → E, 3×3 → 1×1), then the frozen pythia-31m output layer
-   (E → V), plus one trained logit for `<NUL>`. Embedding rows the tokenizer never uses are masked off.
+1. **Decode** the last block's x′ directly (no projection): a tree of unpadded convs, 3×3 (256 → 256,
+   9×9 → 7×7) → BN → ReLU, 3×3 (256 → 256, 7×7 → 5×5) → BN → ReLU, 3×3 (256 → 256, 5×5 → 3×3) → BN → ReLU,
+   3×3 (256 → E, 3×3 → 1×1), then the frozen pythia-31m output layer (E → V), plus one trained logit for
+   `<NUL>`. Embedding rows the tokenizer never uses are masked off.
 2. **Emit.** Softmax, then min-p sampling: only tokens with at least p_min times the top token's probability
    are kept. p_min is stored with the weights; in training it is adjusted so that the model's own text,
    generated from `<NUL>`, scores a fluency of 100 (p_min = {{MINP}} at step {{STEP}}).
@@ -93,132 +116,142 @@ the projections feeding it.
 
 ### Cost per tick
 
-About 0.74 G multiply-accumulates per tick, 82 % of them in the 21 3×3 convs (28.9 M each). The 49 × 6 memory
-updates and reads of a block take about 1.2 M. At 500 Hz that is 0.37 T multiply-accumulates per second, and
-every tick does exactly the same work.
+About 1.92 G multiply-accumulates per tick, 87 % of them in the 35 3×3 convs of the blocks (47.8 M each). Per
+block, the 1×1 projections take about 21.5 M, the causal conv on q, k, v 1.7 M, and the 81 × 6 memory updates and
+reads about 2.0 M. The decoder takes 49.5 M and the output layer 12.9 M. At 500 Hz that is 0.96 T
+multiply-accumulates per second, and every tick does exactly the same work.
 
 ### Streaming on a chip
 
 Every 3×3 conv can be computed row by row from a line buffer of a few rows of its input. The skips are cheap:
 the one around a block's convs spans a single block, and the one around the memory read is per position. No
-full copy of an activation grid has to be held from one layer to a later one.
+full copy of an activation grid has to be held from one layer to a later one, except the q, k, v FIFO, which is
+part of the state. With fixed statistics, each BatchNorm is a per-channel scale and offset that folds into the
+conv before it.
 
 ## Parameters
 
 | Part | Parameters | Trained |
 |---|---|---|
 | Input: Conv1×1_in (256 → 256) | 65,792 | yes |
-| Per block: 3 × Conv3×3 (256 → 256) | 1,770,240 | yes |
+| Per block: 5 × Conv3×3 (256 → 256) | 2,950,400 | yes |
 | Per block: Conv1×1_mix (256 → 256) | 65,792 | yes |
 | Per block: q, k, v (1×1, 256 → 576) | 148,032 | yes |
-| Per block: β, α gates (1×1, 256 → 12) and λ | 3,090 | yes |
+| Per block: q, k, v causal conv (depthwise 3×3 × 4 ticks, 576 channels) | 21,312 | yes |
+| Per block: β, α gates (1×1, 256 → 12) | 3,084 | yes |
 | Per block: Conv1×1_out (192 → 256) | 49,408 | yes |
-| 7 blocks | 14,255,934 | yes |
-| Decoder (tree and `<NUL>` logit) | 1,770,497 | yes |
+| 7 blocks | 22,666,196 | yes |
+| Base windows w (42) | 42 | no, fixed |
+| Decoder (four 3×3 convs and the `<NUL>` logit) | 2,360,577 | yes |
 | Token embedding | 12,877,824 | frozen |
 | Output layer | 12,877,824 | frozen |
-| **Total** | **41,847,871** (16,092,223 trained) | |
+| **Total** | **50,848,255** (25,092,565 trained) | |
+
+The 38 BatchNorms (5 per block and 3 in the decoder) add 19,456 fixed statistics (a mean and a variance per
+channel), estimated in training, not trained by gradient.
 
 ## The figure
 
 [`docs/figures/vla_{{VERSION}}.svg`](../figures/vla_{{VERSION}}.svg) draws one clock tick (40 ms at 25 Hz) in two
 panes, 1920 × 2160. Colours encode the kind of operation, the same in both panes: grey hatched = frozen
-(embedding, output layer); violet = RMS norm and replication; blue = linear convs (1×1 or 3×3); green = conv 3×3
-+ ReLU (no BatchNorm); yellow = the delta-rule memory (Δ) and its read; orange = the β, α gates; brown = L2
-normalization; cyan = the decoder convs; pink = softmax and sampling. A box drawn like a D flip-flop (Q, D and a
-clock notch) is state: a register written once per tick. Solid arrows are data and state paths; dashed arrows
-carry the old state into an update.
+(embedding, output layer); violet = RMS norm and replication; blue = linear 1×1 convs; green = conv 3×3 +
+BatchNorm + ReLU; purple = the causal depthwise conv on q, k, v; yellow = the delta-rule memory (Δ) and its read;
+orange = the β, α gates; brown = L2 normalization; cyan = the decoder convs; pink = softmax and sampling. A box
+drawn like a D flip-flop (Q, D and a clock notch) is state: a register written once per tick. Solid arrows are
+data and state paths; dashed arrows carry the old state into an update.
 
 ### Pane A (top): the whole model
 
-The subtitle line gives the configuration: `--lm` (text only), C 256, the 7×7 grid, 7 blocks, H 6 heads × d 32
-per position, 25 Hz, 16.09 M trained parameters, a fixed state of 2,107,392 values, the input as this token
-copied to every grid position, and training on 256-tick windows with the state never reset.
+The subtitle line gives the configuration: `--lm` (text only), C 256, the 9×9 grid, 7 blocks, H 6 heads × d 32
+per position, 25 Hz, 25.09 M trained parameters, a fixed state of 4,463,424 values, the input as this token
+copied to every grid position, training on 256-tick windows with every document reset, and AdamW with weight
+decay 0.01.
 
 Left to right:
 
 1. **text** enters at the left through an input mux.
 2. **tok_embed (frozen)**, hatched grey: pythia-31m, 50304 × 256.
-3. **RMS · replicate 1×1 → 7×7**, violet: the embedding scaled to unit RMS and copied to every position
-   (labelled **256×7×7**).
+3. **RMS · replicate 1×1 → 9×9**, violet: the embedding scaled to unit RMS and copied to every position
+   (labelled **256×9×9**).
 4. **ctx_cat 1×1 256 → 256**, blue: the channel mix (input step 3).
-5. **block 1 … block 7**, seven rounded light-blue boxes in series. Inside each, left to right: three green bars
-   (the three conv 3×3 + ReLU) and a blue bar (the 1×1), a skip line from the block's input over them to a
+5. **block 1 … block 7**, seven rounded light-blue boxes in series. Inside each, left to right: five green bars
+   (the five conv 3×3 + BN + ReLU) and a blue bar (the 1×1), a skip line from the block's input over them to a
    **(+)**, then a yellow circle **Δ** (the delta-rule memory) whose read is added in. Below each Δ is a
    flip-flop **S**, its memory state: a solid arrow from Δ down into S (the write) and a dashed arrow from S back
-   up into Δ (the old state it updates). Under each block, **3 × conv, 1×1** names the mixing and
-   **49×6×32×32** is the size of the block's memory. The caption reads "each block: u = x + 1×1(3 × (conv 3×3 +
-   ReLU)), then x′ = u + (delta-rule memory Δ read)".
+   up into Δ (the old state it updates). Under each block, **5 × conv, 1×1** names the mixing and
+   **81×6×32×32** is the size of the block's memory. The caption reads "each block: u = x + 1×1(5 × (conv 3×3 +
+   BN + ReLU)), then x′ = u + (delta-rule memory Δ read)".
 6. A dashed orange frame around block 2, "one block, zoomed in: pane B ▼", points to pane B.
 7. The last block's output, the dot labelled **o**, goes straight to the decoder.
-8. **text_dec**: three cyan bars, **3×3 7→5**, **3×3 5→3**, **3×3 3→1**, the decoder tree.
+8. **text_dec**: four cyan bars, **3×3 9→7 · BN · ReLU**, **3×3 7→5 · BN · ReLU**, **3×3 5→3 · BN · ReLU**,
+   **3×3 3→1**, the decoder tree.
 9. **lmhead 256 → 50304 (frozen)**, hatched grey.
 10. **softmax, sample (+ \<NUL\>)**, pink. A line from it runs along the top back to the input mux, labelled
     "the sampled token → the next tick's input (training: the dataset's)".
 
 Below the diagram, the **Legend** lists these colours, the (+) residual add, the flip-flop symbol ("D flip-flop
-register, clocked every tick (S: never reset; it carries across documents)") and the two arrow styles.
+register, clocked every tick (S and the FIFO: reset at each document start)") and the two arrow styles.
 
 ### Pane B (bottom): one block
 
 Its title says all 7 blocks have this structure, each with its own weights and memory; the subtitle gives x as
-256×7×7 per tick, H = 6 heads of d = 32 at each of the 49 positions, that every operation is per position except
-the 3×3 convs, and the base windows exp(−λ), learned, starting log-spaced over the heads from 2 to 16,384 ticks.
+256×9×9 per tick, H = 6 heads of d = 32 at each of the 81 positions, that every operation is per position except
+the 3×3 convs, and the fixed base windows w, 1 … 1,024 ticks log-spaced over all 7 × 6 heads, the gate moving
+each within ×/÷4.
 
 Left to right along the main line:
 
 1. **x from below** (the previous block's output, or the input grid for block 1) splits: one branch goes
-   through three green bars, **conv 3×3 · ReLU**, and a blue **1×1 conv (linear)**, in series; the other
+   through five green bars, **conv 3×3 · BN · ReLU**, and a blue **1×1 conv (linear)**, in series; the other
    runs underneath as the skip, labelled "spatial mixing, per tick". They meet at a **(+)**. The sum is **u**.
 2. From u, the main line runs straight right to a final **(+)** and on as **x′ to the next block**.
-3. Below, u fans out into five 1×1 convs ("per position: 6 heads × 32"): **1×1 conv → q** (query) and **1×1
-   conv → k** (key) in blue, each followed by a brown **L2** box; **1×1 conv → v** (value) in blue;
-   **1×1 conv → β** ("write strength σ(·)") and **1×1 conv → α** ("decay exp(−2 exp(λ) σ(·))") in orange.
+3. Below, u fans out into five 1×1 convs ("per position: 6 heads × 32"): **1×1 conv → q** (query), **1×1 conv →
+   k** (key) and **1×1 conv → v** (value) in blue, which all pass through one purple box, **dw conv 3×3 × 4
+   ticks (causal) + residual**; q and k then each pass a brown **L2** box. **1×1 conv → β** ("write strength
+   σ(·)") and **1×1 conv → α** ("window w · 4^(−tanh(·))") are orange. A dashed box under α, **document start:
+   S and the FIFO zeroed**, marks the reset.
 4. k, v, β and α enter the large yellow **gated delta rule** box: "S ← α · S (I − β k kᵀ) + β v kᵀ", "erase what
    k pointed at, write v there, decay the rest by α", "per position, per head: d×d = 32×32, about 3d² MACs each
    per tick", and in bold "no weights of its own: S is state (fast weights), learned only through the 1×1 convs
    feeding it".
-5. Under it, the flip-flop **S**, "49 × 6 × 32×32 = 301,056", with a solid arrow in from the update and a dashed
+5. Under it, the flip-flop **S**, "81 × 6 × 32×32 = 497,664", with a solid arrow in from the update and a dashed
    arrow, labelled **S (t−1)**, back into it.
 6. The updated memory, **S (t)**, goes up to **read S q** (yellow), which also takes q from the L2 box along the
    top. The read goes to **1×1 out** (blue), then up, labelled **y**, into the final (+).
 7. The panel **training vs the chip**, at the right: in training, everything before Δ runs on all 256 ticks of
-   a window (64 rows) at once, and q, k, v, β, α for the window go to a chunked scan (the WY form of the delta
+   a window (16 rows) at once, and q, k, v, β, α for the window go to a chunked scan (the WY form of the delta
    rule) that gives every S q exactly; the state carries on between windows, and the gradient stops at a
-   window's start. On the chip it runs one tick at a time: per block it holds S and does the convs, five 1×1
-   projections, and 49 × 6 small 32×32 updates and reads, with the same results as training, by construction.
+   window's start. On the chip it runs one tick at a time: per block it holds S and the 3-tick q, k, v FIFO, and
+   does the convs, five 1×1 projections, and 81 × 6 small 32×32 updates and reads, with the same results as
+   training, by construction.
 
 Pane B's legend repeats the colours used there and adds: L2 (q, k scaled to unit length per head, which keeps S
-bounded), the gate formulas β = σ(·), α = exp(−2 exp(λ) σ(·)) with λ per head, (+) as the residual add, and the
-note that S is never reset and carries across documents.
+bounded), the causal depthwise conv on q, k, v (a FIFO of the 3 past ticks), the gate formulas β = σ(·) and
+α = exp(−4^tanh(·) / w) with w fixed per head, (+) as the residual add, and the note that S and the FIFO are
+reset at each document start.
 
 ## Training (for reference)
 
-- From scratch, to step {{STEP}}. A step is one tick (one token) for each of 64 rows, so {{TOKENS}} tokens in all,
-  in {{UPDATES}} optimizer updates.
-- Data: FineWeb sample-10BT, text only.
+- From scratch, to step {{STEP}}, in one run with one configuration. A step is one tick (one token) for each of
+  16 rows, so {{TOKENS}} tokens in all, in {{UPDATES}} optimizer updates.
+- Data: FineWeb-Edu sample-10BT (about 10 B tokens), text only, every document drawn in a fresh random order
+  each pass; 1 document in 32, chosen by a hash of its text, is held out for evaluation.
 - Each row trains on windows of 256 consecutive ticks. Within a window the convs run on all ticks at once, and
   the memories are trained over the whole window by an exact chunked parallel scan. The state carries on from
   one window into the next, but the gradient stops at a window's start. Each block's activations are recomputed
-  in the backward pass to save memory. After each update the window is run again with the new weights to give
-  the state the next window starts from.
-- **Document starts:** in training the state is never reset. When one document ends and the next begins, the
-  previous, unrelated document's memories carry straight on, marked only by the `<NUL>` separator, as when a
-  robot's perception jumps to a new scene, task or speaker. The model has to learn to let go of stale context
-  itself, through α and β, which see the input. Evaluations reset at every document.
-- Optimizer, no gradient clipping throughout; every ramp below is a half cosine over 20,000 steps:
-  - to step 2,926,848: AdamW, β (0.9, 0.95), no weight decay, the learning rate rising from 0 to 3e-4, then held;
-  - to step 3,232,512: the same, the learning rate lowered to 1e-4;
-  - to step 3,716,096: plain SGD (no momentum, no weight decay), the learning rate mostly between 0.03 and 0.1
-    (above about 0.13 training diverged; those attempts were discarded);
-  - to step {{STEP}}: AdamW, β (0.9, 0.95), with fresh moment estimates, the learning rate rising from 0 to
-    1e-3, then held; weight decay 0.1 from step 4,134,912.
-
-  Cross-entropy is normalized per word, not per token.
+  in the backward pass to save memory.
+- **Document starts:** the state (memories and FIFOs) is reset to zero at every document start, in training as
+  in evaluation.
+- **BatchNorm:** in training each BN normalizes with the statistics of the current window (16 rows × 256 ticks ×
+  81 positions) and updates its running statistics (momentum 0.1); the published model uses those running
+  statistics, as fixed constants.
+- Optimizer: AdamW, β (0.9, 0.95), the learning rate rising from 0 to 1e-3 over the first 20,000 steps (a half
+  cosine), then held; weight decay 0.01 on every trained parameter except the β and α gates; no gradient
+  clipping. Cross-entropy is normalized per word, not per token.
 - **Published weights:** an exponential moving average of the trained weights, θ̄ ← θ̄ + (θ − θ̄)/300 after every
   update, kept through the whole run, taken at step {{STEP}}. It removes most of the update-to-update noise:
-  at {{STEP}} it scores about 0.2 nats per token lower on FineWeb than the weights it averages.
-- Frozen: the token embedding and the output layer (pythia-31m).
+  at {{STEP}} it scores about 0.12 nats per token lower on FineWeb-Edu than the weights it averages.
+- Frozen: the token embedding and the output layer (pythia-31m), and the base windows.
 - Numerics: the convs and the q, k, v projection run in bf16 on the GPU, the rest in TF32. In float64, the
   parallel scan equals one-tick stepping to about 1e-14.
 
@@ -238,10 +271,15 @@ The model combines ideas from these papers:
   [arXiv:2406.06484](https://arxiv.org/abs/2406.06484).
 - **Data-dependent scalar decay per head:** T. Dao, A. Gu, *Transformers are SSMs: Generalized Models and
   Efficient Algorithms Through Structured State Space Duality* (2024), [arXiv:2405.21060](https://arxiv.org/abs/2405.21060).
+- **Short causal conv before the memory:** D. Y. Fu et al., *Hungry Hungry Hippos: Towards Language Modeling with
+  State Space Models* (2022), [arXiv:2212.14052](https://arxiv.org/abs/2212.14052); A. Gu, T. Dao, *Mamba:
+  Linear-Time Sequence Modeling with Selective State Spaces* (2023), [arXiv:2312.00752](https://arxiv.org/abs/2312.00752).
 - **Recurrent state at every position of a conv grid:** X. Shi et al., *Convolutional LSTM Network: A Machine
   Learning Approach for Precipitation Nowcasting* (2015), [arXiv:1506.04214](https://arxiv.org/abs/1506.04214).
 - **Residual blocks:** K. He et al., *Deep Residual Learning for Image Recognition* (2015),
   [arXiv:1512.03385](https://arxiv.org/abs/1512.03385).
+- **Batch normalization:** S. Ioffe, C. Szegedy, *Batch Normalization: Accelerating Deep Network Training by
+  Reducing Internal Covariate Shift* (2015), [arXiv:1502.03167](https://arxiv.org/abs/1502.03167).
 - **RMS normalization:** B. Zhang, R. Sennrich, *Root Mean Square Layer Normalization* (2019),
   [arXiv:1910.07467](https://arxiv.org/abs/1910.07467).
 - **Tokenizer, frozen embedding and output layer, and the reference model:** S. Biderman et al., *Pythia: A Suite
@@ -250,5 +288,7 @@ The model combines ideas from these papers:
   [arXiv:1711.05101](https://arxiv.org/abs/1711.05101).
 - **Weight averaging:** B. T. Polyak, A. B. Juditsky, *Acceleration of Stochastic Approximation by Averaging*
   (1992), [doi:10.1137/0330046](https://doi.org/10.1137/0330046).
-- **Training data:** G. Penedo et al., *The FineWeb Datasets: Decanting the Web for the Finest Text Data at
-  Scale* (2024), [arXiv:2406.17557](https://arxiv.org/abs/2406.17557).
+- **Training data:** A. Lozhkov, L. Ben Allal, L. von Werra, T. Wolf, *FineWeb-Edu: the Finest Collection of
+  Educational Content* (2024), [doi:10.57967/hf/2497](https://doi.org/10.57967/hf/2497); G. Penedo et al., *The
+  FineWeb Datasets: Decanting the Web for the Finest Text Data at Scale* (2024),
+  [arXiv:2406.17557](https://arxiv.org/abs/2406.17557).

@@ -81,8 +81,8 @@
     saves power: there are no DRAM chips to keep refreshed and no high-speed interface driving signals between chips,
     and reading a weight from on-chip SRAM takes on the order of a hundred times less energy than fetching it from
     off-chip DRAM. The same small kernels run at
-    every grid position and every tick, so about sixteen million trained weights drive a state of 2.1 million values:
-    associative memories at every grid position, written by the gated delta rule.</p>
+    every grid position and every tick, so about twenty-five million trained weights drive a state of 4.5 million
+    values: associative memories at every grid position, written by the gated delta rule.</p>
     <p class="lede">The state also has a fixed size. Every tick does exactly the same work and finishes in the same
     time, however long the model has been running.</p>
     <nav class="links">
@@ -96,32 +96,33 @@
 
   <figure>
     <a class="fig" href="figures/vla_{{VERSION}}.svg" title="Open the full-size figure">
-      <img src="figures/vla_{{VERSION}}.svg" alt="Block diagram of one clock tick, in two panes. Top: the current token is embedded, normalized, copied to every position of a 7x7 grid and mixed by a 1x1 convolution, then passes through seven ConvDelta blocks, each three 3x3 conv-ReLU layers and a 1x1 convolution around a skip, then a delta-rule memory with its state S whose read is added back; a tree of three 3x3 convolutions and the frozen output layer give the next token, which is fed back as the next input. Bottom: one block in detail, the convs and skip giving u, the q, k, v, beta and alpha projections, the gated delta-rule update of the memory S, its read, and the 1x1 output added to u.">
+      <img src="figures/vla_{{VERSION}}.svg" alt="Block diagram of one clock tick, in two panes. Top: the current token is embedded, normalized, copied to every position of a 9x9 grid and mixed by a 1x1 convolution, then passes through seven ConvDelta blocks, each five 3x3 conv-BatchNorm-ReLU layers and a 1x1 convolution around a skip, then a delta-rule memory with its state S whose read is added back; a tree of 3x3 convolutions and a frozen output layer give the next token, fed back as the next input. Bottom: one block in detail, with the query, key and value projections and their causal conv over the last 4 ticks, the write strength and decay gates, the gated delta rule update of the 32x32 memory per head and position, and its read.">
     </a>
     <figcaption>One clock tick of the published model ({{VERSION}}). Top: the whole model, text only: the
-    current token on every position of the 7 × 7 grid, seven ConvDelta blocks, and the decoder. Bottom: one
-    block, three 3 × 3 convs and a 1 × 1 around a skip, then a gated delta-rule memory at every grid position (6
-    heads of 32 × 32). The
+    current token on every position of the 9 × 9 grid, seven ConvDelta blocks, and the decoder. Bottom: one
+    block, five 3 × 3 convs with BatchNorm and a 1 × 1 around a skip, then a gated delta-rule memory at every grid
+    position (6 heads of 32 × 32). The
     <a href="https://github.com/siliconperception/vla/blob/main/docs/spec/README.md">functional spec</a> walks
     through every part. Select the figure to open it full size.</figcaption>
   </figure>
   <div class="facts">
     <div class="fact"><b>500 Hz</b><span>target tick rate on one chip, with the same work every tick</span></div>
-    <div class="fact"><b>2.1 M</b><span>values of state, fixed in size: 7 blocks × 49 positions × 6 heads of 32 × 32 memories, and nothing else</span></div>
-    <div class="fact"><b>16.1 M</b><span>trained parameters, small enough to hold every weight in on-chip SRAM</span></div>
-    <div class="fact"><b>0</b><span>positional encodings and state resets: trained with the memories carrying on across documents</span></div>
+    <div class="fact"><b>4.5 M</b><span>values of state, fixed in size: 7 blocks × 81 positions × 6 heads of 32 × 32 memories, and the last 3 ticks of their inputs</span></div>
+    <div class="fact"><b>25.1 M</b><span>trained parameters, small enough to hold every weight in on-chip SRAM</span></div>
+    <div class="fact"><b>1 … 1,024</b><span>ticks: the fixed memory time scales, log-spaced over all 42 heads; the input moves each within ×/÷4</span></div>
   </div>
 
   <h2>How a tick works</h2>
   <ol>
-    <li>The current token is embedded, normalized and copied to all 49 positions of a 7 × 7 grid, then mixed by a
-    1 × 1 convolution. Earlier tokens reach the model only through its memories.</li>
-    <li>Seven ConvDelta blocks, in series. Each applies three 3 × 3 convolutions with ReLU (no normalization)
-    and a 1 × 1 convolution, around a skip.</li>
-    <li>At every grid position, 1 × 1 convolutions give 6 heads of query, key and value, a write strength β and a
-    decay α. Each head's 32 × 32 memory is updated by the gated delta rule, M ← α M (I − β k kᵀ) + β v kᵀ: decay,
-    erase what was stored at key k, write v there. It is read with the query and added back through a 1 × 1
-    convolution.</li>
+    <li>The current token is embedded, normalized and copied to all 81 positions of a 9 × 9 grid, then mixed by a
+    1 × 1 convolution. Earlier tokens reach the model only through its state.</li>
+    <li>Seven ConvDelta blocks, in series. Each applies five 3 × 3 convolutions with BatchNorm and ReLU and a 1 × 1
+    convolution, around a skip.</li>
+    <li>At every grid position, 1 × 1 convolutions and a short causal convolution over the last 4 ticks give 6
+    heads of query, key and value; two more give a write strength β and a decay α. Each head forgets over its own
+    fixed time scale, which the input can stretch or shrink up to 4×. Each head's 32 × 32 memory is updated by the
+    gated delta rule, M ← α M (I − β k kᵀ) + β v kᵀ: decay, erase what was stored at key k, write v there. It is
+    read with the query and added back through a 1 × 1 convolution.</li>
     <li>A small tree of convolutions collapses the last block's grid to one vector, and a frozen output layer gives
     the next token, which is fed back as the next input.</li>
   </ol>
@@ -136,7 +137,7 @@
     <p>Pythia publishes checkpoints from the start of its training, so a small CNN with a fixed-size state can be
     compared with a transformer at every point along the way, not only at the end. The plan:</p>
     <ol>
-      <li><b>Same documents.</b> Score both models on the same held-out FineWeb documents, by the same rule
+      <li><b>Same documents.</b> Score both models on the same held-out FineWeb-Edu and FineWeb documents, by the same rule
       (nats per token, and per character, which does not depend on the tokenizer).</li>
       <li><b>Loss against tokens seen.</b> One curve per model: the published VLA weights at each step pushed to
       Hugging Face, and pythia-70m at its checkpoints from 2 M to 300 B tokens.</li>
@@ -145,24 +146,25 @@
       <li><b>Grammar and common sense.</b> BLiMP and ComVE minimal pairs at matched tokens.</li>
       <li><b>Cost per token.</b> Weights, state and operations per token, next to the scores.</li>
     </ol>
-    <p class="note">Pythia was trained on the Pile, not FineWeb; the comparison will show both models on both.
+    <p class="note">Pythia was trained on the Pile, not FineWeb-Edu; the comparison will show both models on both.
     Interim scores for the current weights are on the <a href="https://huggingface.co/siliconperception/vla">model card</a>.</p>
   </div>
 
   <h2>Scores</h2>
   <div class="tablewrap"><table>
     <tr><th></th><th class="n">VLA {{VERSION}}</th><th class="n">pythia-70m</th><th class="n">pythia-70m</th><th class="n">pythia-70m</th></tr>
-    <tr><td>training tokens</td><td class="n">{{TOKENS}}</td><td class="n">268.4 M</td><td class="n">536.9 M</td><td class="n">300 B</td></tr>
-    <tr><td>FineWeb held-out, nats/token</td><td class="n">{{FW}}</td><td class="n">{{PSTEP128_FW}}</td><td class="n">{{PSTEP256_FW}}</td><td class="n">{{PMAIN_FW}}</td></tr>
-    <tr><td>BabyLM 2026 dev, nats/token</td><td class="n">{{BABY}}</td><td class="n">{{PSTEP128_BABY}}</td><td class="n">{{PSTEP256_BABY}}</td><td class="n">{{PMAIN_BABY}}</td></tr>
-    <tr><td>BLiMP, % of 1,005 pairs</td><td class="n">{{BLIMP}}</td><td class="n">{{PSTEP128_BLIMP}}</td><td class="n">{{PSTEP256_BLIMP}}</td><td class="n">{{PMAIN_BLIMP}}</td></tr>
-    <tr><td>ComVE, % of 999 pairs</td><td class="n">{{COMVE}}</td><td class="n">{{PSTEP128_COMVE}}</td><td class="n">{{PSTEP256_COMVE}}</td><td class="n">{{PMAIN_COMVE}}</td></tr>
+    <tr><td>training tokens</td><td class="n">{{TOKENS}}</td><td class="n">33.6 M</td><td class="n">67.1 M</td><td class="n">300 B</td></tr>
+    <tr><td>FineWeb-Edu held-out, nats/token</td><td class="n">{{FWEDU}}</td><td class="n">{{PSTEP16_FWEDU}}</td><td class="n">{{PSTEP32_FWEDU}}</td><td class="n">{{PMAIN_FWEDU}}</td></tr>
+    <tr><td>FineWeb held-out, nats/token</td><td class="n">{{FW}}</td><td class="n">{{PSTEP16_FW}}</td><td class="n">{{PSTEP32_FW}}</td><td class="n">{{PMAIN_FW}}</td></tr>
+    <tr><td>BabyLM 2026 dev, nats/token</td><td class="n">{{BABY}}</td><td class="n">{{PSTEP16_BABY}}</td><td class="n">{{PSTEP32_BABY}}</td><td class="n">{{PMAIN_BABY}}</td></tr>
+    <tr><td>BLiMP, % of 1,005 pairs</td><td class="n">{{BLIMP}}</td><td class="n">{{PSTEP16_BLIMP}}</td><td class="n">{{PSTEP32_BLIMP}}</td><td class="n">{{PMAIN_BLIMP}}</td></tr>
+    <tr><td>ComVE, % of 999 pairs</td><td class="n">{{COMVE}}</td><td class="n">{{PSTEP16_COMVE}}</td><td class="n">{{PSTEP32_COMVE}}</td><td class="n">{{PMAIN_COMVE}}</td></tr>
   </table></div>
   <p class="note">pythia-70m (EleutherAI) is a transformer with the same tokenizer and 19 M parameters outside its embedding and output layer, shown
   at about this model's training tokens and fully trained; same documents, same pairs, same scoring rule (see the
   <a href="https://huggingface.co/siliconperception/vla">model card</a>). Pythia was trained on the Pile, this
-  model on FineWeb. Matched tokens are not matched training: at 268.4 M and 536.9 M tokens pythia has made only 128
-  and 256 updates (of 2 M tokens each), early in its warm-up; this model has made {{UPDATES}} (of 16,384
+  model on FineWeb-Edu. Matched tokens are not matched training: at 33.6 M and 67.1 M tokens pythia has made only 16
+  and 32 updates (of 2 M tokens each), at the start of its warm-up; this model has made {{UPDATES}} (of 4,096
   tokens). Fully trained pythia-70m is the fair reference. The published weights are a running average of the
   trained weights (time constant 300 updates).</p>
 
@@ -190,9 +192,10 @@ done</code></pre>
     <li>Matrix-valued recurrent state: Katharopoulos et al., <a href="https://arxiv.org/abs/2006.16236">Transformers are RNNs: Fast Autoregressive Transformers with Linear Attention</a> (2020)</li>
     <li>Data-dependent decay per head: Dao, Gu, <a href="https://arxiv.org/abs/2405.21060">Transformers are SSMs</a> (Mamba-2, 2024)</li>
     <li>A state at every position of a conv grid: Shi et al., <a href="https://arxiv.org/abs/1506.04214">Convolutional LSTM Network</a> (2015)</li>
-    <li>Residual blocks: He et al., <a href="https://arxiv.org/abs/1512.03385">Deep Residual Learning for Image Recognition</a> (2015); RMS norm: Zhang, Sennrich, <a href="https://arxiv.org/abs/1910.07467">Root Mean Square Layer Normalization</a> (2019)</li>
+    <li>Short causal conv before the memory: Fu et al., <a href="https://arxiv.org/abs/2212.14052">Hungry Hungry Hippos</a> (2022); Gu, Dao, <a href="https://arxiv.org/abs/2312.00752">Mamba</a> (2023)</li>
+    <li>Residual blocks: He et al., <a href="https://arxiv.org/abs/1512.03385">Deep Residual Learning for Image Recognition</a> (2015); batch norm: Ioffe, Szegedy, <a href="https://arxiv.org/abs/1502.03167">Batch Normalization</a> (2015); RMS norm: Zhang, Sennrich, <a href="https://arxiv.org/abs/1910.07467">Root Mean Square Layer Normalization</a> (2019)</li>
     <li>Tokenizer, frozen embedding and output layer, reference model: Biderman et al., <a href="https://arxiv.org/abs/2304.01373">Pythia</a> (2023)</li>
-    <li>Optimizer: Loshchilov, Hutter, <a href="https://arxiv.org/abs/1711.05101">Decoupled Weight Decay Regularization</a> (2017); weight averaging: Polyak, Juditsky, <a href="https://doi.org/10.1137/0330046">Acceleration of Stochastic Approximation by Averaging</a> (1992); data: Penedo et al., <a href="https://arxiv.org/abs/2406.17557">The FineWeb Datasets</a> (2024)</li>
+    <li>Optimizer: Loshchilov, Hutter, <a href="https://arxiv.org/abs/1711.05101">Decoupled Weight Decay Regularization</a> (2017); weight averaging: Polyak, Juditsky, <a href="https://doi.org/10.1137/0330046">Acceleration of Stochastic Approximation by Averaging</a> (1992); data: Lozhkov et al., <a href="https://huggingface.co/datasets/HuggingFaceFW/fineweb-edu">FineWeb-Edu</a> (2024); Penedo et al., <a href="https://arxiv.org/abs/2406.17557">The FineWeb Datasets</a> (2024)</li>
   </ul>
 
   <footer>

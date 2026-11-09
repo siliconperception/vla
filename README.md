@@ -1,10 +1,11 @@
 # VLA: a recurrent CNN vision-language-action model
 
 `vla.py` is a language model with a fixed-size state and no positional encoding, built from convolutions on a
-7 × 7 grid. The published model, v626, is a ConvDelta model. Its input is only the current token, copied to
-every grid position. Seven residual blocks follow, each three 3 × 3 convolutions (no normalization) and a 1 × 1 around a skip, then
-an associative memory at every grid position (6 heads of 32 × 32) written by the gated delta rule. Every clock
-tick the model reads one token, updates its memories, and decodes the next token.
+9 × 9 grid. The published model, v657, is a ConvDelta model. Its input is only the current token, copied to
+every grid position. Seven residual blocks follow, each five 3 × 3 convolutions with BatchNorm and a 1 × 1 around a
+skip, then an associative memory at every grid position (6 heads of 32 × 32) written by the gated delta rule, each
+head forgetting over its own fixed time scale (1 to 1,024 ticks across the 42 heads, which the input can move up to
+4×). Every clock tick the model reads one token, updates its memories, and decodes the next token.
 
 Most commercial applications for autonomous, agile robots do not require superintelligence. They need
 conversational common sense, grounded in and modulated by what the device perceives: sound, video, touch. To
@@ -17,14 +18,14 @@ on-chip SRAM, so there is no external memory, and the weights stay programmable.
 saves power: there are no DRAM chips to keep refreshed and no high-speed interface driving signals between chips,
 and reading a weight from on-chip SRAM takes on the order of a hundred times less energy than fetching it from
 off-chip DRAM. One set of small convolution kernels is reused at every grid position and every tick, so about
-sixteen million trained weights drive a state of 2.1 million values. And the state never grows, so every tick does the
+twenty-five million trained weights drive a state of 4.5 million values. And the state never grows, so every tick does the
 same work in the same time, however long the model has been running.
 
-![One clock tick of the VLA](docs/figures/vla_v626.svg)
+![One clock tick of the VLA](docs/figures/vla_v657.svg)
 
-*One clock tick of the published model, v626. Top: the whole model, text only: the current token on every
-position of the 7 × 7 grid, seven ConvDelta blocks, and the decoder. Bottom: one block, three 3 × 3 convs and a
-1 × 1 around a skip, then a gated delta-rule memory at every grid position. The [functional spec](docs/spec/README.md) walks through the
+*One clock tick of the published model, v657. Top: the whole model, text only: the current token on every
+position of the 9 × 9 grid, seven ConvDelta blocks, and the decoder. Bottom: one block, five 3 × 3 convs with
+BatchNorm and a 1 × 1 around a skip, then a gated delta-rule memory at every grid position. The [functional spec](docs/spec/README.md) walks through the
 figure part by part.*
 
 - **Model:** [huggingface.co/siliconperception/vla](https://huggingface.co/siliconperception/vla)
@@ -38,7 +39,7 @@ figure part by part.*
 git clone https://github.com/siliconperception/vla && cd vla
 pip install -r requirements.txt
 
-# generate from the published weights (downloads ~170 MB once)
+# generate from the published weights (downloads ~200 MB once)
 for p in "The colors of the rainbow are" \
          "The best way to learn a new language is" \
          "My grandmother's recipe for apple pie starts with" \
@@ -47,8 +48,8 @@ for p in "The colors of the rainbow are" \
   python vla.py --pretrained --generate --n 120 --prompt "$p" --device cuda
 done
 
-# score them on held-out text (FineWeb is streamed from the Hugging Face hub)
-python vla.py --pretrained --eval --eval_corpora fineweb --eval_docs 100 --device cuda
+# score them on held-out text (FineWeb-Edu is streamed from the Hugging Face hub)
+python vla.py --pretrained --eval --eval_corpora fwedu --eval_docs 100 --device cuda
 ```
 
 `--pretrained` restores the weights and every setting they were trained with. `--device cpu` works too, more
@@ -58,13 +59,14 @@ slowly.
 
 Each tick (see [docs/spec](docs/spec/README.md) for the exact computation):
 
-1. The current token is embedded, RMS-normalized and copied to all 49 positions of the 7 × 7 grid, then mixed
-   by a 1 × 1 convolution (256 → 256). Earlier tokens reach the model only through its memories.
+1. The current token is embedded, RMS-normalized and copied to all 81 positions of the 9 × 9 grid, then mixed
+   by a 1 × 1 convolution (256 → 256). Earlier tokens reach the model only through its state.
 2. Seven ConvDelta blocks, in series. Each block:
-   - applies three 3 × 3 convolutions with ReLU (no normalization) and a linear 1 × 1 convolution, around a
+   - applies five 3 × 3 convolutions, each with BatchNorm and ReLU, and a linear 1 × 1 convolution, around a
      skip, giving u;
-   - at every grid position, computes 6 heads of query q, key k, value v (1 × 1 convolutions; q and k unit
-     length), a write strength β and a decay α;
+   - at every grid position, computes 6 heads of query q, key k, value v (1 × 1 convolutions plus a causal
+     depthwise 3 × 3 convolution over the last 4 ticks; q and k unit length), a write strength β and a decay α,
+     α = exp(−4^tanh(g) / w) with a fixed base window w per head;
    - updates each head's 32 × 32 memory M by the gated delta rule, M ← α M (I − β k kᵀ) + β v kᵀ: decay,
      erase what was stored at key k, write v there;
    - reads M q and adds it to u through a 1 × 1 convolution.
@@ -76,30 +78,30 @@ run on all 256 ticks of a window at once, and the memories are trained over the 
 parallel scan (the WY form of the delta rule). The state carries on between windows. On a chip the model runs
 one tick at a time, with the same result, and every conv streams row by row from a few-row line buffer.
 
-In training the state is never reset (`--reset_prob 0`): at a document start the previous document's memories
-carry on, and the model must learn to drop them itself, as a robot's continuous perception jumps between scenes.
+The state (the memories and the last 3 ticks of q, k, v) is reset to zero at every document start, in training
+(`--reset_prob 1`) and in evaluation.
 
 ## Training your own
 
 ```bash
-# v626's configuration from scratch: text from FineWeb (sample-10BT), 64 rows x 256-tick windows, no
-# BatchNorm, AdamW with the learning rate warmed from 0 to 3e-4 over 20,000 steps, then held; a running
-# average of the weights (time constant 300 updates) is kept and evaluated alongside the live weights
-python vla.py --mix fineweb:1 --shards 14 --shard_offset 1 --lm --context 7 --n_hidden 256 --c_context 256 \
-    --linout_kernel 0 --attn 0 --convdelta 7 --cd_heads 6 --cd_dim 32 --cd_taps 0 --cd_convs 3 --cd_chunk 32 \
-    --cd_mix_out --cd_mem_res --cd_no_gp --cd_no_bn --cd_windows 2:16384 --grid_hist 0 \
-    --batch 64 --bptt 256 --ckpt_ticks --reset_prob 0 --clock_hz 25 --nul_weight 1 --loss_norm words \
-    --optimizer adamw --betas 0.9,0.95 --weight_decay 0 --weight_ema 300 \
-    --schedule coswarm --lr_min 0 --lr_max 0.0003 --lr_period 20000 \
+# v657's configuration, the published model's, from scratch: text from FineWeb-Edu (sample-10BT, every document
+# in a fresh random order each pass; put its arrow cache on an SSD), 16 rows x 256-tick windows, every document
+# reset, fixed base windows 1 ... 1,024 ticks moved by the input within x/÷4, AdamW with the learning rate warmed
+# from 0 to 1e-3 over 20,000 steps, then held, weight decay 0.01 except on the gates; a running average of the
+# weights (time constant 300 updates) is kept and evaluated alongside the live weights
+python vla.py --mix fwedu:1 --full_shuffle --lm --context 9 --n_hidden 256 --c_context 256 \
+    --linout_kernel 0 --attn 0 --convdelta 7 --cd_heads 6 --cd_dim 32 --cd_taps 0 --cd_convs 5 --cd_chunk 32 \
+    --cd_mix_out --cd_mem_res --cd_no_gp --cd_qkv_conv 3x3x4 --grid_hist 0 \
+    --cd_band 4 --cd_tau "1,3.3,11,35,114,371;1.2,3.9,13,41,135,440;1.4,4.6,15,49,159,521;1.7,5.4,18,58,189,617;2,6.4,21,68,224,730;2.3,7.6,25,81,265,865;2.8,9,29,96,314,1024" \
+    --dec_tree_kernels 3,3,3,3 --dec_relu --dec_bn \
+    --batch 16 --bptt 256 --ckpt_ticks --reset_prob 1 --clock_hz 25 --nul_weight 1 --loss_norm words \
+    --optimizer adamw --betas 0.9,0.95 --weight_decay 0.01 --no-wd_mem --no-wd_gates --weight_ema 300 \
+    --schedule decay --lr_max 1e-9 --lr_final 0.001 --decay_steps 20000 --decay_start 0 \
     --save checkpoint/my_run.pt --log log/exp.my_run
 ```
 
-The published weights continued from this run's step 2,926,848: the learning rate lowered to 1e-4, then from
-step 3,232,512 about 480,000 steps of plain SGD (learning rates mostly 0.03 to 0.1; above about 0.13 it
-diverged), then AdamW again from step 3,716,096, the learning rate warmed from 0 to 1e-3 and held, with
-weight decay 0.1 from step 4,134,912 (`--weight_decay 0.1`). The published weights are the running average at step 6,160,000
-(`--use_ema 300` on `--load` gives the same weights from a checkpoint); `--load` resumes a checkpoint with its
-optimizer state and its average.
+The published weights are this run's running average at step 3,700,000 (`--use_ema 300` on `--load` gives the
+same weights from a checkpoint); `--load` resumes a checkpoint with its optimizer state and its average.
 
 The same `vla.py` also trains the earlier register models (`--ctx_ema`, `--write_gate`, `--layers`) and
 multimodal runs (`--mix` with image and video corpora, `--streams 3`). `tools/run.sh` is the launcher used for
@@ -127,9 +129,9 @@ corpora (BabyLM, image and video features) are built by the `tools/*_prep.py` sc
 - Data-dependent decay per head: T. Dao, A. Gu, [Transformers are SSMs](https://arxiv.org/abs/2405.21060) (Mamba-2, 2024)
 - Short causal conv before the memory: D. Y. Fu et al., [Hungry Hungry Hippos](https://arxiv.org/abs/2212.14052) (2022); A. Gu, T. Dao, [Mamba](https://arxiv.org/abs/2312.00752) (2023)
 - A state at every position of a conv grid: X. Shi et al., [Convolutional LSTM Network](https://arxiv.org/abs/1506.04214) (2015)
-- Residual blocks: K. He et al., [Deep Residual Learning for Image Recognition](https://arxiv.org/abs/1512.03385) (2015); RMS norm: B. Zhang, R. Sennrich, [Root Mean Square Layer Normalization](https://arxiv.org/abs/1910.07467) (2019)
+- Residual blocks: K. He et al., [Deep Residual Learning for Image Recognition](https://arxiv.org/abs/1512.03385) (2015); batch norm: S. Ioffe, C. Szegedy, [Batch Normalization](https://arxiv.org/abs/1502.03167) (2015); RMS norm: B. Zhang, R. Sennrich, [Root Mean Square Layer Normalization](https://arxiv.org/abs/1910.07467) (2019)
 - Tokenizer, frozen embedding and output layer, reference model: S. Biderman et al., [Pythia](https://arxiv.org/abs/2304.01373) (2023)
-- Optimizer: I. Loshchilov, F. Hutter, [Decoupled Weight Decay Regularization](https://arxiv.org/abs/1711.05101) (2017); weight averaging: B. T. Polyak, A. B. Juditsky, [Acceleration of Stochastic Approximation by Averaging](https://doi.org/10.1137/0330046) (1992); data: G. Penedo et al., [The FineWeb Datasets](https://arxiv.org/abs/2406.17557) (2024)
+- Optimizer: I. Loshchilov, F. Hutter, [Decoupled Weight Decay Regularization](https://arxiv.org/abs/1711.05101) (2017); weight averaging: B. T. Polyak, A. B. Juditsky, [Acceleration of Stochastic Approximation by Averaging](https://doi.org/10.1137/0330046) (1992); data: A. Lozhkov et al., [FineWeb-Edu](https://huggingface.co/datasets/HuggingFaceFW/fineweb-edu) (2024); G. Penedo et al., [The FineWeb Datasets](https://arxiv.org/abs/2406.17557) (2024)
 
 ## License
 
