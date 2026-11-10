@@ -565,15 +565,29 @@ parser.add_argument('--batch',      default=250,  type=int, help='independent do
 parser.add_argument('--lr_max',     default=0.01, type=float, help='peak / constant lr')
 parser.add_argument('--lr_min',     default=1e-4, type=float, help='coswarm start lr')
 parser.add_argument('--lr_period',  default=20000, type=int, help='coswarm rise length in steps')
-parser.add_argument('--schedule',   default='coswarm', choices=['const', 'coswarm', 'decay'],
+parser.add_argument('--schedule',   default='coswarm', choices=['const', 'coswarm', 'decay', 'plateau'],
                     help='const: --lr_max throughout. coswarm: half-cosine rise from --lr_min '
                          'to --lr_max over --lr_period global steps, then hold. decay: coswarm, '
                          'then a half-cosine fall to --lr_final over --decay_steps steps from '
-                         '--decay_start, then hold')
+                         '--decay_start, then hold. plateau: coswarm, then x --plateau_factor '
+                         'each time the held-out loss (the first --weight_ema average\'s, else the '
+                         'live one) has gone --plateau_patience evals without a new best by '
+                         '--plateau_delta; never below --lr_final, and with --plateau_end never '
+                         'above a log-linear fall from --lr_max (where the schedule began) to '
+                         '--lr_final at that step, so it reaches --lr_final by then whatever the '
+                         'curve does')
 parser.add_argument('--lr_final',   default=1e-3, type=float, help='decay: final lr')
 parser.add_argument('--decay_steps', default=200000, type=int, help='decay: fall length in steps')
 parser.add_argument('--decay_start', default=None, type=int, metavar='STEP',
                     help='decay: global step the fall begins (default: this run\'s first step)')
+parser.add_argument('--plateau_patience', default=4, type=int, metavar='N',
+                    help='plateau: evals without a new best before a cut')
+parser.add_argument('--plateau_factor', default=0.5, type=float, help='plateau: lr multiplier per cut')
+parser.add_argument('--plateau_delta', default=0.002, type=float, metavar='NATS',
+                    help='plateau: how far below the best an eval must be to count as a new best')
+parser.add_argument('--plateau_end', default=None, type=int, metavar='STEP',
+                    help='plateau: the global step by which the lr reaches --lr_final (e.g. the '
+                         'step of the token budget)')
 parser.add_argument('--eval_at_start', action='store_true',
                     help='also run the held-out eval at a resumed run\'s first step')
 parser.add_argument('--profile', default=0, type=int, metavar='N',
@@ -1061,6 +1075,7 @@ _cd_grown = []               # --convdelta above a checkpoint's: the indices of 
 _new_names = []              # regexes of parameters new on --load (not in the checkpoint's EMA)
 _aud_switch = None           # --load with another --audio_encoder: (old, new)
 _start_step = 0
+_ckpt_plateau, _ckpt_log = None, ''
 _start_exs = 0
 _start_toks = 0
 _start_exs_by = {}            # corpus -> examples trained, for the STEP ex_/ep_ columns
@@ -1107,6 +1122,8 @@ if _loaded_ckpt is not None:
     if 'full_crops' not in _saved and not any(a.startswith('--full_crops') for a in sys.argv):
         args.full_crops = 0.0         # trained before full views existed: keep its crops
     _start_step = int(_loaded_ckpt.get('step', 0))
+    _ckpt_plateau = _loaded_ckpt.get('plateau')      # (--schedule plateau; the checkpoint is
+    _ckpt_log = _loaded_ckpt.get('log') or ''        #  released before the schedule is built)
     _start_exs = int(_loaded_ckpt.get('examples', 0))
     # tokens trained (one per row per step); a checkpoint from before the count: step x its batch
     _start_toks = int(_loaded_ckpt.get('tokens', _start_step * int(_saved.get('batch') or args.batch)))
@@ -8248,10 +8265,97 @@ def _wema_eval(step):
             _wema_swap(T)
 
 
+# --schedule plateau: the cut so far (scale), the best held-out loss and the evals since it
+# (bad), and the step the schedule began (the --plateau_end fall starts there); in the checkpoint
+_plateau = dict(scale=1.0, best=float('inf'), best_step=-1, bad=0, begin=None, cuts=0)
+
+
+def _plateau_tag():
+    """The EVAL tag the plateau schedule watches: the first --weight_ema average, else live."""
+    c = ([c for c in _eval_corpus_names() if c not in _MEDIA_DATASETS] or [''])[0]
+    if not _wema:
+        return c
+    T = next(iter(_wema))
+    return f'{c}~ema{T // 1000}K' if T % 1000 == 0 else f'{c}~ema{T}'
+
+
+def _plateau_ceiling(step):
+    """--plateau_end: the log-linear fall's lr / lr_max at a global step (1 without it)."""
+    if not args.plateau_end or _plateau['begin'] is None:
+        return 1.0
+    b = _plateau['begin']
+    u = min(1.0, max(0.0, (step - b) / max(1, args.plateau_end - b)))
+    return (args.lr_final / args.lr_max) ** u
+
+
+def _plateau_lr(step):
+    return args.lr_max * max(args.lr_final / args.lr_max, min(_plateau['scale'], _plateau_ceiling(step)))
+
+
+def _plateau_cut(step):
+    """Cut the lr if the evals since the best have reached --plateau_patience (and it is above
+    --lr_final); the PLATEAU line's note, or ''."""
+    P = _plateau
+    if P['bad'] < args.plateau_patience or _plateau_lr(step) <= args.lr_final * (1 + 1e-9):
+        return ''
+    P['scale'] = min(P['scale'], _plateau_ceiling(step)) * args.plateau_factor
+    P['bad'], P['cuts'] = 0, P['cuts'] + 1
+    return f' -> cut {P["cuts"]}: x{args.plateau_factor:g}'
+
+
+def _plateau_see(step, v, emit=True):
+    """One held-out loss into the plateau schedule; cut the lr after --plateau_patience evals
+    without a new best."""
+    P = _plateau
+    if v is None or not math.isfinite(v):
+        return
+    if v < P['best'] - args.plateau_delta:
+        P['best'], P['best_step'], P['bad'] = float(v), int(step), 0
+    else:
+        P['bad'] += 1
+    cut = _plateau_cut(step)
+    if emit:
+        _emit(f'PLATEAU step {step:10} {_plateau_tag()} {v:.6f} best {P["best"]:.6f}@{P["best_step"]} '
+              f'bad {P["bad"]}/{args.plateau_patience}{cut} lr {_plateau_lr(step):.3e}')
+
+
+def _plateau_init():
+    """The schedule's state: the checkpoint's, or, the first time (a run switching to plateau),
+    seeded from the loaded log's EVAL history of the watched tag, so a plateau already under way
+    counts (and may cut at once)."""
+    if args.schedule != 'plateau':
+        return
+    if _ckpt_plateau:
+        _plateau.update(_ckpt_plateau)
+        print(f'--schedule plateau: resumed {_plateau}', flush=True)
+        return
+    _plateau['begin'] = int(_start_step)
+    hist = []
+    if _ckpt_log:
+        tag = _plateau_tag()
+        for m in re.finditer(r'^EVAL step +(\d+) corpus (\S+) +clean +(\S+)', _ckpt_log, re.M):
+            if m.group(2) == tag and int(m.group(1)) <= _start_step:
+                hist.append((int(m.group(1)), float(m.group(3))))
+    for st, v in hist:                   # the same rule as at each eval, without cuts
+        if v < _plateau['best'] - args.plateau_delta:
+            _plateau['best'], _plateau['best_step'], _plateau['bad'] = v, st, 0
+        else:
+            _plateau['bad'] += 1
+    print(f'--schedule plateau: from step {_start_step}, {len(hist)} past {_plateau_tag()} evals: best '
+          f'{_plateau["best"]:.6f}@{_plateau["best_step"]}, {_plateau["bad"]} evals since'
+          + (f'; reaching {args.lr_final:g} by step {args.plateau_end}' if args.plateau_end else ''), flush=True)
+    cut = _plateau_cut(_start_step)      # a plateau already under way: cut now
+    if cut:
+        _emit(f'PLATEAU step {_start_step:10} {_plateau_tag()} (past evals) best {_plateau["best"]:.6f}'
+              f'@{_plateau["best_step"]}{cut} lr {_plateau_lr(_start_step):.3e}')
+
+
 def _lr_factor(step):
     """lr / lr_max at a global step."""
     if args.schedule == 'const':
         return 1.0
+    if args.schedule == 'plateau' and step >= args.lr_period:
+        return _plateau_lr(step) / args.lr_max
     if args.schedule == 'decay':
         d0 = _start_step if args.decay_start is None else args.decay_start
         if step >= d0:
@@ -8263,6 +8367,7 @@ def _lr_factor(step):
     return (args.lr_min + (args.lr_max - args.lr_min) * f) / args.lr_max
 
 
+_plateau_init()
 scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=_lr_factor)
 if _start_step:              # resume: fast-forward the schedule to the checkpoint's step
     scheduler.last_epoch = _start_step
@@ -8374,7 +8479,8 @@ def _save(i, n_examples):
                 'lr': optimizer.param_groups[0]['lr'],
                 'optimizer': optimizer.state_dict(), 'opt_names': _opt_names(),
                 'win_optimizer': _win_opt.state_dict() if _win_opt is not None else None,
-                'weight_ema': {T: dict(e) for T, e in _wema.items()}}, args.save)
+                'weight_ema': {T: dict(e) for T, e in _wema.items()},
+                'plateau': dict(_plateau) if args.schedule == 'plateau' else None}, args.save)
 
 
 def _gen_lines(i):
@@ -8994,6 +9100,8 @@ try:
             if _judge is not None:
                 _judge.park()
             _wema_eval(i)
+            if args.schedule == 'plateau':
+                _plateau_see(i, (_eval_results.get(_plateau_tag()) or {}).get('clean'))
 
         if i % args.checkpoint == 0:
             _save(i, n_examples)
