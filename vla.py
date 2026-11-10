@@ -335,6 +335,15 @@ parser.add_argument('--cd_band', default=0.0, type=float, metavar='F',
                          'and fix w: log a = -(1/w) F^tanh(g) (0 = off: log a = -(1/w) 2 sigmoid(g), the window '
                          'free to grow without bound, and w learned). A bank of fixed, log-spaced timescales: '
                          'forgetting as a power law, not drift to "never forget". Restored by --load')
+parser.add_argument('--tau_l2', default=0.0, type=float, metavar='LAMBDA',
+                    help='--convdelta: an L2 penalty on every token\'s decay window tau = -1/log a (after the '
+                         'gate; ticks): LAMBDA x the mean of (tau / --tau_l2_ref)^2 over the tokens, grid positions '
+                         'and heads of each block, averaged over the blocks, added to the training loss. Its pull '
+                         '(2 LAMBDA tau^2 per e-fold) grows with the window, so it reins in runaway windows and '
+                         'hardly touches short ones. Without --cd_band the windows are unbounded: start them short '
+                         'with --cd_windows (e.g. 1:16). Training only; the MEM lines give each head\'s largest tau')
+parser.add_argument('--tau_l2_ref', default=1024.0, type=float, metavar='TICKS',
+                    help='--tau_l2: the window that costs LAMBDA (a head held there: LAMBDA / (blocks x heads))')
 parser.add_argument('--cd_qkv_conv', default=None, metavar='SxSxT',
                     help='--convdelta: a residual depthwise conv on the memory\'s q, k, v (after the 1x1, before '
                          'q and k are normalized): each channel its own S x S kernel over the grid and T taps '
@@ -1697,6 +1706,22 @@ def _delta_chunk(qc, kc, vc, bc, lc, rc, S):
     return o, g0[:, -1, None, None] * S + (U * gC[:, :, None]).transpose(1, 2) @ kc
 
 
+
+class _TauL2(torch.autograd.Function):
+    """Identity on log a; backward adds c x d/d(log a) of sum (tau^2), tau = -1/log a (clamped at
+    1e6 ticks): c 2 tau^3. A larger log a (nearer 0) is a longer window, so descent shortens it."""
+    @staticmethod
+    def forward(ctx, loga, c):
+        ctx.save_for_backward(loga)
+        ctx.c = c
+        return loga.view_as(loga)
+
+    @staticmethod
+    def backward(ctx, g):
+        loga, = ctx.saved_tensors
+        tau = -1.0 / loga.float().clamp_max(-1e-6)
+        return g + (ctx.c * 2.0 * tau ** 3).to(g.dtype), None
+
 def _delta_scan(q, k, v, beta, loga, reset, S0, chunk=64, grid=None, ckpt=True):
     """--convdelta: the gated delta rule over a sequence, chunkwise in parallel.
     q, k [N, T, dk] (L2-normalized), v [N, T, dv], beta, loga [N, T] (write strength, log decay),
@@ -2050,11 +2075,24 @@ class ConvDeltaBlock(nn.Module):
             loga = -self.lam.exp() * self.band ** torch.tanh(ga)
         else:
             loga = -self.lam.exp() * 2 * torch.sigmoid(ga)
+        if self.training and args.tau_l2 and loga.requires_grad:
+            loga = self._tau_l2(loga)
         if self.training:            # for the STEP line's tau, beta and the MEM lines
             with torch.no_grad():
                 self.stats = torch.stack([-torch.log((-loga.detach().float()).clamp_min(1e-12)).mean((0, 1)),
                                           beta.detach().float().mean((0, 1))])
         return q, k, v, beta, loga
+
+    def _tau_l2(self, loga):
+        """--tau_l2: loga unchanged, with the penalty's gradient added in backward (no loss term:
+        it survives the block checkpoint's recompute). Records the penalty and each head's
+        largest tau for the MEM lines."""
+        coef = args.tau_l2 / max(1, int(args.convdelta or 1))         # the blocks' mean
+        with torch.no_grad():
+            tau = (-1.0 / loga.detach().float().clamp_max(-1e-6))
+            self.tau_pen = ((tau / args.tau_l2_ref) ** 2).mean()
+            self.tau_hi = tau.flatten(0, -2).amax(0)
+        return _TauL2.apply(loga, coef / (args.tau_l2_ref ** 2 * loga.numel()))
 
     def _read_out(self, o, M):
         """o [M, P, H (+ F), d] -> the block's addend [M, C, S, S]."""
@@ -7260,9 +7298,12 @@ def _mem_lines(step):
         off += b.state_ch
         w = b.tau or (-b.lam.detach().float()).exp().tolist()   # (--cd_tau: the fixed windows)
         lt, be = b.stats.tolist()
+        hi = ''
+        if args.tau_l2 and getattr(b, 'tau_hi', None) is not None:   # --tau_l2: each head's largest tau, the penalty
+            hi = ' max' + ''.join(' ' + _kfmt(x) for x in b.tau_hi.tolist()) + f' L2 {float(b.tau_pen):.2e}'
         _emit(f'MEM step {step:10} block {bi:2} w' + ''.join(f'{x:6.0f}' for x in w) +   # fixed widths: columns align
               ' tau' + ''.join(' ' + _kfmt(math.exp(x)) for x in lt) +
-              ' beta' + ''.join(f'{x:5.2f}' for x in be) + S_)
+              ' beta' + ''.join(f'{x:5.2f}' for x in be) + S_ + hi)
 
 
 def _heldout_eval(step):
