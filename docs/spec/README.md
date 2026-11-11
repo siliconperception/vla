@@ -1,10 +1,10 @@
 # VLA functional specification (model)
 
 This is what the model computes, tick by tick, for the published configuration (`siliconperception/vla`,
-run v657, a ConvDelta model). It specifies the function, not an implementation. `vla.py` is the reference:
+run v662, a ConvDelta model). It specifies the function, not an implementation. `vla.py` is the reference:
 where this text and the code disagree, the code is right and this text is a bug.
 
-![One clock tick of the model](../figures/vla_v657.svg)
+![One clock tick of the model](../figures/vla_v662.svg)
 
 ## Dimensions
 
@@ -111,7 +111,7 @@ the projections feeding it.
    `<NUL>`. Embedding rows the tokenizer never uses are masked off.
 2. **Emit.** Softmax, then min-p sampling: only tokens with at least p_min times the top token's probability
    are kept. p_min is stored with the weights; in training it is adjusted so that the model's own text,
-   generated from `<NUL>`, scores a fluency of 100 (p_min = 0.0067 at step 3,700,000).
+   generated from `<NUL>`, scores a fluency of 100 (p_min = 0.0064 at step 10,800,000).
 3. The sampled token is the next tick's input (in training, the dataset's next token is).
 
 ### Cost per tick
@@ -152,7 +152,7 @@ channel), estimated in training, not trained by gradient.
 
 ## The figure
 
-[`docs/figures/vla_v657.svg`](../figures/vla_v657.svg) draws one clock tick (40 ms at 25 Hz) in two
+[`docs/figures/vla_v662.svg`](../figures/vla_v662.svg) draws one clock tick (40 ms at 25 Hz) in two
 panes, 1920 × 2160. Colours encode the kind of operation, the same in both panes: grey hatched = frozen
 (embedding, output layer); violet = RMS norm and replication; blue = linear 1×1 convs; green = conv 3×3 +
 BatchNorm + ReLU; purple = the causal depthwise conv on q, k, v; yellow = the delta-rule memory (Δ) and its read;
@@ -164,8 +164,8 @@ data and state paths; dashed arrows carry the old state into an update.
 
 The subtitle line gives the configuration: `--lm` (text only), C 256, the 9×9 grid, 7 blocks, H 6 heads × d 32
 per position, 25 Hz, 25.09 M trained parameters, a fixed state of 4,463,424 values, the input as this token
-copied to every grid position, training on 256-tick windows with every document reset, and AdamW with weight
-decay 0.01.
+copied to every grid position, training on 256-tick windows with every document reset, and AdamW (weight decay
+0.01), then plain SGD.
 
 Left to right:
 
@@ -232,8 +232,9 @@ reset at each document start.
 
 ## Training (for reference)
 
-- From scratch, to step 3,700,000, in one run with one configuration. A step is one tick (one token) for each of
-  16 rows, so 59.2 M tokens in all, in 14,453 optimizer updates.
+- From scratch, to step 10,800,000, in one run with one architecture, resumed three times with a new optimizer
+  setting (runs v657, v659, v660, v662). A step is one tick (one token) for each of
+  16 rows, so 172.8 M tokens in all, in 42,187 optimizer updates.
 - Data: FineWeb-Edu sample-10BT (about 10 B tokens), text only, every document drawn in a fresh random order
   each pass; 1 document in 32, chosen by a hash of its text, is held out for evaluation.
 - Each row trains on windows of 256 consecutive ticks. Within a window the convs run on all ticks at once, and
@@ -245,12 +246,17 @@ reset at each document start.
 - **BatchNorm:** in training each BN normalizes with the statistics of the current window (16 rows × 256 ticks ×
   81 positions) and updates its running statistics (momentum 0.1); the published model uses those running
   statistics, as fixed constants.
-- Optimizer: AdamW, β (0.9, 0.95), the learning rate rising from 0 to 1e-3 over the first 20,000 steps (a half
-  cosine), then held; weight decay 0.01 on every trained parameter except the β and α gates; no gradient
+- Optimizer, by stage. Steps 0 to 5,484,288 (v657): AdamW, β (0.9, 0.95), the learning rate rising from 0 to
+  1e-3 over the first 20,000 steps (a half cosine), then held; weight decay 0.01 on every trained parameter
+  except the β and α gates. To 8,962,048 (v659): the same AdamW, the learning rate halved whenever 4 evaluations
+  (50,000 steps apart) of the averaged weights passed without a 0.002-nat gain, to 4.9e-4, 2.4e-4, 1.2e-4, then
+  6.1e-5. To 10,478,080 (v660): plain SGD, no momentum, no weight decay, the learning rate rising from 0 to 0.1
+  over 20,000 steps (a half cosine), then held. To 10,800,000 (v662): the same SGD, rising to 0.2. No gradient
   clipping. Cross-entropy is normalized per word, not per token.
 - **Published weights:** an exponential moving average of the trained weights, θ̄ ← θ̄ + (θ − θ̄)/300 after every
-  update, kept through the whole run, taken at step 3,700,000. It removes most of the update-to-update noise:
-  at 3,700,000 it scores about 0.12 nats per token lower on FineWeb-Edu than the weights it averages.
+  update, kept through the whole run, taken at step 10,800,000. It removes most of the update-to-update noise:
+  over the last 200,000 steps it scored 0.13 to 0.35 nats per token lower on FineWeb-Edu than the weights it
+  averages.
 - Frozen: the token embedding and the output layer (pythia-31m), and the base windows.
 - Numerics: the convs and the q, k, v projection run in bf16 on the GPU, the rest in TF32. In float64, the
   parallel scan equals one-tick stepping to about 1e-14.

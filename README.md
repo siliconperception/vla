@@ -1,7 +1,7 @@
 # VLA: a recurrent CNN vision-language-action model
 
 `vla.py` is a language model with a fixed-size state and no positional encoding, built from convolutions on a
-9 × 9 grid. The published model, v657, is a ConvDelta model. Its input is only the current token, copied to
+9 × 9 grid. The published model, v662, is a ConvDelta model. Its input is only the current token, copied to
 every grid position. Seven residual blocks follow, each five 3 × 3 convolutions with BatchNorm and a 1 × 1 around a
 skip, then an associative memory at every grid position (6 heads of 32 × 32) written by the gated delta rule, each
 head forgetting over its own fixed time scale (1 to 1,024 ticks across the 42 heads, which the input can move up to
@@ -21,9 +21,9 @@ off-chip DRAM. One set of small convolution kernels is reused at every grid posi
 twenty-five million trained weights drive a state of 4.5 million values. And the state never grows, so every tick does the
 same work in the same time, however long the model has been running.
 
-![One clock tick of the VLA](docs/figures/vla_v657.svg)
+![One clock tick of the VLA](docs/figures/vla_v662.svg)
 
-*One clock tick of the published model, v657. Top: the whole model, text only: the current token on every
+*One clock tick of the published model, v662. Top: the whole model, text only: the current token on every
 position of the 9 × 9 grid, seven ConvDelta blocks, and the decoder. Bottom: one block, five 3 × 3 convs with
 BatchNorm and a 1 × 1 around a skip, then a gated delta-rule memory at every grid position. The [functional spec](docs/spec/README.md) walks through the
 figure part by part.*
@@ -84,23 +84,39 @@ The state (the memories and the last 3 ticks of q, k, v) is reset to zero at eve
 ## Training your own
 
 ```bash
-# v657's configuration, the published model's, from scratch: text from FineWeb-Edu (sample-10BT, every document
-# in a fresh random order each pass; put its arrow cache on an SSD), 16 rows x 256-tick windows, every document
-# reset, fixed base windows 1 ... 1,024 ticks moved by the input within x/÷4, AdamW with the learning rate warmed
-# from 0 to 1e-3 over 20,000 steps, then held, weight decay 0.01 except on the gates; a running average of the
-# weights (time constant 300 updates) is kept and evaluated alongside the live weights
-python vla.py --mix fwedu:1 --full_shuffle --lm --context 9 --n_hidden 256 --c_context 256 \
-    --linout_kernel 0 --attn 0 --convdelta 7 --cd_heads 6 --cd_dim 32 --cd_taps 0 --cd_convs 5 --cd_chunk 32 \
-    --cd_mix_out --cd_mem_res --cd_no_gp --cd_qkv_conv 3x3x4 --grid_hist 0 \
-    --cd_band 4 --cd_tau "1,3.3,11,35,114,371;1.2,3.9,13,41,135,440;1.4,4.6,15,49,159,521;1.7,5.4,18,58,189,617;2,6.4,21,68,224,730;2.3,7.6,25,81,265,865;2.8,9,29,96,314,1024" \
-    --dec_tree_kernels 3,3,3,3 --dec_relu --dec_bn \
-    --batch 16 --bptt 256 --ckpt_ticks --reset_prob 1 --clock_hz 25 --nul_weight 1 --loss_norm words \
-    --optimizer adamw --betas 0.9,0.95 --weight_decay 0.01 --no-wd_mem --no-wd_gates --weight_ema 300 \
-    --schedule decay --lr_max 1e-9 --lr_final 0.001 --decay_steps 20000 --decay_start 0 \
-    --save checkpoint/my_run.pt --log log/exp.my_run
+# The published model's configuration: text from FineWeb-Edu (sample-10BT, every document in a fresh random order
+# each pass; put its arrow cache on an SSD), 16 rows x 256-tick windows, every document reset, fixed base windows
+# 1 ... 1,024 ticks moved by the input within x/÷4; a running average of the weights (time constant 300 updates)
+# is kept and evaluated alongside the live weights. A resume repeats these flags (--load restores only the
+# architecture, the weights, the optimizer state and the average) and overrides the optimizer and schedule.
+RUN=(--mix fwedu:1 --full_shuffle --lm --context 9 --n_hidden 256 --c_context 256
+    --linout_kernel 0 --attn 0 --convdelta 7 --cd_heads 6 --cd_dim 32 --cd_taps 0 --cd_convs 5 --cd_chunk 32
+    --cd_mix_out --cd_mem_res --cd_no_gp --cd_qkv_conv 3x3x4 --grid_hist 0
+    --cd_band 4 --cd_tau "1,3.3,11,35,114,371;1.2,3.9,13,41,135,440;1.4,4.6,15,49,159,521;1.7,5.4,18,58,189,617;2,6.4,21,68,224,730;2.3,7.6,25,81,265,865;2.8,9,29,96,314,1024"
+    --dec_tree_kernels 3,3,3,3 --dec_relu --dec_bn
+    --batch 16 --bptt 256 --ckpt_ticks --reset_prob 1 --clock_hz 25 --nul_weight 1 --loss_norm words
+    --optimizer adamw --betas 0.9,0.95 --weight_decay 0.01 --no-wd_mem --no-wd_gates --weight_ema 300
+    --schedule decay --lr_max 1e-9 --lr_final 0.001 --decay_steps 20000 --decay_start 0
+    --save checkpoint/my_run.pt --log log/exp.my_run)
+
+# 1 (v657), from scratch to step 5,484,288: AdamW, the lr warmed from 0 to 1e-3 over 20,000 steps, then held,
+#   weight decay 0.01 except on the gates
+python vla.py "${RUN[@]}" --run_steps 5484288
+# 2 (v659), to step 8,962,048: the same AdamW, the lr halved after 4 evals of the average's loss without a
+#   0.002 gain (cut to 4.9e-4, 2.4e-4, 1.2e-4 and 6.1e-5)
+python vla.py "${RUN[@]}" --load checkpoint/my_run.pt --run_steps 3477760 --schedule plateau --lr_max 1e-3 \
+    --lr_min 1e-9 --lr_period 20000 --lr_final 1e-5 --plateau_patience 4 --plateau_delta 0.002 \
+    --plateau_factor 0.5 --plateau_end 62500000
+# 3 (v660), to step 10,478,080: plain SGD, no momentum, no weight decay, the lr warmed from 0 to 0.1 over
+#   20,000 steps, then held
+python vla.py "${RUN[@]}" --load checkpoint/my_run.pt --run_steps 1516032 --optimizer sgd --momentum 0 \
+    --weight_decay 0 --lr_final 0.1 --decay_start 8962048
+# 4 (v662), to step 10,800,000: the same SGD, the lr warmed from 0 to 0.2 over 20,000 steps, then held
+python vla.py "${RUN[@]}" --load checkpoint/my_run.pt --run_steps 321920 --optimizer sgd --momentum 0 \
+    --weight_decay 0 --lr_final 0.2 --decay_start 10478080
 ```
 
-The published weights are this run's running average at step 3,700,000 (`--use_ema 300` on `--load` gives the
+The published weights are this run's running average at step 10,800,000 (`--use_ema 300` on `--load` gives the
 same weights from a checkpoint); `--load` resumes a checkpoint with its optimizer state and its average.
 
 The same `vla.py` also trains the earlier register models (`--ctx_ema`, `--write_gate`, `--layers`) and

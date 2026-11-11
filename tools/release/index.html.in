@@ -195,7 +195,7 @@ done</code></pre>
     <li>Short causal conv before the memory: Fu et al., <a href="https://arxiv.org/abs/2212.14052">Hungry Hungry Hippos</a> (2022); Gu, Dao, <a href="https://arxiv.org/abs/2312.00752">Mamba</a> (2023)</li>
     <li>Residual blocks: He et al., <a href="https://arxiv.org/abs/1512.03385">Deep Residual Learning for Image Recognition</a> (2015); batch norm: Ioffe, Szegedy, <a href="https://arxiv.org/abs/1502.03167">Batch Normalization</a> (2015); RMS norm: Zhang, Sennrich, <a href="https://arxiv.org/abs/1910.07467">Root Mean Square Layer Normalization</a> (2019)</li>
     <li>Tokenizer, frozen embedding and output layer, reference model: Biderman et al., <a href="https://arxiv.org/abs/2304.01373">Pythia</a> (2023)</li>
-    <li>Optimizer: Loshchilov, Hutter, <a href="https://arxiv.org/abs/1711.05101">Decoupled Weight Decay Regularization</a> (2017); weight averaging: Polyak, Juditsky, <a href="https://doi.org/10.1137/0330046">Acceleration of Stochastic Approximation by Averaging</a> (1992); data: Lozhkov et al., <a href="https://huggingface.co/datasets/HuggingFaceFW/fineweb-edu">FineWeb-Edu</a> (2024); Penedo et al., <a href="https://arxiv.org/abs/2406.17557">The FineWeb Datasets</a> (2024)</li>
+    <li>Optimizer: Loshchilov, Hutter, <a href="https://arxiv.org/abs/1711.05101">Decoupled Weight Decay Regularization</a> (2017), then plain SGD; weight averaging: Polyak, Juditsky, <a href="https://doi.org/10.1137/0330046">Acceleration of Stochastic Approximation by Averaging</a> (1992); data: Lozhkov et al., <a href="https://huggingface.co/datasets/HuggingFaceFW/fineweb-edu">FineWeb-Edu</a> (2024); Penedo et al., <a href="https://arxiv.org/abs/2406.17557">The FineWeb Datasets</a> (2024)</li>
   </ul>
 
   <footer>

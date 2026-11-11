@@ -1,6 +1,6 @@
 """Draw docs/figures/vla_<model>.svg: one clock tick of a VLA model, 16:9 (1920 x 1080).
 
-usage: python tools/figure_vla.py [--model v498|v499|v502|v505|v511|v531|v533|v536|v538|v540|v541|v552|v564|v569|v579|v583|v592|v594|v597|v624|v626|v646|v650|v657] [--out OUT]
+usage: python tools/figure_vla.py [--model v498|v499|v502|v505|v511|v531|v533|v536|v538|v540|v541|v552|v564|v569|v579|v583|v592|v594|v597|v624|v626|v646|v650|v657|v662] [--out OUT]
 
 v498: recurrent CNN + two order-2 Legendre memories (4096, 64 ticks) + copy + recall attention, never
 reset. v499: no registers, the recall attention's ring is the whole state, reset at each example.
@@ -42,12 +42,14 @@ v650: v646 with a BatchNorm before every ReLU, in the blocks (--no-cd_no_bn) and
 windows starting 1 … 256 ticks (--cd_windows 1:256), the q, k, v conv as an nn.Conv3d (the same function).
 v657: v650 with fixed base windows, 1 … 1,024 ticks log-spaced over all 42 heads (--cd_tau), the gate moving
 each within x/÷4 (--cd_band 4), every document reset (--reset_prob 1), AdamW weight decay 0.01 (none on the
-gates), trained on FineWeb-Edu."""
+gates), trained on FineWeb-Edu.
+v662: v657's model, trained on from AdamW to plain SGD (no momentum, no weight decay, lr 0.1 then 0.2);
+drawn as v657 with the training caption changed."""
 import argparse
 import re
 
 ap = argparse.ArgumentParser()
-ap.add_argument('--model', default='v498', choices=('v498', 'v499', 'v502', 'v505', 'v511', 'v531', 'v533', 'v536', 'v538', 'v540', 'v541', 'v552', 'v564', 'v569', 'v579', 'v583', 'v592', 'v594', 'v597', 'v624', 'v626', 'v646', 'v650', 'v657'))
+ap.add_argument('--model', default='v498', choices=('v498', 'v499', 'v502', 'v505', 'v511', 'v531', 'v533', 'v536', 'v538', 'v540', 'v541', 'v552', 'v564', 'v569', 'v579', 'v583', 'v592', 'v594', 'v597', 'v624', 'v626', 'v646', 'v650', 'v657', 'v662'))
 ap.add_argument('--out', default=None)
 a = ap.parse_args()
 NAME = a.model                            # the title and file name
@@ -55,6 +57,8 @@ if a.model == 'v541':
     a.model = 'v540'                      # same model as v540
 if a.model in ('v594', 'v597'):
     a.model = 'v592'                      # same model as v592
+if a.model == 'v662':
+    a.model = 'v657'                      # same model as v657 (AdamW, then plain SGD)
 V657 = a.model == 'v657'                  # v650 + fixed base windows 1 … 1,024 (x/÷4 band), every document reset
 if V657:
     a.model = 'v650'
@@ -1133,6 +1137,8 @@ def draw_v536():
                   .replace('α = exp(−2 exp(λ) σ(·)), λ per head', 'α = exp(−4^tanh(·) / w), w fixed per head')
                   .replace('>S zeroed<', '>S and the FIFO zeroed<')
                   for o in out]
+    if NAME == 'v662':                    # AdamW, then plain SGD
+        out[:] = [o.replace('AdamW, weight decay 0.01', 'AdamW (weight decay 0.01), then plain SGD') for o in out]
     if V646:                              # a 9x9 grid, 16 rows
         out[:] = [o.replace('(32 rows)', '(16 rows)').replace('7×7', '9×9').replace('49×6×32×32', '81×6×32×32')
                   .replace('49 × 6 × 32×32 = 301,056', '81 × 6 × 32×32 = 497,664')

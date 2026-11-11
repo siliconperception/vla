@@ -16,7 +16,7 @@ datasets:
 
 # VLA (ConvDelta)
 
-**Release v657, step 3,700,000** (59.2 M training tokens).
+**Release v662, step 10,800,000** (172.8 M training tokens).
 
 A language model with a fixed-size state and no positional encoding, built from convolutions on a 9 × 9 grid. Its
 input is only the current token, copied to every grid position. Seven residual ConvDelta blocks follow. Each one
@@ -38,7 +38,7 @@ one fetched from off-chip DRAM.
 
 Code, functional spec and figures: [github.com/siliconperception/vla](https://github.com/siliconperception/vla)
 
-![One clock tick](https://raw.githubusercontent.com/siliconperception/vla/main/docs/figures/vla_v657.svg)
+![One clock tick](https://raw.githubusercontent.com/siliconperception/vla/main/docs/figures/vla_v662.svg)
 
 ## Use
 
@@ -73,21 +73,30 @@ kept.
 
 ## Training
 
-- From scratch, in one run with one configuration: 3,700,000 steps, one token per row per step, 16 rows
-  (59.2 M tokens, 14,453 optimizer updates). Each row trains on 256-tick windows, all ticks of a window at
+- From scratch, in one run with one architecture, resumed three times with a new optimizer setting (runs v657,
+  v659, v660, v662): 10,800,000 steps, one token per row per step, 16 rows (172.8 M tokens, 42,187 optimizer
+  updates). Each row trains on 256-tick windows, all ticks of a window at
   once (the memories through an exact chunked parallel scan); the state carries on between windows and the
   gradient stops at a window's start.
-- AdamW (β 0.9, 0.95), learning rate warmed from 0 to 1e-3 over the first 20,000 steps and held; weight decay
-  0.01, except on the β and α gates. No gradient clipping. The loss is normalized per word rather than per token.
+- Optimizer, by stage:
+  - steps 0 to 5,484,288 (v657): AdamW (β 0.9, 0.95), learning rate warmed from 0 to 1e-3 over the first 20,000
+    steps and held; weight decay 0.01, except on the β and α gates;
+  - to 8,962,048 (v659): the same AdamW, the learning rate halved whenever 4 evaluations (50,000 steps apart) of
+    the averaged weights passed without a 0.002-nat gain: 4.9e-4, 2.4e-4, 1.2e-4, then 6.1e-5;
+  - to 10,478,080 (v660): plain SGD, no momentum, no weight decay, the learning rate warmed from 0 to 0.1 over
+    20,000 steps and held;
+  - to 10,800,000 (v662): the same SGD, warmed from 0 to 0.2 over 20,000 steps and held.
+
+  No gradient clipping. The loss is normalized per word rather than per token.
 - The published weights are a running average of the trained weights (an exponential moving average with a
-  time constant of 300 updates, kept through the whole run), not the last update's weights. At 3,700,000 it scores
-  about 0.12 nats per token lower on FineWeb-Edu than the weights it averages.
+  time constant of 300 updates, kept through the whole run), not the last update's weights. Over the last 200,000
+  steps it scored 0.13 to 0.35 nats per token lower on FineWeb-Edu than the weights it averages.
 - Data: FineWeb-Edu sample-10BT (10 B tokens), text only, every document drawn in a fresh random order each pass;
   1 document in 32 (by a hash of its text) is held out. The state, memories and q, k, v buffer, is reset to zero
   at every document start, in training and evaluation.
 - The [spec](https://github.com/siliconperception/vla/blob/main/docs/spec/README.md) gives the exact computation.
 
-## Evaluation (at the published step, 3,700,000)
+## Evaluation (at the published step, 10,800,000)
 
 The reference is EleutherAI's [pythia-70m](https://huggingface.co/EleutherAI/pythia-70m): a transformer with the
 same tokenizer, so losses per token compare directly. Its 70 M parameters include 19 M outside the token
@@ -97,20 +106,20 @@ scored on the same documents and pairs, by the same rule.
 
 | | **this model** | pythia-70m | pythia-70m | pythia-70m |
 |---|---|---|---|---|
-| training tokens | **59.2 M** | 33.6 M (step 16) | 67.1 M (step 32) | 300 B (final) |
-| FineWeb-Edu held-out (100 documents, nats/token) | **4.242** | 10.489 | 9.793 | 3.579 |
-| FineWeb held-out (100 documents, nats/token) | **4.519** | 10.489 | 9.823 | 3.731 |
-| BabyLM 2026 dev (100 pieces, nats/token) | **3.991** | 10.285 | 9.448 | 3.250 |
-| BLiMP (1,005 pairs from all 67 paradigms), % | **71.8** | 53.5 | 52.0 | 75.7 |
-| ComVE (999 pairs, common sense), % | **66.8** | 54.8 | 54.0 | 69.7 |
+| training tokens | **172.8 M** | 33.6 M (step 16) | 67.1 M (step 32) | 300 B (final) |
+| FineWeb-Edu held-out (100 documents, nats/token) | **4.068** | 10.489 | 9.793 | 3.579 |
+| FineWeb held-out (100 documents, nats/token) | **4.342** | 10.489 | 9.823 | 3.731 |
+| BabyLM 2026 dev (100 pieces, nats/token) | **3.873** | 10.285 | 9.448 | 3.250 |
+| BLiMP (1,005 pairs from all 67 paradigms), % | **73.6** | 53.5 | 52.0 | 75.7 |
+| ComVE (999 pairs, common sense), % | **66.3** | 54.8 | 54.0 | 69.7 |
 
 Losses are the mean over documents of each document's mean loss per token, from a zero state (this model) or a
 bare document start (pythia); a document with any token over 20 nats is counted as a runaway and left out
-(3 % of the FineWeb-Edu documents for this model). Pythia was trained on the Pile, this model on
+(10 % of the FineWeb-Edu documents for this model). Pythia was trained on the Pile, this model on
 FineWeb-Edu, so the FineWeb-Edu row is in-domain for this model only. Matched tokens are not matched training:
 pythia's 33.6 M and 67.1 M tokens are only 16 and 32 optimizer updates of 2 M tokens each, at the start of its
-learning-rate warm-up, while this model's are 14,453 updates of 4,096 tokens. Fully trained pythia-70m is the
-fair reference: this model is still short of it, by about 0.7 nats per token on FineWeb-Edu and 3 to 4 points on
+learning-rate warm-up, while this model's are 42,187 updates of 4,096 tokens. Fully trained pythia-70m is the
+fair reference: this model is still short of it, by about 0.5 nats per token on FineWeb-Edu and 2 to 3 points on
 BLiMP and ComVE. A pair is right when the model gives the correct sentence the lower
 total loss, each sentence read without context; chance is 50 %. For scale on the pairs: babyllama-10m-2024
 (trained on 10 M words) scores 70.0 / 63.7 and SmolLM2-135M 80.9 / 79.3.
@@ -119,9 +128,9 @@ total loss, each sentence read without context; chance is 50 %. For scale on the
 
 From the prompt in bold, with these weights. Locally fluent in places, repetitive, not yet coherent:
 
-> **The best way to learn a new language is** to change grammar and create a new language which will bring it along the way.
+> **The best way to learn a new language is** to change the name of a teacher or student.
 
-> **The history of the bicycle began in** 1972, when the first generation of wheelcar engine sold home for the first time, which after the first generation of electric cars became an electrical power.
+> **The history of the bicycle began in** 1879. The first generation of wheelcarriages resulted in the Second World War, …
 
 ## Limits
 
@@ -141,7 +150,7 @@ blocks use residual connections ([He et al. 2015](https://arxiv.org/abs/1512.033
 ([Ioffe, Szegedy 2015](https://arxiv.org/abs/1502.03167)), and a short causal conv before the memory as in H3 and
 Mamba ([Fu et al. 2022](https://arxiv.org/abs/2212.14052); [Gu, Dao 2023](https://arxiv.org/abs/2312.00752)). Tokenizer, frozen embedding and output layer, and the
 reference model: Pythia ([Biderman et al. 2023](https://arxiv.org/abs/2304.01373)). Optimizer: AdamW
-([Loshchilov, Hutter 2017](https://arxiv.org/abs/1711.05101)); weight averaging
+([Loshchilov, Hutter 2017](https://arxiv.org/abs/1711.05101)), then plain SGD; weight averaging
 ([Polyak, Juditsky 1992](https://doi.org/10.1137/0330046)). Data: FineWeb-Edu
 ([Penedo et al. 2024](https://arxiv.org/abs/2406.17557)).
 
